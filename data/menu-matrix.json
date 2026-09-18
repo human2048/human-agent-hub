@@ -1,0 +1,23 @@
+{
+  "merchant": {
+    "name": "Sabor Cybernético",
+    "whatsapp_phone": "573000000000",
+    "currency": "COP",
+    "city": "Bogotá"
+  },
+  "categories": [
+    {
+      "id": "cat-1",
+      "name": "Hamburguesas Artesanales",
+      "products": [
+        {
+          "id": "prod-101",
+          "name": "Cyber Burger Doble",
+          "description": "Doble carne 150g, queso cheddar fundido, tocineta crocante y salsa de la casa.",
+          "price": 28000,
+          "image_url": "https://images.unsplash.com/photo-1568901346375-23c9450c58cd?w=500"
+        }
+      ]
+    }
+  ]
+}
