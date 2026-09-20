@@ -3,46 +3,68 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SaaS Local Élite | Experiencia Digital</title>
-    <!-- Tailwind CSS para diseño minimalista y moderno estilo SaaS de clase mundial -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>CiberNiche Store - MVP Pro</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
-        body {
-            font-family: 'Plus Jakarta Sans', sans-serif;
-            background-color: #0f172a;
-            color: #f8fafc;
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
         }
-        .glass-card {
-            background: rgba(30, 41, 59, 0.7);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+        body { 
+            font-family: system-ui, -apple-system, sans-serif; 
+            background: #0f172a; 
+            color: #f8fafc; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            height: 100vh; 
+            margin: 0; 
         }
-        .transition-smooth {
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        .card { 
+            background: #1e293b; 
+            padding: 2.5rem; 
+            border-radius: 1rem; 
+            box-shadow: 0 10px 25px rgba(0,0,0,0.4); 
+            text-align: center; 
+            max-width: 400px; 
+            width: 100%;
+            animation: fadeIn 1.2s ease-in-out;
         }
+        h1 { color: #38bdf8; margin-bottom: 0.5rem; }
+        p { color: #94a3b8; font-size: 0.95rem; margin-bottom: 1.5rem; }
+        input { 
+            width: 100%; 
+            padding: 0.75rem; 
+            margin-bottom: 1rem; 
+            border-radius: 0.5rem; 
+            border: 1px solid #334155; 
+            background: #0f172a; 
+            color: white;
+            box-sizing: border-box;
+        }
+        button { 
+            background: #0284c7; 
+            color: white; 
+            border: none; 
+            padding: 0.75rem 1.5rem; 
+            border-radius: 0.5rem; 
+            font-weight: bold; 
+            cursor: pointer; 
+            width: 100%;
+            transition: background 0.3s;
+        }
+        button:hover { background: #0369a1; }
+        .badge { display: inline-block; background: #065f46; color: #34d399; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.8rem; margin-top: 1.2rem; }
     </style>
 </head>
-<body class="min-h-screen flex flex-col items-center justify-center p-4">
-    <div class="w-full max-w-md glass-card rounded-2xl p-8 shadow-2xl transition-smooth">
-        <div class="text-center mb-6">
-            <span class="bg-indigo-500/10 text-indigo-400 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider">Verificado por IA</span>
-            <h1 class="text-2xl font-bold mt-3 text-white">SaaS Local Élite</h1>
-            <p class="text-slate-400 text-sm mt-1">Selecciona una opción para continuar con tu pedido o consulta.</p>
-        </div>
-        
-        <div class="space-y-4">
-            <button onclick="window.location.href='https://wa.me/?text=Hola%20quiero%20más%20información'" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3 px-4 rounded-xl shadow-lg transition-smooth flex items-center justify-center space-x-2">
-                <span>💬 Pedir por WhatsApp</span>
-            </button>
-            <button onclick="alert('Sistema operando de forma autónoma')" class="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold py-3 px-4 rounded-xl border border-slate-700 transition-smooth">
-                📋 Ver Catálogo Completo
-            </button>
-        </div>
-        
-        <div class="mt-8 text-center text-xs text-slate-500">
-            Powered by CyberNiche Autonomous Agent Hub
-        </div>
+<body>
+    <div class="card">
+        <h1>CiberNiche Store</h1>
+        <p>Plataforma corporativa impulsada por agentes autónomos locales.</p>
+        <form onsubmit="event.preventDefault(); alert('¡Formulario conectado y operativo!');">
+            <input type="email" placeholder="Ingresa tu correo profesional..." required>
+            <button type="submit">Unirme al MVP</button>
+        </form>
+        <div class="badge">● Sistema Operativo y En Vivo</div>
     </div>
 </body>
 </html>
