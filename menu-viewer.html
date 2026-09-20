@@ -3,17 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CyberNiche Lab - Menu Viewer</title>
-    <style>
-        body { font-family: Arial, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: auto; background: #1e293b; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        h1 { color: #38bdf8; text-align: center; }
-    </style>
+    <title>Menú Digital QR - Pedidos por WhatsApp</title>
 </head>
 <body>
-    <div class="container">
-        <h1>CyberNiche-Lab Autonomous Interface</h1>
-        <p>Estado del sistema: Operativo y optimizado para producción.</p>
+    <div id="app">
+        <header>
+            <h1 id="restaurant-name">Menú Digital</h1>
+        </header>
+        <main id="menu-items">
+            <!-- Los platillos se cargan dinámicamente -->
+        </main>
+        <footer>
+            <button id="whatsapp-order-btn">Pedir por WhatsApp</button>
+        </footer>
     </div>
 </body>
 </html>
