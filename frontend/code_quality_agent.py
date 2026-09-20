@@ -1,91 +1,98 @@
 import os
 import re
+from typing import Dict, Any
 
-class CodeQualityAgent:
+class FrontendBuilderAgent:
     """
-    Code Quality & Frontend Agent (code_quality_agent.py)
-    Dominio: Interfaz de Usuario y Estándares de Código.
-    Audita y valida archivos HTML/CSS garantizando estándares HTML5,
-    adaptabilidad móvil (Mobile-First) y optimización en menu-viewer.html.
+    Frontend Builder Agent (frontend/code_quality_agent.py)
+    Rol: Ingeniero UI/UX Senior y Arquitecto Frontend.
+    Dominio: Construcción de interfaces web de alta conversión (Mobile-First, 
+    diseño minimalista tipo SaaS moderno, paletas profesionales y animaciones fluidas).
     """
-    def __init__(self, frontend_dir="frontend"):
+    def __init__(self, frontend_dir: str = "frontend"):
         self.frontend_dir = frontend_dir
+        if not os.path.exists(self.frontend_dir):
+            os.makedirs(self.frontend_dir)
 
-    def audit_html_file(self, file_name: str = "menu-viewer.html") -> dict:
+    def execute(self, file_name: str = "menu-viewer.html", brand_name: str = "Micro-SaaS Local") -> Dict[str, Any]:
         """
-        Inspecciona el archivo HTML del visor de menús y verifica
-        el cumplimiento de estándares esenciales de la plataforma.
+        Diseña, programa y escribe de manera autónoma una interfaz web de nivel profesional 
+        basada en principios de UX/UI y alta conversión.
         """
-        file_path = os.path.join(self.frontend_dir, file_name)
-        
-        # Si el archivo está en la raíz, intentar encontrarlo allí
-        if not os.path.exists(file_path) and os.path.exists(file_name):
-            file_path = file_name
-
-        if not os.path.exists(file_path):
-            return {
-                "agent": "CodeQualityAgent",
-                "status": "ERROR_FILE_NOT_FOUND",
-                "file": file_name,
-                "passed_checks": False
-            }
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # Chequeos de auditoría de código HTML5 y Responsive Design
-        checks = {
-            "has_doctype": bool(re.search(r"<!DOCTYPE\s+html>", content, re.IGNORECASE)),
-            "has_html_tag": bool(re.search(r"<html[^>]*>", content, re.IGNORECASE)),
-            "has_head_tag": bool(re.search(r"<head[^>]*>", content, re.IGNORECASE)),
-            "has_body_tag": bool(re.search(r"<body[^>]*>", content, re.IGNORECASE)),
-            "has_viewport_meta": "viewport" in content.lower(),
-            "has_charset_utf8": "utf-8" in content.lower(),
-            "has_whatsapp_button_hook": "whatsapp" in content.lower() or "pedir" in content.lower()
-        }
-
-        # Evaluación general
-        failed_checks = [check for check, passed in checks.items() if not passed]
-        is_compliant = len(failed_checks) == 0
-
-        report = {
-            "agent": "CodeQualityAgent",
-            "status": "FRONTEND_AUDIT_PASSED" if is_compliant else "FRONTEND_AUDIT_WARNING",
-            "file": file_name,
-            "passed_checks": is_compliant,
-            "audit_details": checks,
-            "missing_elements": failed_checks
-        }
-
-        status_icon = "🎨 [CodeQualityAgent] ✅" if is_compliant else "🎨 [CodeQualityAgent] ⚠️"
-        print(f"{status_icon} Auditoría en '{file_name}': {'APROBADA' if is_compliant else 'REVISIÓN REQUERIDA'}")
-        if failed_checks:
-            print(f"   ⚠️ Elementos faltantes: {', '.join(failed_checks)}")
-
-        return report
-
-if __name__ == "__main__":
-    # Test aislado con creación de un menu-viewer.html de prueba optimizado
-    agent = CodeQualityAgent(".")
-    
-    # Crear un archivo HTML base para la prueba
-    sample_html = """<!DOCTYPE html>
+        try:
+            file_path = os.path.join(self.frontend_dir, file_name)
+            
+            # Código fuente optimizado con estándares de élite (UI/UX moderna, Tailwind CSS nativo, transiciones y responsividad)
+            elite_html_content = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Menú Digital Mobile-First</title>
+    <title>{brand_name} | Experiencia Digital</title>
+    <!-- Tailwind CSS para diseño minimalista y moderno estilo SaaS de clase mundial -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+        body {{
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+        }}
+        .glass-card {{
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .transition-smooth {{
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }}
+    </style>
 </head>
-<body>
-    <div id="menu-container">
-        <h1>Mi Comercio Local</h1>
-        <button id="btn-whatsapp">Pedir por WhatsApp</button>
+<body class="min-h-screen flex flex-col items-center justify-center p-4">
+    <div class="w-full max-w-md glass-card rounded-2xl p-8 shadow-2xl transition-smooth">
+        <div class="text-center mb-6">
+            <span class="bg-indigo-500/10 text-indigo-400 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider">Verificado por IA</span>
+            <h1 class="text-2xl font-bold mt-3 text-white">{brand_name}</h1>
+            <p class="text-slate-400 text-sm mt-1">Selecciona una opción para continuar con tu pedido o consulta.</p>
+        </div>
+        
+        <div class="space-y-4">
+            <button onclick="window.location.href='https://wa.me/?text=Hola%20quiero%20más%20información'" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3 px-4 rounded-xl shadow-lg transition-smooth flex items-center justify-center space-x-2">
+                <span>💬 Pedir por WhatsApp</span>
+            </button>
+            <button onclick="alert('Sistema operando de forma autónoma')" class="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold py-3 px-4 rounded-xl border border-slate-700 transition-smooth">
+                📋 Ver Catálogo Completo
+            </button>
+        </div>
+        
+        <div class="mt-8 text-center text-xs text-slate-500">
+            Powered by CyberNiche Autonomous Agent Hub
+        </div>
     </div>
 </body>
 </html>"""
-    
-    with open("menu-viewer.html", "w", encoding="utf-8") as f:
-        f.write(sample_html)
 
-    # Auditar el archivo creado
-    agent.audit_html_file("menu-viewer.html")
+            # Escritura directa en el disco duro (Acción real sobre el proyecto)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(elite_html_content)
+
+            print(f"🎨 [FrontendBuilderAgent] Interfaz optimizada y escrita exitosamente en: {file_path}")
+            
+            return {
+                "agent": "FrontendBuilderAgent",
+                "status": "SUCCESS",
+                "file_path": file_path,
+                "message": "Interfaz de alta conversión generada con estándares profesionales."
+            }
+
+        except Exception as e:
+            print(f"❌ [FrontendBuilderAgent] Error crítico en generación frontend: {e}")
+            return {
+                "agent": "FrontendBuilderAgent",
+                "status": "ERROR",
+                "error_message": str(e)
+            }
+
+if __name__ == "__main__":
+    agent = FrontendBuilderAgent()
+    agent.execute()
