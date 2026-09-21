@@ -1,0 +1,381 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_snapshot_multiline_session_env_injection.py ===
+"""Newline in bridged session env must not become shell code via the snapshot.
+
+Regression for issue #71296: bash 3.2 ``export -p`` prints a value containing
+a newline as a multi-line ``declare -x NAME="…`` block. The old line-based
+``grep -vE`` filter removed only the opener; continuation lines (e.g.
+``curl … | bash #`` smuggled into a Matrix room/display name) persisted into
+the shared terminal snapshot and executed on the next ``source``, with stdout
+discarded by the wrapper.
+"""
+
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from tools.environments.base_session_env import _export_dump_excluding_session_vars
+
+
+def _bash() -> str:
+    return "/bin/bash" if os.path.exists("/bin/bash") else "bash"
+
+
+def _run_dump_and_source(
+    *,
+    tmp_path: Path,
+    env_name: str,
+    env_value: str,
+    marker: Path,
+) -> subprocess.CompletedProcess:
+    snap = tmp_path / "snap"
+    dump = _export_dump_excluding_session_vars(shlex.quote(str(snap)))
+    q_snap = shlex.quote(str(snap))
+    q_marker = shlex.quote(str(marker))
+    script = f"""
+set -e
+export {env_name}
+{dump}
+if grep -qE 'pwned|touch |{env_name}' {q_snap}; then
+  echo "LEAKED_INTO_SNAPSHOT" >&2
+  exit 2
+fi
+bash -c 'source {q_snap} >/dev/null 2>&1 || true'
+if [ -e {q_marker} ]; then
+  echo "PAYLOAD_EXECUTED" >&2
+  exit 3
+fi
+if ! grep -qE '^declare -x PATH=' {q_snap}; then
+  echo "PATH_MISSING" >&2
+  exit 4
+fi
+"""
+    env = os.environ.copy()
+    env[env_name] = env_value
+    return subprocess.run(
+        [_bash(), "-c", script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_multiline_session_chat_name_not_executed_via_snapshot(tmp_path: Path):
+    """Continuation lines of HERMES_SESSION_CHAT_NAME must not run on source."""
+    marker = tmp_path / "pwned"
+    chat_name = f"demo\ntouch {marker} #"
+    proc = _run_dump_and_source(
+        tmp_path=tmp_path,
+        env_name="HERMES_SESSION_CHAT_NAME",
+        env_value=chat_name,
+        marker=marker,
+    )
+    assert proc.returncode == 0, (
+        f"rc={proc.returncode}\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_multiline_session_user_name_not_executed_via_snapshot(tmp_path: Path):
+    """Same hole via HERMES_SESSION_USER_NAME (display-name path)."""
+    marker = tmp_path / "pwned_user"
+    user_name = f"alice\ntouch {marker} #"
+    proc = _run_dump_and_source(
+        tmp_path=tmp_path,
+        env_name="HERMES_SESSION_USER_NAME",
+        env_value=user_name,
+        marker=marker,
+    )
+    assert proc.returncode == 0, (
+        f"rc={proc.returncode}\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    assert not marker.exists()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_snapshot_session_id_leak.py ===
+"""Cross-session HERMES_SESSION_ID leak via the shared bash snapshot.
+
+Regression coverage for the bug where a single long-lived backend serves many
+sessions through ONE ``_active_environments["default"]`` LocalEnvironment (the
+messaging gateway, TUI, and desktop/web dashboard all collapse the terminal to
+"default"). That environment persists a bash *session snapshot* file and
+``source``s it before every command. ``export -p`` dumped the FIRST session's
+``HERMES_SESSION_ID`` into the snapshot, so every LATER session ``source``d that
+stale value and its ``echo $HERMES_SESSION_ID`` reported a FOREIGN session's id
+— overriding the correct per-command Popen env injected by
+``_inject_session_context_env``.
+
+The fix strips the per-session bridged vars (HERMES_SESSION_* / UI /
+CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
+``tools/environments/base_session_env.py``; they are re-injected fresh on every
+command. The same dump must drop the scope markers a delegate_task child / cron
+run stamps per command (HERMES_DELEGATED_CHILD_CONTEXT, HERMES_CRON_SESSION), or
+the parent's next command is misread as that child (#90782, #71941).
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+import pytest
+
+from tools.environments.base_session_env import (
+    _SNAPSHOT_EXCLUDED_ENV_REGEX,
+    _export_dump_excluding_session_vars,
+)
+
+
+# ---------------------------------------------------------------------------
+# Unit: the exclusion regex matches exactly the bridged vars, nothing else.
+# ---------------------------------------------------------------------------
+
+def test_regex_matches_bridged_session_vars():
+    rx = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
+    # Every var the gateway bridges, and the delegate_task marker, must be excluded.
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    from gateway.session_context import _VAR_MAP
+
+    for name in (*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER):
+        line = f'declare -x {name}="whatever"'
+        assert rx.search(line), f"{name} should be excluded from the snapshot"
+
+
+def test_export_snippet_shape():
+    snippet = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
+    assert "export -p" in snippet
+    # Unset-by-name (not line-grep): multi-line declare values must not leave
+    # continuation lines in the snapshot (issue #71296).
+    assert "unset" in snippet
+    assert "${!HERMES_SESSION_*}" in snippet
+    assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
+    assert "${!HERMES_BROWSER_CONTROL_*}" in snippet
+    assert "HERMES_UI_SESSION_ID" in snippet
+    assert "grep -vE" not in snippet
+    assert '"$__hermes_snap_tmp"' in snippet
+    # The redirection must be attached to a brace group wrapping the dump,
+    # NOT to a pipeline segment: a redirect on a pipeline segment expands the
+    # temp-path variable inside that segment's subshell (potentially
+    # inconsistently with the parent that expands the follow-up ``mv``
+    # operand), silently orphaning the dump and breaking snapshot env
+    # persistence entirely.
+    assert snippet.lstrip().startswith("{ ")
+    assert "|| true; }" in snippet
+    assert snippet.rstrip().endswith('> "$__hermes_snap_tmp"')
+
+
+# ---------------------------------------------------------------------------
+# Integration: real LocalEnvironment, two sessions, no cross-contamination.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_no_cross_session_leak(tmp_path):
+    import threading
+
+    from gateway.session_context import _VAR_MAP, _UNSET, set_session_vars
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+    try:
+        def run_as(sid):
+            out = {}
+
+            def worker():
+                for v in _VAR_MAP.values():
+                    v.set(_UNSET)
+                set_session_vars(session_key="k" + sid, session_id=sid, source="desktop")
+                out["r"] = env.execute('echo "[$HERMES_SESSION_ID]"')
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join()
+            return out["r"].get("output", "")
+
+        out_a = run_as("SIDAAA")
+        out_b = run_as("SIDBBB")
+
+        assert "SIDAAA" in out_a, f"session A saw {out_a!r}"
+        # The core assertion: B must see its OWN id, not A's leaked via snapshot.
+        assert "SIDBBB" in out_b, f"session B saw {out_b!r}"
+        assert "SIDAAA" not in out_b, f"session B leaked A's id: {out_b!r}"
+
+        # And the snapshot file must not carry the session id at all.
+        snap = env._snapshot_path
+        if os.path.exists(snap):
+            with open(snap) as f:
+                assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# #90782 / #71941: scope markers (delegate_task child, cron run) must not
+# persist into the snapshot either.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
+    """Run the real dump: nothing the gateway bridges per command, nor the
+    delegate_task marker, may survive ``export -p``; ordinary exports must."""
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    from gateway.session_context import _VAR_MAP
+
+    scoped = [*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER]
+    exports = "; ".join([f'export {n}="x"' for n in scoped] + ['export HERMES_HOME="/h"', 'export MYVAR="keep"'])
+    out = subprocess.run(
+        ["bash", "-c", f"{exports}; {_export_dump_excluding_session_vars('/dev/stdout')}"],
+        capture_output=True, text=True, check=True).stdout
+    leaked = [n for n in scoped if f"declare -x {n}=" in out]
+    assert not leaked, f"persisted into the snapshot: {leaked}"
+    assert 'declare -x HERMES_HOME="/h"' in out
+    assert 'declare -x MYVAR="keep"' in out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_snapshot_does_not_turn_later_commands_into_delegated_children(tmp_path):
+    """A snapshot re-dumped during a delegated child's command must not re-export
+    the marker into the parent's next ``source`` (#90782)."""
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    probe = f'printf "[${{{DELEGATED_CHILD_ENV_MARKER}+set}}]"'
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        with delegated_child_context():
+            child = env.execute(probe)
+        assert "[set]" in child["output"], f"delegated child lost its marker: {child!r}"
+        parent = env.execute(probe)
+        assert "[]" in parent["output"], f"parent command inherited the marker: {parent!r}"
+    finally:
+        env.cleanup()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_spill_safety.py ===
+"""Symlink-refusal and permission tests for tools.spill_safety.
+
+The bug class: spill/cache writers used ``open(path, "w")`` /
+``Path.write_text`` in predictable directories, which follows a pre-planted
+symlink and redirects the write onto an arbitrary user-owned file. Every
+helper must refuse the link (never write through it) while keeping normal
+writes byte-identical.
+"""
+
+import os
+import stat
+import sys
+
+import pytest
+
+from tools.spill_safety import (
+    ensure_spill_dir,
+    open_exclusive,
+    write_text_exclusive,
+)
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX perms/symlinks")
+
+
+def test_write_creates_file_with_content(tmp_path):
+    target = tmp_path / "spill.txt"
+    write_text_exclusive(target, "hello\n")
+    assert target.read_text(encoding="utf-8") == "hello\n"
+
+
+@posix_only
+def test_private_file_is_0600(tmp_path):
+    target = tmp_path / "spill.txt"
+    write_text_exclusive(target, "secret", private=True)
+    assert stat.S_IMODE(os.lstat(target).st_mode) == 0o600
+
+
+@posix_only
+def test_private_dir_is_0700_and_tightened(tmp_path):
+    d = tmp_path / "spills"
+    d.mkdir(mode=0o755)
+    ensure_spill_dir(d, private=True)
+    assert stat.S_IMODE(os.lstat(d).st_mode) == 0o700
+
+
+def test_ensure_spill_dir_refuses_symlinked_leaf(tmp_path):
+    victim = tmp_path / "victim-dir"
+    victim.mkdir()
+    link = tmp_path / "spills"
+    link.symlink_to(victim)
+    with pytest.raises(OSError):
+        ensure_spill_dir(link)
+
+
+def test_refuses_planted_symlink(tmp_path):
+    """The core attack: symlink at the spill path must fail, not redirect."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("original")
+    target = tmp_path / "spill.txt"
+    target.symlink_to(victim)
+    with pytest.raises(OSError):
+        write_text_exclusive(target, "attacker-controlled")
+    assert victim.read_text() == "original"
+
+
+def test_refuses_dangling_symlink(tmp_path):
+    target = tmp_path / "spill.txt"
+    target.symlink_to(tmp_path / "does-not-exist.txt")
+    with pytest.raises(OSError):
+        write_text_exclusive(target, "x")
+    assert not (tmp_path / "does-not-exist.txt").exists()
+
+
+def test_overwrite_removes_symlink_not_its_target(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("original")
+    target = tmp_path / "spill.txt"
+    target.symlink_to(victim)
+    write_text_exclusive(target, "redacted copy", overwrite=True)
+    # Link replaced by a real file; the link's target untouched.
+    assert not target.is_symlink()
+    assert target.read_text(encoding="utf-8") == "redacted copy"
+    assert victim.read_text() == "original"
+
+
+def test_overwrite_replaces_regular_file(tmp_path):
+    target = tmp_path / "spill.txt"
+    target.write_text("raw")
+    write_text_exclusive(target, "redacted", overwrite=True)
+    assert target.read_text(encoding="utf-8") == "redacted"
+
+
+def test_overwrite_refuses_directory(tmp_path):
+    target = tmp_path / "spill.txt"
+    target.mkdir()
+    with pytest.raises(OSError):
+        write_text_exclusive(target, "x", overwrite=True)
+    assert target.is_dir()
+
+
+def test_exclusive_create_fails_on_existing_without_overwrite(tmp_path):
+    target = tmp_path / "spill.txt"
+    target.write_text("first")
+    with pytest.raises(OSError):
+        write_text_exclusive(target, "second")
+    assert target.read_text() == "first"
+
+
+def test_open_exclusive_streaming_write(tmp_path):
+    target = tmp_path / "spill.log"
+    with open_exclusive(target, errors="replace") as fh:
+        fh.write("chunk1")
+        fh.write("chunk2")
+    assert target.read_text(encoding="utf-8") == "chunk1chunk2"
+

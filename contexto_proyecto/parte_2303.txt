@@ -1,0 +1,327 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_tool_executor_checkpoint_paths.py ===
+"""Behavioral coverage for checkpoint path resolution across terminal backends."""
+
+import json
+import os
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+from agent.tool_executor import _ToolCallRef, _begin_tool_execution, _ensure_file_checkpoint
+from agent.turn_explainers import TurnExplainersMixin
+from tools.checkpoint_manager import CheckpointManager
+from tools.terminal_tool import _active_environments, _env_lock
+
+
+@pytest.fixture
+def manager(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", tmp_path / "checkpoints")
+    return CheckpointManager(enabled=True)
+
+
+@pytest.fixture
+def container_task_id(monkeypatch):
+    class FakeDockerEnvironment:  # class-name hint is how file_tools_paths classifies live envs
+        pass
+
+    task_id = "container-checkpoint-task"
+    with _env_lock:
+        monkeypatch.setitem(_active_environments, task_id, FakeDockerEnvironment())
+    yield task_id
+    with _env_lock:
+        _active_environments.pop(task_id, None)
+
+
+def test_relative_file_checkpoint_uses_task_workspace(tmp_path, monkeypatch):
+    """Checkpoint lookup must use the same cwd as a relative file mutation."""
+    process_cwd = tmp_path / "opt" / "hermes"
+    workspace_cwd = tmp_path / "opt" / "data" / "workspace"
+    process_cwd.mkdir(parents=True)
+    workspace_cwd.mkdir(parents=True)
+
+    # Both directories contain content so checkpointing the wrong one would
+    # still succeed and remain observable as the regression did in Docker.
+    (process_cwd / "pyproject.toml").write_text("[project]\nname = 'hermes'\n")
+    (workspace_cwd / "pyproject.toml").write_text("[project]\nname = 'workspace'\n")
+    (workspace_cwd / "existing.txt").write_text("before\n")
+
+    monkeypatch.chdir(process_cwd)
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace_cwd))
+    monkeypatch.setattr(
+        "tools.checkpoint_manager.CHECKPOINT_BASE",
+        tmp_path / "checkpoints",
+    )
+
+    manager = CheckpointManager(enabled=True)
+    agent = SimpleNamespace(_checkpoint_mgr=manager)
+
+    _ensure_file_checkpoint(
+        agent,
+        "write_file",
+        {"path": "test_permissions2.txt"},
+        "gateway-session",
+    )
+
+    assert manager.list_checkpoints(str(workspace_cwd))
+    assert manager.list_checkpoints(str(process_cwd)) == []
+
+
+def test_container_backend_task_leaves_host_store_untouched(tmp_path, manager, container_task_id):
+    """A container-backed task's paths are container paths: no host snapshot from the file or
+    destructive-terminal hooks and no host ledger entry, even when an unrelated host tree shares
+    the spelling. A local task on the same manager still gets its checkpoint (control)."""
+    host_file = tmp_path / "workspace" / "project" / "a.txt"
+    host_file.parent.mkdir(parents=True)
+    host_file.write_text("host content\n", encoding="utf-8")
+    path = str(host_file)
+    agent = SimpleNamespace(
+        _checkpoint_mgr=manager, _turn_failed_file_mutations={}, _turn_file_mutation_paths=set(),
+        quiet_mode=True, tool_progress_callback=None, tool_start_callback=None, _touch_activity=lambda *_: None,
+    )
+
+    _ensure_file_checkpoint(agent, "write_file", {"path": path}, container_task_id)
+    ref = _ToolCallRef("terminal", {"command": f"rm -rf {host_file.parent}"}, container_task_id, "call-1", [])
+    _begin_tool_execution(agent, ref, None)
+    TurnExplainersMixin._record_file_mutation_result(
+        agent, "write_file", {"path": path, "content": "x"},
+        json.dumps({"bytes_written": 1, "resolved_path": path}), False, task_id=container_task_id,
+    )
+    assert manager.list_checkpoints(str(host_file.parent)) == []
+    assert not (tmp_path / "checkpoints").exists()
+
+    _ensure_file_checkpoint(agent, "write_file", {"path": path}, "local-task")
+    assert len(manager.list_checkpoints(str(host_file.parent))) == 1
+
+
+@pytest.mark.asyncio
+async def test_container_session_refuses_host_rollback_on_every_surface(tmp_path, monkeypatch, manager, capsys):
+    """A host checkpoint left by an earlier local session is never restored or diffed from a
+    container-backed session: CLI /rollback + /diff session, gateway /rollback + /diff session,
+    and the rollback.restore RPC all answer with the backend reason instead."""
+    from gateway import run as gateway_run
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+    from tui_gateway import server
+
+    host_dir = tmp_path / "workspace" / "project"
+    host_dir.mkdir(parents=True)
+    (host_dir / "a.txt").write_text("before\n", encoding="utf-8")
+    manager.ensure_checkpoint(str(host_dir), "earlier local session")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")  # the configured backend, as the product bridges it
+    monkeypatch.setenv("TERMINAL_CWD", str(host_dir))
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("host checkpoint operation reached from a container-backed session")
+
+    monkeypatch.setattr(manager, "restore", refuse)
+    monkeypatch.setattr(manager, "diff", refuse)
+    monkeypatch.setattr(manager, "session_diff", refuse)
+
+    cli = SimpleNamespace(
+        _checkpoint_manager=lambda _lines: manager,
+        _resolve_checkpoint_ref=lambda ref, cps: cps[int(ref) - 1]["hash"],
+        _rollback_restore=refuse, _rollback_diff=refuse,
+    )
+    for command in ("/rollback 1 --all", "/rollback diff 1"):
+        CLICommandsMixin._handle_rollback_command(cli, command)
+        assert "docker" in "".join(capsys.readouterr())
+    CLICommandsMixin._print_session_diff(cli, str(host_dir), False)
+    assert "docker" in "".join(capsys.readouterr())
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._checkpoint_manager = lambda: manager
+    source = SessionSource(platform=Platform.TELEGRAM, user_id="u", chat_id="c", user_name="t", chat_type="dm")
+    for text in ("/rollback 1", "/rollback 1 --all"):
+        assert "docker" in await runner._handle_rollback_command(MessageEvent(text=text, source=source))
+    assert "docker" in await runner._handle_diff_command(MessageEvent(text="/diff session", source=source))
+    listing = await runner._handle_rollback_command(MessageEvent(text="/rollback", source=source))
+    assert "docker" in listing and "earlier local session" in listing  # listing stays visible
+
+    session = {
+        "agent": SimpleNamespace(_checkpoint_mgr=manager), "cwd": str(host_dir), "running": False,
+        "session_key": "container-key", "history": [], "history_lock": threading.Lock(), "history_version": 0,
+    }
+    monkeypatch.setitem(server._sessions, "container-sid", session)
+    resp = server.handle_request(
+        {"id": "1", "method": "rollback.restore", "params": {"session_id": "container-sid", "hash": "1"}}
+    )
+    assert resp["result"]["success"] is False and "docker" in resp["result"]["error"]
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")  # control: a local session still dispatches
+    monkeypatch.setattr(manager, "restore", lambda *a, **k: {"success": True, "restored_to": "x", "reason": "r"})
+    resp = server.handle_request(
+        {"id": "2", "method": "rollback.restore", "params": {"session_id": "container-sid", "hash": "1"}}
+    )
+    assert resp["result"]["success"] is True
+    assert (host_dir / "a.txt").read_text(encoding="utf-8") == "before\n"
+    assert os.environ["TERMINAL_ENV"] == "local"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_tool_executor_contextvar_propagation.py ===
+"""Regression guard for PR #16660 (salvaged as PR #18027): ContextVar
+propagation into concurrent tool worker threads.
+
+Background
+----------
+Gateway adapters (Slack, Telegram, Discord, ...) set
+``tools.approval_context._approval_session_key`` as a ContextVar before calling
+``agent.run_conversation`` so that dangerous-command approval prompts route
+back to the channel/session that initiated the tool call. When the agent
+dispatches multiple tools in parallel, it uses
+``concurrent.futures.ThreadPoolExecutor.submit(...)`` — and ``submit`` runs
+the callable in a *fresh* context, NOT the caller's context. Without an
+explicit ``contextvars.copy_context().run(...)`` wrapper, worker threads
+observe the ContextVar's default value, fall through to the
+``os.environ`` legacy fallback (which the gateway overwrites at each
+agent step), and route the approval card to *whichever session stepped
+most recently* — not the one that raised the prompt. Confirmed in the
+wild on Slack with two concurrent channels: session A's `rm -rf`
+approval card was delivered to session B.
+
+The fix (4 LOC in ``run_agent.py``) snapshots the caller's context with
+``copy_context()`` and submits ``ctx.run(_run_tool, …)`` instead of
+``_run_tool`` directly. Mirrors ``asyncio.to_thread`` semantics.
+
+This suite follows the ``contextvar-run-in-executor-bridge`` skill's
+two-test pattern: one end-to-end test proves the fix works at the
+call-site level, one documents the Python contract that makes the fix
+necessary. If anyone ever reverts the wrapper, the call-site test
+fails while the contract test keeps passing — a clear diagnostic
+signal for *why* the call-site regressed.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import contextvars
+import threading
+
+
+def test_executor_submit_without_copy_context_does_not_propagate():
+    """Documents the Python contract the fix relies on.
+
+    ``concurrent.futures.ThreadPoolExecutor.submit(fn)`` runs ``fn`` in a
+    worker thread with a fresh, empty context. A ContextVar set by the
+    caller is invisible inside ``fn``. This is the exact trap that made
+    approval-session routing race in the gateway before #16660.
+
+    If this test ever fails — i.e. submit() starts propagating
+    ContextVars by default — the copy_context() wrapper in run_agent.py
+    becomes redundant but not harmful, and the call-site test below
+    should be updated accordingly.
+    """
+    probe: contextvars.ContextVar[str] = contextvars.ContextVar(
+        "probe_default_propagation", default="unset"
+    )
+
+    def read_in_worker() -> str:
+        return probe.get()
+
+    probe.set("set-in-main")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        observed = ex.submit(read_in_worker).result(timeout=5)
+
+    assert observed == "unset", (
+        "Unexpected: executor.submit propagated a ContextVar without "
+        "copy_context(). If Python's behavior changed, update "
+        "test_run_tool_worker_sees_parent_context below."
+    )
+
+
+
+
+def test_run_tool_worker_sees_parent_approval_session_key():
+    """End-to-end call-site guard.
+
+    Mirrors the exact shape of the fixed call site in
+    ``run_agent.py::_execute_tool_calls_concurrent`` — a
+    ``ThreadPoolExecutor`` with ``executor.submit(ctx.run, fn, *args)``.
+    Sets the real ``tools.approval_context._approval_session_key`` ContextVar
+    in the caller and asserts the worker observes it via
+    ``tools.approval.get_current_session_key()``.
+
+    If the PR's ``copy_context().run`` wrapper is reverted, this test
+    fails with ``Expected 'session-A' but worker saw 'default'``.
+    """
+    from tools.approval import get_current_session_key
+    from tools.approval_context import _approval_session_key
+
+    observed: dict = {}
+    barrier = threading.Event()
+
+    def worker_equivalent_to_run_tool() -> None:
+        # Mirror what real _run_tool does early: read the session key.
+        observed["session_key"] = get_current_session_key(default="FALLBACK")
+        barrier.set()
+
+    # Set the ContextVar the gateway would set before calling agent.run.
+    token = _approval_session_key.set("session-A")
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ctx = contextvars.copy_context()
+            fut = ex.submit(ctx.run, worker_equivalent_to_run_tool)
+            fut.result(timeout=5)
+        assert barrier.is_set(), "worker did not complete"
+    finally:
+        _approval_session_key.reset(token)
+
+    assert observed.get("session_key") == "session-A", (
+        f"Worker thread did not inherit _approval_session_key from caller. "
+        f"Expected 'session-A', got {observed.get('session_key')!r}. "
+        "This is the bug that PR #16660 fixed — approval prompts route to "
+        "the wrong session in concurrent gateway traffic. Check whether "
+        "the copy_context().run wrapper in _execute_tool_calls_concurrent "
+        "was removed."
+    )
+
+
+
+
+def test_two_concurrent_tool_batches_keep_session_keys_isolated():
+    """End-to-end guard: two callers each set a different session key
+    and submit workers concurrently. Each worker must see its own
+    caller's key, not the other's.
+
+    Guards against a future "optimization" that reuses a single context
+    snapshot across callers (which would collapse isolation the same way
+    the unfixed ``submit`` does).
+    """
+    from tools.approval import get_current_session_key
+    from tools.approval_context import _approval_session_key
+
+    results: dict = {}
+
+    def caller(label: str) -> None:
+        token = _approval_session_key.set(f"session-{label}")
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                ctx = contextvars.copy_context()
+                fut = ex.submit(
+                    ctx.run,
+                    lambda: get_current_session_key(default="FALLBACK"),
+                )
+                results[label] = fut.result(timeout=5)
+        finally:
+            _approval_session_key.reset(token)
+
+    t_a = threading.Thread(target=caller, args=("A",))
+    t_b = threading.Thread(target=caller, args=("B",))
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=10)
+    t_b.join(timeout=10)
+
+    assert results.get("A") == "session-A", (
+        f"Session A worker saw {results.get('A')!r}, expected 'session-A'"
+    )
+    assert results.get("B") == "session-B", (
+        f"Session B worker saw {results.get('B')!r}, expected 'session-B'"
+    )
+

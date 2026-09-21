@@ -1,0 +1,297 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_pty_query_responder.py ===
+"""Tests for tools.pty_query_responder (port of openai/codex#41436).
+
+Covers the byte-level scanner (exact queries, chunk splits, DEC private-mode
+queries, passthrough of unhandled sequences) and a live PTY E2E where a
+subprocess blocks on a cursor-position report until answered.
+"""
+
+import os
+import sys
+import time
+
+import pytest
+
+from tools.pty_query_responder import PtyQueryResponder
+
+
+def test_plain_output_passes_through():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"hello world\n")
+    assert out == b"hello world\n"
+    assert resp == b""
+
+
+def test_device_status_report_answered_and_stripped():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"before\x1b[5nafter")
+    assert out == b"beforeafter"
+    assert resp == b"\x1b[0n"
+
+
+def test_window_size_query_reports_spawn_dimensions():
+    r = PtyQueryResponder(rows=30, cols=120)
+    out, resp = r.process(b"\x1b[18t")
+    assert out == b""
+    assert resp == b"\x1b[8;30;120t"
+
+
+def test_cursor_position_report():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"\x1b[6n")
+    assert out == b""
+    assert resp == b"\x1b[1;1R"
+
+
+def test_dec_private_mode_query_reported_unrecognized():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"\x1b[?1049$p")
+    assert out == b""
+    assert resp == b"\x1b[?1049;0$y"
+
+
+def test_combined_stream_matches_codex_fixture():
+    # Mirrors the driver-backed test in openai/codex#41436: queries split
+    # across chunks, mixed with a color escape and plain text.
+    r = PtyQueryResponder()
+    out1, resp1 = r.process(b"before\x1b[")
+    out2, resp2 = r.process(b"5n\x1b[18t\x1b[6n\x1b[?1049$p\x1b[31mafter")
+    assert resp1 + resp2 == b"\x1b[0n\x1b[8;24;80t\x1b[1;1R\x1b[?1049;0$y"
+    assert out1 + out2 + r.flush() == b"before\x1b[31mafter"
+
+
+def test_query_split_across_many_chunks():
+    r = PtyQueryResponder()
+    total_out = b""
+    total_resp = b""
+    for b in (b"\x1b", b"[", b"6", b"n"):
+        out, resp = r.process(b)
+        total_out += out
+        total_resp += resp
+    assert total_out == b""
+    assert total_resp == b"\x1b[1;1R"
+
+
+def test_unhandled_csi_sequence_passes_through():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"\x1b[31mred\x1b[0m")
+    assert out == b"\x1b[31mred\x1b[0m"
+    assert resp == b""
+
+
+def test_non_csi_escape_passes_through():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"\x1bMreverse")
+    assert out == b"\x1bMreverse"
+    assert resp == b""
+
+
+def test_fresh_esc_aborts_partial_sequence():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"\x1b[6\x1b[5n")
+    # The aborted partial "\x1b[6" is flushed through; the complete
+    # device-status query is answered and stripped.
+    assert out == b"\x1b[6"
+    assert resp == b"\x1b[0n"
+
+
+def test_oversized_mode_query_passes_through():
+    r = PtyQueryResponder()
+    seq = b"\x1b[?12345678901$p"  # 11 digits > MAX_MODE_DIGITS
+    out, resp = r.process(seq)
+    assert resp == b""
+    assert out + r.flush() == seq
+
+
+def test_flush_returns_incomplete_tail():
+    r = PtyQueryResponder()
+    out, resp = r.process(b"text\x1b[1")
+    assert out == b"text"
+    assert resp == b""
+    assert r.flush() == b"\x1b[1"
+    # flush is destructive
+    assert r.flush() == b""
+
+
+def test_dec_mode_non_digit_passes_through():
+    r = PtyQueryResponder()
+    seq = b"\x1b[?10a9$p"
+    out, resp = r.process(seq)
+    assert resp == b""
+    assert out + r.flush() == seq
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX ptyprocess only")
+def test_live_pty_subprocess_unblocked_by_cursor_report(tmp_path):
+    """E2E: a PTY subprocess blocking on ESC[6n exits once answered.
+
+    Mirrors direct_terminal_queries_are_answered from openai/codex#41436.
+    """
+    ptyprocess = pytest.importorskip("ptyprocess")
+    from tools.pty_query_responder import PtyQueryResponder
+
+    script = (
+        "stty -echo -icanon; printf 'alpha\\033[6n'; "
+        "dd bs=1 count=6 2>/dev/null; printf '\\nok'"
+    )
+    proc = ptyprocess.PtyProcess.spawn(
+        ["/bin/sh", "-c", script], dimensions=(24, 80)
+    )
+    responder = PtyQueryResponder()
+    output = b""
+    deadline = time.time() + 10
+    try:
+        while proc.isalive() and time.time() < deadline:
+            try:
+                chunk = proc.read(4096)
+            except EOFError:
+                break
+            if not chunk:
+                continue
+            out, replies = responder.process(chunk)
+            output += out
+            if replies:
+                proc.write(replies)
+        # Drain anything left after exit.
+        while True:
+            try:
+                chunk = proc.read(4096)
+            except EOFError:
+                break
+            if not chunk:
+                break
+            out, replies = responder.process(chunk)
+            output += out
+    finally:
+        if proc.isalive():
+            proc.terminate(force=True)
+            pytest.fail(f"subprocess still blocked; output={output!r}")
+    output += responder.flush()
+    assert b"alpha" in output
+    assert b"ok" in output
+    # The query itself must have been stripped from the captured output,
+    # and the echoed reply is what dd consumed (not visible w/ -echo).
+    assert b"\x1b[6n" not in output
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_react_to_message_tool.py ===
+"""Ownership tests for desktop message reactions."""
+
+from unittest.mock import MagicMock
+
+from tools import react_to_message_tool as reactions
+
+
+def test_reaction_database_closes_when_write_fails(monkeypatch):
+    db = MagicMock()
+    db.latest_message_row_id.return_value = 42
+    db.set_message_reaction.side_effect = RuntimeError("write failed")
+    monkeypatch.setattr(reactions, "_open_session_db", lambda: db)
+    monkeypatch.setattr(
+        reactions,
+        "get_session_env",
+        lambda _name, _default="": "session-1",
+    )
+
+    result = reactions.react_to_message_tool("👍")
+
+    assert "write failed" in result
+    db.close.assert_called_once()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_read_binary_type_disclosure.py ===
+"""Tests for magic-byte type disclosure in the binary-file refusal.
+
+"Binary file — use appropriate tools" names a recovery the model may not
+have (file-only toolsets), so it thrashes. Naming the TYPE answers
+what-is-this in one read: "Binary file (PNG image data, 4.0 KB)".
+"""
+
+import json
+import random
+
+import pytest
+
+from tools.file_operations import describe_binary_file, identify_binary_bytes
+from tools.file_tools import read_file_tool
+
+_RNG = random.Random(20260810)
+
+
+def _noise(n: int) -> bytes:
+    return bytes(_RNG.getrandbits(8) for _ in range(n))
+
+
+class TestIdentifyBinaryBytes:
+    @pytest.mark.parametrize(
+        "prefix,expected",
+        [
+            (b"\x89PNG\r\n\x1a\n", "PNG image data"),
+            (b"\xff\xd8\xff", "JPEG image data"),
+            (b"%PDF-", "PDF document"),
+            (b"PK\x03\x04", "ZIP archive"),
+            (b"\x1f\x8b", "gzip compressed data"),
+            (b"\x7fELF", "ELF executable"),
+            (b"MZ", "Windows PE executable"),
+            (b"SQLite format 3\x00", "SQLite database"),
+        ],
+    )
+    def test_known_signatures(self, prefix, expected):
+        assert expected in identify_binary_bytes(prefix + _noise(64))
+
+    def test_unknown_binary(self):
+        assert identify_binary_bytes(b"\x00\x01\x02" * 100) == "unknown binary"
+
+    def test_empty_sample(self):
+        assert identify_binary_bytes(b"") == "unknown binary"
+
+    def test_iso_media_requires_ftyp(self):
+        # Three NULs alone are too weak; require ftyp at offset 4.
+        assert identify_binary_bytes(b"\x00\x00\x00\x18ftypmp42" + _noise(32)).startswith("ISO media")
+        assert identify_binary_bytes(b"\x00\x00\x00\x18AAAA" + _noise(32)) == "unknown binary"
+
+
+class TestDescribeBinaryFile:
+    def test_size_units(self):
+        assert "512 bytes" in describe_binary_file(b"\x7fELF", 512)
+        assert "4.0 KB" in describe_binary_file(b"\x7fELF", 4096)
+        assert "2.0 MB" in describe_binary_file(b"\x7fELF", 2 * 1024 * 1024)
+
+    def test_none_sample(self):
+        assert "unknown binary" in describe_binary_file(None, 100)
+
+
+class TestReadFileBinaryDisclosure:
+    def test_lying_extension_names_real_type(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        p = tmp_path / "data.txt"  # extension says text; bytes say PNG
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + _noise(4096))
+        result = json.loads(read_file_tool(str(p)))
+        assert "PNG image data" in result.get("error", "")
+        assert "4.1 KB" in result["error"] or "4.0 KB" in result["error"]
+
+    def test_extensionless_binary_named(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        p = tmp_path / "mystery"
+        p.write_bytes(b"\x7fELF" + _noise(1024))
+        result = json.loads(read_file_tool(str(p)))
+        assert "ELF executable" in result.get("error", "")
+
+    def test_unknown_binary_still_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        p = tmp_path / "junk.out"
+        p.write_bytes(b"\x00\x01\x02" * 500)
+        result = json.loads(read_file_tool(str(p)))
+        assert "unknown binary" in result.get("error", "")
+
+    def test_text_file_unaffected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        p = tmp_path / "ok.txt"
+        p.write_text("hello world\n")
+        result = json.loads(read_file_tool(str(p)))
+        assert "hello world" in result.get("content", "")
+

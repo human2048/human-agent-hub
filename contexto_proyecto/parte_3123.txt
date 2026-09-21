@@ -1,0 +1,362 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_context_warning.py ===
+"""Tests for the low context length warning in the CLI banner."""
+
+import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+
+
+@pytest.fixture
+def _isolate(tmp_path, monkeypatch):
+    """Isolate HERMES_HOME so tests don't touch real config."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+
+@pytest.fixture
+def cli_obj(_isolate):
+    """Create a minimal HermesCLI instance for banner testing."""
+    with patch("cli.load_cli_config", return_value={
+        "display": {"tool_progress": "new"},
+        "terminal": {},
+    }), patch("cli.get_tool_definitions", return_value=[]), \
+         patch("hermes_cli.banner.build_welcome_banner"):
+        from cli import HermesCLI
+        obj = HermesCLI.__new__(HermesCLI)
+        obj.model = "test-model"
+        obj.enabled_toolsets = ["hermes-core"]
+        obj.compact = False
+        obj.console = MagicMock()
+        obj.session_id = None
+        obj.api_key = "test"
+        obj.base_url = ""
+        obj.provider = "test"
+        obj._provider_source = None
+        # Mock agent with context compressor
+        obj.agent = SimpleNamespace(
+            context_compressor=SimpleNamespace(context_length=None)
+        )
+        return obj
+
+
+class TestLowContextWarning:
+    """Tests that the CLI warns about low context lengths."""
+
+    def test_warning_for_below_minimum_context(self, cli_obj):
+        """Warning shown when context is below Hermes' minimum."""
+        cli_obj.agent.context_compressor.context_length = 32768
+        with patch("cli.get_tool_definitions", return_value=[]), \
+             patch("hermes_cli.banner.build_welcome_banner"):
+            cli_obj.show_banner()
+
+        calls = [str(c) for c in cli_obj.console.print.call_args_list]
+        warning_calls = [c for c in calls if "too low" in c]
+        assert len(warning_calls) == 1
+        minimum_calls = [c for c in calls if f"{MINIMUM_CONTEXT_LENGTH:,}" in c]
+        assert minimum_calls
+
+
+    def test_warning_for_2048_context(self, cli_obj):
+        """Warning shown for 2048 tokens (common LM Studio default)."""
+        cli_obj.agent.context_compressor.context_length = 2048
+        with patch("cli.get_tool_definitions", return_value=[]), \
+             patch("hermes_cli.banner.build_welcome_banner"):
+            cli_obj.show_banner()
+
+        calls = [str(c) for c in cli_obj.console.print.call_args_list]
+        warning_calls = [c for c in calls if "too low" in c]
+        assert len(warning_calls) == 1
+
+    def test_no_warning_at_boundary(self, cli_obj):
+        """No warning at exactly Hermes' minimum context length."""
+        cli_obj.agent.context_compressor.context_length = MINIMUM_CONTEXT_LENGTH
+        with patch("cli.get_tool_definitions", return_value=[]), \
+             patch("hermes_cli.banner.build_welcome_banner"):
+            cli_obj.show_banner()
+
+        calls = [str(c) for c in cli_obj.console.print.call_args_list]
+        warning_calls = [c for c in calls if "too low" in c]
+        assert len(warning_calls) == 0
+
+    def test_no_warning_above_boundary(self, cli_obj):
+        """No warning above Hermes' minimum context length."""
+        cli_obj.agent.context_compressor.context_length = MINIMUM_CONTEXT_LENGTH + 1
+        with patch("cli.get_tool_definitions", return_value=[]), \
+             patch("hermes_cli.banner.build_welcome_banner"):
+            cli_obj.show_banner()
+
+        calls = [str(c) for c in cli_obj.console.print.call_args_list]
+        warning_calls = [c for c in calls if "too low" in c]
+        assert len(warning_calls) == 0
+
+    def test_ollama_specific_hint(self, cli_obj):
+        """Ollama-specific fix shown when port 11434 detected."""
+        cli_obj.agent.context_compressor.context_length = 4096
+        cli_obj.base_url = "http://localhost:11434/v1"
+        with patch("cli.get_tool_definitions", return_value=[]), \
+             patch("hermes_cli.banner.build_welcome_banner"):
+            cli_obj.show_banner()
+
+        calls = [str(c) for c in cli_obj.console.print.call_args_list]
+        ollama_hints = [c for c in calls if "OLLAMA_CONTEXT_LENGTH" in c]
+        assert len(ollama_hints) == 1
+        assert str(MINIMUM_CONTEXT_LENGTH) in ollama_hints[0]
+
+
+    def test_generic_hint_for_other_servers(self, cli_obj):
+        """Generic fix shown for unknown servers."""
+        cli_obj.agent.context_compressor.context_length = 4096
+        cli_obj.base_url = "http://localhost:8080/v1"
+        with patch("cli.get_tool_definitions", return_value=[]), \
+             patch("hermes_cli.banner.build_welcome_banner"):
+            cli_obj.show_banner()
+
+        calls = [str(c) for c in cli_obj.console.print.call_args_list]
+        generic_hints = [c for c in calls if "config.yaml" in c]
+        assert len(generic_hints) == 1
+
+
+    def test_compact_banner_does_not_crash_on_narrow_terminal(self, cli_obj):
+        """Compact mode should still have ctx_len defined for warning logic."""
+        cli_obj.agent.context_compressor.context_length = 4096
+
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((70, 40))), \
+             patch("cli._build_compact_banner", return_value="compact banner"):
+            cli_obj.show_banner()
+
+        calls = [str(c) for c in cli_obj.console.print.call_args_list]
+        warning_calls = [c for c in calls if "too low" in c]
+        assert len(warning_calls) == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_copy_command.py ===
+"""Tests for CLI /copy command."""
+
+from unittest.mock import MagicMock, patch
+
+from cli import HermesCLI
+
+
+def _make_cli() -> HermesCLI:
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj.config = {}
+    cli_obj.console = MagicMock()
+    cli_obj.agent = None
+    cli_obj.conversation_history = []
+    cli_obj.session_id = "sess-copy-test"
+    cli_obj._pending_input = MagicMock()
+    cli_obj._app = None
+    return cli_obj
+
+
+def test_copy_copies_latest_assistant_message():
+    cli_obj = _make_cli()
+    cli_obj.conversation_history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "first"},
+        {"role": "assistant", "content": "latest"},
+    ]
+
+    with patch("hermes_cli.clipboard.write_clipboard_text", return_value=True) as mock_copy:
+        result = cli_obj.process_command("/copy")
+
+    assert result is True
+    mock_copy.assert_called_once_with("latest")
+
+
+def test_copy_with_index_uses_requested_assistant_message():
+    cli_obj = _make_cli()
+    cli_obj.conversation_history = [
+        {"role": "assistant", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+
+    with patch("hermes_cli.clipboard.write_clipboard_text", return_value=True) as mock_copy:
+        cli_obj.process_command("/copy 1")
+
+    mock_copy.assert_called_once_with("one")
+
+
+def test_copy_strips_reasoning_blocks_before_copy():
+    cli_obj = _make_cli()
+    cli_obj.conversation_history = [
+        {
+            "role": "assistant",
+            "content": "<REASONING_SCRATCHPAD>internal</REASONING_SCRATCHPAD>\nVisible answer",
+        }
+    ]
+
+    with patch("hermes_cli.clipboard.write_clipboard_text", return_value=True) as mock_copy:
+        cli_obj.process_command("/copy")
+
+    mock_copy.assert_called_once_with("Visible answer")
+
+
+
+
+def test_copy_prefers_osc52_in_ssh_sessions():
+    """Over SSH, native tools write the REMOTE clipboard — OSC 52 reaches
+    the local terminal instead (#31528)."""
+    cli_obj = _make_cli()
+    cli_obj.conversation_history = [{"role": "assistant", "content": "remote answer"}]
+
+    with patch("hermes_cli.clipboard.write_clipboard_text", return_value=True) as mock_native, \
+         patch("hermes_cli.clipboard.is_remote_shell_session", return_value=True), \
+         patch.object(cli_obj, "_write_osc52_clipboard") as mock_osc52:
+        cli_obj.process_command("/copy")
+
+    mock_osc52.assert_called_once_with("remote answer")
+    mock_native.assert_not_called()
+
+
+def test_copy_native_first_when_local():
+    cli_obj = _make_cli()
+    cli_obj.conversation_history = [{"role": "assistant", "content": "local answer"}]
+
+    with patch("hermes_cli.clipboard.write_clipboard_text", return_value=True) as mock_native, \
+         patch("hermes_cli.clipboard.is_remote_shell_session", return_value=False), \
+         patch.object(cli_obj, "_write_osc52_clipboard") as mock_osc52:
+        cli_obj.process_command("/copy")
+
+    mock_native.assert_called_once_with("local answer")
+    mock_osc52.assert_not_called()
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_custom_provider_vision.py ===
+"""End-to-end CLI coverage for named custom-provider vision routing.
+
+Adapted from the independently reproduced CLI regression in #69896.  Unlike
+that PR, these tests keep the live transport canonical (``provider=custom``)
+and assert that the separate requested identity reaches each capability gate.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+
+MODEL = "qwen3.8-max-preview"
+REQUESTED_PROVIDER = "custom:qwen-token-plan"
+
+
+class _RuntimeCLI(CLIAgentSetupMixin):
+    def __init__(self, *, model: str, provider: str):
+        self.model = model
+        self.requested_provider = provider
+        self.provider = provider
+        self.api_key = None
+        self.base_url = None
+        self.api_mode = "chat_completions"
+        self.acp_command = None
+        self.acp_args = []
+        self.agent = None
+        self._fallback_model = []
+        self._explicit_api_key = None
+        self._explicit_base_url = None
+        self._credential_pool = None
+        self.service_tier = None
+
+    def _normalize_model_for_provider(self, _provider: str) -> bool:
+        return False
+
+
+def _write_profile_config(hermes_home) -> None:
+    (hermes_home / "config.yaml").write_text(
+        """
+model:
+  default: ollama-cloud/glm-5.2
+  provider: ollama-cloud
+providers:
+  qwen-token-plan:
+    base_url: https://qwen-token-plan.example/v1
+    api_key: test-key
+    models:
+      qwen3.8-max-preview:
+        supports_vision: true
+agent:
+  image_input_mode: auto
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _resolve_cli_route():
+    from hermes_cli._parser import build_top_level_parser
+    from hermes_constants import get_hermes_home
+
+    _write_profile_config(get_hermes_home())
+    parser, _subparsers, _chat = build_top_level_parser()
+    args, _unknown = parser.parse_known_args(
+        ["-m", MODEL, "--provider", REQUESTED_PROVIDER, "chat"]
+    )
+    cli = _RuntimeCLI(model=args.model, provider=args.provider)
+    assert cli._ensure_runtime_credentials() is True
+    return cli, cli._resolve_turn_agent_config("inspect the image")
+
+
+def test_real_cli_args_keep_transport_and_capability_identities_separate():
+    from agent.image_routing import decide_image_input_mode
+    from hermes_cli.config import load_config
+
+    cli, route = _resolve_cli_route()
+    runtime = route["runtime"]
+
+    assert cli.provider == "custom"
+    assert cli.requested_provider == REQUESTED_PROVIDER
+    assert runtime["provider"] == "custom"
+    assert runtime["requested_provider"] == REQUESTED_PROVIDER
+    assert decide_image_input_mode(
+        runtime["provider"],
+        route["model"],
+        load_config(),
+        requested_provider=runtime["requested_provider"],
+    ) == "native"
+
+    # A credential refresh with the same two identities must retain the live
+    # agent instead of treating canonicalization as a provider switch.
+    sentinel_agent = SimpleNamespace()
+    cli.agent = sentinel_agent
+    assert cli._ensure_runtime_credentials() is True
+    assert cli.agent is sentinel_agent
+
+
+def test_named_identity_reaches_agent_and_vision_tool_native_gates():
+    from agent.auxiliary_client import reset_runtime_main, set_runtime_main
+    from run_agent import AIAgent
+    from tools.vision_tools import _should_use_native_vision_fast_path
+
+    _cli, route = _resolve_cli_route()
+    runtime = route["runtime"]
+    token = set_runtime_main(
+        runtime["provider"],
+        route["model"],
+        requested_provider=runtime["requested_provider"],
+        base_url=runtime["base_url"],
+        api_key=runtime["api_key"],
+        api_mode=runtime["api_mode"],
+    )
+    try:
+        agent = AIAgent.__new__(AIAgent)
+        agent.provider = runtime["provider"]
+        agent.requested_provider = runtime["requested_provider"]
+        agent.model = route["model"]
+
+        assert agent._model_supports_vision() is True
+        assert _should_use_native_vision_fast_path() is True
+    finally:
+        reset_runtime_main(token)
+

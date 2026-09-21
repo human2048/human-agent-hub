@@ -1,0 +1,563 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\guides\local-llm-on-mac.md ===
+---
+sidebar_position: 2
+title: "在 Mac 上运行本地 LLM"
+description: "使用 llama.cpp 或 MLX 在 macOS 上搭建兼容 OpenAI 的本地 LLM 服务器，涵盖模型选择、内存优化以及 Apple Silicon 上的实测基准数据"
+---
+
+# 在 Mac 上运行本地 LLM
+
+本指南介绍如何在 macOS 上运行一个兼容 OpenAI API 的本地 LLM 服务器。你将获得完整的隐私保护、零 API 费用，以及 Apple Silicon 上出乎意料的出色性能。
+
+我们涵盖两个后端：
+
+| 后端 | 安装方式 | 优势 | 格式 |
+|---------|---------|---------|--------|
+| **llama.cpp** | `brew install llama.cpp` | 首 token 延迟最低，量化 KV 缓存节省内存 | GGUF |
+| **omlx** | [omlx.ai](https://omlx.ai) | token 生成速度最快，原生 Metal 优化 | MLX (safetensors) |
+
+两者均暴露兼容 OpenAI 的 `/v1/chat/completions` 端点。Hermes 支持任意一个——只需将其指向 `http://localhost:8080` 或 `http://localhost:8000`。
+
+:::info 仅限 Apple Silicon
+本指南面向搭载 Apple Silicon（M1 及更新）的 Mac。Intel Mac 可使用 llama.cpp，但无 GPU 加速——性能会明显更慢。
+:::
+
+---
+
+## 选择模型
+
+入门推荐 **Qwen3.5-9B**——这是一个强推理模型，量化后可在 8GB+ 统一内存上轻松运行。
+
+| 变体 | 磁盘占用 | 所需内存（128K 上下文） | 后端 |
+|---------|-------------|---------------------------|---------|
+| Qwen3.5-9B-Q4_K_M (GGUF) | 5.3 GB | ~10 GB（含量化 KV 缓存） | llama.cpp |
+| Qwen3.5-9B-mlx-lm-mxfp4 (MLX) | ~5 GB | ~12 GB | omlx |
+
+**内存估算规则：** 模型大小 + KV 缓存。9B Q4 模型约 5 GB。128K 上下文下 Q4 量化的 KV 缓存额外占用约 4–5 GB。若使用默认（f16）KV 缓存，则会膨胀至约 16 GB。llama.cpp 中的量化 KV 缓存参数是内存受限系统的关键技巧。
+
+对于更大的模型（27B、35B），你需要 32 GB+ 的统一内存。9B 是 8–16 GB 机器的最佳选择。
+
+---
+
+## 方案 A：llama.cpp
+
+llama.cpp 是移植性最强的本地 LLM 运行时。在 macOS 上，它开箱即用地通过 Metal 进行 GPU 加速。
+
+### 安装
+
+```bash
+brew install llama.cpp
+```
+
+安装后即可全局使用 `llama-server` 命令。
+
+### 下载模型
+
+你需要 GGUF 格式的模型。最简便的来源是通过 `huggingface-cli` 从 Hugging Face 下载：
+
+```bash
+brew install huggingface-cli
+```
+
+然后下载：
+
+```bash
+huggingface-cli download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q4_K_M.gguf --local-dir ~/models
+```
+
+:::tip 受限模型
+Hugging Face 上的部分模型需要身份验证。如果遇到 401 或 404 错误，请先运行 `huggingface-cli login`。
+:::
+
+### 启动服务器
+
+```bash
+llama-server -m ~/models/Qwen3.5-9B-Q4_K_M.gguf \
+  -ngl 99 \
+  -c 131072 \
+  -np 1 \
+  -fa on \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --host 0.0.0.0
+```
+
+各参数说明：
+
+| 参数 | 用途 |
+|------|---------|
+| `-ngl 99` | 将所有层卸载到 GPU（Metal）。设置较大的数值以确保没有层留在 CPU 上。 |
+| `-c 131072` | 上下文窗口大小（128K token）。内存不足时可减小此值。 |
+| `-np 1` | 并行槽数量。单用户使用时保持为 1——更多槽会分摊内存预算。 |
+| `-fa on` | Flash attention。减少内存占用并加速长上下文推理。 |
+| `--cache-type-k q4_0` | 将 key 缓存量化为 4-bit。**这是最大的内存节省手段。** |
+| `--cache-type-v q4_0` | 将 value 缓存量化为 4-bit。与上一项合用，相比 f16 可将 KV 缓存内存减少约 75%。 |
+| `--host 0.0.0.0` | 监听所有网络接口。若不需要网络访问，可改为 `127.0.0.1`。 |
+
+当你看到以下输出时，服务器已就绪：
+
+```
+main: server is listening on http://0.0.0.0:8080
+srv  update_slots: all slots are idle
+```
+
+### 内存受限系统的优化
+
+`--cache-type-k q4_0 --cache-type-v q4_0` 参数是内存有限系统最重要的优化手段。以下是 128K 上下文下的影响对比：
+
+| KV 缓存类型 | KV 缓存内存（128K 上下文，9B 模型） |
+|---------------|--------------------------------------|
+| f16（默认） | ~16 GB |
+| q8_0 | ~8 GB |
+| **q4_0** | **~4 GB** |
+
+在 8 GB Mac 上，使用 `q4_0` KV 缓存并将上下文缩减为 `-c 32768`（32K）。在 16 GB 上，可以轻松使用 128K 上下文。在 32 GB+ 上，可以运行更大的模型或多个并行槽。
+
+如果仍然内存不足，优先减小上下文大小（`-c`），然后尝试更小的量化级别（Q3_K_M 代替 Q4_K_M）。
+
+### 测试
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-9B-Q4_K_M.gguf",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 50
+  }' | jq .choices[0].message.content
+```
+
+### 获取模型名称
+
+如果忘记了模型名称，可查询 models 端点：
+
+```bash
+curl -s http://localhost:8080/v1/models | jq '.data[].id'
+```
+
+---
+
+## 方案 B：通过 omlx 使用 MLX
+
+[omlx](https://omlx.ai) 是一款 macOS 原生应用，用于管理和提供 MLX 模型服务。MLX 是 Apple 自研的机器学习框架，专为 Apple Silicon 统一内存架构优化。
+
+### 安装
+
+从 [omlx.ai](https://omlx.ai) 下载并安装。它提供图形界面用于模型管理，并内置服务器。
+
+### 下载模型
+
+使用 omlx 应用浏览并下载模型。搜索 `Qwen3.5-9B-mlx-lm-mxfp4` 并下载。模型存储在本地（通常位于 `~/.omlx/models/`）。
+
+### 启动服务器
+
+omlx 默认在 `http://127.0.0.1:8000` 上提供服务。通过应用 UI 启动服务，或在可用时使用 CLI。
+
+### 测试
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-9B-mlx-lm-mxfp4",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 50
+  }' | jq .choices[0].message.content
+```
+
+### 列出可用模型
+
+omlx 可同时提供多个模型的服务：
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models | jq '.data[].id'
+```
+
+---
+
+## 基准测试：llama.cpp vs MLX
+
+两个后端在同一台机器（Apple M5 Max，128 GB 统一内存）上测试，使用相同模型（Qwen3.5-9B），量化级别相当（GGUF 使用 Q4_K_M，MLX 使用 mxfp4）。五个不同 prompt，每个运行三次，后端顺序测试以避免资源竞争。
+
+### 结果
+
+| 指标 | llama.cpp (Q4_K_M) | MLX (mxfp4) | 胜者 |
+|--------|-------------------|-------------|--------|
+| **TTFT（首 token 延迟，均值）** | **67 ms** | 289 ms | llama.cpp（快 4.3 倍） |
+| **TTFT（p50）** | **66 ms** | 286 ms | llama.cpp（快 4.3 倍） |
+| **生成速度（均值）** | 70 tok/s | **96 tok/s** | MLX（快 37%） |
+| **生成速度（p50）** | 70 tok/s | **96 tok/s** | MLX（快 37%） |
+| **总耗时（512 token）** | 7.3s | **5.5s** | MLX（快 25%） |
+
+### 含义解读
+
+- **llama.cpp** 在 prompt 处理上表现突出——其 flash attention + 量化 KV 缓存流水线可在约 66ms 内返回第一个 token。如果你在构建对响应速度敏感的交互式应用（聊天机器人、自动补全），这是显著优势。
+
+- **MLX** 一旦开始生成，token 速度快约 37%。对于批量任务、长文本生成，或任何更关注总完成时间而非初始延迟的场景，MLX 完成得更快。
+
+- 两个后端都**极为稳定**——多次运行间的方差可忽略不计。这些数据可作为可靠参考。
+
+### 如何选择？
+
+| 使用场景 | 推荐 |
+|----------|---------------|
+| 交互式聊天、低延迟工具 | llama.cpp |
+| 长文本生成、批量处理 | MLX (omlx) |
+| 内存受限（8–16 GB） | llama.cpp（量化 KV 缓存无可匹敌） |
+| 同时提供多个模型服务 | omlx（内置多模型支持） |
+| 最大兼容性（含 Linux） | llama.cpp |
+
+---
+
+## 连接 Hermes
+
+本地服务器启动后：
+
+```bash
+hermes model
+```
+
+选择 **Custom endpoint**，按提示操作。系统会询问 base URL 和模型名称——使用你所配置的后端对应的值即可。
+
+---
+
+## 超时设置
+
+Hermes 会自动检测本地端点（localhost、局域网 IP）并放宽其流式传输超时限制。大多数情况下无需额外配置。
+
+如果仍然遇到超时错误（例如在慢速硬件上使用超大上下文），可以覆盖流式读取超时：
+
+```bash
+# 在 .env 中——将默认的 120s 提高到 30 分钟
+HERMES_STREAM_READ_TIMEOUT=1800
+```
+
+| 超时类型 | 默认值 | 本地自动调整 | 环境变量覆盖 |
+|---------|---------|----------------------|------------------|
+| 流式读取（socket 级别） | 120s | 提升至 1800s | `HERMES_STREAM_READ_TIMEOUT` |
+| 停滞流检测 | 180s | 完全禁用 | `HERMES_STREAM_STALE_TIMEOUT` |
+| API 调用（非流式） | 1800s | 无需调整 | `HERMES_API_TIMEOUT` |
+
+流式读取超时最容易引发问题——它是接收下一个数据块的 socket 级别截止时间。在大上下文的预填充（prefill）阶段，本地模型可能在处理 prompt 时数分钟内没有任何输出。自动检测机制会透明地处理这一情况。
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\guides\local-ollama-setup.md ===
+---
+sidebar_position: 9
+title: "使用 Ollama 在本地运行 Hermes — 零 API 费用"
+description: "使用 Ollama 和 Gemma 4 等开放权重模型在本机完整运行 Hermes Agent 的分步指南，无需云端 API 密钥或付费订阅"
+---
+
+# 使用 Ollama 在本地运行 Hermes — 零 API 费用
+
+## 问题所在
+
+云端 LLM API 按 token（令牌）计费。一次高强度的编程会话可能花费 5–20 美元。对于个人项目、学习或隐私敏感的工作，费用会不断累积——而且你的每一段对话都会发送给第三方。
+
+## 本指南解决什么
+
+你将在自己的硬件上完整运行 Hermes Agent，使用 [Ollama](https://ollama.com) 作为模型后端。无需 API 密钥，无需订阅，数据不会离开你的机器。配置完成后，Hermes 的使用体验与 OpenRouter 或 Anthropic 完全一致——终端命令、文件编辑、网页浏览、任务委派——只是模型在本地运行。
+
+完成后，你将拥有：
+
+- Ollama 提供一个或多个开放权重模型的服务
+- Hermes 通过自定义端点连接到 Ollama
+- 一个可以编辑文件、执行命令、浏览网页的本地 agent
+- 可选：由你自己的硬件驱动的 Telegram/Discord 机器人
+
+## 所需条件
+
+| 组件 | 最低配置 | 推荐配置 |
+|-----------|---------|-------------|
+| **内存** | 8 GB（适用于 3B 模型） | 32+ GB（适用于 27B+ 模型） |
+| **存储** | 5 GB 可用空间 | 30+ GB（适用于多个模型） |
+| **CPU** | 4 核 | 8+ 核（AMD EPYC、Ryzen、Intel Xeon） |
+| **GPU** | 非必需 | 配备 8+ GB 显存的 NVIDIA GPU 可显著提速 |
+
+:::tip 仅 CPU 可用，但响应速度较慢
+Ollama 可在纯 CPU 服务器上运行。现代 8 核 CPU 运行 9B 模型约可达 ~10 tokens/sec。31B 模型在 CPU 上更慢（~2–5 tokens/sec）——每次响应需要 30–120 秒，但可以正常工作。GPU 能大幅改善这一情况。对于纯 CPU 环境，通过环境变量（而非 `config.yaml` 键）放宽 API 超时时间：
+
+```bash
+# ~/.hermes/.env
+HERMES_API_TIMEOUT=1800   # 30 分钟 — 为慢速本地模型留出充裕时间
+```
+:::
+
+## 第一步：安装 Ollama
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+验证是否正在运行：
+
+```bash
+ollama --version
+curl http://localhost:11434/api/tags   # 应返回 {"models":[]}
+```
+
+## 第二步：拉取模型
+
+根据你的硬件选择：
+
+| 模型 | 磁盘占用 | 所需内存 | 工具调用 | 适用场景 |
+|-------|-------------|------------|:------------:|----------|
+| `gemma4:31b` | ~20 GB | 24+ GB | 支持 | 最佳质量——工具使用和推理能力强 |
+| `gemma2:27b` | ~16 GB | 20+ GB | 不支持 | 对话任务，不支持工具使用 |
+| `gemma2:9b` | ~5 GB | 8+ GB | 不支持 | 快速问答——无法调用工具 |
+| `llama3.2:3b` | ~2 GB | 4+ GB | 不支持 | 仅适合轻量级快速回答 |
+
+:::warning 工具调用至关重要
+Hermes 是一个**agentic（智能体）**助手——它通过工具调用来编辑文件、执行命令和浏览网页。不支持工具调用的模型只能进行对话，无法执行操作。要体验完整的 Hermes 功能，请使用支持工具的模型（如 `gemma4:31b`）。
+:::
+
+拉取你选择的模型：
+
+```bash
+ollama pull gemma4:31b
+```
+
+:::info 多个模型
+你可以拉取多个模型，并在 Hermes 中使用 `/model` 切换。Ollama 按需将活跃模型加载到内存，并自动卸载空闲模型。
+:::
+
+验证模型是否正常工作：
+
+```bash
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma4:31b",
+    "messages": [{"role": "user", "content": "Say hello"}],
+    "max_tokens": 50
+  }'
+```
+
+你应该看到包含模型回复的 JSON 响应。
+
+## 第三步：配置 Hermes
+
+运行 Hermes 设置向导：
+
+```bash
+hermes setup
+```
+
+当提示选择提供商时，选择 **Custom Endpoint**，并输入：
+
+- **Base URL：** `http://localhost:11434/v1`
+- **API Key：** 留空或输入 `no-key`（Ollama 不需要密钥）
+- **Model：** `gemma4:31b`（或你拉取的模型）
+
+也可以直接编辑 `~/.hermes/config.yaml`：
+
+```yaml
+model:
+  default: "gemma4:31b"
+  provider: "custom"
+  base_url: "http://localhost:11434/v1"
+```
+
+## 第四步：开始使用 Hermes
+
+```bash
+hermes
+```
+
+就这样。你现在运行的是一个完全本地化的 agent。试试看：
+
+```
+You: List all Python files in this directory and count the lines of code in each
+
+You: Read the README.md and summarize what this project does
+
+You: Create a Python script that fetches the weather for Ho Chi Minh City
+```
+
+Hermes 将使用终端工具、文件操作和你的本地模型——无需任何云端调用。
+
+## 第五步：为任务选择合适的模型
+
+并非每个任务都需要最大的模型。以下是实用指南：
+
+| 任务 | 推荐模型 | 原因 |
+|------|-------------------|-----|
+| 文件编辑、代码、终端命令 | `gemma4:31b` | 唯一具备可靠工具调用能力的模型 |
+| 快速问答（无需工具调用） | `gemma2:9b` | 对话任务响应速度快 |
+| 轻量级聊天 | `llama3.2:3b` | 最快，但能力非常有限 |
+
+:::note
+对于完整的 agentic 工作（编辑文件、执行命令、浏览网页），`gemma4:31b` 目前是支持工具调用的最佳本地选项。请关注 [Ollama 的模型库](https://ollama.com/library) 以获取更新模型——工具调用支持正在快速扩展。
+:::
+
+在会话中即时切换模型：
+
+```
+/model gemma2:9b
+```
+
+## 第六步：优化速度
+
+### 增大 Ollama 的上下文窗口
+
+默认情况下，Ollama 使用 2048 token 的上下文。对于 agentic 工作（工具调用、长对话），需要更大的上下文：
+
+```bash
+# 创建一个扩展上下文的 Modelfile
+cat > /tmp/Modelfile << 'EOF'
+FROM gemma4:31b
+PARAMETER num_ctx 16384
+EOF
+
+ollama create gemma4-16k -f /tmp/Modelfile
+```
+
+然后将 Hermes 配置中的模型名称更新为 `gemma4-16k`。
+
+### 保持模型常驻内存
+
+默认情况下，Ollama 在模型空闲 5 分钟后将其卸载。对于持久化的 gateway 机器人，保持模型常驻：
+
+```bash
+# 将 keep-alive 设置为 24 小时
+curl http://localhost:11434/api/generate \
+  -d '{"model": "gemma4:31b", "keep_alive": "24h"}'
+```
+
+或在 Ollama 的环境变量中全局设置：
+
+```bash
+# /etc/systemd/system/ollama.service.d/override.conf
+[Service]
+Environment="OLLAMA_KEEP_ALIVE=24h"
+```
+
+### 使用 GPU 卸载（如有）
+
+如果你有 NVIDIA GPU，Ollama 会自动将层卸载到 GPU。通过以下命令检查：
+
+```bash
+ollama ps   # 显示已加载的模型及 GPU 层数
+```
+
+对于 12 GB 显存 GPU 上的 31B 模型，你将获得部分卸载（约 40 层在 GPU 上，其余在 CPU 上），仍能带来显著的速度提升。
+
+## 第七步：作为 Gateway 机器人运行（可选）
+
+一旦 Hermes 在 CLI 中本地运行正常，你可以将其作为 Telegram 或 Discord 机器人对外提供服务——仍完全运行在你的硬件上。
+
+### Telegram
+
+1. 通过 [@BotFather](https://t.me/BotFather) 创建机器人并获取 token
+2. 添加到 `~/.hermes/config.yaml`：
+
+```yaml
+model:
+  default: "gemma4:31b"
+  provider: "custom"
+  base_url: "http://localhost:11434/v1"
+
+platforms:
+  telegram:
+    enabled: true
+    token: "YOUR_TELEGRAM_BOT_TOKEN"
+```
+
+3. 启动 gateway：
+
+```bash
+hermes gateway
+```
+
+现在在 Telegram 上给你的机器人发消息——它将使用你的本地模型进行响应。
+
+### Discord
+
+1. 在 [discord.com/developers](https://discord.com/developers/applications) 创建 Discord 应用
+2. 添加到配置：
+
+```yaml
+platforms:
+  discord:
+    enabled: true
+    token: "YOUR_DISCORD_BOT_TOKEN"
+```
+
+3. 启动：`hermes gateway`
+
+## 第八步：设置回退方案（可选）
+
+本地模型在处理复杂任务时可能力不从心。设置一个仅在本地模型失败时激活的云端回退：
+
+```yaml
+model:
+  default: "gemma4:31b"
+  provider: "custom"
+  base_url: "http://localhost:11434/v1"
+
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4
+```
+
+这样，90% 的使用是免费的（本地），只有困难任务才会调用付费 API。
+
+## 故障排查
+
+### 启动时出现"Connection refused"
+
+Ollama 未在运行。启动它：
+
+```bash
+sudo systemctl start ollama
+# 或
+ollama serve
+```
+
+### 响应缓慢
+
+- **检查模型大小与内存：** 如果模型所需内存超过可用内存，会发生磁盘交换。请使用更小的模型或增加内存。
+- **检查 `ollama ps`：** 如果没有 GPU 层被卸载，响应受 CPU 限制。这对于纯 CPU 服务器是正常现象。
+- **减少上下文：** 长对话会降低推理速度。定期使用 `/compress`，或在配置中设置更低的压缩阈值。
+
+### 模型不遵循工具调用
+
+不支持工具调用的模型会输出纯文本，而非结构化的函数调用。解决方案：
+
+- **使用支持工具调用的模型** —— 在上面列出的模型中，只有 `gemma4:31b` 具备可靠的工具调用能力。
+- **Hermes 具备自动修复功能** —— 它能检测格式错误的工具调用并自动尝试修复。
+- **设置回退方案** —— 如果本地模型连续失败 3 次，Hermes 将回退到云端提供商。
+
+### 上下文窗口错误
+
+Ollama 默认上下文（2048 token）对于 agentic 工作来说太小。请参阅[第六步](#step-6-optimize-for-speed)了解如何增大上下文。
+
+## 费用对比
+
+以下是与云端 API 相比，本地运行的节省情况，基于典型编程会话（约 10 万 token 输入，约 2 万 token 输出）：
+
+| 提供商 | 每次会话费用 | 每月费用（每日使用） |
+|----------|-----------------|---------------------|
+| Anthropic Claude Sonnet | ~$0.80 | ~$24 |
+| OpenRouter（GPT-4o） | ~$0.60 | ~$18 |
+| **Ollama（本地）** | **$0.00** | **$0.00** |
+
+你唯一的成本是电费——根据硬件不同，每次会话约 $0.01–0.05。
+
+## 本地运行效果好的场景
+
+- **文件编辑和代码生成** —— 9B+ 模型处理效果良好
+- **终端命令** —— Hermes 封装命令、执行并读取输出，与模型无关
+- **网页浏览** —— 浏览器工具负责抓取内容，模型只需解读结果
+- **定时任务（Cron job）和计划任务** —— 与云端设置完全一致
+- **多平台 gateway** —— Telegram、Discord、Slack 均可与本地模型配合使用
+
+## 云端模型更具优势的场景
+
+- **非常复杂的多步推理** —— 70B+ 或 Claude Opus 等云端模型明显更强
+- **长上下文窗口** —— 云端模型提供 10 万–100 万 token；本地模型通常为 8K–32K
+- **大篇幅响应的速度** —— 对于长文本生成，云端推理比纯 CPU 本地运行更快
+
+最佳策略：日常任务使用本地模型，困难任务设置云端回退。

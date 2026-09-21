@@ -1,0 +1,382 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_bot_profile_prompt_isolation.py ===
+"""Regression: a bot profile's system prompt must reflect ITS OWN skills/home,
+never the launch (default) profile's — even when the agent build runs on a
+thread that did not bind the HERMES_HOME ContextVar.
+
+Root cause this guards (confirmed empirically): ContextVars do not propagate
+into ``threading.Thread``. ``build_skills_system_prompt`` and the
+active-profile line resolved the home via the ambient ``get_hermes_home()``,
+so an unbound build thread fell back to ``~/.hermes`` (default) and leaked
+default's full skills index + "Active Hermes profile: default" into a bot's
+prompt, while the live ``skills_list()`` (re-bound per turn) correctly
+showed the bot's real, empty set. The agent now resolves its own home from
+its ``_session_db.db_path`` and passes it explicitly.
+"""
+
+import re
+import threading
+
+import pytest
+
+
+def _skills_body(prompt: str) -> str:
+    m = re.search(r"<available_skills>(.*?)</available_skills>", prompt, re.DOTALL)
+    return (m.group(1).strip() if m else "")
+
+
+def test_skills_prompt_scoped_to_override_not_ambient_home(tmp_path, monkeypatch):
+    """An explicit skills_dir_override wins over ambient HERMES_HOME, on a
+    bare thread with no override bound."""
+    from agent import prompt_builder
+
+    # A "default" home WITH skills (the thing that must NOT leak).
+    default_home = tmp_path / "default"
+    default_skills = default_home / "skills" / "general" / "leaky-skill"
+    default_skills.mkdir(parents=True)
+    (default_skills / "SKILL.md").write_text(
+        "---\nname: leaky-skill\ndescription: should never appear in a bot prompt\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    # An empty bot profile (no skills dir at all).
+    bot_skills = tmp_path / "profiles" / "emptybot" / "skills"
+
+    # Bind ambient home to default (mimics a build thread that lost the
+    # bot's override and fell back to launch).
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=False)
+
+    result = {}
+
+    def build():
+        # No set_hermes_home_override on THIS thread — ambient resolves to
+        # default. The override arg must still scope to the empty bot.
+        result["bot"] = _skills_body(
+            prompt_builder.build_skills_system_prompt(skills_dir_override=bot_skills)
+        )
+
+    t = threading.Thread(target=build)
+    t.start()
+    t.join()
+
+    assert result["bot"] == "", (
+        "empty bot profile leaked skills from the ambient (default) home: "
+        + result["bot"][:200]
+    )
+
+
+def test_agent_home_resolves_from_session_db_path(tmp_path):
+    """The agent's own home is read from its session_db, independent of any
+    ContextVar."""
+    from agent import system_prompt
+
+    bot_home = tmp_path / "profiles" / "mybot"
+    bot_home.mkdir(parents=True)
+
+    class _DB:
+        db_path = bot_home / "state.db"
+
+    class _Agent:
+        _session_db = _DB()
+
+    assert system_prompt._agent_home(_Agent()) == bot_home
+    assert system_prompt._agent_skills_dir(_Agent()) == bot_home / "skills"
+
+
+def test_agent_home_none_without_session_db():
+    from agent import system_prompt
+
+    class _Agent:
+        _session_db = None
+
+    assert system_prompt._agent_home(_Agent()) is None
+    assert system_prompt._agent_skills_dir(_Agent()) is None
+
+
+def test_profile_name_correct_on_bound_profile_session(tmp_path, monkeypatch):
+    """Regression for the fix-of-the-fix: on a CORRECTLY bound profile session
+    the ambient home IS the profile dir, so deriving the profile name with
+    ``get_hermes_home()/profiles`` as the root would never match and every
+    profile would misreport as \"default\". The name must derive from the
+    hermes ROOT (get_default_hermes_root)."""
+    from agent import system_prompt
+
+    bot_home = tmp_path / "profiles" / "mybot"
+    bot_home.mkdir(parents=True)
+
+    # Bound session: HERMES_HOME env points at the profile dir itself.
+    monkeypatch.setenv("HERMES_HOME", str(bot_home))
+
+    assert system_prompt._profile_name_for_home(bot_home) == "mybot"
+
+
+def test_profile_name_default_when_home_is_root(tmp_path, monkeypatch):
+    from agent import system_prompt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert system_prompt._profile_name_for_home(tmp_path) == "default"
+
+
+def test_profile_name_correct_when_ambient_is_another_profile(tmp_path, monkeypatch):
+    """CodeRabbit case: agent belongs to profile A while the ambient home is
+    bound to profile B. The root must derive independently of the ambient
+    home, so A still resolves as 'mybot' (not 'default', and never 'other')."""
+    from agent import system_prompt
+
+    bot_home = tmp_path / "profiles" / "mybot"
+    bot_home.mkdir(parents=True)
+    other_home = tmp_path / "profiles" / "other"
+    other_home.mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(other_home))
+
+    assert system_prompt._profile_name_for_home(bot_home) == "mybot"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_bounded_response.py ===
+"""Tests for bounded reads of streaming HTTP error response bodies.
+
+Exercises the real ``httpx`` streaming path against an in-process socket server
+(no mocks) so the byte-cap and hard-deadline contracts are validated end to end,
+the way they behave against a real misbehaving provider.
+
+Covers the bug class ported from openclaw/openclaw#95108: an unbounded
+``response.read()`` on a non-OK streaming response can balloon memory (huge
+body) or hang forever (body opens then stalls).
+"""
+
+from __future__ import annotations
+
+import http.server
+import json
+import socketserver
+import threading
+import time
+
+import httpx
+import pytest
+
+from agent.bounded_response import read_streaming_error_body
+
+
+class _ThreadingServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _make_handler():
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002 - http.server API
+            pass
+
+        def do_POST(self):  # noqa: N802 - http.server API
+            if self.path == "/oversize":
+                # ~128 MiB if read unbounded; no Content-Length.
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                try:
+                    for _ in range(2000):
+                        self.wfile.write(b"x" * 65536)
+                        self.wfile.flush()
+                except Exception:
+                    pass
+            elif self.path == "/stall":
+                # Send a little, then stall forever (no further bytes).
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"partial failure detail")
+                self.wfile.flush()
+                time.sleep(60)
+            elif self.path == "/normal":
+                body = json.dumps(
+                    {
+                        "error": {
+                            "code": 429,
+                            "message": "quota exceeded",
+                            "status": "RESOURCE_EXHAUSTED",
+                        }
+                    }
+                ).encode()
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/empty":
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+    return _Handler
+
+
+@pytest.fixture()
+def server_base():
+    httpd = _ThreadingServer(("127.0.0.1", 0), _make_handler())
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        httpd.shutdown()
+
+
+@pytest.fixture()
+def client():
+    # Generous read timeout so the bounding is provably done by our helper,
+    # not by httpx's own timeout.
+    c = httpx.Client(
+        timeout=httpx.Timeout(connect=5.0, read=45.0, write=5.0, pool=5.0)
+    )
+    try:
+        yield c
+    finally:
+        c.close()
+
+
+def test_oversize_body_is_capped(server_base, client):
+    start = time.monotonic()
+    with client.stream("POST", server_base + "/oversize") as response:
+        text = read_streaming_error_body(
+            response, max_bytes=64 * 1024, timeout_s=10.0
+        )
+    elapsed = time.monotonic() - start
+    assert 0 < len(text) <= 64 * 1024
+    # Capping must return promptly, not after draining the whole body.
+    assert elapsed < 9.0
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_budget_reasoning_details_exclusion.py ===
+"""Regression tests for #73298 (second site): the tail-budget walk must not
+charge the signed/base64 ``reasoning_details`` envelope at chars/4.
+
+The preflight estimator (``model_metadata._estimate_message_tokens_without_images``)
+excludes ``reasoning_details`` entirely; ``_estimate_msg_budget_tokens`` in the
+compressor mirrors that for the envelope while — per the #51800 counter-argument —
+still counting actual thinking TEXT when it is not already carried by
+``reasoning``/``reasoning_content``.
+"""
+
+from agent.context_compressor import (
+    _estimate_msg_budget_tokens,
+    _reasoning_details_text_chars,
+)
+
+
+def _signed_thinking_block(thinking_chars: int, sig_chars: int) -> dict:
+    return {
+        "type": "thinking",
+        "thinking": "t" * thinking_chars,
+        "signature": "s" * sig_chars,
+    }
+
+
+class TestBudgetExcludesReasoningDetailsEnvelope:
+    def test_signature_blob_not_charged(self):
+        base = {"role": "assistant", "content": "hello there"}
+        with_envelope = dict(
+            base,
+            reasoning_details=[_signed_thinking_block(0, 40_000)],
+        )
+        plain = _estimate_msg_budget_tokens(base)
+        loaded = _estimate_msg_budget_tokens(with_envelope)
+        # 40K chars of base64 signature would add ~10K phantom tokens at
+        # chars/4. The envelope must be invisible to the budget.
+        assert loaded - plain < 50, (
+            f"signed envelope inflated the budget by {loaded - plain} tokens"
+        )
+
+    def test_thinking_text_still_counted(self):
+        """#51800: real reasoning text must stay visible to the budget when
+        it is not duplicated into reasoning/reasoning_content."""
+        base = {"role": "assistant", "content": "hello there"}
+        with_text = dict(
+            base,
+            reasoning_details=[_signed_thinking_block(8_000, 0)],
+        )
+        plain = _estimate_msg_budget_tokens(base)
+        loaded = _estimate_msg_budget_tokens(with_text)
+        # 8K chars of thinking ≈ 2K tokens at chars/4.
+        assert loaded - plain > 1_000, (
+            "thinking TEXT inside reasoning_details was dropped from the "
+            f"budget (delta {loaded - plain}); only the envelope may be excluded"
+        )
+
+    def test_duplicated_thinking_text_not_double_charged(self):
+        """Anthropic-wire sessions carry the prose byte-identical in both
+        reasoning_content and reasoning_details; charge it once."""
+        prose = "deep thought " * 1_000
+        msg = {
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": prose,
+            "reasoning_details": [
+                {"type": "thinking", "thinking": prose, "signature": "s" * 5_000},
+            ],
+        }
+        once = _estimate_msg_budget_tokens(
+            {"role": "assistant", "content": "hi", "reasoning_content": prose}
+        )
+        both = _estimate_msg_budget_tokens(msg)
+        assert both - once < 100, (
+            f"thinking prose charged twice (delta {both - once} tokens)"
+        )
+
+    def test_codex_encrypted_content_is_opaque_to_local_estimates(self):
+        """Ciphertext is priced by the provider's own count, never by its bytes (a native
+        compaction checkpoint alone is ~5M chars, #100611): the budget walk and the trigger
+        estimator both charge it ~0, so only real usage ever prices it (#104462)."""
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        base = {"role": "assistant", "content": "hi"}
+        loaded = dict(base, codex_reasoning_items=[{"type": "reasoning", "encrypted_content": "e" * 20_000}])
+        assert _estimate_msg_budget_tokens(loaded) - _estimate_msg_budget_tokens(base) < 50
+        assert estimate_messages_tokens_rough([loaded]) - estimate_messages_tokens_rough([base]) < 50
+
+
+class TestReasoningDetailsTextChars:
+    def test_none_and_empty(self):
+        assert _reasoning_details_text_chars(None) == 0
+        assert _reasoning_details_text_chars([]) == 0
+        assert _reasoning_details_text_chars("") == 0
+
+    def test_string_counts_fully(self):
+        assert _reasoning_details_text_chars("abcd" * 10) == 40
+
+    def test_envelope_keys_skipped(self):
+        blocks = [
+            {"type": "thinking", "thinking": "abc", "signature": "S" * 999},
+            {"type": "redacted_thinking", "data": "D" * 999},
+            {"type": "text", "text": "xy"},
+        ]
+        assert _reasoning_details_text_chars(blocks) == 5
+
+
+class TestPreflightExcludesReasoningDetails:
+    """Regression coverage for the preflight half (#73306 shipped without a
+    test): _estimate_message_tokens_without_images must not count the
+    reasoning_details envelope."""
+
+    def test_preflight_estimate_ignores_reasoning_details(self):
+        from agent.model_metadata import _estimate_message_tokens_without_images
+
+        base = {"role": "assistant", "content": "hello there"}
+        loaded = dict(
+            base,
+            reasoning_details=[_signed_thinking_block(10_000, 40_000)],
+        )
+        plain = _estimate_message_tokens_without_images(base)
+        with_details = _estimate_message_tokens_without_images(loaded)
+        assert with_details - plain < 50, (
+            "preflight estimator counted the reasoning_details payload "
+            f"(delta {with_details - plain} tokens) — compression would fire "
+            "at a fraction of real usage on thinking models (#73298)"
+        )
+

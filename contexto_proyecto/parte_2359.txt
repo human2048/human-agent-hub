@@ -1,0 +1,264 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\ci\test_e2e_screenshot_status.py ===
+"""Tests for scripts/ci/e2e_screenshot_status.py."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+_PATH = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "e2e_screenshot_status.py"
+_spec = importlib.util.spec_from_file_location("e2e_screenshot_status", _PATH)
+if _spec is None or _spec.loader is None:
+    raise ImportError("Failed to load e2e_screenshot_status.py")
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+
+def test_status_selects_only_new_explicit_screenshots_and_all_diffs(tmp_path):
+    for name in (
+        "explicit-proof.png",
+        "test-finished-1.png",
+        "visual-actual.png",
+        "visual-expected.png",
+        "visual-diff.png",
+    ):
+        (tmp_path / name).write_bytes(b"png")
+
+    base_manifest = tmp_path / "main-manifest.json"
+    base_manifest.write_text('{"screenshot_names":["already-on-main.png"]}', encoding="utf-8")
+    (tmp_path / "already-on-main.png").write_bytes(b"png")
+
+    selection = _mod.select_evidence(tmp_path, base_manifest)
+    status = _mod.build_status(selection, "https://github.test/artifacts/1")
+
+    result = status[0]["results"][0]
+    assert result["kind"] == "info"
+    assert result["summary"] == "1 new screenshot vs main; 1 visual diff."
+    assert _mod.EVIDENCE_START in result["detail"]
+    assert "already-on-main.png" not in result["detail"]
+    assert result["link"] == "https://github.test/artifacts/1"
+
+
+def test_cli_output_ends_with_newline_for_github_output_delimiter(tmp_path, monkeypatch):
+    output = tmp_path / "review-status.json"
+    manifest = tmp_path / "main-manifest.json"
+    evidence_dir = tmp_path / "evidence"
+    monkeypatch.setattr(sys, "argv", [
+        "e2e_screenshot_status.py",
+        "--results-dir", str(tmp_path),
+        "--manifest-output", str(manifest),
+        "--evidence-dir", str(evidence_dir),
+        "--output", str(output),
+    ])
+
+    assert _mod.main() == 0
+    assert output.read_text(encoding="utf-8") == "[]\n"
+    assert manifest.read_text(encoding="utf-8") == '{"screenshot_names": [], "version": 1}\n'
+    assert evidence_dir.joinpath("e2e-evidence.json").is_file()
+
+
+=== ARCHIVO: .\hermes-agent\tests\ci\test_emit_review_status.py ===
+"""Tests for scripts/ci/emit_review_status.py."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+_PATH = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "emit_review_status.py"
+_spec = importlib.util.spec_from_file_location("emit_review_status", _PATH)
+if _spec is None or _spec.loader is None:
+    raise ImportError("Failed to load emit_review_status.py")
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules["emit_review_status"] = _mod
+_spec.loader.exec_module(_mod)
+
+
+def test_ci_review_status_links_to_each_sensitive_file_change():
+    results = _mod.build_results(
+        ci_review=True,
+        mcp_catalog=False,
+        supply_chain=False,
+        label_present=False,
+        ci_review_files='[".github/workflows/ci.yml", "apps/desktop/eslint.config.mjs"]',
+        repo_url="https://github.com/nousresearch/hermes-agent",
+        base_sha="base456",
+        head_sha="abc123",
+    )
+
+    assert results[0]["detail"] == (
+        "**Sensitive files changed:**\n"
+        "- [`.github/workflows/ci.yml`](https://github.com/nousresearch/hermes-agent/compare/base456...abc123#diff-b803fcb7f17ed9235f1e5cb1fcd2f5d3b2838429d4368ae4c57ce4436577f03f)\n"
+        "- [`apps/desktop/eslint.config.mjs`](https://github.com/nousresearch/hermes-agent/compare/base456...abc123#diff-a45471520795db6e46840d1ba2a82c1f8a2841039bd60fb50624488c5f192438)"
+    )
+
+
+def test_approved_ci_review_is_visible_info():
+    results = _mod.build_results(
+        ci_review=True,
+        mcp_catalog=False,
+        supply_chain=False,
+        label_present=True,
+        ci_review_files='[".github/workflows/ci.yml"]',
+        repo_url="https://github.com/nousresearch/hermes-agent",
+        base_sha="base456",
+        head_sha="abc123",
+    )
+
+    assert results == [{
+        "kind": "info",
+        "title": "CI-sensitive file review",
+        "summary": (
+            "PR touches sensitive files, but the `ci-reviewed` label has been "
+            "added, approving them."
+        ),
+        "detail": (
+            "**Sensitive files changed:**\n"
+            "- [`.github/workflows/ci.yml`](https://github.com/nousresearch/hermes-agent/compare/base456...abc123#diff-b803fcb7f17ed9235f1e5cb1fcd2f5d3b2838429d4368ae4c57ce4436577f03f)"
+        ),
+    }]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\ci\test_list_os_marked_tests.py ===
+"""Tests for ``scripts/ci/list_os_marked_tests.py``.
+
+The helper decides which files the macOS / Windows CI lanes import. Its
+failure modes matter more than its happy path: if it silently returned an
+empty list, the OS lane would run zero tests and still report green — the
+exact silent-coverage-loss the lanes exist to prevent. So the contracts under
+test are "finds real markers", "refuses to emit nothing", and "rejects an
+unknown marker".
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "ci" / "list_os_marked_tests.py"
+
+
+def _run(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=REPO_ROOT,
+    )
+
+
+def _write(root: Path, relpath: str, body: str) -> Path:
+    path = root / relpath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("marker", ["linux_only", "macos_only", "windows_only"])
+def test_finds_decorator_and_pytestmark_forms(tmp_path, marker):
+    """Both the decorator form and module-level ``pytestmark`` are detected."""
+    _write(
+        tmp_path,
+        "test_decorated.py",
+        f"import pytest\n\n\n@pytest.mark.{marker}\ndef test_x():\n    pass\n",
+    )
+    _write(
+        tmp_path,
+        "nested/test_module_level.py",
+        f"import pytest\n\npytestmark = pytest.mark.{marker}\n\n\ndef test_y():\n    pass\n",
+    )
+    # A file with no marker at all must not be selected.
+    _write(tmp_path, "test_plain.py", "def test_z():\n    pass\n")
+
+    result = _run(marker, str(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    listed = result.stdout.split()
+    assert any(p.endswith("test_decorated.py") for p in listed)
+    assert any(p.endswith("test_module_level.py") for p in listed)
+    assert not any(p.endswith("test_plain.py") for p in listed)
+
+
+def test_marker_matched_as_whole_word(tmp_path):
+    """``macos_only`` must not match a longer identifier that contains it."""
+    _write(
+        tmp_path,
+        "test_lookalike.py",
+        "import pytest\n\n\n@pytest.mark.macos_only_extra\ndef test_x():\n    pass\n",
+    )
+
+    result = _run("macos_only", str(tmp_path))
+
+    # No genuine match: the helper must fail rather than emit nothing.
+    assert result.returncode == 1
+    assert "macos_only" in result.stderr
+
+
+def test_exits_nonzero_when_no_file_carries_the_marker(tmp_path):
+    """The load-bearing guard: an empty result is an error, never a silent pass."""
+    _write(tmp_path, "test_plain.py", "def test_z():\n    pass\n")
+
+    result = _run("windows_only", str(tmp_path))
+
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
+    assert "renamed or dropped" in result.stderr
+
+
+def test_rejects_unknown_marker(tmp_path):
+    result = _run("bsd_only", str(tmp_path))
+
+    assert result.returncode == 2
+    assert "unknown marker" in result.stderr
+
+
+def test_rejects_missing_root():
+    result = _run("macos_only", "/nonexistent/path/for/this/test")
+
+    assert result.returncode == 2
+    assert "no such directory" in result.stderr
+
+
+def test_emits_repo_relative_posix_paths():
+    """Output feeds a bash command line on the Windows runner, so separators
+    must be POSIX and paths repo-relative.
+
+    Asserted against the real ``tests/`` tree, which is the only case CI
+    exercises — an out-of-repo root can't be made repo-relative and is
+    emitted absolute instead.
+    """
+    result = _run("windows_only")
+
+    assert result.returncode == 0, result.stderr
+    listed = result.stdout.split()
+    assert listed
+    for line in listed:
+        assert "\\" not in line
+        assert not Path(line).is_absolute()
+
+
+def test_real_tree_selects_files_for_every_marker():
+    """Against the actual ``tests/`` tree each marker resolves to real files.
+
+    This is the invariant the CI lanes depend on — not a snapshot of which
+    files those are, only that each marker is in use and every listed path
+    exists.
+    """
+    for marker in ("linux_only", "macos_only", "windows_only"):
+        result = _run(marker)
+        assert result.returncode == 0, f"{marker}: {result.stderr}"
+        listed = result.stdout.split()
+        assert listed, f"{marker} selected no files"
+        for rel in listed:
+            assert (REPO_ROOT / rel).is_file(), f"{marker} listed missing {rel}"
+

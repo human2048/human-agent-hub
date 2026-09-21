@@ -1,0 +1,509 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\monitoring\test_cron_health_export.py ===
+from __future__ import annotations
+
+
+import pytest
+
+
+def _metric(snapshot, name):
+    return next(metric for metric in snapshot.metrics if metric.name == name)
+
+
+
+
+
+
+def test_execution_projection_is_opaque_bounded_and_content_free():
+    from agent.monitoring.cron_health import project_execution_event
+
+    event = project_execution_event(
+        {
+            "id": "execution-private-id",
+            "job_id": "Payroll for alice@example.com and token top-secret-token",
+            "source": "builtin",
+            "status": "failed",
+            "claimed_at": "2026-07-24T12:00:00+00:00",
+            "started_at": "2026-07-24T12:00:01+00:00",
+            "finished_at": "2026-07-24T12:00:03.250000+00:00",
+            "error": "Bearer top-secret-token rejected for alice@example.com",
+        },
+        delivery_outcome="failed",
+    ).to_dict()
+
+    assert event["event"] == "cron_execution"
+    assert event["status"] == "failed"
+    assert event["job_key"].startswith("sha256:")
+    assert len(event["job_key"]) == len("sha256:") + 24
+    assert event["duration_ms"] == 2250
+    assert event["delivery_outcome"] == "failed"
+    assert event["error_class"] == "auth_failed"
+    assert "job_id" not in event
+    assert "error" not in event
+    assert "alice@example.com" not in str(event)
+    assert "top-secret-token" not in str(event)
+
+
+
+
+
+
+@pytest.mark.parametrize("message", ["oauth refresh failed", "tokenizer crashed", "HTTP 4015"])
+def test_error_classification_avoids_auth_substring_false_positives(message):
+    from agent.monitoring.cron_health import classify_cron_error
+
+    assert classify_cron_error(message) == "unknown"
+
+
+
+
+
+
+def test_terminal_execution_emission_flushes_and_failures_are_fail_open(monkeypatch):
+    from agent.monitoring import cron_health, emitter
+
+    calls = []
+
+    class FakeEmitter:
+        def emit(self, event):
+            calls.append(("emit", event.to_dict()["status"]))
+
+        def flush(self, timeout):
+            calls.append(("flush", timeout))
+            raise RuntimeError("collector unavailable")
+
+    monkeypatch.setattr(emitter, "get_emitter", lambda: FakeEmitter())
+
+    cron_health.emit_execution_state(
+        {"job_id": "private", "source": "builtin", "status": "completed"}
+    )
+
+    assert calls == [("emit", "completed"), ("flush", 1.0)]
+
+
+
+
+
+
+def test_registered_observable_metric_names_cover_snapshot_metrics(monkeypatch):
+    """Every gauge emitted in the runtime snapshot must also be registered in the
+    observable-gauge metric_names list, or the OTLP exporter never observes it.
+
+    This asserts the vocabulary-registration invariant documented in
+    website/docs/developer-guide/gateway-monitoring.md: an emitted-but-unregistered gauge is
+    silently dropped. Regression guard for background_work / cron additions.
+    """
+    from agent.monitoring import gateway_health_export
+
+    # Build a representative snapshot (gateway + cron + background_work) without
+    # a live gateway by stubbing the gateway snapshot to the real metric names.
+    class _M:
+        def __init__(self, name):
+            self.name = name
+            self.value = 0
+            self.attributes = {}
+
+    gateway_snapshot = type("S", (), {"metrics": [
+        _M("hermes.gateway.up"), _M("hermes.gateway.active_agents"),
+        _M("hermes.gateway.busy"), _M("hermes.gateway.drainable"),
+        _M("hermes.gateway.restart_requested"),
+        _M("hermes.platform.up"), _M("hermes.platform.degraded"),
+    ]})()
+    cron_snapshot = type("S", (), {"metrics": [
+        _M("hermes.cron.scheduler.heartbeat_age_seconds"),
+        _M("hermes.cron.scheduler.last_success_age_seconds"),
+        _M("hermes.cron.scheduler.catch_up_occurrences"),
+        _M("hermes.cron.jobs.enabled"), _M("hermes.cron.jobs.running"),
+        _M("hermes.cron.jobs.overdue"),
+    ]})()
+    monkeypatch.setattr(gateway_health_export, "_read_gateway_snapshot", lambda config: gateway_snapshot)
+    monkeypatch.setattr(gateway_health_export, "_read_cron_snapshot", lambda: cron_snapshot)
+
+    snapshot_names = {m.name for m in gateway_health_export._read_runtime_snapshot({}).metrics}
+
+    registered = set(gateway_health_export._OBSERVABLE_METRIC_NAMES)
+
+    missing = snapshot_names - registered
+    assert not missing, f"gauges emitted but NOT registered in metric_names (will be silently dropped): {sorted(missing)}"
+
+
+def test_monitoring_docs_distinguish_relay_health_scope_and_terminal_flush():
+    from pathlib import Path
+
+    text = Path("website/docs/developer-guide/gateway-monitoring.md").read_text(encoding="utf-8")
+
+    assert "Hermes Agent-owned Relay transport health" in text
+    assert "authoritative shared connector/platform state" in text
+    assert "up to one second" in text
+    assert "terminal" in text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\monitoring\test_emitter.py ===
+"""Tests for the monitoring emitter: hot-path invariant + subscriber fan-out."""
+
+from __future__ import annotations
+
+import time
+
+from agent.monitoring.emitter import MonitoringEmitter
+
+
+def test_emit_never_raises_when_disabled():
+    em = MonitoringEmitter(enabled=False)
+    em.emit({"event": "gateway_health", "name": "gateway.health_snapshot"})
+    assert em.stats()["queued"] == 0
+    em.close()
+
+
+def test_process_singleton_stays_dormant_until_subscribed():
+    from agent.monitoring import emitter
+
+    emitter.reset_emitter_for_tests()
+    try:
+        emitter.emit({"event": "gateway_health", "name": "gateway.lifecycle"})
+        singleton = emitter.get_emitter()
+        assert singleton.stats()["queued"] == 0
+        assert singleton._started is False
+
+        subscriber = lambda _batch: None  # noqa: E731
+        singleton.subscribe(subscriber)
+        emitter.emit({"event": "gateway_health", "name": "gateway.lifecycle"})
+        assert singleton._started is True
+        singleton.unsubscribe(subscriber)
+    finally:
+        emitter.reset_emitter_for_tests()
+
+
+
+
+
+
+
+
+def test_unsubscribe_stops_delivery():
+    em = MonitoringEmitter()
+    seen: list = []
+    cb = lambda batch: seen.extend(batch)  # noqa: E731
+    em.subscribe(cb)
+    em.emit({"event": "gateway_health", "name": "a"})
+    em.flush()
+    em.unsubscribe(cb)
+    em.emit({"event": "gateway_health", "name": "b"})
+    em.flush()
+    em.close()
+    assert [ev["name"] for ev in seen] == ["a"]
+
+
+
+
+def test_hot_path_is_fast():
+    em = MonitoringEmitter()
+    start = time.perf_counter()
+    for _ in range(1_000):
+        em.emit({"event": "gateway_health", "name": "gateway.health_snapshot"})
+    elapsed = time.perf_counter() - start
+    em.close()
+    # 1000 emits should be far under a second even on slow CI.
+    assert elapsed < 1.0
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\monitoring\test_export_redaction.py ===
+"""Export redaction tests — the security-critical layer.
+
+Invariants:
+  * One unconditional scrub: secrets AND PII, no modes, no knobs.
+  * Fails CLOSED: if the redactor can't run, the raw string is never emitted.
+  * Structure (subsystem names, error codes) survives; free-text PII does not.
+"""
+
+from __future__ import annotations
+
+from unittest import mock
+
+import agent.monitoring.redaction as R
+
+
+def test_secret_key_always_stripped():
+    fake_key = "sk-ant-api03-" + "A" * 24  # constructed to dodge literal-scrubbers
+    out = R.redact_for_export(f"calling with key {fake_key} and moving on")
+    assert out is not None
+    assert fake_key not in out
+
+
+
+
+def test_bearer_header_stripped():
+    out = R.redact_for_export("Authorization: Bearer abc.def-ghi_jkl")
+    assert out is not None
+    assert "abc.def-ghi_jkl" not in out
+
+
+
+
+
+
+
+
+def test_structure_preserved():
+    out = R.redact_for_export("platform.slack entered fatal after auth_failed")
+    assert out is not None
+    assert "platform.slack" in out
+    assert "auth_failed" in out
+
+
+def test_fails_closed_when_redactor_unavailable():
+    with mock.patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError):
+        out = R.redact_for_export("secret sauce sk-live-key")
+    assert out == "[redaction-unavailable]"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\monitoring\test_gateway_health_export.py ===
+from __future__ import annotations
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_otlp_attrs_redact_strings_and_never_export_profile():
+    from agent.monitoring.otlp_exporter import _span_attrs
+
+    attrs = _span_attrs({
+        "event": "gateway_health",
+        "name": "gateway.lifecycle",
+        "profile": "user@example.com",
+        "exit_reason": "Bearer top-secret-token-0123456789 for user@example.com",
+    })
+
+    assert "hermes.profile" not in attrs
+    assert "top-secret-token-0123456789" not in str(attrs)
+    assert "user@example.com" not in str(attrs)
+
+
+def test_resource_attributes_are_allowlisted_and_sanitized():
+    from agent.monitoring.otlp_exporter import _safe_resource_attributes
+
+    attrs = _safe_resource_attributes({
+        "service.name": "hermes-gateway",
+        "service.instance.id": "install-1",
+        "deployment.environment.name": "staging",
+        "user.email": "user@example.com",
+        "authorization": "Bearer top-secret-token-0123456789",
+        "custom.request.id": "unbounded",
+    })
+
+    assert attrs == {
+        "service.name": "hermes-gateway",
+        "service.instance.id": attrs["service.instance.id"],
+        "deployment.environment.name": "staging",
+    }
+    assert attrs["service.instance.id"].startswith("sha256:")
+    assert "install-1" not in attrs["service.instance.id"]
+
+
+
+
+
+
+def test_diagnostic_log_attributes_are_allowlisted_redacted_and_profile_free():
+    from agent.monitoring.gateway_health_export import _diagnostic_log_attributes
+
+    attrs = _diagnostic_log_attributes({
+        "event": "gateway_diagnostic",
+        "name": "platform.fatal",
+        "subsystem": "platform.slack",
+        "profile": "user@example.com",
+        "error_code": "Bearer top-secret-token-0123456789",
+        "custom": "must-not-egress",
+    })
+
+    assert "hermes.profile" not in attrs
+    assert "hermes.custom" not in attrs
+    assert "top-secret-token-0123456789" not in str(attrs)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_install_id_persists_across_calls(tmp_path, monkeypatch):
+    """A minted install id must survive restarts (service.instance.id continuity)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("{}\n")
+
+    import hermes_cli.config as cfg_mod
+    from agent.monitoring.policy import ensure_install_id
+
+    first = ensure_install_id(cfg_mod.load_config())
+    assert first and first != "unknown"
+    # Persisted: a fresh load (simulating a new gateway process) returns the same id.
+    second = ensure_install_id(cfg_mod.load_config())
+    assert second == first
+    assert first in (tmp_path / "config.yaml").read_text()
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\monitoring\test_otlp_exporter.py ===
+"""OTLP exporter tests: config resolution, span mapping, streaming subscriber.
+
+No SQLite involved — monitoring is an egress path, so the exporter consumes
+emitter batches directly. Uses the in-memory OTel span exporter; skipped when
+the optional otlp extra is not installed.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+otel = pytest.importorskip("opentelemetry.sdk.trace", reason="otlp extra not installed")
+
+import agent.monitoring.otlp_exporter as OE
+from agent.monitoring.emitter import MonitoringEmitter
+
+
+def _mem_provider():
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+def test_gateway_health_event_maps_to_span_with_attrs():
+    provider, mem = _mem_provider()
+    n = OE.export_batch(provider, [{
+        "event": "gateway_health", "name": "gateway.lifecycle",
+        "old_state": "starting", "new_state": "running",
+        "active_agents": 2, "pid": 4242,
+    }])
+    assert n == 1
+    spans = mem.get_finished_spans()
+    assert spans[0].name == "hermes.gateway_health"
+    attrs = dict(spans[0].attributes or {})
+    assert attrs["hermes.old_state"] == "starting"
+    assert attrs["hermes.new_state"] == "running"
+    assert attrs["hermes.active_agents"] == 2
+
+
+
+
+
+
+def test_headers_resolve_from_env_not_value(monkeypatch):
+    monkeypatch.setenv("DD_KEY_ENV", "secret-value")
+    resolved = OE._resolve_headers({"DD-API-KEY": "DD_KEY_ENV", "X-Missing": "NOPE_ENV"})
+    assert resolved == {"DD-API-KEY": "secret-value"}
+
+
+
+
+def test_trace_resource_includes_stable_hashed_instance():
+    attrs = OE._resource_attributes(
+        {"monitoring": {"install_id": "private-install-id"}}
+    )
+
+    assert attrs["service.name"] == "hermes-gateway"
+    assert attrs["service.instance.id"].startswith("sha256:")
+    assert len(attrs["service.instance.id"]) == len("sha256:") + 24
+    assert "private-install-id" not in str(attrs)
+    assert attrs["telemetry.scope"] == "gateway_monitoring"
+
+
+def test_trace_resource_includes_configured_deployment_environment():
+    attrs = OE._resource_attributes({
+        "monitoring": {
+            "install_id": "private-install-id",
+            "gateway_health_export": {
+                "resource_attributes": {"deployment.environment.name": "production"},
+            },
+        },
+    })
+
+    assert attrs["deployment.environment.name"] == "production"
+    assert attrs["service.name"] == "hermes-gateway"
+
+
+
+
+def test_streamer_receives_events_and_respects_filter(monkeypatch):
+    provider, mem = _mem_provider()
+    monkeypatch.setattr(OE, "_make_provider", lambda cfg: (provider, None))
+    streamer = OE.OTLPStreamer(
+        {}, event_filter=lambda ev: ev.get("event") == "gateway_health")
+
+    em = MonitoringEmitter()
+    em.subscribe(streamer)
+    em.emit({"event": "gateway_health", "name": "gateway.health_snapshot"})
+    em.emit({"event": "model_call", "provider": "anthropic"})  # filtered out
+    em.flush()
+    em.close()
+
+    spans = mem.get_finished_spans()
+    assert [s.name for s in spans] == ["hermes.gateway_health"]
+    assert streamer.exported == 1
+
+
+def test_failing_streamer_never_breaks_emitter(monkeypatch):
+    def boom(cfg):
+        raise RuntimeError("no provider")
+
+    em = MonitoringEmitter()
+
+    def bad_subscriber(batch):
+        raise RuntimeError("export down")
+
+    seen: list = []
+    em.subscribe(bad_subscriber)
+    em.subscribe(lambda batch: seen.extend(batch))
+    em.emit({"event": "gateway_health", "name": "gateway.lifecycle"})
+    em.flush()
+    em.close()
+    assert len(seen) == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\monitoring\__init__.py ===
+

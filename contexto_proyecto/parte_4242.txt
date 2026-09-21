@@ -1,0 +1,348 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_patch_v4a_gate.py ===
+"""patch V4A provider gate (#95681).
+
+V4A is the OpenAI apply_patch dialect; the dual-mode schema taxed every
+non-OpenAI session ~149 tok/call for a format their models weren't
+trained on. Base schema = replace-only (mode gone, path/old/new required);
+the V4A layer renders only for OpenAI-family mains. Handler accepts both
+shapes from any model (replay compat; mode defaults to replace).
+"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+import tools.file_tools as ft
+
+
+def _family(prov, model):
+    with patch("agent.auxiliary_client._read_main_provider", return_value=prov), \
+         patch("agent.auxiliary_client._read_main_model", return_value=model):
+        return ft._is_openai_family_main()
+
+
+def _override(prov, model):
+    with patch("agent.auxiliary_client._read_main_provider", return_value=prov), \
+         patch("agent.auxiliary_client._read_main_model", return_value=model):
+        return ft._patch_schema_overrides()
+
+
+class TestPatchV4AGate(unittest.TestCase):
+    def test_family_detector(self):
+        for prov, model, want in [
+            ("openai", "gpt-5.2", True),
+            ("openai-codex", "codex-large", True),
+            ("azure-openai", "deploy-x", True),
+            ("openrouter", "openai/gpt-5.2", True),
+            ("nous", "openai/o5-mini", True),
+            ("openrouter", "anthropic/claude-sonnet-4", False),
+            ("anthropic", "claude-fable-5", False),
+            ("nous", "hermes-4-405b", False),
+            ("", "", False),
+        ]:
+            self.assertEqual(_family(prov, model), want, (prov, model))
+
+    def test_base_schema_is_replace_only(self):
+        props = ft.PATCH_SCHEMA["parameters"]["properties"]
+        self.assertNotIn("mode", props)
+        self.assertNotIn("patch", props)
+        self.assertEqual(ft.PATCH_SCHEMA["parameters"]["required"],
+                         ["path", "old_string", "new_string"])
+        self.assertNotIn("V4A", ft.PATCH_SCHEMA["description"])
+
+    def test_openai_family_gets_v4a_layer(self):
+        o = _override("openai", "gpt-5.2")
+        self.assertIn("V4A", o["description"])
+        self.assertIn("mode", o["parameters"]["properties"])
+        self.assertIn("patch", o["parameters"]["properties"])
+        self.assertEqual(o["parameters"]["required"], ["mode"])
+
+    def test_non_openai_gets_no_override(self):
+        self.assertEqual(_override("anthropic", "claude-fable-5"), {})
+
+    def test_handler_accepts_both_shapes_regardless(self):
+        """Wire compat: replace works without mode; V4A applies even from
+        sessions whose schema never advertised it."""
+        work = tempfile.mkdtemp(prefix="v4a_t_")
+        f1 = os.path.join(work, "a.txt")
+        open(f1, "w").write("alpha beta\n")
+        r = json.loads(ft.patch_tool(path=f1, old_string="beta", new_string="B"))
+        self.assertFalse(r.get("error"), r)
+        v4a = (
+            "*** Begin Patch\n"
+            f"*** Update File: {f1}\n@@\n-alpha B\n+A B\n"
+            "*** End Patch"
+        )
+        r = json.loads(ft.patch_tool(mode="patch", patch=v4a))
+        self.assertFalse(r.get("error"), r)
+        self.assertEqual(open(f1).read().strip(), "A B")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_patch_ws_diagnosis.py ===
+"""Tests for whitespace-visualized mismatch diagnosis in patch no-match hints."""
+
+import json
+
+import pytest
+
+from tools.fuzzy_match import (
+    _visualize_whitespace,
+    find_closest_lines,
+    fuzzy_find_and_replace,
+)
+
+
+class TestVisualizeWhitespace:
+    def test_spaces_and_tabs_visualized(self):
+        assert _visualize_whitespace("\t    x = 1") == "→····x = 1"
+
+    def test_interior_whitespace_untouched(self):
+        assert _visualize_whitespace("  a  b") == "··a  b"
+
+    def test_no_leading_ws(self):
+        assert _visualize_whitespace("plain") == "plain"
+
+
+class TestWhitespaceDiagnosis:
+    def test_whitespace_shaped_miss_shows_both_lines(self):
+        # File uses tabs; the model sends 4 spaces AND a wrong second line so
+        # every fuzzy strategy misses (content mismatch), but line 1 is a
+        # whitespace-only difference worth diagnosing.
+        content = "def f():\n\tvalue = compute_thing()\n\treturn value\n"
+        old = "    value = compute_thing()\n    return wrong_name"
+        hint = find_closest_lines(old, content)
+        assert "Whitespace difference detected" in hint
+        assert "→value = compute_thing()" in hint
+        assert "····value = compute_thing()" in hint
+
+    def test_content_miss_has_no_whitespace_block(self):
+        content = "alpha = 1\nbeta = 2\n"
+        old = "alpha = 999"
+        hint = find_closest_lines(old, content)
+        assert "Whitespace difference detected" not in hint
+
+    def test_exact_line_present_no_ws_block(self):
+        # anchor matches raw -> no whitespace diagnosis needed
+        content = "  x = 1\n  y = 2\n"
+        old = "  x = 1\n  z = 3"
+        hint = find_closest_lines(old, content)
+        assert "Whitespace difference detected" not in hint
+
+
+class TestEndToEndHint:
+    def test_no_match_error_carries_ws_diagnosis(self):
+        # Second line's CONTENT differs (wrong call name) so all 9 fuzzy
+        # strategies genuinely miss; first line differs only in whitespace,
+        # so the hint should include the whitespace diagnosis.
+        content = "class A:\n\tdef run(self):\n\t\tstart_engine()\n\t\treturn 1\n"
+        old = "    def run(self):\n        boot_engine_wrong()\n        return 2"
+        new = "    def run(self):\n        start_engine()\n        return 3"
+        _c, count, _s, err = fuzzy_find_and_replace(content, old, new)
+        assert count == 0
+        from tools.fuzzy_match import format_no_match_hint
+        hint = format_no_match_hint(err, count, old, content)
+        assert "Did you mean" in hint
+        assert "Whitespace difference detected" in hint
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_permanent_allowlist_reconcile.py ===
+"""`command_allowlist` is a file the operator edits; a save must not clobber it.
+
+`load_permanent_allowlist()` runs once, at module import (tools/approval.py, the
+call at the bottom of the module), and `load_permanent()` only ever unions into
+`_permanent_approved` — nothing removes. `save_permanent_allowlist()` then wrote
+that in-memory set straight back over `config["command_allowlist"]`.
+
+So a hand edit made while a Hermes process is live was undone by the next
+`[a]lways`, in both directions at once: an entry the operator ADDED on disk was
+deleted, and an entry they REMOVED — the documented way to withdraw a standing
+approval — came back.
+
+Reconciling at write time fixes both. The file is re-read and the result is
+what is on disk now, plus what this process approved since its own baseline.
+"""
+
+import logging
+
+import pytest
+
+import tools.approval as approval
+
+
+@pytest.fixture
+def fake_config(monkeypatch):
+    """A dict standing in for config.yaml, plus a clean module baseline."""
+    store = {"command_allowlist": []}
+
+    def _load():
+        return {"command_allowlist": list(store["command_allowlist"])}
+
+    def _save(config):
+        store["command_allowlist"] = list(config.get("command_allowlist", []))
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _load, raising=False)
+    monkeypatch.setattr("hermes_cli.config.save_config", _save, raising=False)
+
+    saved_approved = set(approval._permanent_approved)
+    saved_baseline = dict(approval._permanent_baseline_by_home)
+    approval._permanent_approved.clear()
+    approval._permanent_baseline_by_home.clear()
+    try:
+        yield store
+    finally:
+        approval._permanent_approved.clear()
+        approval._permanent_approved.update(saved_approved)
+        approval._permanent_baseline_by_home.clear()
+        approval._permanent_baseline_by_home.update(saved_baseline)
+
+
+def _start_process_with(store, entries):
+    """Simulate import-time load against the current file contents."""
+    store["command_allowlist"] = list(entries)
+    approval.load_permanent(set(entries))
+    approval._permanent_baseline_by_home[""] = set(entries)
+
+
+# ── the two halves of the bug ─────────────────────────────────────────
+
+
+def test_an_entry_the_operator_added_on_disk_survives_a_save(fake_config):
+    _start_process_with(fake_config, ["git status", "ls *"])
+    fake_config["command_allowlist"] = ["git status", "ls *", "npm test"]
+
+    approval.approve_permanent("docker *")
+    approval.save_permanent_allowlist(approval._permanent_approved)
+
+    assert "npm test" in fake_config["command_allowlist"], (
+        "a hand-added entry was deleted by an unrelated [a]lways"
+    )
+    assert "docker *" in fake_config["command_allowlist"]
+
+
+def test_an_entry_the_operator_revoked_on_disk_is_not_resurrected(fake_config):
+    _start_process_with(fake_config, ["git status", "ls *"])
+    fake_config["command_allowlist"] = ["ls *"]          # operator revokes it
+
+    approval.approve_permanent("docker *")
+    approval.save_permanent_allowlist(approval._permanent_approved)
+
+    assert "git status" not in fake_config["command_allowlist"], (
+        "a revoked standing approval came back on the next save"
+    )
+    assert sorted(fake_config["command_allowlist"]) == ["docker *", "ls *"]
+
+
+def test_a_revoked_entry_stops_being_honoured_in_memory_after_the_save(fake_config):
+    _start_process_with(fake_config, ["git status", "ls *"])
+    fake_config["command_allowlist"] = ["ls *"]
+
+    approval.approve_permanent("docker *")
+    approval.save_permanent_allowlist(approval._permanent_approved)
+
+    assert "git status" not in approval._permanent_approved
+    assert "ls *" in approval._permanent_approved
+    assert "docker *" in approval._permanent_approved
+
+
+def test_a_second_process_writing_first_does_not_lose_this_ones_approval(fake_config):
+    """Two live Hermes processes. Whoever writes second must not drop the first."""
+    _start_process_with(fake_config, ["ls *"])
+    # The other process approved something and wrote it out.
+    fake_config["command_allowlist"] = ["ls *", "cargo *"]
+
+    approval.approve_permanent("docker *")
+    approval.save_permanent_allowlist(approval._permanent_approved)
+
+    assert sorted(fake_config["command_allowlist"]) == ["cargo *", "docker *", "ls *"]
+
+
+def test_save_failure_is_logged_not_raised(fake_config, monkeypatch, caplog):
+    """The existing contract: a config write failure must not break approval."""
+    _start_process_with(fake_config, ["ls *"])
+
+    def _boom():
+        raise OSError("disk full")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _boom, raising=False)
+    approval.approve_permanent("docker *")
+    with caplog.at_level(logging.WARNING, logger=approval.logger.name):
+        approval.save_permanent_allowlist(approval._permanent_approved)   # must not raise
+    assert "Could not save allowlist" in caplog.text
+    assert "docker *" in approval._permanent_approved
+
+
+def test_a_caller_that_passes_a_smaller_set_does_not_remove(fake_config):
+    """Documented consequence of reconciling: ``patterns`` may only add.
+
+    A future `allowlist remove` built on this function would silently no-op.
+    The docstring says so; this pins it so the next reader finds out here
+    rather than in production.
+    """
+    _start_process_with(fake_config, ["ls *", "docker *"])
+
+    approval.save_permanent_allowlist({"ls *"})          # tries to drop docker *
+
+    assert "docker *" in fake_config["command_allowlist"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_plugin_compat_warning.py ===
+"""The plugin-compat layer tells plugin authors where a name went, once, and internal code never trips it.
+
+Kept alongside the compat layer (tests/hermes_cli/test_compat_manifest_targets.py); both are deleted with it.
+"""
+import importlib
+import json
+import warnings
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+MANIFEST = ROOT / "compat_manifest.json"
+pytestmark = pytest.mark.skipif(not MANIFEST.exists(), reason="compat layer removed (scheduled revert)")
+
+
+def _a_lazy_entry():
+    entries = json.loads(MANIFEST.read_text())["entries"]
+    e = next(x for x in entries if x["kind"] == "moved-lazy" and x["facade"] == "tools.web_tools")
+    return e["facade"], e["name"]
+
+
+def test_compat_resolution_warns_once_per_name_with_the_new_location():
+    from hermes_cli.plugin_compat import HermesPluginCompatWarning, _seen
+    facade, name = _a_lazy_entry()
+    _seen.discard((facade, name))
+    mod = importlib.import_module(facade)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        getattr(mod, name)
+        getattr(mod, name)
+    ours = [w for w in rec if issubclass(w.category, HermesPluginCompatWarning)]
+    assert len(ours) == 1, [str(w.message) for w in rec]
+    msg = str(ours[0].message)
+    assert f"`{facade}.{name}` moved to `" in msg and "removed on 2026-09-14" in msg
+
+
+def test_importing_the_facade_itself_does_not_warn():
+    """Only RESOLVING a compat name warns; plugins that import the module for its live API stay silent."""
+    from hermes_cli.plugin_compat import HermesPluginCompatWarning
+    import sys
+    sys.modules.pop("tools.web_tools", None)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        importlib.import_module("tools.web_tools")
+    assert not [w for w in rec if issubclass(w.category, HermesPluginCompatWarning)]
+

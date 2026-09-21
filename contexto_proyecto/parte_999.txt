@@ -1,0 +1,406 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\palettes\macaron.md ===
+# macaron
+
+Soft macaron pastel color blocks on warm cream
+
+## Background
+
+- Color: Warm Cream (#F5F0E8)
+- Texture: Subtle warm paper grain
+
+## Colors
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Warm Cream | #F5F0E8 | Primary background |
+| Primary Text | Deep Charcoal | #2D2D2D | Headlines, main text, outlines |
+| Macaron Blue | Sky Blue | #A8D8EA | Info block fill, cool-toned zones |
+| Macaron Mint | Mint Green | #B5E5CF | Info block fill, growth/positive zones |
+| Macaron Lavender | Lavender | #D5C6E0 | Info block fill, abstract/concept zones |
+| Macaron Peach | Peach | #FFD5C2 | Info block fill, warm-toned zones |
+| Accent | Coral Red | #E8655A | Key data, warnings, emphasis |
+| Muted Text | Warm Gray | #6B6B6B | Secondary annotations, small labels |
+
+## Accent
+
+Coral Red (#E8655A) for key data, warnings, and emphasis highlights. Use sparingly — one or two elements per illustration.
+
+## Semantic Constraint
+
+Soft pastel macaron color palette. Use block colors as rounded card backgrounds for distinct information sections. Accent coral red sparingly for emphasis on key terms only. Do NOT render color names, hex codes, or role labels as visible text in the image.
+
+## Best For
+
+Educational content, knowledge sharing, concept explainers, tutorials, tech summaries, onboarding materials
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\palettes\mono-ink.md ===
+# mono-ink
+
+Black ink on pure white with sparse semantic accent colors
+
+## Background
+
+- Color: Pure White (#FFFFFF)
+- Texture: Clean, no grain, no tint
+
+## Colors
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Pure White | #FFFFFF | Canvas |
+| Primary | Near Black | #1A1A1A | All lines, text, figures, arrows |
+| Accent (risk/emphasis) | Coral Red | #E8655A | Risk, problem, gap, key emphasis |
+| Accent (positive) | Muted Teal | #5FA8A8 | Positive, solution, "after" state |
+| Accent (neutral tag) | Dusty Lavender | #9B8AB5 | Neutral tags, category labels |
+| Soft Fill | Pale Gray | #F0F0F0 | Subtle zone backgrounds (optional) |
+
+## Accent
+
+Use black ink for all structural elements — lines, text, figures. Accent colors appear only for semantic highlighting: coral red for risks/gaps/problems, muted teal for positive/solution/after-states, dusty lavender for neutral category tags. Total colored pixels must remain under 10% of canvas. Pale gray may back a subtle zone but must never dominate.
+
+## Semantic Constraint
+
+Black ink on white canvas. Accent colors for semantic highlighting only — total colored pixels under 10% of canvas. Do NOT render color names, hex codes, or role labels as visible text in the image.
+
+## Compatible With
+
+- `ink-notes` (primary, default pairing)
+- `minimal` (strict monochrome variation, drops the style's built-in accent)
+- `sketch` (pencil + ink hybrid look)
+
+## Not Recommended With
+
+- `sketch-notes` — its "no pure white backgrounds" rule conflicts
+- `warm`, `elegant`, `watercolor`, `fantasy-animation` — color-heavy by design, mono-ink strips their identity
+
+## Best For
+
+Professional visual notes, Before/After essays, tech manifestos, framework analogies, whiteboard-presentation explainers
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\palettes\neon.md ===
+# neon
+
+Vibrant neon colors on dark backgrounds
+
+## Background
+
+- Color: Deep Purple (#2D1B4E)
+- Texture: Subtle grid pattern or solid dark
+
+## Colors
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Deep Purple | #2D1B4E | Primary background |
+| Alt Background | Dark Teal | #0F4C5C | Alternative sections |
+| Primary | Hot Pink | #FF1493 | Main accent |
+| Secondary | Electric Cyan | #00FFFF | Supporting elements |
+| Tertiary | Neon Yellow | #FFFF00 | Highlights |
+| Accent 1 | Lime Green | #32CD32 | Energy, success |
+| Accent 2 | Orange | #FF6B35 | Warmth |
+| Text | White | #FFFFFF | Text elements |
+
+## Accent
+
+Hot Pink (#FF1493) for primary emphasis. High contrast neon-on-dark creates immediate visual impact.
+
+## Semantic Constraint
+
+Vibrant neon-on-dark palette. High contrast, immediate visual impact. Do NOT render color names, hex codes, or role labels as visible text in the image.
+
+## Best For
+
+Gaming, retro tech, 80s/90s nostalgic content, bold editorial, trend and pop culture
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\palettes\warm.md ===
+# warm
+
+Warm earth tones on soft peach, no cool colors
+
+## Background
+
+- Color: Soft Peach (#FFECD2)
+- Texture: Warm paper texture
+
+## Colors
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Soft Peach | #FFECD2 | Primary background |
+| Outlines | Deep Charcoal | #2D2D2D | All element outlines |
+| Primary | Warm Orange | #ED8936 | Main accent color |
+| Secondary | Terracotta | #C05621 | Warm depth |
+| Tertiary | Golden Yellow | #F6AD55 | Highlights, energy |
+| Accent | Deep Brown | #744210 | Grounding, anchoring |
+| Text | Warm Charcoal | #4A4A4A | Text elements |
+
+## Accent
+
+Warm Orange (#ED8936) for primary emphasis. Warm-only palette — no cool colors (no green, blue, purple). Modern-retro feel.
+
+## Semantic Constraint
+
+Warm earth tone palette. Warm-only — no cool colors (no green, blue, purple). Do NOT render color names, hex codes, or role labels as visible text in the image.
+
+## Best For
+
+Product showcases, team introductions, feature grids, brand content, personal growth, lifestyle
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\blueprint.md ===
+# blueprint
+
+Precise technical blueprint style with engineering precision
+
+## Design Aesthetic
+
+Clean, structured visual metaphors using blueprints, diagrams, and schematics. Precise, analytical and aesthetically refined. Information presented in grid-based layouts with engineering precision. Technical drawing quality with professional polish.
+
+## Background
+
+- Color: Blueprint Off-White (#FAF8F5)
+- Texture: Subtle grid overlay, engineering paper feel
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Blueprint Paper | #FAF8F5 | Primary background |
+| Grid | Light Gray | #E5E5E5 | Background grid lines |
+| Primary Text | Deep Slate | #334155 | Headlines, body |
+| Primary Accent | Engineering Blue | #2563EB | Key elements |
+| Secondary Accent | Navy Blue | #1E3A5F | Supporting elements |
+| Tertiary | Light Blue | #BFDBFE | Fills, backgrounds |
+| Warning | Amber | #F59E0B | Warnings, emphasis |
+
+## Visual Elements
+
+- Precise lines with consistent stroke weights
+- Technical schematics and clean vector graphics
+- Thin line work in technical drawing style
+- Connection lines: straight or 90-degree angles only
+- Data visualization with minimal charts
+- Dimension lines and measurement indicators
+- Cross-section style diagrams
+- Isometric or orthographic projections
+
+## Style Rules
+
+### Do
+
+- Maintain consistent line weights
+- Use grid alignment for all elements
+- Keep color palette restrained
+- Create clear visual hierarchy through scale
+- Use geometric precision for all shapes
+
+### Don't
+
+- Use hand-drawn or organic shapes
+- Add decorative flourishes
+- Use curved connection lines
+- Include photographic elements
+- Add unnecessary embellishments
+
+## Best For
+
+Technical architecture, system design, data analysis, engineering documentation, process flows, infrastructure articles
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\chalkboard.md ===
+# chalkboard
+
+Black chalkboard background with colorful chalk drawing style
+
+## Design Aesthetic
+
+Classic classroom chalkboard aesthetic with hand-drawn chalk illustrations. Nostalgic educational feel with imperfect, sketchy lines that capture the warmth of traditional teaching. Colorful chalk creates visual hierarchy while maintaining the authentic chalkboard experience.
+
+## Background
+
+- Color: Chalkboard Black (#1A1A1A) or Dark Green-Black (#1C2B1C)
+- Texture: Realistic chalkboard texture with subtle scratches, dust particles, and faint eraser marks
+
+## Typography
+
+Hand-drawn chalk lettering style with visible chalk texture. Imperfect baseline adds authenticity. White or bright colored chalk for emphasis.
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Chalkboard Black | #1A1A1A | Primary background |
+| Alt Background | Green-Black | #1C2B1C | Traditional green board |
+| Primary Text | Chalk White | #F5F5F5 | Main text, outlines |
+| Accent 1 | Chalk Yellow | #FFE566 | Highlights, emphasis |
+| Accent 2 | Chalk Pink | #FF9999 | Secondary highlights |
+| Accent 3 | Chalk Blue | #66B3FF | Diagrams, links |
+| Accent 4 | Chalk Green | #90EE90 | Success, nature |
+| Accent 5 | Chalk Orange | #FFB366 | Warnings, energy |
+
+## Visual Elements
+
+- Hand-drawn chalk illustrations with sketchy, imperfect lines
+- Chalk dust effects around text and key elements
+- Doodles: stars, arrows, underlines, circles, checkmarks
+- Mathematical formulas and simple diagrams
+- Eraser smudges and chalk residue textures
+- Wooden frame border optional
+- Stick figures and simple icons
+- Connection lines with hand-drawn feel
+
+## Style Rules
+
+### Do
+
+- Maintain authentic chalk texture on all elements
+- Use imperfect, hand-drawn quality throughout
+- Add subtle chalk dust and smudge effects
+- Create visual hierarchy with color variety
+- Include playful doodles and annotations
+
+### Don't
+
+- Use perfect geometric shapes
+- Create clean digital-looking lines
+- Add photorealistic elements
+- Use gradients or glossy effects
+- Make it look computerized
+
+## Best For
+
+Educational articles, tutorials, teaching content, workshops, informal learning, knowledge sharing, how-to guides, classroom-style explanations
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\editorial.md ===
+# editorial
+
+Magazine-style editorial infographic for professional content
+
+## Design Aesthetic
+
+High-quality magazine explainer aesthetic. Clear visual storytelling with structured layouts and professional typography. Think Wired, The Verge, or quality science publications. Complex information made digestible.
+
+## Background
+
+- Color: Pure White (#FFFFFF) or Light Gray (#F8F9FA)
+- Texture: None or subtle paper grain
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Pure White | #FFFFFF | Primary background |
+| Alt Background | Light Gray | #F8F9FA | Section backgrounds |
+| Primary Text | Near Black | #1A1A1A | Headlines, body |
+| Secondary Text | Dark Gray | #4A5568 | Captions |
+| Accent 1 | Editorial Blue | #2563EB | Primary accent |
+| Accent 2 | Coral | #F97316 | Secondary accent |
+| Accent 3 | Emerald | #10B981 | Positive elements |
+| Accent 4 | Amber | #F59E0B | Attention points |
+| Dividers | Medium Gray | #D1D5DB | Section dividers |
+
+## Visual Elements
+
+- Clean flat illustrations
+- Structured multi-section layouts
+- Callout boxes for insights
+- Icon-based visualizations
+- Visual metaphors for concepts
+- Flow diagrams with hierarchy
+- Pull quotes and highlights
+- Clear section dividers
+
+## Style Rules
+
+### Do
+
+- Create clear narrative flow
+- Use structured layouts
+- Include callout boxes
+- Design visual metaphors
+- Maintain magazine polish
+
+### Don't
+
+- Use photographic imagery
+- Create cluttered layouts
+- Mix too many styles
+- Add purposeless decoration
+- Compromise clarity for style
+
+## Best For
+
+Technology explainers, science communication, research articles, policy analysis, investigative pieces, thought leadership, long-form journalism
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\elegant.md ===
+# elegant
+
+Refined, sophisticated illustration style for professional content
+
+## Design Aesthetic
+
+Elegant and refined visual approach with sophisticated color palette. Professional polish with subtle artistic touches. Emphasizes clarity and thoughtful composition. Conveys authority and trustworthiness without being cold or clinical.
+
+## Background
+
+- Color: Warm Cream (#F5F0E6) or Soft Beige (#FAF6F0)
+- Texture: Subtle paper texture, very light grain
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Warm Cream | #F5F0E6 | Primary background |
+| Primary | Soft Coral | #E8A598 | Main accent color |
+| Secondary | Muted Teal | #5B8A8A | Supporting elements |
+| Tertiary | Dusty Rose | #D4A5A5 | Subtle highlights |
+| Accent | Gold | #C9A962 | Premium touches |
+| Alt Accent | Copper | #B87333 | Warm metallic notes |
+| Text | Charcoal | #3D3D3D | Text and outlines |
+
+## Visual Elements
+
+- Delicate line work with refined strokes
+- Subtle icons with balanced weight
+- Graceful curves and flowing compositions
+- Soft gradients with smooth transitions
+- Balanced whitespace and breathing room
+- Thin borders and elegant dividers
+- Subtle drop shadows for depth
+
+## Style Rules
+
+### Do
+
+- Use refined color combinations
+- Create balanced, harmonious compositions
+- Keep elements light and airy
+- Use subtle gradients sparingly
+- Maintain generous margins
+
+### Don't
+
+- Use harsh contrasts
+- Overcrowd the composition
+- Add playful or casual elements
+- Use neon or overly bright colors
+- Create busy or cluttered layouts
+
+## Best For
+
+Professional articles, thought leadership pieces, business topics, executive communications, corporate blogs, strategy discussions, industry analysis
+

@@ -1,0 +1,226 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\oneshot.py ===
+"""Shared one-off LLM requests for non-conversational helpers.
+
+A "one-shot" is a single stateless model call outside any conversation (commit
+messages, rename suggestions, summaries): it never touches session history or
+prompt caching. Call with explicit ``instructions``/``user_input`` or a registered
+``template`` + ``variables`` so prompt engineering stays consistent across
+CLI/TUI/desktop. Model selection rides :func:`agent.auxiliary_client.call_llm`:
+``main_runtime`` inherits the live session's provider/model, else ``task``
+resolves a cheap backend.
+"""
+
+import logging
+from typing import Any, Callable, Dict, Optional, Tuple
+
+from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+logger = logging.getLogger(__name__)
+
+# Templates are plain callables (not str.format) so diff/code payloads with
+# literal "{" / "}" pass through untouched.
+PromptTemplate = Callable[[Dict[str, Any]], Tuple[str, str]]
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit].rstrip() + "\n…(truncated)"
+
+
+_COMMIT_INSTRUCTIONS = (
+    "You write git commit messages. Given a diff of staged changes, write ONE concise Conventional Commits "
+    "message describing what the change does and why.\n"
+    "Rules:\n"
+    "- Subject line: type(scope): summary — imperative mood, lower-case, no trailing period, ≤ 72 "
+    "characters. Types: feat, fix, refactor, perf, docs, test, build, chore, style, ci.\n"
+    "- Omit the scope if it isn't obvious.\n"
+    "- Add a short body (wrapped at ~72 cols) ONLY when the change needs explanation; skip it for "
+    "small/obvious changes.\n"
+    "- Describe the actual change, never restate the diff line-by-line.\n"
+    "- Return ONLY the commit message text — no quotes, no markdown fences, no preamble."
+)
+
+
+def _commit_message_template(variables: Dict[str, Any]) -> Tuple[str, str]:
+    diff = _truncate(str(variables.get("diff") or ""), 12000)
+    recent = _truncate(str(variables.get("recent_commits") or ""), 1500)
+    parts = []
+    if recent.strip():
+        parts.append(
+            "Recent commit subjects from this repo (match their style/conventions):\n"
+            f"{recent}"
+        )
+    parts.append("Diff to describe:\n" + (diff or "(no textual diff available)"))
+    # "Regenerate" must yield something new even on greedy/server-pinned
+    # temperature models; a nonce isn't enough, so hand back the previous
+    # message and require a genuinely different one.
+    avoid = _truncate(str(variables.get("avoid") or "").strip(), 1000)
+    if avoid:
+        parts.append(
+            "You already proposed the message below and the user wants a different one. Write a NEW message with "
+            "different wording (and, if reasonable, a different emphasis or scope framing) — do not repeat "
+            f"it:\n{avoid}"
+        )
+    return _COMMIT_INSTRUCTIONS, "\n\n".join(parts)
+
+
+# Registry of named templates; add an entry to give a new surface a reusable prompt.
+PROMPT_TEMPLATES: Dict[str, PromptTemplate] = {
+    "commit_message": _commit_message_template,
+}
+
+
+def render_template(name: str, variables: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """Resolve a registered template into (instructions, user_input); KeyError if unknown."""
+    template = PROMPT_TEMPLATES.get(name)
+    if template is None:
+        raise KeyError(f"unknown one-shot template: {name}")
+    return template(variables or {})
+
+
+def run_oneshot(
+    *,
+    instructions: str = "",
+    user_input: str = "",
+    template: Optional[str] = None,
+    variables: Optional[Dict[str, Any]] = None,
+    task: str = "title_generation",
+    max_tokens: int = 1024,
+    temperature: Optional[float] = 0.3,
+    timeout: float = 60.0,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Run a single stateless LLM request and return its text (fence-stripped).
+
+    Raises RuntimeError when no provider is configured (from :func:`call_llm`),
+    KeyError for an unknown template, ValueError when the prompt is empty.
+    """
+    if template:
+        instructions, user_input = render_template(template, variables)
+    has_instructions = bool((instructions or "").strip())
+    if not has_instructions and not (user_input or "").strip():
+        raise ValueError("run_oneshot requires a template or instructions/user_input")
+    messages = [{"role": "system", "content": instructions}] if has_instructions else []
+    messages.append({"role": "user", "content": user_input or ""})
+    response = call_llm(
+        task=task,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=timeout,
+        main_runtime=main_runtime,
+    )
+    return _strip_code_fence((extract_content_or_reasoning(response) or "").strip())
+
+
+def _strip_code_fence(text: str) -> str:
+    """Drop a single wrapping ``` fence the model may have added."""
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\opencode_affinity.py ===
+"""``x-opencode-session`` — OpenCode relay session-affinity header.
+
+OpenCode (opencode.ai Zen/Go relay) pins requests that share an
+``x-opencode-session`` value to the same upstream backend, which is what
+keeps its prompt cache warm across the turns of one conversation. The value
+only has to be opaque and consistent per conversation, so it is derived the
+same way as the other conversation-affinity hints Hermes already sends
+(OpenRouter's sticky ``session_id``, xAI's ``x-grok-conv-id``): the
+host-declared routing scope first, then the ambient conversation root, then
+the physical session id — normalized through ``_cache_scope_from_session_id``
+so cron fires of one job share a scope.
+
+Every OpenCode request — main turn on any transport, auxiliary calls
+(compression, titles, vision, MoA) — goes through :func:`opencode_session_headers`
+so the header cannot drift per code path.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+OPENCODE_SESSION_HEADER = "x-opencode-session"
+
+
+def is_opencode_target(provider: Optional[str], base_url: Optional[str]) -> bool:
+    """True when *provider* or *base_url* addresses the OpenCode relay.
+
+    Matches the built-in opencode-zen/go providers, custom
+    ``opencode-<family>-*`` providers, and any base_url hosted on opencode.ai.
+    """
+    try:
+        from hermes_cli.models import opencode_provider_family
+
+        if opencode_provider_family(provider) is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        from agent.anthropic_endpoints import _is_opencode_endpoint
+
+        return _is_opencode_endpoint(str(base_url or ""))
+    except Exception:
+        return False
+
+
+def opencode_session_headers(
+    provider: Optional[str],
+    base_url: Optional[str],
+    session_id: Optional[str] = None,
+) -> dict[str, str]:
+    """Return ``{"x-opencode-session": <key>}`` for OpenCode targets, else ``{}``."""
+    if not is_opencode_target(provider, base_url):
+        return {}
+    try:
+        from agent.portal_tags import get_affinity_scope, get_conversation_context
+        from agent.transports.codex import _cache_scope_from_session_id
+
+        key = _cache_scope_from_session_id(
+            # Top-level session_id → OpenRouter's sticky routing key. Per their prompt-caching docs it is
+            # used directly as the routing key instead of hashing the opening messages, and it activates
+            # stickiness on the first successful request rather than only after a cache hit. Resolve it from
+            # the declared routing scope first (set only by a host that names its own conversation, #96811),
+            # then the ambient conversation contextvar, with the explicit argument as fallback. The gap this
+            # closes is the auxiliary call sites — compression, title generation, vision, web_extract,
+            # session_search, MoA slots — which funnel through ``agent.auxiliary_client``. That module has
+            # no session handle and passes no ``session_id``, so those calls sent NO sticky key at all and
+            # each routed independently of the conversation it belonged to (#70820). Mirrors the Nous Portal
+            # profile, which resolves the same way (f2f4df064d). The ambient value is the session-lineage
+            # ROOT, so it also stays stable for installs that opt out of the default ``compression.in_place:
+            # true`` and across delegate-subagent trees.
+            get_affinity_scope() or get_conversation_context() or session_id
+        )
+    except Exception:
+        key = str(session_id or "")
+    return {OPENCODE_SESSION_HEADER: key} if key else {}
+
+
+def merge_opencode_session_headers(
+    kwargs: dict[str, Any],
+    provider: Optional[str],
+    base_url: Optional[str],
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Merge the affinity header into ``kwargs["extra_headers"]`` (in place).
+
+    Existing per-request headers win, so a caller-pinned value is preserved.
+    Non-OpenCode targets are left untouched.
+    """
+    headers = opencode_session_headers(provider, base_url, session_id)
+    if headers:
+        existing = kwargs.get("extra_headers")
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        for key, value in headers.items():
+            merged.setdefault(key, value)
+        kwargs["extra_headers"] = merged
+    return kwargs
+

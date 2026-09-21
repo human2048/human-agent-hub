@@ -1,0 +1,390 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_mirror.py ===
+"""Tests for gateway/mirror.py — session mirroring."""
+
+import importlib
+import json
+from unittest.mock import patch, MagicMock
+
+import gateway.mirror as mirror_mod
+from gateway.mirror import (
+    mirror_to_session,
+    _find_session_id,
+)
+
+
+def _setup_sessions(tmp_path, sessions_data):
+    """Helper to write a fake sessions.json and patch module-level paths."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    index_file = sessions_dir / "sessions.json"
+    index_file.write_text(json.dumps(sessions_data), encoding="utf-8")
+    return sessions_dir, index_file
+
+
+class TestFindSessionId:
+    def test_finds_matching_session(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "agent:main:telegram:dm": {
+                "session_id": "sess_abc",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-01-01T00:00:00",
+            }
+        })
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            result = _find_session_id("telegram", "12345")
+
+        assert result == "sess_abc"
+
+    def test_returns_most_recent(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "old": {
+                "session_id": "sess_old",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-01-01T00:00:00",
+            },
+            "new": {
+                "session_id": "sess_new",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-02-01T00:00:00",
+            },
+        })
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            result = _find_session_id("telegram", "12345")
+
+        assert result == "sess_new"
+
+    def test_thread_id_disambiguates_same_chat(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "topic_a": {
+                "session_id": "sess_topic_a",
+                "origin": {"platform": "telegram", "chat_id": "-1001", "thread_id": "10"},
+                "updated_at": "2026-01-01T00:00:00",
+            },
+            "topic_b": {
+                "session_id": "sess_topic_b",
+                "origin": {"platform": "telegram", "chat_id": "-1001", "thread_id": "11"},
+                "updated_at": "2026-02-01T00:00:00",
+            },
+        })
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            result = _find_session_id("telegram", "-1001", thread_id="10")
+
+        assert result == "sess_topic_a"
+
+
+class TestMirrorToSession:
+
+
+    def test_successful_mirror_uses_user_id_for_group_session(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "alice": {
+                "session_id": "sess_alice",
+                "origin": {"platform": "telegram", "chat_id": "-1001", "user_id": "alice"},
+                "updated_at": "2026-01-01T00:00:00",
+            },
+            "bob": {
+                "session_id": "sess_bob",
+                "origin": {"platform": "telegram", "chat_id": "-1001", "user_id": "bob"},
+                "updated_at": "2026-02-01T00:00:00",
+            },
+        })
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+            result = mirror_to_session(
+                "telegram",
+                "-1001",
+                "Hello group!",
+                source_label="cli",
+                user_id="alice",
+            )
+
+        assert result is True
+        mock_sqlite.assert_called_once()
+        assert mock_sqlite.call_args[0][0] == "sess_alice"
+
+    def test_no_matching_session(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {})
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            result = mirror_to_session("telegram", "99999", "Hello!")
+
+        assert result is False
+
+
+    def test_failed_sqlite_write_reports_false(self, tmp_path):
+        """A mirror whose transcript write raises must not report success (#10130)."""
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "dm": {
+                "session_id": "sess_dm",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "updated_at": "2026-01-01T00:00:00",
+            },
+        })
+        broken_db = MagicMock()
+        broken_db.find_session_by_origin.return_value = None  # resolve via sessions.json
+        broken_db.append_message.side_effect = OSError("disk full")
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("hermes_state_registry.acquire", return_value=broken_db), \
+             patch("hermes_state_registry.release_or_close"):
+            result = mirror_to_session("telegram", "123", "Hello!")
+
+        assert result is False
+        broken_db.append_message.assert_called_once()
+
+
+class TestAppendToSqlite:
+    def test_connection_is_released_after_use(self, tmp_path):
+        """Verify _append_to_sqlite returns the shared SessionDB reference."""
+        from gateway.mirror import _append_to_sqlite
+        mock_db = MagicMock()
+        released = []
+
+        with patch("hermes_state_registry.acquire", return_value=mock_db), \
+             patch(
+                 "hermes_state_registry.release_or_close",
+                 side_effect=lambda db: released.append(db),
+             ):
+            _append_to_sqlite("sess_1", {"role": "assistant", "content": "hello"})
+
+        mock_db.append_message.assert_called_once()
+        assert released == [mock_db], (
+            "the shared handle must be released exactly once after use"
+        )
+
+
+class TestSessionsIndexProfileScoping:
+    """#112844: the fallback index must follow the active profile, not the launch one."""
+
+    @staticmethod
+    def _write_index(home, session_id):
+        d = home / "sessions"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "sessions.json").write_text(json.dumps({
+            "agent:main:telegram:dm": {
+                "session_id": session_id,
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-01-01T00:00:00",
+            }
+        }), encoding="utf-8")
+
+    def test_fallback_follows_active_profile_home(self, tmp_path, monkeypatch):
+        """A profile switched in after import must be read, not the launch profile's index.
+
+        The module captures ``sessions.json`` under the home that was live at import. Under the
+        multiplexed gateway one process serves every profile, so a lookup for another profile
+        must not resolve against the launch profile's index and return its session id.
+        """
+        launch_home, active_home = tmp_path / "launch", tmp_path / "active"
+        self._write_index(launch_home, "sess_launch")
+        self._write_index(active_home, "sess_active")
+
+        # Re-import the module with the launch home live: this is the import-time capture.
+        monkeypatch.setenv("HERMES_HOME", str(launch_home))
+        importlib.reload(mirror_mod)
+        try:
+            # A request for a different profile is now served by the same process.
+            monkeypatch.setenv("HERMES_HOME", str(active_home))
+            assert mirror_mod._find_session_id("telegram", "12345") == "sess_active"
+        finally:
+            monkeypatch.undo()
+            importlib.reload(mirror_mod)
+
+    def test_patched_constant_still_wins(self, tmp_path, monkeypatch):
+        """Tests that patch ``_SESSIONS_INDEX`` keep overriding the live home."""
+        patched = tmp_path / "patched"
+        self._write_index(patched, "sess_patched")
+
+        monkeypatch.setattr(mirror_mod, "_SESSIONS_INDEX", patched / "sessions" / "sessions.json")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "elsewhere"))
+
+        assert mirror_mod._find_session_id("telegram", "12345") == "sess_patched"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_mixed_attachment_routing.py ===
+"""Regression tests for mixed-attachment routing in gateway/run.py.
+
+Issue #25935: when a message mixes a real image with a document (e.g. a .md
+brief), Discord types the whole message MessageType.PHOTO. The per-attachment
+loops must classify each attachment by its OWN mimetype:
+
+  * A document must NOT be swept into image_paths just because the message-level
+    type is PHOTO — mislabelling it as an image sent its bytes to the vision
+    endpoint, which rejected them with a non-retryable HTTP 400 and killed the
+    whole turn ("Could not process image").
+  * That same document must STILL reach the agent as a readable cached file via
+    the document context-note path, even though the message-level type isn't
+    DOCUMENT.
+
+The message-level fallback (PHOTO/VOICE/AUDIO/VIDEO) is preserved only for
+attachments whose per-file mimetype is unknown (empty) — platforms that don't
+populate media_types.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import merge_pending_message_event
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run import (
+    GatewayRunner,
+    _build_media_placeholder,
+    _event_media_is_audio,
+    _event_media_is_image,
+    _event_media_is_video,
+)
+from gateway.session import SessionSource
+
+
+def _evt(media_urls, media_types, message_type):
+    return SimpleNamespace(
+        media_urls=media_urls,
+        media_types=media_types,
+        message_type=message_type,
+    )
+
+
+# ─── per-attachment classification helpers ───────────────────────────────────
+
+
+def test_image_trusts_own_mime_over_photo_message_type():
+    evt = _evt(["/c/pic.png", "/c/brief.md"], ["image/png", "text/markdown"], MessageType.PHOTO)
+    assert _event_media_is_image(evt, 0) is True
+    # The document must NOT be promoted to an image by the PHOTO fallback.
+    assert _event_media_is_image(evt, 1) is False
+
+
+# ─── _build_media_placeholder ────────────────────────────────────────────────
+
+
+def test_placeholder_document_in_photo_message_is_not_an_image():
+    evt = _evt(["/c/product.png", "/c/brief.md"], ["image/png", "text/markdown"], MessageType.PHOTO)
+    out = _build_media_placeholder(evt)
+    assert "[User sent an image: /c/product.png]" in out
+    assert "[User sent an image: /c/brief.md]" not in out
+    assert "[User sent a file: /c/brief.md]" in out
+
+
+@pytest.mark.asyncio
+async def test_mixed_document_event_preserves_audio_as_non_stt_file_path():
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")}
+    )
+    runner.adapters = {}
+    runner._pending_native_image_paths_by_session = {}
+    runner._session_model_overrides = {}
+    runner._session_reasoning_overrides = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="mixed-audio",
+        chat_type="dm",
+        user_id="42",
+        user_name="Tester",
+    )
+    event = MessageEvent(
+        text="inspect both",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=["/cache/audio.mp3", "/cache/report.pdf"],
+        media_types=["audio/mpeg", "application/pdf"],
+    )
+
+    prepared = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert prepared is not None
+    assert "/cache/audio.mp3" in prepared
+    assert "/cache/report.pdf" in prepared
+    assert "transcrib" in prepared.lower()
+
+
+def test_pending_media_merge_preserves_per_attachment_inline_contract():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="merge",
+        chat_type="dm",
+        user_id="42",
+    )
+    existing = MessageEvent(
+        text="first",
+        message_type=MessageType.PHOTO,
+        source=source,
+        media_urls=["/cache/image.png"],
+        media_types=["image/png"],
+    )
+    incoming = MessageEvent(
+        text="second",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=["/cache/notes.txt"],
+        media_types=["text/plain"],
+        media_text_inlined=[False],
+    )
+    pending = {"session": existing}
+
+    merge_pending_message_event(pending, "session", incoming)
+
+    assert existing.media_urls == ["/cache/image.png", "/cache/notes.txt"]
+    assert existing.media_text_inlined == [None, False]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_moa_one_shot_restore.py ===
+"""One-shot model overrides (``/moa <prompt>``, ``/model --once``) must be restored on every exit.
+
+These exercise the real ``GatewayRunner`` helpers the message-handling ``finally`` and the
+stop/reset/eviction paths call, so they prove the production logic — not a re-implementation of
+it. The bug being guarded: the restore used to live in the ``try`` block, so a turn that raised
+skipped it and the MoA override leaked permanently (every later message silently fanned out
+through MoA).
+"""
+
+import pytest
+
+from gateway.run import GatewayRunner
+
+KEY = "agent:main:telegram:dm:999"
+PRIOR = {"provider": "openrouter", "model": "gpt-4"}
+
+
+def _runner_with_pending_once():
+    runner = object.__new__(GatewayRunner)
+    runner._evict_cached_agent = lambda session_key: None
+    state = runner._session_state(KEY)
+    state.conversation.model_override = {"provider": "moa", "model": "default"}
+    state.conversation.one_turn_restore = {"had_override": True, "override": dict(PRIOR)}
+    return runner, state
+
+
+def test_restore_runs_from_finally_even_when_turn_raises():
+    runner, state = _runner_with_pending_once()
+    gen = runner._begin_session_run_generation(KEY)
+
+    with pytest.raises(RuntimeError):
+        try:
+            raise RuntimeError("provider error mid-turn")
+        finally:
+            runner._restore_pending_one_turn_model_override(KEY, gen)
+
+    assert state.conversation.model_override == PRIOR
+    assert state.conversation.one_turn_restore is None
+

@@ -1,0 +1,351 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_ssh_ownership_endpoint.py ===
+import os
+import types
+
+import pytest
+from fastapi.testclient import TestClient
+
+from hermes_cli import web_server
+
+
+def test_ssh_ownership_endpoint_requires_token_and_returns_exact_nonce(monkeypatch):
+    token = "t" * 64
+    nonce = "0123456789abcdef"
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
+    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", nonce)
+    web_server.app.state.auth_required = False
+    client = TestClient(web_server.app)
+
+    assert client.get("/api/ssh/ownership").status_code == 401
+    response = client.get(
+        "/api/ssh/ownership",
+        headers={"X-Hermes-Session-Token": token},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "sshOwnerNonce": nonce,
+        "protocolVersion": 1,
+        "runtimeIntact": True,
+    }
+
+
+def test_ssh_ownership_reports_replaced_runtime(tmp_path, monkeypatch):
+    token = "t" * 64
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
+    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", "0123456789abcdef")
+    monkeypatch.setattr(web_server, "_SSH_RUNTIME_MARKER", None)
+    # A REAL purelib file whose recorded inode deliberately mismatches what
+    # os.stat now reports — never patch os.stat globally here: web_server.os
+    # is the os module itself, and swapping its stat() poisons every other
+    # thread in this worker process (daemon threads from earlier tests crash
+    # in their excepthooks → nondeterministic teardown errors across the
+    # whole suite, the Aug 2026 CI flake).
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    st = purelib.stat()
+    monkeypatch.setattr(
+        web_server, "_SSH_RUNTIME_PURELIB", (str(purelib), st.st_dev, st.st_ino + 1)
+    )
+    client = TestClient(web_server.app)
+
+    response = client.get("/api/ssh/ownership", headers={"X-Hermes-Session-Token": token})
+
+    assert response.status_code == 200
+    assert response.json()["runtimeIntact"] is False
+
+
+def test_ssh_runtime_marker_detects_recreated_venv_even_with_reused_inode(
+    tmp_path, monkeypatch
+):
+    """The exact #82429 repro: rm -rf venv && recreate. On ext4 the new
+    site-packages directory routinely REUSES the old inode (proven live
+    during salvage), so the stat snapshot alone reports intact. The marker
+    file is the deterministic tier: it dies with the old tree."""
+    purelib = tmp_path / "venv" / "lib" / "site-packages"
+    purelib.mkdir(parents=True)
+    # Swap the MODULE ATTRIBUTE on web_server, not sysconfig.get_paths itself:
+    # sysconfig is process-global, and mutating it races every other thread
+    # in the worker (same cross-thread poisoning class as the os.stat patch
+    # this file used to have).
+    monkeypatch.setattr(
+        web_server,
+        "sysconfig",
+        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
+    )
+
+    web_server._apply_ssh_owner_nonce("0123456789abcdef")
+    try:
+        assert web_server._ssh_runtime_intact() is True
+
+        # Replace the venv; the recreated directory may reuse the inode.
+        import shutil
+
+        shutil.rmtree(tmp_path / "venv")
+        purelib.mkdir(parents=True)
+
+        assert web_server._ssh_runtime_intact() is False, (
+            "marker tier must catch a recreated venv regardless of inode reuse"
+        )
+    finally:
+        web_server._apply_ssh_owner_nonce(None)
+
+
+def test_ssh_runtime_marker_survives_in_place_installs(tmp_path, monkeypatch):
+    """pip/uv installs INTO the live venv must not read as a replacement."""
+    purelib = tmp_path / "venv" / "lib" / "site-packages"
+    purelib.mkdir(parents=True)
+    # Swap the MODULE ATTRIBUTE on web_server, not sysconfig.get_paths itself:
+    # sysconfig is process-global, and mutating it races every other thread
+    # in the worker (same cross-thread poisoning class as the os.stat patch
+    # this file used to have).
+    monkeypatch.setattr(
+        web_server,
+        "sysconfig",
+        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
+    )
+
+    web_server._apply_ssh_owner_nonce("0123456789abcdef")
+    try:
+        (purelib / "newpkg").mkdir()  # a package landing in the live venv
+        assert web_server._ssh_runtime_intact() is True
+    finally:
+        web_server._apply_ssh_owner_nonce(None)
+
+
+def test_ssh_runtime_readonly_purelib_falls_back_to_stat(tmp_path, monkeypatch):
+    """When site-packages is unwritable the marker can't be placed; the
+    stat-snapshot fallback still arms (weaker, never a false stale)."""
+    purelib = tmp_path / "venv" / "lib" / "site-packages"
+    purelib.mkdir(parents=True)
+    # Swap the MODULE ATTRIBUTE on web_server, not sysconfig.get_paths itself:
+    # sysconfig is process-global, and mutating it races every other thread
+    # in the worker (same cross-thread poisoning class as the os.stat patch
+    # this file used to have).
+    monkeypatch.setattr(
+        web_server,
+        "sysconfig",
+        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
+    )
+    # Make the directory REALLY unwritable instead of patching builtins.open:
+    # a global open() patch races every other thread in the worker process
+    # (daemon threads crash in their excepthooks → nondeterministic teardown
+    # errors file-wide, the Aug 2026 CI flake). chmod is thread-safe and
+    # exercises the genuine OSError path.
+    if os.geteuid() == 0:  # pragma: no cover - root ignores mode bits
+        pytest.skip("directory write bits are not enforced for root")
+    purelib.chmod(0o555)
+    try:
+        web_server._apply_ssh_owner_nonce("0123456789abcdef")
+        try:
+            assert web_server._SSH_RUNTIME_MARKER is None
+            assert web_server._SSH_RUNTIME_PURELIB is not None
+            assert web_server._ssh_runtime_intact() is True
+        finally:
+            web_server._apply_ssh_owner_nonce(None)
+    finally:
+        purelib.chmod(0o755)  # let tmp_path cleanup succeed
+
+
+def test_ssh_ownership_endpoint_is_absent_without_owner_nonce(monkeypatch):
+    token = "t" * 64
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
+    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", None)
+    web_server.app.state.auth_required = False
+    client = TestClient(web_server.app)
+
+    response = client.get(
+        "/api/ssh/ownership",
+        headers={"X-Hermes-Session-Token": token},
+    )
+    assert response.status_code == 404
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_ssh_session_token_parser.py ===
+import argparse
+import os
+
+import pytest
+from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+from hermes_cli.main import cmd_dashboard
+from hermes_cli.main_dashboard import _read_ssh_session_token_file
+from hermes_cli.subcommands.dashboard import build_dashboard_parser
+
+
+def dashboard_parser():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_dashboard_parser(
+        subparsers,
+        cmd_dashboard=lambda _args: None,
+        cmd_dashboard_register=lambda _args: None,
+    )
+    return parser
+
+
+def test_serve_help_advertises_secure_ssh_bootstrap_flags(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        dashboard_parser().parse_args(["serve", "--help"])
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--ssh-session-token-file PATH" in output
+    assert "--ssh-owner-nonce NONCE" in output
+
+
+
+
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX fixture uses mode bits; Windows read_token requires protected DACLs",
+)
+def test_token_file_is_read_and_unlinked_through_private_directory(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    hermes_home = home / ".hermes"
+    token_dir = hermes_home / "desktop-ssh" / ("a" * 32)
+    token_dir.mkdir(parents=True, mode=0o700)
+    token_path = token_dir / "0123456789abcdef.token"
+    token_path.write_text("b" * 64)
+    token_path.chmod(0o600)
+    override = set_hermes_home_override(hermes_home)
+    try:
+        assert _read_ssh_session_token_file(str(token_path)) == "b" * 64
+        assert not token_path.exists()
+    finally:
+        reset_hermes_home_override(override)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX desktop-ssh token path")
+def test_token_anchor_is_os_home_not_active_profile(tmp_path, monkeypatch):
+    """Regression for #69551: the Desktop client always writes the token under
+    ``$HOME/.hermes/desktop-ssh`` (a literal ``~/.hermes/desktop-ssh`` in
+    apps/desktop/electron/remote-lifecycle.ts, expanded against the account's
+    $HOME). A non-default sticky profile re-homes ``get_hermes_home()`` to
+    ``<root>/profiles/<name>``, and a Docker-style ``HERMES_HOME`` can point
+    elsewhere entirely — neither must move the validator off
+    ``$HOME/.hermes/desktop-ssh``, or the token is wrongly rejected."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    token_dir = home / ".hermes" / "desktop-ssh" / ("a" * 32)
+    token_dir.mkdir(parents=True, mode=0o700)
+    token_path = token_dir / "0123456789abcdef.token"
+
+    # A sticky profile and a custom (Docker) root both point get_hermes_home()
+    # away from $HOME/.hermes; the anchor must ignore both.
+    for elsewhere in (home / ".hermes" / "profiles" / "coder", tmp_path / "opt" / "data"):
+        token_path.write_text("b" * 64)
+        token_path.chmod(0o600)
+        override = set_hermes_home_override(elsewhere)
+        try:
+            assert _read_ssh_session_token_file(str(token_path)) == "b" * 64
+            assert not token_path.exists()
+        finally:
+            reset_hermes_home_override(override)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX desktop-ssh token path")
+def test_token_under_profile_desktop_ssh_is_rejected(tmp_path, monkeypatch):
+    """The client never writes under a profile-scoped desktop-ssh dir, so a token
+    placed there must be rejected even while that profile is active — proving the
+    anchor is the OS home, not the active profile (#69551)."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    profile_home = home / ".hermes" / "profiles" / "coder"
+    token_dir = profile_home / "desktop-ssh" / ("a" * 32)
+    token_dir.mkdir(parents=True, mode=0o700)
+    token_path = token_dir / "0123456789abcdef.token"
+    token_path.write_text("b" * 64)
+    token_path.chmod(0o600)
+    override = set_hermes_home_override(profile_home)
+    try:
+        with pytest.raises(SystemExit, match="desktop-ssh directory"):
+            _read_ssh_session_token_file(str(token_path))
+    finally:
+        reset_hermes_home_override(override)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink contract")
+def test_token_file_rejects_symlink(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    token_dir = home / ".hermes" / "desktop-ssh" / ("a" * 32)
+    token_dir.mkdir(parents=True, mode=0o700)
+    target = tmp_path / "token"
+    target.write_text("b" * 64)
+    target.chmod(0o600)
+    token_path = token_dir / "0123456789abcdef.token"
+    token_path.symlink_to(target)
+    override = set_hermes_home_override(home / ".hermes")
+    try:
+        with pytest.raises(SystemExit, match="symlink|not accessible"):
+            _read_ssh_session_token_file(str(token_path))
+        assert not token_path.exists()
+        assert target.read_text() == "b" * 64
+    finally:
+        reset_hermes_home_override(override)
+
+
+def test_token_file_rejects_parent_escape(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    token_root = home / ".hermes" / "desktop-ssh"
+    token_root.mkdir(parents=True, mode=0o700)
+    escaped = token_root.parent / "0123456789abcdef.token"
+    escaped.write_text("b" * 64)
+    escaped.chmod(0o600)
+    override = set_hermes_home_override(home / ".hermes")
+    try:
+        with pytest.raises(SystemExit, match="invalid runtime path"):
+            _read_ssh_session_token_file(str(token_root / ".." / escaped.name))
+        assert escaped.exists()
+    finally:
+        reset_hermes_home_override(override)
+
+
+def test_windows_runtime_root_stays_at_machine_root_for_named_profile(tmp_path, monkeypatch):
+    from hermes_cli import windows_ssh_runtime
+
+    machine_root = tmp_path / "custom-hermes-root"
+    monkeypatch.setenv("HERMES_HOME", str(machine_root / "profiles" / "writer_2"))
+
+    assert windows_ssh_runtime._root() == machine_root / "desktop-ssh"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_stale_aux_local_endpoint.py ===
+"""Aux pins on local/LAN endpoints are not "stale" — they never bill a provider (#106228)."""
+
+import pytest
+
+from agent.model_metadata import is_local_endpoint
+from hermes_cli.web_server_config import _stale_aux_pins
+
+
+def test_local_endpoint_pins_are_excluded_from_stale_aux_report():
+    cfg = {"auxiliary": {
+        "title_generation": {"provider": "openai", "model": "llama3.2:3b", "base_url": "http://byron.local:11434/v1"},
+        "vision": {"provider": "openai", "model": "llama3.2-vision:11b", "base_url": "http://192.168.1.10:11434/v1"},
+        "compression": {"provider": "openai", "model": "gpt-4o-mini", "base_url": "https://api.example.com/v1"},
+        "curator": {"provider": "openai", "model": "gpt-4o-mini"},
+        # "main" follows the main provider by definition (#97310); Moonshot's Hermes guide ships it.
+        "review": {"provider": "main", "model": "kimi-k3"},
+    }}
+    stale = _stale_aux_pins(cfg, "ollama-cloud")
+    # Only the pins that can still bill a provider survive: public custom URL, no base_url.
+    assert sorted(entry["task"] for entry in stale) == ["compression", "curator"]
+
+
+@pytest.mark.parametrize(("url", "local"), [
+    ("http://byron.local:11434/v1", True),  # RFC 6762 mDNS, LAN-only
+    ("http://[fd00::1]:11434", True),  # IPv6 ULA
+    ("http://[2607:f8b0::1]:11434", False),  # global IPv6 must not ride the "no dots" rule
+])
+def test_is_local_endpoint_mdns_and_ipv6_scope(url, local):
+    assert is_local_endpoint(url) is local
+

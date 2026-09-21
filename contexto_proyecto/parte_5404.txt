@@ -1,0 +1,487 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\messaging\qqbot.md ===
+# QQ Bot
+
+通过**官方 QQ Bot API（v2）**将 Hermes 接入 QQ——支持私聊（C2C）、群组 @-提及、频道及直接消息，并具备语音转写功能。
+
+## 概述
+
+QQ Bot 适配器使用[官方 QQ Bot API](https://bot.q.qq.com/wiki/develop/api-v2/) 实现以下功能：
+
+- 通过持久 **WebSocket** 连接至 QQ Gateway（网关）接收消息
+- 通过 **REST API** 发送文本和 Markdown 回复
+- 下载并处理图片、语音消息及文件附件
+- 使用腾讯内置 ASR 或可配置的 STT（语音转文字）提供商转写语音消息
+
+## 前提条件
+
+1. **QQ Bot 应用** — 在 [q.qq.com](https://q.qq.com) 注册：
+   - 创建新应用并记录您的 **App ID** 和 **App Secret**
+   - 启用所需 intent（意图）：C2C 消息、群组 @-消息、频道消息
+   - 在沙盒模式下配置机器人以进行测试，或发布至生产环境
+
+2. **依赖项** — 适配器需要 `aiohttp` 和 `httpx`：
+   ```bash
+   pip install aiohttp httpx
+   ```
+
+## 配置
+
+### 交互式设置
+
+```bash
+hermes gateway setup
+```
+
+从平台列表中选择 **QQ Bot** 并按提示操作。
+
+### 手动配置
+
+在 `~/.hermes/.env` 中设置所需环境变量：
+
+```bash
+QQ_APP_ID=your-app-id
+QQ_CLIENT_SECRET=your-app-secret
+```
+
+## 环境变量
+
+| 变量 | 描述 | 默认值 |
+|---|---|---|
+| `QQ_APP_ID` | QQ Bot App ID（必填） | — |
+| `QQ_CLIENT_SECRET` | QQ Bot App Secret（必填） | — |
+| `QQBOT_HOME_CHANNEL` | 用于 cron/通知投递的 OpenID | — |
+| `QQBOT_HOME_CHANNEL_NAME` | 主频道显示名称 | `Home` |
+| `QQ_ALLOWED_USERS` | 允许私聊访问的用户 OpenID 列表（逗号分隔） | 开放（所有用户） |
+| `QQ_GROUP_ALLOWED_USERS` | 允许群组访问的群组 OpenID 列表（逗号分隔） | — |
+| `QQ_ALLOW_ALL_USERS` | 设为 `true` 以允许所有私聊 | `false` |
+| `QQ_PORTAL_HOST` | 覆盖 QQ portal 主机（沙盒路由设为 `sandbox.q.qq.com`） | `q.qq.com` |
+| `QQ_STT_API_KEY` | 语音转文字提供商的 API 密钥 | — |
+| `QQ_STT_BASE_URL` | （不直接读取——请在 `config.yaml` 中设置 `platforms.qqbot.extra.stt.baseUrl`） | n/a |
+| `QQ_STT_MODEL` | STT 模型名称 | `glm-asr` |
+
+## 高级配置
+
+如需精细控制，可在 `~/.hermes/config.yaml` 中添加平台设置：
+
+```yaml
+platforms:
+  qqbot:
+    enabled: true
+    extra:
+      app_id: "your-app-id"
+      client_secret: "your-secret"
+      markdown_support: true       # enable QQ markdown (msg_type 2). Config-only; no env-var equivalent.
+      dm_policy: "open"          # open | allowlist | disabled
+      allow_from:
+        - "user_openid_1"
+      group_policy: "open"       # open | allowlist | disabled
+      group_allow_from:
+        - "group_openid_1"
+      stt:
+        provider: "zai"          # zai (GLM-ASR), openai (Whisper), etc.
+        baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4"
+        apiKey: "your-stt-key"
+        model: "glm-asr"
+```
+
+## 语音消息（STT）
+
+语音转写分两个阶段进行：
+
+1. **QQ 内置 ASR**（免费，始终优先尝试）——QQ 在语音消息附件中提供 `asr_refer_text`，使用腾讯自有语音识别
+2. **已配置的 STT 提供商**（备用）——若 QQ 的 ASR 未返回文本，适配器将调用兼容 OpenAI 的 STT API：
+
+   - **智谱/GLM（zai）**：默认提供商，使用 `glm-asr` 模型
+   - **OpenAI Whisper**：设置 `QQ_STT_BASE_URL` 和 `QQ_STT_MODEL`
+   - 任何兼容 OpenAI 的 STT 端点
+
+## 故障排查
+
+### 机器人立即断开连接（快速断连）
+
+通常原因如下：
+- **App ID / Secret 无效** — 在 q.qq.com 仔细核对您的凭据
+- **缺少权限** — 确保机器人已启用所需 intent
+- **仅限沙盒的机器人** — 若机器人处于沙盒模式，只能接收来自 QQ 沙盒测试频道的消息
+
+### 语音消息未被转写
+
+1. 检查附件数据中是否存在 QQ 内置的 `asr_refer_text`
+2. 若使用自定义 STT 提供商，验证 `QQ_STT_API_KEY` 是否正确设置
+3. 查看 gateway 日志中的 STT 错误信息
+
+### 消息未送达
+
+- 在 q.qq.com 验证机器人的 **intent** 是否已启用
+- 若私聊访问受限，检查 `QQ_ALLOWED_USERS`
+- 对于群组消息，确保机器人被 **@提及**（群组策略可能需要加入白名单）
+- 检查 `QQBOT_HOME_CHANNEL` 以确认 cron/通知投递配置
+
+### 连接错误
+
+- 确保已安装 `aiohttp` 和 `httpx`：`pip install aiohttp httpx`
+- 检查与 `api.sgroup.qq.com` 及 WebSocket gateway 的网络连通性
+- 查看 gateway 日志以获取详细错误信息和重连行为
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\messaging\signal.md ===
+---
+sidebar_position: 6
+title: "Signal"
+description: "通过 signal-cli 守护进程将 Hermes Agent 设置为 Signal 机器人"
+---
+
+# Signal 配置
+
+Hermes 通过以 HTTP 模式运行的 [signal-cli](https://github.com/AsamK/signal-cli) 守护进程连接到 Signal。适配器通过 SSE（Server-Sent Events，服务器推送事件）实时接收消息，并通过 JSON-RPC 发送响应。
+
+Signal 是隐私保护最完善的主流即时通讯工具——默认端对端加密、开源协议、极少的元数据收集。这使其非常适合对安全性要求较高的 Agent 工作流。
+
+:::info 无需新增 Python 依赖
+Signal 适配器使用 `httpx`（已是 Hermes 的核心依赖）进行所有通信，无需安装额外的 Python 包。你只需在外部安装 signal-cli。
+:::
+
+---
+
+## 前提条件
+
+- **signal-cli** — 基于 Java 的 Signal 客户端（[GitHub](https://github.com/AsamK/signal-cli)）
+- **Java 17+** 运行时 — signal-cli 所需
+- **一个已安装 Signal 的手机号**（用于作为辅助设备关联）
+
+### 安装 signal-cli
+
+```bash
+# macOS
+brew install signal-cli
+
+# Linux（下载最新版本）
+VERSION=$(curl -Ls -o /dev/null -w %{url_effective} \
+  https://github.com/AsamK/signal-cli/releases/latest | sed 's/^.*\/v//')
+curl -L -O "https://github.com/AsamK/signal-cli/releases/download/v${VERSION}/signal-cli-${VERSION}.tar.gz"
+sudo tar xf "signal-cli-${VERSION}.tar.gz" -C /opt
+sudo ln -sf "/opt/signal-cli-${VERSION}/bin/signal-cli" /usr/local/bin/
+```
+
+:::caution
+signal-cli **不在** apt 或 snap 仓库中。上述 Linux 安装方式直接从 [GitHub releases](https://github.com/AsamK/signal-cli/releases) 下载。
+:::
+
+---
+
+## 第一步：关联你的 Signal 账号
+
+signal-cli 作为**关联设备**运行——类似 WhatsApp Web，但用于 Signal。你的手机仍是主设备。
+
+```bash
+# 生成关联 URI（显示二维码或链接）
+signal-cli link -n "HermesAgent"
+```
+
+1. 在手机上打开 **Signal**
+2. 进入 **设置 → 关联设备**
+3. 点击 **关联新设备**
+4. 扫描二维码或输入 URI
+
+---
+
+## 第二步：启动 signal-cli 守护进程
+
+```bash
+# 将 +1234567890 替换为你的 Signal 手机号（E.164 格式）
+signal-cli --account +1234567890 daemon --http 127.0.0.1:8080
+```
+
+:::tip
+保持此进程在后台运行。你可以使用 `systemd`、`tmux`、`screen`，或将其作为服务运行。
+:::
+
+验证是否正在运行：
+
+```bash
+curl http://127.0.0.1:8080/api/v1/check
+# 应返回：{"versions":{"signal-cli":...}}
+```
+
+---
+
+## 第三步：配置 Hermes
+
+最简单的方式：
+
+```bash
+hermes gateway setup
+```
+
+从平台菜单中选择 **Signal**。向导将：
+
+1. 检查 signal-cli 是否已安装
+2. 提示输入 HTTP URL（默认：`http://127.0.0.1:8080`）
+3. 测试与守护进程的连通性
+4. 询问你的账号手机号
+5. 配置允许的用户和访问策略
+
+### 手动配置
+
+在 `~/.hermes/.env` 中添加：
+
+```bash
+# 必填
+SIGNAL_HTTP_URL=http://127.0.0.1:8080
+SIGNAL_ACCOUNT=+1234567890
+
+# 安全设置（推荐）
+SIGNAL_ALLOWED_USERS=+1234567890,+0987654321    # 逗号分隔的 E.164 号码或 UUID
+
+# 可选
+SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # 启用群组（省略则禁用，* 表示全部）
+SIGNAL_HOME_CHANNEL=+1234567890                  # cron 任务的默认投递目标
+```
+
+然后启动 gateway：
+
+```bash
+hermes gateway              # 前台运行
+hermes gateway install      # 安装为用户服务
+sudo hermes gateway install --system   # 仅 Linux：开机自启系统服务
+```
+
+---
+
+## 访问控制
+
+### 私信访问
+
+私信访问遵循与其他 Hermes 平台相同的模式：
+
+1. **已设置 `SIGNAL_ALLOWED_USERS`** → 仅允许这些用户发送消息
+2. **未设置白名单** → 未知用户会收到私信配对码（通过 `hermes pairing approve signal CODE` 审批）
+3. **`SIGNAL_ALLOW_ALL_USERS=true`** → 任何人均可发送消息（谨慎使用）
+
+### 群组访问
+
+群组访问由 `SIGNAL_GROUP_ALLOWED_USERS` 环境变量控制：
+
+| 配置 | 行为 |
+|------|------|
+| 未设置（默认） | 忽略所有群组消息，机器人仅响应私信。 |
+| 设置群组 ID | 仅监听列出的群组（如 `groupId1,groupId2`）。 |
+| 设置为 `*` | 机器人在其所在的任意群组中均会响应。 |
+
+---
+
+## 功能特性
+
+### 附件
+
+适配器支持双向收发媒体文件。
+
+**接收**（用户 → Agent）：
+
+- **图片** — PNG、JPEG、GIF、WebP（通过魔数自动检测）
+- **音频** — MP3、OGG、WAV、M4A（若已配置 Whisper，语音消息将自动转录）
+- **文档** — PDF、ZIP 及其他文件类型
+
+**发送**（Agent → 用户）：
+
+Agent 可通过响应中的 `MEDIA:` 标签发送媒体文件，支持以下投递方式：
+
+- **图片** — `send_multiple_images` 和 `send_image_file` 将 PNG、JPEG、GIF、WebP 作为原生 Signal 附件发送
+- **语音** — `send_voice` 将音频文件（OGG、MP3、WAV、M4A、AAC）作为附件发送
+- **视频** — `send_video` 发送 MP4 视频文件
+- **文档** — `send_document` 发送任意文件类型（PDF、ZIP 等）
+
+所有外发媒体均通过 Signal 标准附件 API 处理。与某些平台不同，Signal 在协议层面不区分语音消息和文件附件。
+
+附件大小限制：**100 MB**（双向）。
+
+:::warning
+**Signal 服务器会对附件上传进行速率限制**，适配器使用调度器批量发送多张图片，每批最多 32 张，并按照 Signal 服务器策略限速上传。
+:::
+
+### 原生格式、引用回复与表情回应
+
+Signal 消息以**原生格式**渲染，而非显示原始 markdown 字符。适配器将 markdown（`**粗体**`、`*斜体*`、`` `代码` ``、`~~删除线~~`、`||剧透||`、标题）转换为 Signal `bodyRanges`，使文本在接收方客户端以真实样式显示，而非可见的 `**` 或 `` ` `` 字符。
+
+**引用回复。** 当 Hermes 回复某条特定消息时，会发送原生引用回复——与 Signal 用户使用"回复"功能时看到的 UI 效果相同。对于响应入站消息而生成的回复，此功能自动生效。
+
+**表情回应。** Agent 可通过标准 reaction API 对消息添加表情回应；回应会以 emoji 形式显示在被引用消息上，而非额外的文字。
+
+以上功能无需额外配置——在近期的 signal-cli 版本中默认启用。若你的 `signal-cli` 版本过旧，Hermes 会回退到纯文本投递，并记录一次性警告日志。
+
+### 长消息
+
+Signal 单条消息上限为 **8,000 字符**。Hermes 会自动将更长的回复拆分为带编号的分段（`(1/3)`、`(2/3)`……）发送，而不是截断内容。此行为覆盖所有投递路径——实时对话回复、cron 任务投递、`hermes send` 以及 MCP `send_message` 调用——且原生格式（加粗、斜体、代码、剧透）在分段边界处保持不变。
+
+### 正在输入指示器
+
+机器人在处理消息时会发送正在输入指示器，每 8 秒刷新一次。
+
+### 手机号脱敏
+
+所有手机号在日志中自动脱敏：
+- `+15551234567` → `+155****4567`
+- 适用于 Hermes gateway 日志和全局脱敏系统
+
+### 给自己发消息（单号码配置）
+
+如果你将 signal-cli 作为自己手机号的**关联辅助设备**运行（而非单独的机器人号码），可以通过 Signal 的"给自己发消息"功能与 Hermes 交互。
+
+只需从手机向自己发送消息——signal-cli 会接收到该消息，Hermes 在同一会话中响应。
+
+**工作原理：**
+- "给自己发消息"以 `syncMessage.sentMessage` 信封形式到达
+- 适配器检测到这些消息是发给机器人自身账号的，并将其作为普通入站消息处理
+- 回声保护（已发时间戳追踪）防止无限循环——机器人自身的回复会被自动过滤
+
+**无需额外配置。** 只要 `SIGNAL_ACCOUNT` 与你的手机号匹配，此功能自动生效。
+
+### 健康监控
+
+适配器监控 SSE 连接，并在以下情况自动重连：
+- 连接断开（指数退避：2s → 60s）
+- 120 秒内无任何活动（向 signal-cli 发送 ping 以验证连通性）
+
+---
+
+## 故障排查
+
+| 问题 | 解决方案 |
+|------|----------|
+| 配置时提示 **"Cannot reach signal-cli"** | 确保 signal-cli 守护进程正在运行：`signal-cli --account +YOUR_NUMBER daemon --http 127.0.0.1:8080` |
+| **消息未收到** | 检查 `SIGNAL_ALLOWED_USERS` 是否包含发送方号码（E.164 格式，带 `+` 前缀） |
+| **"signal-cli not found on PATH"** | 安装 signal-cli 并确保其在 PATH 中，或使用 Docker |
+| **连接持续断开** | 检查 signal-cli 日志中的错误信息，确保已安装 Java 17+。 |
+| **群组消息被忽略** | 使用具体群组 ID 配置 `SIGNAL_GROUP_ALLOWED_USERS`，或设为 `*` 允许所有群组。 |
+| **机器人对所有人无响应** | 配置 `SIGNAL_ALLOWED_USERS`，使用私信配对，或通过 gateway 策略显式允许所有用户（如需更广泛的访问权限）。 |
+| **消息重复** | 确保只有一个 signal-cli 实例在监听你的手机号 |
+
+---
+
+## 安全
+
+:::warning
+**务必配置访问控制。** 机器人默认具有终端访问权限。若未设置 `SIGNAL_ALLOWED_USERS` 或私信配对，gateway 会拒绝所有入站消息作为安全措施。
+:::
+
+- 手机号在所有日志输出中均已脱敏
+- 使用私信配对或显式白名单安全地引导新用户
+- 除非明确需要群组支持，否则保持群组禁用状态，或仅将受信任的群组加入白名单
+- Signal 的端对端加密保护传输中的消息内容
+- `~/.local/share/signal-cli/` 中的 signal-cli 会话数据包含账号凭据——请像保护密码一样保护它
+
+---
+
+## 环境变量参考
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `SIGNAL_HTTP_URL` | 是 | — | signal-cli HTTP 端点 |
+| `SIGNAL_ACCOUNT` | 是 | — | 机器人手机号（E.164） |
+| `SIGNAL_ALLOWED_USERS` | 否 | — | 逗号分隔的手机号/UUID |
+| `SIGNAL_GROUP_ALLOWED_USERS` | 否 | — | 要监听的群组 ID，或 `*` 表示全部（省略则禁用群组） |
+| `SIGNAL_ALLOW_ALL_USERS` | 否 | `false` | 允许任意用户交互（跳过白名单） |
+| `SIGNAL_HOME_CHANNEL` | 否 | — | cron 任务的默认投递目标 |
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\messaging\simplex.md ===
+# SimpleX Chat
+
+[SimpleX Chat](https://simplex.chat/) 是一个私密的去中心化即时通讯平台，用户完全掌控自己的联系人和群组。与其他平台不同，SimpleX 不分配任何持久用户 ID——每个联系人在建立连接时由系统生成一个不透明的内部 ID，这使其成为目前隐私性最强的即时通讯工具之一。
+
+## 前提条件
+
+- 已安装并以守护进程方式运行的 **simplex-chat** CLI
+- Python 包 **websockets**（`pip install websockets`）
+
+## 安装 simplex-chat
+
+从 [simplex-chat GitHub releases](https://github.com/simplex-chat/simplex-chat/releases) 页面下载最新版本：
+
+```bash
+# Linux / macOS binary
+curl -L https://github.com/simplex-chat/simplex-chat/releases/latest/download/simplex-chat-ubuntu-22_04-x86-64 -o simplex-chat
+chmod +x simplex-chat
+```
+
+SimpleX Chat 项目未发布聊天客户端的预构建 Docker 镜像；如需在 Docker 下运行，请从 [simplex-chat 仓库](https://github.com/simplex-chat/simplex-chat) 源码构建。
+
+## 启动守护进程
+
+```bash
+simplex-chat -p 5225
+```
+
+守护进程默认在 `ws://127.0.0.1:5225` 上监听 WebSocket 连接。
+
+## 配置 Hermes
+
+### 通过设置向导
+
+```bash
+hermes gateway setup
+```
+
+选择 **SimpleX Chat** 并按提示操作。
+
+### 通过环境变量
+
+将以下内容添加到 `~/.hermes/.env`：
+
+```
+SIMPLEX_WS_URL=ws://127.0.0.1:5225
+SIMPLEX_ALLOWED_USERS=<contact-id-1>,<contact-id-2>
+SIMPLEX_HOME_CHANNEL=<contact-id>
+```
+
+| 变量 | 是否必填 | 说明 |
+|---|---|---|
+| `SIMPLEX_WS_URL` | 是 | simplex-chat 守护进程的 WebSocket URL |
+| `SIMPLEX_ALLOWED_USERS` | 建议填写 | 允许使用 Agent 的联系人 ID，以逗号分隔 |
+| `SIMPLEX_ALLOW_ALL_USERS` | 可选 | 设为 `true` 以允许所有联系人（请谨慎使用） |
+| `SIMPLEX_HOME_CHANNEL` | 可选 | cron 任务投递的默认联系人 ID |
+| `SIMPLEX_HOME_CHANNEL_NAME` | 可选 | 主频道的可读标签 |
+
+## 查找联系人 ID
+
+启动守护进程后，与你的 Agent 联系人开启一段对话。联系人 ID 将出现在会话日志中，或通过 `hermes send_message action=list` 查看。
+
+## 授权
+
+默认情况下**所有联系人均被拒绝访问**。你必须选择以下方式之一：
+
+1. 将 `SIMPLEX_ALLOWED_USERS` 设置为以逗号分隔的联系人 ID 列表，或
+2. 使用 **DM 配对**——向 Bot 发送任意消息，Bot 将回复一个配对码。通过 `hermes pairing approve simplex <CODE>` 输入该配对码。
+
+## 在 cron 任务中使用 SimpleX
+
+```python
+cronjob(
+    action="create",
+    schedule="every 1h",
+    deliver="simplex",          # uses SIMPLEX_HOME_CHANNEL
+    prompt="Check for alerts and summarise."
+)
+```
+
+或指定特定联系人：
+
+```python
+send_message(target="simplex:<contact-id>", message="Done!")
+```
+
+## 隐私说明
+
+- SimpleX 从不暴露手机号或电子邮件地址——联系人使用不透明 ID 标识
+- Hermes 与守护进程之间的连接为本地 WebSocket（`ws://127.0.0.1:5225`）——数据不会离开你的机器
+- 消息在到达守护进程之前已由 SimpleX 协议进行端到端加密
+
+## 故障排查
+
+**"Cannot reach daemon"** — 确保 `simplex-chat -p 5225` 正在运行，且端口与 `SIMPLEX_WS_URL` 一致。
+
+**"websockets not installed"** — 运行 `pip install websockets`。
+
+**消息未收到** — 检查该联系人的 ID 是否已加入 `SIMPLEX_ALLOWED_USERS`，或通过 DM 配对方式批准该联系人。

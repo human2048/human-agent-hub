@@ -1,0 +1,277 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_web_tools_truncate.py ===
+"""Unit tests for the truncate-and-store web_extract path (no LLM).
+
+Covers convert_base64_images_to_links, _truncate_with_footer, _store_full_text,
+_get_extract_char_limit, and the end-to-end web_extract_tool truncation behavior.
+"""
+import asyncio
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+import tools.web_tools as wt
+from tools import web_tools_truncate
+
+
+class TestImageConversion:
+    def test_markdown_base64_image_keeps_alt_drops_blob(self):
+        blob = "A" * 5000
+        text = f"before ![a cat]( data:image/png;base64,{blob}) after"
+        out = web_tools_truncate.convert_base64_images_to_links(text)
+        assert "[IMAGE: a cat]" in out
+        assert "base64" not in out
+        assert blob not in out
+        assert "before" in out and "after" in out
+
+
+    def test_bare_and_parenthesised_base64_become_placeholder(self):
+        blob = "Z" * 3000
+        bare = web_tools_truncate.convert_base64_images_to_links(f"data:image/gif;base64,{blob}")
+        assert bare == "[IMAGE]"
+        paren = web_tools_truncate.convert_base64_images_to_links(f"(data:image/gif;base64,{blob})")
+        assert paren == "[IMAGE]"
+
+
+class TestTruncation:
+    def test_short_content_returned_whole(self):
+        content = "# Title\n\nshort body\n"
+        out, truncated = web_tools_truncate._truncate_with_footer(content, "https://e.com", 15000)
+        assert out == content
+        assert truncated is False
+
+
+    def test_truncation_stores_full_text_readable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        body = "UNIQUE_MIDDLE_MARKER\n" + ("\n".join(f"row {i}" for i in range(5000)))
+        out, truncated = web_tools_truncate._truncate_with_footer(body, "https://example.com/doc", 3000)
+        assert truncated is True
+        # Extract the stored path from the footer and confirm full text is there.
+        path_line = next(ln for ln in out.splitlines() if "Full text saved to:" in ln)
+        stored_path = path_line.split("Full text saved to:", 1)[1].strip()
+        assert os.path.exists(stored_path)
+        full = Path(stored_path).read_text(encoding="utf-8")
+        assert "UNIQUE_MIDDLE_MARKER" in full
+        assert "row 2500" in full  # the omitted-middle row is in the stored file
+
+
+class TestCharLimitConfig:
+    def test_default_when_unset(self):
+        with patch("tools.web_tools._load_web_config", return_value={}):
+            assert web_tools_truncate._get_extract_char_limit() == web_tools_truncate.DEFAULT_EXTRACT_CHAR_LIMIT
+
+
+    def test_bad_value_falls_back(self):
+        with patch("tools.web_tools._load_web_config", return_value={"extract_char_limit": "nope"}):
+            assert web_tools_truncate._get_extract_char_limit() == web_tools_truncate.DEFAULT_EXTRACT_CHAR_LIMIT
+
+
+class TestEndToEnd:
+    def test_web_extract_truncates_large_page_no_llm(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        big = "\n".join(f"para {i} " + "y" * 80 for i in range(3000))
+
+        class FakeProvider:
+            name = "fake"
+            display_name = "Fake"
+
+            def supports_extract(self):
+                return True
+
+            async def extract(self, urls, **kwargs):
+                return [{"url": urls[0], "title": "Big Page", "content": big,
+                         "raw_content": big, "metadata": {}}]
+
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools.async_is_safe_url", new=_AsyncTrue()), \
+             patch("agent.web_search_registry.get_provider", return_value=FakeProvider()):
+            result = json.loads(asyncio.new_event_loop().run_until_complete(
+                wt.web_extract_tool(["https://example.com/big"], char_limit=5000)
+            ))
+
+        assert "results" in result
+        content = result["results"][0]["content"]
+        assert "[TRUNCATED]" in content
+        assert "Full text saved to:" in content
+        # No LLM was involved: para 0 (head) and the last para (tail) are verbatim.
+        assert "para 0 " in content
+        assert "para 2999 " in content
+
+
+def _make_awaitable(value):
+    async def _coro(*a, **k):
+        return value
+    return _coro()
+
+
+class _AsyncTrue:
+    """Async callable that always returns True (re-awaitable per call)."""
+    async def __call__(self, *a, **k):
+        return True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_whatsapp_send_message_media.py ===
+"""WhatsApp media delivery for send_message (#19105).
+
+Covers two layers:
+
+* ``_bridge_media_type`` — extension/voice/force_document -> bridge mediaType.
+* ``_standalone_send`` — text-first then per-file ``/send-media`` uploads,
+  media-only (skip ``/send``), and missing-file errors. The bridge HTTP calls
+  are mocked at the ``aiohttp.ClientSession`` boundary.
+"""
+
+import asyncio
+import os
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from plugins.platforms.whatsapp.adapter import _bridge_media_type, _standalone_send
+
+
+# ---------------------------------------------------------------------------
+# _bridge_media_type
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,is_voice,force_document,expected",
+    [
+        ("a.png", False, False, "image"),
+        ("a.JPG", False, False, "image"),
+        ("a.jpeg", False, False, "image"),
+        ("a.webp", False, False, "image"),
+        ("a.gif", False, False, "image"),
+        ("a.mp4", False, False, "video"),
+        ("a.mov", False, False, "video"),
+        ("a.webm", False, False, "video"),
+        ("a.ogg", True, False, "audio"),
+        ("a.opus", False, False, "audio"),
+        ("a.mp3", False, False, "audio"),
+        ("a.wav", False, False, "audio"),
+        ("a.pdf", False, False, "document"),
+        ("a.zip", False, False, "document"),
+        # force_document overrides everything
+        ("a.png", False, True, "document"),
+        ("a.mp4", False, True, "document"),
+        # is_voice wins over a video extension
+        ("a.mp4", True, False, "audio"),
+    ],
+)
+def test_bridge_media_type(path, is_voice, force_document, expected):
+    assert _bridge_media_type(path, is_voice, force_document) == expected
+
+
+# ---------------------------------------------------------------------------
+# _standalone_send — bridge HTTP mocked
+# ---------------------------------------------------------------------------
+
+
+def _resp(status, json_data=None, text_data=None):
+    r = AsyncMock()
+    r.status = status
+    r.json = AsyncMock(return_value=json_data or {})
+    r.text = AsyncMock(return_value=text_data or "")
+    return r
+
+
+def _session_with(responses):
+    """Build a mocked aiohttp.ClientSession that returns *responses* in order
+    and records every POST (url, json_payload)."""
+    calls = []
+    idx = [0]
+
+    def _post(url, **kwargs):
+        calls.append((url, kwargs.get("json")))
+        r = responses[idx[0]] if idx[0] < len(responses) else responses[-1]
+        idx[0] += 1
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=r)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    session = MagicMock()
+    session.post = MagicMock(side_effect=_post)
+    session_ctx = MagicMock()
+    session_ctx.__aenter__ = AsyncMock(return_value=session)
+    session_ctx.__aexit__ = AsyncMock(return_value=False)
+    return session_ctx, calls
+
+
+def _pconfig():
+    return SimpleNamespace(token="", extra={"bridge_port": 3000})
+
+
+def _tmpfile(suffix):
+    f = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    f.write(b"x")
+    f.close()
+    return f.name
+
+
+def test_text_plus_mixed_media_routes_native_types():
+    img = _tmpfile(".png")
+    vid = _tmpfile(".mp4")
+    voice = _tmpfile(".ogg")
+    try:
+        session_ctx, calls = _session_with(
+            [
+                _resp(200, {"messageId": "t1"}),
+                _resp(200, {"messageId": "m1"}),
+                _resp(200, {"messageId": "m2"}),
+                _resp(200, {"messageId": "m3"}),
+            ]
+        )
+        with patch("aiohttp.ClientSession", return_value=session_ctx):
+            res = asyncio.run(
+                _standalone_send(
+                    _pconfig(),
+                    "12345",
+                    "hello",
+                    media_files=[(img, False), (vid, False), (voice, True)],
+                )
+            )
+        assert res["success"] is True
+        # text first, then three media uploads in order
+        assert calls[0][0].endswith("/send")
+        assert calls[0][1]["message"] == "hello"
+        media_types = [c[1]["mediaType"] for c in calls if c[0].endswith("/send-media")]
+        assert media_types == ["image", "video", "audio"]
+        # chat id normalized to a WhatsApp JID
+        assert "@" in calls[0][1]["chatId"]
+    finally:
+        for p in (img, vid, voice):
+            os.unlink(p)
+
+
+def test_missing_captioned_file_falls_back_to_text():
+    """If the single captioned file is missing, the caption is delivered as a
+    plain /send message rather than being silently lost (W1)."""
+    session_ctx, calls = _session_with([_resp(200, {"messageId": "t1"})])
+    with patch("aiohttp.ClientSession", return_value=session_ctx):
+        res = asyncio.run(
+            _standalone_send(
+                _pconfig(),
+                "12345",
+                "",
+                media_files=[("/no/such/file.png", False)],
+                caption="floor plan",
+            )
+        )
+    # The send still surfaces the missing-file error...
+    assert "error" in res
+    assert "not found" in res["error"]
+    # ...but the caption text was delivered on its own first.
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/send")
+    assert calls[0][1]["message"] == "floor plan"
+

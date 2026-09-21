@@ -1,0 +1,417 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\features\tool-gateway.md ===
+---
+title: "Nous Tool Gateway（工具网关）"
+description: "通过 Nous 订阅统一使用网页搜索、文生图、语音合成与浏览器自动化，无需单独申请 Firecrawl、FAL、OpenAI、Browser Use 等 API Key"
+sidebar_label: "Tool Gateway"
+sidebar_position: 2
+---
+
+# Nous Tool Gateway（工具网关）
+
+:::tip 快速开始
+Tool Gateway 包含在付费 Nous Portal 订阅中。**[管理订阅 →](https://portal.nousresearch.com/manage-subscription)**
+:::
+
+**Tool Gateway** 让已付费的 [Nous Portal](https://portal.nousresearch.com) 用户通过同一份订阅，直接使用网页搜索、文生图、语音合成（TTS）与浏览器自动化，而**不必**再分别注册 Firecrawl、FAL、OpenAI、Browser Use 等服务的 API Key。
+
+## 包含能力
+
+| 工具 | 作用 | 若不用网关，可改用 |
+|------|------|---------------------|
+| **网页搜索与抓取** | 通过 Firecrawl 搜索并抽取页面内容 | `FIRECRAWL_API_KEY`、`EXA_API_KEY`、`PARALLEL_API_KEY`、`TAVILY_API_KEY` |
+| **文生图** | 通过 FAL 生成图像（8 个模型：FLUX 2 Klein/Pro、GPT-Image、Nano Banana Pro、Ideogram、Recraft V4 Pro、Qwen、Z-Image） | `FAL_KEY` |
+| **语音合成** | 通过 OpenAI TTS 将文字转为语音 | `VOICE_TOOLS_OPENAI_KEY`、`ELEVENLABS_API_KEY` |
+| **浏览器自动化** | 通过 Browser Use 控制云端浏览器 | `BROWSER_USE_API_KEY`、`BROWSERBASE_API_KEY` |
+
+上述四类能力均计入 Nous 订阅计费。你可以按需组合——例如网页与文生图走网关，TTS 仍使用自己的 ElevenLabs Key。
+
+## 资格与账号
+
+Tool Gateway 仅对 **[付费](https://portal.nousresearch.com/manage-subscription)** Nous Portal 订阅开放；免费档不可用——请 [升级订阅](https://portal.nousresearch.com/manage-subscription) 后解锁。
+
+检查当前状态：
+
+```bash
+hermes status
+```
+
+在输出中找到 **Nous Tool Gateway** 小节：会标明哪些工具经订阅网关启用、哪些使用直连 Key、哪些尚未配置。
+
+## 如何启用 Tool Gateway
+
+### 在模型配置流程中
+
+运行 `hermes model` 并选择 Nous Portal 作为提供商时，Hermes 会主动询问是否启用 Tool Gateway：
+
+```
+Your Nous subscription includes the Tool Gateway.
+
+  The Tool Gateway gives you access to web search, image generation,
+  text-to-speech, and browser automation through your Nous subscription.
+  No need to sign up for separate API keys — just pick the tools you want.
+
+  ○ Web search & extract (Firecrawl) — not configured
+  ○ Image generation (FAL) — not configured
+  ○ Text-to-speech (OpenAI TTS) — not configured
+  ○ Browser automation (Browser Use) — not configured
+
+  ● Enable Tool Gateway
+  ○ Skip
+```
+
+选择 **Enable Tool Gateway** 即可。
+
+若 `.env` 中已有部分直连 API Key，提示会相应变化：可为全部工具启用网关（直连 Key 仍保留在 `.env` 但运行时不用）、仅为未配置项启用，或完全跳过。
+
+### 通过 `hermes tools`
+
+也可在交互式工具配置中逐项启用：
+
+```bash
+hermes tools
+```
+
+选择工具类别（Web、Browser、Image Generation、TTS），再将提供商选为 **Nous Subscription**。这会把该类别的选择键写为 `nous`（例如 `image_gen.provider: nous`）。
+
+### 手动编辑配置
+
+每个工具类别只有一个选择键，选 **Nous Subscription** 即写入 `nous`：
+
+```yaml
+web:
+  backend: nous          # 网页搜索/抓取走 Tool Gateway
+
+image_gen:
+  provider: nous
+
+tts:
+  provider: nous
+
+stt:
+  provider: nous
+
+browser:
+  cloud_provider: nous
+```
+
+## 工作原理
+
+当某工具类别的选择键为 `nous` 时，运行时会把 API 调用路由到 Nous Tool Gateway，而不是使用直连 Key：
+
+1. **网页工具** — `web_search` / `web_extract` 走网关的 Firecrawl 端点  
+2. **文生图** — `image_generate` 走网关的 FAL 端点  
+3. **TTS** — `text_to_speech` 走网关的 OpenAI Audio 端点  
+4. **浏览器** — `browser_navigate` 等走网关的 Browser Use 端点  
+
+网关使用 Nous Portal 凭据认证（在 `hermes model` 完成后写入 `~/.hermes/auth.json`）。
+
+### 优先级
+
+运行时**始终使用已保存的选择**，凭据是否存在不会影响路由：
+
+- **选择为 `nous`** → 走网关，即使 `.env` 里仍有直连 Key（例如 `FAL_KEY` 会被忽略）
+- **选择为具体厂商**（如 `fal`、`firecrawl`）→ 直连；若对应 Key 缺失则报错并提示运行 `hermes tools`，**不会**静默回退到网关
+- **从未配置过的类别** → 按可用凭据自动检测（行为不变）；但一旦存在选择，仅往 `.env` 加 Key 不会改变路由
+
+（旧版的 `use_gateway` 布尔键已废弃：不再写入，读取时 `use_gateway: true` 等同于 `nous`。请改用 `hermes tools` 选择提供商。）
+
+## 切回直连 Key
+
+对单个工具停用网关：
+
+```bash
+hermes tools    # 选择该工具 → 选直连提供商
+```
+
+或在配置中把选择键改回具体厂商：
+
+```yaml
+web:
+  backend: firecrawl  # 此时使用 .env 中的 FIRECRAWL_API_KEY
+```
+
+在 `hermes tools` 中选择非网关提供商时，选择键会被改写为该厂商名（旧的 `use_gateway` 键若存在会被一并移除），避免配置自相矛盾。
+
+## 查看状态
+
+```bash
+hermes status
+```
+
+**Nous Tool Gateway** 小节示例：
+
+```
+◆ Nous Tool Gateway
+  Nous Portal   ✓ managed tools available
+  Web tools       ✓ active via Nous subscription
+  Image gen       ✓ active via Nous subscription
+  TTS             ✓ active via Nous subscription
+  Browser         ○ active via Browser Use key
+  Modal           ○ available via subscription (optional)
+```
+
+标记为 “active via Nous subscription” 的即经网关路由；带自有 Key 的会显示当前激活的提供商。
+
+## 进阶：自建网关
+
+若使用自建或自定义网关，可在 `~/.hermes/.env` 中用环境变量覆盖端点：
+
+```bash
+TOOL_GATEWAY_DOMAIN=nousresearch.com     # 网关路由基础域名
+TOOL_GATEWAY_SCHEME=https                 # http 或 https（默认 https）
+TOOL_GATEWAY_USER_TOKEN=your-token        # 鉴权 Token（通常由程序自动填充）
+FIRECRAWL_GATEWAY_URL=https://...         # 单独覆盖 Firecrawl 端点
+```
+
+这些变量与订阅状态无关，始终可在配置中看到，便于自建基础设施。
+
+## 常见问题
+
+### 需要删掉已有的 API Key 吗？
+
+不需要。类别选择为 **Nous Subscription**（`nous`）时，运行时会忽略该类别的直连 Key；Key 仍保留在 `.env`。之后在 `hermes tools` 里改回直连提供商，Key 即恢复生效。
+
+### 能否部分工具走网关、部分走直连？
+
+可以。选择按工具类别独立配置。例如：网页与文生图选 Nous Subscription，TTS 用 ElevenLabs，浏览器用 Browserbase。
+
+### 订阅到期会怎样？
+
+经网关路由的工具会停止工作，直到你 [续订](https://portal.nousresearch.com/manage-subscription) 或通过 `hermes tools` 改回直连 Key。
+
+### 与「消息网关」（各聊天平台）是否冲突？
+
+不冲突。Tool Gateway 作用于**工具运行时**的 API 路由，与 CLI、Telegram、Discord 等入口无关。
+
+### Modal 算在 Tool Gateway 里吗？
+
+Modal（无服务器终端后端）可作为 Nous 订阅的可选附加能力，但**不会**由 Tool Gateway 安装向导一并打开——请单独通过 `hermes setup terminal` 或在 `config.yaml` 中配置。
+
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\features\tools.md ===
+---
+sidebar_position: 1
+title: "工具与工具集"
+description: "Hermes Agent 工具概览——可用工具、工具集工作方式及终端后端"
+---
+
+# 工具与工具集
+
+工具是扩展 Agent 能力的函数。它们被组织为逻辑上的**工具集**，可按平台启用或禁用。
+
+## 可用工具
+
+Hermes 内置了丰富的工具注册表，涵盖网页搜索、浏览器自动化、终端执行、文件编辑、记忆、委托、RL 训练、消息投递、Home Assistant 等功能。
+
+:::note
+**Honcho 跨会话记忆**作为记忆提供者插件（`plugins/memory/honcho/`）提供，而非内置工具集。安装方式请参阅 [Plugins](./plugins.md)。
+:::
+
+高层分类：
+
+| 分类 | 示例 | 描述 |
+|----------|----------|-------------|
+| **Web** | `web_search`, `web_extract` | 搜索网页并提取页面内容。 |
+| **X 搜索** | `x_search` | 通过 xAI 内置的 `x_search` Responses 工具搜索 X（Twitter）帖子和话题——需要 xAI 凭据（SuperGrok OAuth 或 `XAI_API_KEY`）；默认关闭，可通过 `hermes tools` → 🐦 X (Twitter) Search 启用。 |
+| **终端与文件** | `terminal`, `process`, `read_file`, `patch` | 执行命令并操作文件。 |
+| **浏览器** | `browser_navigate`, `browser_snapshot`, `browser_vision` | 支持文本和视觉的交互式浏览器自动化。 |
+| **媒体** | `vision_analyze`, `image_generate`, `video_generate`, `video_analyze`, `text_to_speech` | 多模态分析与生成。`video_generate` 和 `video_analyze` 需手动启用（通过 `hermes tools` 或 `--toolsets` 添加 `video_gen` / `video` 工具集）。 |
+| **Agent 编排** | `todo`, `clarify`, `execute_code`, `delegate_task` | 规划、澄清、代码执行及子 Agent 委托。 |
+| **记忆与召回** | `memory`, `session_search` | 持久化记忆与会话搜索。 |
+| **自动化与投递** | `cronjob`, `send_message` | 支持创建/列出/更新/暂停/恢复/运行/删除操作的定时任务，以及出站消息投递。 |
+| **集成** | `ha_*`、MCP server 工具 | Home Assistant、MCP 及其他集成。 |
+
+如需查看由代码派生的权威注册表，请参阅 [内置工具参考](../../reference/tools-reference.md) 和 [工具集参考](../../reference/toolsets-reference.md)。
+
+:::tip Nous Tool Gateway
+付费 [Nous Portal](https://portal.nousresearch.com) 订阅者可通过 **[Tool Gateway](tool-gateway.md)** 使用网页搜索、图像生成、TTS 和浏览器自动化——无需单独配置 API 密钥。运行 `hermes model` 启用，或通过 `hermes tools` 配置各工具。
+:::
+
+## 使用工具集
+
+```bash
+# 使用指定工具集
+hermes chat --toolsets "web,terminal"
+
+# 查看所有可用工具
+hermes tools
+
+# 按平台交互式配置工具
+hermes tools
+```
+
+常用工具集包括 `web`、`search`、`terminal`、`file`、`browser`、`vision`、`image_gen`、`moa`、`skills`、`tts`、`todo`、`memory`、`session_search`、`cronjob`、`code_execution`、`delegation`、`clarify`、`homeassistant`、`messaging`、`spotify`、`discord`、`discord_admin`、`debugging` 和 `safe`。
+
+完整列表（包括 `hermes-cli`、`hermes-telegram` 等平台预设以及 `mcp-<server>` 等动态 MCP 工具集）请参阅 [工具集参考](../../reference/toolsets-reference.md)。
+
+## 终端后端
+
+终端工具可在不同环境中执行命令：
+
+| 后端 | 描述 | 适用场景 |
+|---------|-------------|----------|
+| `local` | 在本机运行（默认） | 开发、可信任务 |
+| `docker` | 隔离容器 | 安全性、可复现性 |
+| `ssh` | 远程服务器 | 沙箱隔离，防止 Agent 修改自身代码 |
+| `singularity` | HPC 容器 | 集群计算、无 root 权限 |
+| `modal` | 云端执行 | 无服务器、弹性扩展 |
+| `daytona` | 云端沙箱工作区 | 持久化远程开发环境 |
+| `vercel_sandbox` | Vercel Sandbox 云微虚拟机 | 带快照文件系统持久化的云端执行 |
+
+### 配置
+
+```yaml
+# 在 ~/.hermes/config.yaml 中
+terminal:
+  backend: local    # 或：docker, ssh, singularity, modal, daytona, vercel_sandbox
+  cwd: "."          # 工作目录
+  timeout: 180      # 命令超时时间（秒）
+```
+
+### Docker 后端
+
+```yaml
+terminal:
+  backend: docker
+  docker_image: python:3.11-slim
+```
+
+**单个持久容器，在整个进程生命周期内共享。** Hermes 在首次使用时启动一个长期运行的容器（`docker run -d ... sleep 2h`），并通过 `docker exec` 将所有终端、文件及 `execute_code` 调用路由到同一容器中。工作目录变更、已安装的包、环境调整以及写入 `/workspace` 的文件，在同一 Hermes 进程的整个生命周期内，跨 `/new`、`/reset` 和 `delegate_task` 子 Agent 均会保留。容器在关闭时停止并删除。
+
+这意味着 Docker 后端的行为类似持久化沙箱虚拟机，而非每次命令都使用全新容器。如果你执行过一次 `pip install foo`，该包在本次会话的剩余时间内均可用。如果你执行了 `cd /workspace/project`，后续的 `ls` 调用将看到该目录。完整的生命周期详情及控制 `/workspace` 和 `/root` 是否跨 Hermes 重启保留的 `container_persistent` 标志，请参阅 [配置 → Docker 后端](../configuration.md#docker-backend)。
+
+### SSH 后端
+
+推荐用于安全场景——Agent 无法修改自身代码：
+
+```yaml
+terminal:
+  backend: ssh
+```
+```bash
+# 在 ~/.hermes/.env 中设置凭据
+TERMINAL_SSH_HOST=my-server.example.com
+TERMINAL_SSH_USER=myuser
+TERMINAL_SSH_KEY=~/.ssh/id_rsa
+```
+
+### Singularity/Apptainer
+
+```bash
+# 为并行 worker 预构建 SIF
+apptainer build ~/python.sif docker://python:3.11-slim
+
+# 配置
+hermes config set terminal.backend singularity
+hermes config set terminal.singularity_image ~/python.sif
+```
+
+### Modal（无服务器云）
+
+```bash
+uv pip install modal
+modal setup
+hermes config set terminal.backend modal
+```
+
+### Vercel Sandbox
+
+```bash
+pip install 'hermes-agent[vercel]'
+hermes config set terminal.backend vercel_sandbox
+hermes config set terminal.vercel_runtime node24
+```
+
+需同时配置 `VERCEL_TOKEN`、`VERCEL_PROJECT_ID` 和 `VERCEL_TEAM_ID` 三个凭据。此访问令牌配置方式是在 Render、Railway、Docker 及类似平台上进行部署和正常长期运行 Hermes 进程的推荐路径。支持的运行时为 `node24`、`node22` 和 `python3.13`；Hermes 默认使用 `/vercel/sandbox` 作为远程工作区根目录。
+
+对于本地一次性开发，Hermes 也接受短期 Vercel OIDC token：
+
+```bash
+VERCEL_OIDC_TOKEN="$(vc project token <project-name>)" hermes chat
+```
+
+在已关联的 Vercel 项目目录中：
+
+```bash
+VERCEL_OIDC_TOKEN="$(vc project token)" hermes chat
+```
+
+启用 `container_persistent: true` 后，Hermes 使用 Vercel 快照在同一任务的沙箱重建时保留文件系统状态，其中可包含沙箱内 Hermes 同步的凭据、技能和缓存文件。快照不保留活跃进程、PID 空间或相同的活跃沙箱标识。
+
+后台终端命令使用 Hermes 通用的非本地进程流程：在沙箱存活期间，spawn、poll、wait、log 和 kill 均通过标准 process 工具运行，但 Hermes 不提供清理或重启后的原生 Vercel 后台进程恢复能力。
+
+`container_disk` 保持未设置或使用共享默认值 `51200`；Vercel Sandbox 不支持自定义磁盘大小，设置后将导致诊断/后端创建失败。
+
+### 容器资源
+
+为所有容器后端配置 CPU、内存、磁盘和持久化：
+
+```yaml
+terminal:
+  backend: docker  # 或 singularity, modal, daytona, vercel_sandbox
+  container_cpu: 1              # CPU 核心数（默认：1）
+  container_memory: 5120        # 内存（MB，默认：5GB）
+  container_disk: 51200         # 磁盘（MB，默认：50GB）
+  container_persistent: true    # 跨会话持久化文件系统（默认：true）
+```
+
+启用 `container_persistent: true` 后，已安装的包、文件和配置将跨会话保留。
+
+### 容器安全
+
+所有容器后端均启用安全加固：
+
+- 只读根文件系统（Docker）
+- 丢弃所有 Linux capabilities
+- 禁止权限提升
+- PID 限制（256 个进程）
+- 完整命名空间隔离
+- 通过卷挂载实现持久化工作区，而非可写根层
+
+Docker 可通过 `terminal.docker_forward_env` 接受显式的环境变量白名单，但转发的变量对容器内的命令可见，应视为在该会话中已暴露。
+
+## 后台进程管理
+
+启动后台进程并进行管理：
+
+```python
+terminal(command="pytest -v tests/", background=true)
+# 返回：{"session_id": "proc_abc123", "pid": 12345}
+
+# 然后使用 process 工具进行管理：
+process(action="list")       # 显示所有运行中的进程
+process(action="poll", session_id="proc_abc123")   # 检查状态
+process(action="wait", session_id="proc_abc123")   # 阻塞直到完成
+process(action="log", session_id="proc_abc123")    # 完整输出
+process(action="kill", session_id="proc_abc123")   # 终止进程
+process(action="write", session_id="proc_abc123", data="y")  # 发送输入
+```
+
+PTY 模式（`pty=true`）可启用 Codex 和 Claude Code 等交互式 CLI 工具。
+
+## 已完成后台进程的结果
+
+后台命令完成后，其退出状态和捕获的输出会保留在当前配置档案中。
+无头父进程退出或 Hermes 重启后，请恢复启动该命令的会话（或其上下文压缩后的
+延续会话），再使用原始 `session_id` 调用 `process(action="log")` 读取输出、
+调用 `process(action="poll")` 查看退出状态。即使知道完整进程标识，其他会话
+或未绑定所属会话的请求也不能读取保留的结果。`process(action="list")`
+也会列出当前任务或会话的保留结果。
+
+每个配置档案在 `logs/process-results/` 下最多保留最近 **64 个已完成结果**，
+自完成起保存不超过 **7 天**。每份记录最多包含滚动输出末尾的 **200,000 个字符**，
+始终使用终端的敏感信息脱敏规则，即使实时输出的脱敏功能已关闭。
+后续读取或写入结果时会清理过期记录。
+恢复结果不会重新运行命令，也不会重放完成通知。这仅保护父进程存活期间已经
+完成的工作，不保证未完成的子进程在超时或崩溃后继续运行。
+
+## Sudo 支持
+
+如果命令需要 sudo，系统会提示你输入密码（在本次会话内缓存）。也可在 `~/.hermes/.env` 中设置 `SUDO_PASSWORD`。
+
+:::warning
+在消息平台上，如果 sudo 失败，输出中会提示将 `SUDO_PASSWORD` 添加到 `~/.hermes/.env`。
+:::

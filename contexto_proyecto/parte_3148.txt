@@ -1,0 +1,303 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_terminal_response_sanitizer.py ===
+"""Tests for defensive terminal control-response stripping in the CLI.
+
+Covers Cursor Position Report (CPR / DSR) responses that occasionally
+leak into the input buffer after terminal resize storms or multiplexer
+tab switches — see issue #14692.
+"""
+
+from cli import _strip_leaked_terminal_responses_with_meta
+
+
+def _strip_leaked_terminal_responses(text: str) -> str:
+    cleaned, _ = _strip_leaked_terminal_responses_with_meta(text)
+    return cleaned
+
+
+class TestStripLeakedTerminalResponses:
+
+
+    def test_strips_canonical_dsr_response(self):
+        # Reports from issue #14692
+        text = "\x1b[53;1R"
+        assert _strip_leaked_terminal_responses(text) == ""
+
+
+    def test_strips_multiple_dsr_responses(self):
+        text = "a\x1b[53;1Rb\x1b[51;1Rc\x1b[50;9Rd"
+        assert _strip_leaked_terminal_responses(text) == "abcd"
+
+
+
+
+
+
+    def test_strips_sgr_mouse_report_esc_form(self):
+        text = "abc\x1b[<65;1;49Mdef"
+        assert _strip_leaked_terminal_responses(text) == "abcdef"
+
+
+
+    def test_strips_sgr_mouse_report_with_large_coordinates(self):
+        text = "abc\x1b[<10000;12345;98765Mdef"
+        assert _strip_leaked_terminal_responses(text) == "abcdef"
+
+    def test_strips_multiple_concatenated_sgr_mouse_reports(self):
+        text = "<65;1;49M<35;1;42Mhello<64;1;40m"
+        assert _strip_leaked_terminal_responses(text) == "hello"
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_terminal_shortcuts.py ===
+"""Regression tests for terminal navigation/focus escape sequences.
+
+Ghostty/macOS window and tab navigation can deliver terminal focus reports
+(CSI I / CSI O) to the running TUI. These must be consumed by the input parser,
+not inserted into the prompt buffer and cleaned up later.
+"""
+
+from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.keys import Keys
+
+from hermes_cli.pt_input_extras import install_ignored_terminal_sequences
+
+
+def _parse_keys(data: str):
+    events = []
+    parser = Vt100Parser(events.append)
+    parser.feed_and_flush(data)
+    return [(event.key, event.data) for event in events]
+
+
+def test_focus_events_are_parser_level_ignored_before_prompt_buffer():
+    install_ignored_terminal_sequences()
+
+    assert _parse_keys("\x1b[O\x1b[Ihello") == [
+        (Keys.Ignore, "\x1b[O"),
+        (Keys.Ignore, "\x1b[I"),
+        ("h", "h"),
+        ("e", "e"),
+        ("l", "l"),
+        ("l", "l"),
+        ("o", "o"),
+    ]
+
+
+def test_regular_escape_shortcuts_still_parse_normally():
+    install_ignored_terminal_sequences()
+
+    assert _parse_keys("\x1bg") == [(Keys.Escape, "\x1b"), ("g", "g")]
+
+
+def test_install_is_idempotent_and_setdefault_safe():
+    """Second call should return 0 (no new mappings); existing user
+    registrations must not be overwritten."""
+    first = install_ignored_terminal_sequences()
+    second = install_ignored_terminal_sequences()
+    # At most first should be 2 (both CSI I + CSI O), second always 0
+    # since the entries are now present.
+    assert second == 0
+    assert first in (0, 1, 2)  # 0 if a prior test in same process already installed
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_tools_command.py ===
+"""Tests for /tools slash command handler in the interactive CLI."""
+
+from unittest.mock import MagicMock, patch
+
+from cli import HermesCLI
+
+
+def _make_cli(enabled_toolsets=None):
+    """Build a minimal HermesCLI stub without running __init__."""
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj.enabled_toolsets = set(enabled_toolsets or ["web", "memory"])
+    cli_obj._command_running = False
+    cli_obj.console = MagicMock()
+    return cli_obj
+
+
+# ── /tools (no subcommand) ──────────────────────────────────────────────────
+
+
+class TestToolsSlashNoSubcommand:
+
+    def test_bare_tools_shows_tool_list(self):
+        cli_obj = _make_cli()
+        with patch.object(cli_obj, "show_tools") as mock_show:
+            cli_obj._handle_tools_command("/tools")
+        mock_show.assert_called_once()
+
+
+
+# ── /tools list ─────────────────────────────────────────────────────────────
+
+
+class TestToolsSlashList:
+
+    def test_list_calls_backend(self, capsys):
+        cli_obj = _make_cli()
+        with patch("hermes_cli.tools_config.load_config",
+                   return_value={"platform_toolsets": {"cli": ["web"]}}), \
+             patch("hermes_cli.tools_config.save_config"):
+            cli_obj._handle_tools_command("/tools list")
+        out = capsys.readouterr().out
+        assert "web" in out
+
+
+
+# ── /tools disable (session reset) ──────────────────────────────────────────
+
+
+class TestToolsSlashDisableWithReset:
+
+    def test_disable_applies_directly_and_resets_session(self):
+        """Disable applies immediately (no confirmation prompt) and resets session."""
+        cli_obj = _make_cli(["web", "memory"])
+        with patch("hermes_cli.tools_config.load_config",
+                   return_value={"platform_toolsets": {"cli": ["web", "memory"]}}), \
+             patch("hermes_cli.tools_config.save_config"), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value={"memory"}), \
+             patch("hermes_cli.config.load_config", return_value={}), \
+             patch.object(cli_obj, "new_session") as mock_reset:
+            cli_obj._handle_tools_command("/tools disable web")
+        mock_reset.assert_called_once()
+        assert "web" not in cli_obj.enabled_toolsets
+
+
+    def test_disable_always_resets_session(self):
+        """Even without a confirmation prompt, disable always resets the session."""
+        cli_obj = _make_cli(["web", "memory"])
+        with patch("hermes_cli.tools_config.load_config",
+                   return_value={"platform_toolsets": {"cli": ["web", "memory"]}}), \
+             patch("hermes_cli.tools_config.save_config"), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value={"memory"}), \
+             patch("hermes_cli.config.load_config", return_value={}), \
+             patch.object(cli_obj, "new_session") as mock_reset:
+            cli_obj._handle_tools_command("/tools disable web")
+        mock_reset.assert_called_once()
+
+
+
+# ── /tools enable (session reset) ───────────────────────────────────────────
+
+
+class TestToolsSlashEnableWithReset:
+
+    def test_enable_applies_directly_and_resets_session(self):
+        """Enable applies immediately (no confirmation prompt) and resets session."""
+        cli_obj = _make_cli(["memory"])
+        with patch("hermes_cli.tools_config.load_config",
+                   return_value={"platform_toolsets": {"cli": ["memory"]}}), \
+             patch("hermes_cli.tools_config.save_config"), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value={"memory", "web"}), \
+             patch("hermes_cli.config.load_config", return_value={}), \
+             patch.object(cli_obj, "new_session") as mock_reset:
+            cli_obj._handle_tools_command("/tools enable web")
+        mock_reset.assert_called_once()
+        assert "web" in cli_obj.enabled_toolsets
+
+    def test_enable_missing_name_prints_usage(self, capsys):
+        cli_obj = _make_cli()
+        cli_obj._handle_tools_command("/tools enable")
+        out = capsys.readouterr().out
+        assert "Usage" in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_user_message_preview.py ===
+import importlib
+import sys
+from unittest.mock import MagicMock, patch
+
+
+
+_cli_mod = None
+
+
+def _make_cli(user_message_preview=None):
+    global _cli_mod
+    clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {
+            "compact": False,
+            "tool_progress": "all",
+            "user_message_preview": user_message_preview or {"first_lines": 2, "last_lines": 2},
+        },
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    prompt_toolkit_stubs = {
+        "prompt_toolkit": MagicMock(),
+        "prompt_toolkit.history": MagicMock(),
+        "prompt_toolkit.styles": MagicMock(),
+        "prompt_toolkit.patch_stdout": MagicMock(),
+        "prompt_toolkit.application": MagicMock(),
+        "prompt_toolkit.layout": MagicMock(),
+        "prompt_toolkit.layout.processors": MagicMock(),
+        "prompt_toolkit.filters": MagicMock(),
+        "prompt_toolkit.layout.dimension": MagicMock(),
+        "prompt_toolkit.layout.menus": MagicMock(),
+        "prompt_toolkit.widgets": MagicMock(),
+        "prompt_toolkit.key_binding": MagicMock(),
+        "prompt_toolkit.completion": MagicMock(),
+        "prompt_toolkit.formatted_text": MagicMock(),
+        "prompt_toolkit.auto_suggest": MagicMock(),
+    }
+    with patch.dict(sys.modules, prompt_toolkit_stubs), patch.dict("os.environ", clean_env, clear=False):
+        import cli as mod
+
+        mod = importlib.reload(mod)
+        _cli_mod = mod
+        with patch.object(mod, "get_tool_definitions", return_value=[]), patch.dict(mod.__dict__, {"CLI_CONFIG": clean_config}):
+            return mod.HermesCLI()
+
+
+class TestSubmittedUserMessagePreview:
+    def test_default_preview_shows_first_two_lines_and_last_two_lines(self):
+        cli = _make_cli()
+
+        rendered = cli._format_submitted_user_message_preview(
+            "line1\nline2\nline3\nline4\nline5\nline6"
+        )
+
+        assert "line1" in rendered
+        assert "line2" in rendered
+        assert "line5" in rendered
+        assert "line6" in rendered
+        assert "line3" not in rendered
+        assert "line4" not in rendered
+        assert "(+2 more lines)" in rendered
+
+    def test_preview_can_hide_last_lines(self):
+        cli = _make_cli({"first_lines": 2, "last_lines": 0})
+
+        rendered = cli._format_submitted_user_message_preview(
+            "line1\nline2\nline3\nline4\nline5\nline6"
+        )
+
+        assert "line1" in rendered
+        assert "line2" in rendered
+        assert "line5" not in rendered
+        assert "line6" not in rendered
+        assert "(+4 more lines)" in rendered
+
+    def test_invalid_first_lines_value_falls_back_to_one(self):
+        cli = _make_cli({"first_lines": 0, "last_lines": 2})
+
+        rendered = cli._format_submitted_user_message_preview("line1\nline2\nline3\nline4")
+
+        assert "line1" in rendered
+        assert "line3" in rendered
+        assert "line4" in rendered
+        assert "(+1 more line)" in rendered
+

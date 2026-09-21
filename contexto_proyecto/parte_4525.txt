@@ -1,0 +1,254 @@
+
+
+=== ARCHIVO: .\hermes-agent\tools\annotate_preview_tool.py ===
+"""Persistent element annotations in the Hermes desktop GUI's in-app browser.
+
+Unlike ``drive_preview``'s self-retiring marks, an annotation outlines an element
+(or, with ``hold``, the whole visible field) until removed. Annotations bind to
+elements, not coordinates: they ride scrolls and vanish with their element, so
+navigation clears them. Same ``preview.act`` bridge as ``drive_preview`` (the
+renderer resolves refs and owns the overlay). ``desktop_ui`` toolset only.
+"""
+
+import json
+from typing import Callable, Optional
+
+from tools.registry import registry, tool_error
+
+ACTIONS = ("add", "hold", "remove", "clear")
+
+# Renderer verbs keyed by ours; `clear` is `unpin` with no target = "all of them".
+WIRE = {"add": "pin", "hold": "hold", "remove": "unpin", "clear": "unpin"}
+
+
+def annotate_preview_tool(
+    action: str = "add", ref: Optional[str] = None, selector: Optional[str] = None,
+    label: Optional[str] = None, callback: Optional[Callable] = None,
+) -> str:
+    """Put one annotation up, take one down, or clear them all."""
+    if callback is None:
+        return tool_error("annotate_preview is only available in the Hermes desktop app.")
+    verb = (action or "add").strip().lower()
+    if verb not in ACTIONS:
+        return tool_error(f"action must be one of: {', '.join(ACTIONS)}.")
+    if verb in ("add", "remove") and not (ref or selector):
+        return tool_error(f"{verb} needs a ref from drive_preview action='elements' (e.g. 'btn-sign-in') or a CSS selector.")
+
+    targeted = verb not in ("clear", "hold")
+    fields = (("action", WIRE[verb]), ("ref", ref if targeted else None), ("selector", selector if targeted else None), ("text", label))
+    payload = {name: val for name, val in fields if val is not None}
+    try:
+        raw = callback(payload)
+    except Exception as exc:
+        return tool_error(f"Failed to annotate the in-app browser: {exc}")
+    if not raw:
+        return tool_error("The annotation timed out, or no GUI window answered. Open a page with open_preview first.")
+    try:
+        return json.dumps(json.loads(raw), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return json.dumps({"text": str(raw)}, ensure_ascii=False)
+
+
+ANNOTATE_PREVIEW_SCHEMA = {
+    "name": "annotate_preview",
+    "description": (
+        "Highlight elements on the preview-pane page, lastingly (drive_preview's own "
+        "marks fade; annotations stay until removed) — point at findings, "
+        "flag what you're about to change, keep your place. Use the refs "
+        "from drive_preview action='elements'. add: outline one element "
+        "(optional short label — a word or two, drawn on the page). hold: "
+        "freeze the whole visible field, every element outlined and named. "
+        "remove/clear: take one/all down. Marks follow their element on "
+        "scroll; navigation clears them."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": list(ACTIONS),
+                "description": "Defaults to 'add'.",
+            },
+            "ref": {
+                "type": "string",
+                "description": "Ref from drive_preview elements.",
+            },
+            "selector": {
+                "type": "string",
+                "description": "CSS selector fallback. Prefer ref.",
+            },
+            "label": {
+                "type": "string",
+                "description": "Optional caption, e.g. 'cheapest'.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+registry.register(
+    name="annotate_preview",
+    toolset="desktop_ui",
+    schema=ANNOTATE_PREVIEW_SCHEMA,
+    handler=lambda args, **kw: annotate_preview_tool(
+        action=args.get("action", "add"),
+        ref=args.get("ref"),
+        selector=args.get("selector"),
+        label=args.get("label"),
+        callback=kw.get("callback"),
+    ),
+    emoji="🔖",
+)
+
+
+
+=== ARCHIVO: .\hermes-agent\tools\ansi_strip.py ===
+"""Strip ANSI escape sequences from subprocess output so they never reach the
+model's context (models otherwise copy them into file writes). Covers full
+ECMA-48: CSI, OSC (BEL/ST), DCS/SOS/PM/APC, nF, Fp/Fe/Fs and 8-bit C1 controls."""
+
+import re
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b"
+    r"(?:"
+        r"\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]"     # CSI sequence
+        r"|\][\s\S]*?(?:\x07|\x1b\\)"                  # OSC (BEL or ST terminator)
+        r"|[PX^_][\s\S]*?(?:\x1b\\)"                   # DCS/SOS/PM/APC strings
+        r"|[\x20-\x2f]+[\x30-\x7e]"                    # nF escape sequences
+        r"|[\x30-\x7e]"                                 # Fp/Fe/Fs single-byte
+    r")"
+    r"|\x9b[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]"       # 8-bit CSI
+    r"|\x9d[\s\S]*?(?:\x07|\x9c)"                       # 8-bit OSC
+    r"|[\x80-\x9f]",                                    # Other 8-bit C1 controls
+    re.DOTALL,
+)
+# Fast-path checks: skip the full regex when no candidate bytes are present.
+_HAS_ESCAPE = re.compile(r"[\x1b\x80-\x9f]")
+_HAS_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_HAS_UNICODE_TAG = re.compile(r"[\U000E0000-\U000E007F]")
+
+# C0 controls (minus tab/newline/CR) plus DEL: they survive strip_ansi() (which only
+# removes *sequences*) but are dangerous echoed to a terminal (BEL, backspace, NUL).
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Unicode TAG chars (U+E0000–U+E007F) render as nothing but LLM tokenizers see them:
+# the "ASCII smuggling" injection channel. Emoji tag sequences (TR51: U+1F3F4 base +
+# tag spec + U+E007F CANCEL TAG, e.g. Scotland/Wales flags) are the only legit use.
+# Deprecated as language tags, these render as nothing in every terminal and chat UI but are perfectly
+# visible to an LLM tokenizer — the classic "ASCII smuggling" prompt-injection channel (hide
+# `\u{E0069}\u{E0067}\u{E006E}...` = invisible instructions inside otherwise benign tool output). Ported
+# from block/goose#10746. The ONLY legitimate modern use is emoji tag sequences (Unicode TR51): a U+1F3F4
+# black-flag base followed by tag spec characters and the U+E007F CANCEL TAG terminator (e.g. the flags of
+# Scotland/Wales/England). goose strips those too; we preserve them — same rationale as keeping ZWJ inside
+# emoji sequences.
+_UNICODE_TAG_SUB_RE = re.compile(
+    r"(\U0001F3F4[\U000E0020-\U000E007E]+\U000E007F)"  # valid emoji tag seq (kept)
+    r"|[\U000E0000-\U000E007F]"                        # any other tag char (stripped)
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences; clean text passes through unchanged (fast path)."""
+    if not text or not _HAS_ESCAPE.search(text):
+        return text
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def sanitize_display_text(text: str) -> str:
+    """Sanitize stored/untrusted text before echoing it to a terminal: strips ANSI
+    sequences AND bare control chars, keeping only newlines/tabs (CRs become newlines
+    so ``\\r``-overwrite spoofing can't hide content). Rich's ``Text()`` does NOT
+    neutralize raw escape bytes, so a replayed ``/resume`` message must not be able
+    to clear the screen, retitle the window, or restyle UI.
+
+    Use this when re-rendering conversation history or other persisted text in a terminal UI (e.g. the
+    ``/resume`` recap): a message that arrived with embedded escapes — pasted content, gateway-origin text,
+    or model output echoing injected tool results — must not be able to clear the screen, retitle the
+    window, move the cursor, or restyle adjacent UI when replayed. Mirrors openai/codex#31494
+    (``sanitize_user_text``).
+    """
+    if not text or not _HAS_CONTROL.search(text):
+        return text
+    text = strip_ansi(text)
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_CHARS_RE.sub("", text)
+
+
+def strip_unicode_tags(text: str) -> str:
+    """Remove invisible Unicode TAG chars (a prompt-injection smuggling channel in
+    untrusted tool output); valid emoji tag sequences are preserved.
+
+    Returns the input unchanged (fast path) when no plane-14 tag characters are present. Ported from
+    block/goose#10746.
+    """
+    if not text or not _HAS_UNICODE_TAG.search(text):
+        return text
+    return _UNICODE_TAG_SUB_RE.sub(lambda m: m.group(1) or "", text)
+
+
+
+=== ARCHIVO: .\hermes-agent\tools\apply_layout_tool.py ===
+"""Apply a layout preset in the Hermes desktop GUI (``layout.apply`` via ``desktop_ui``).
+
+The renderer resolves the id against its layouts registry (core, plugin and user
+presets are one list); only the active window's session acts, so a background turn
+never rearranges the desktop. Preset ids are free-form on purpose. The renderer
+answers with the applied id/title, or the available ids when unknown, so the model
+can self-correct without a registry-listing tool.
+"""
+
+from tools import desktop_ui
+from tools.registry import registry, tool_error
+
+
+def apply_layout_tool(preset: str) -> str:
+    """Ask the desktop GUI to apply layout preset ``preset``."""
+    name = (preset or "").strip()
+    if not name:
+        return tool_error("preset is required — a layout preset id, e.g. 'default' or 'focus'.")
+    return desktop_ui.emit_or_error(
+        "layout.apply", {"preset": name}, f"Failed to apply layout '{name}': ",
+        "Layout apply is only available in the Hermes desktop app.", {"success": True, "preset": name},
+    )
+
+
+APPLY_LAYOUT_SCHEMA = {
+    "name": "apply_layout",
+    "description": (
+        "Apply a saved layout preset to the Hermes desktop app when the user "
+        "asks to rearrange the workspace. Built-ins: default (chat + "
+        "sidebars), focus (chat only), terminal-deck, quad; plugin/user "
+        "presets by id. To reveal ONE pane, use focus_pane instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "preset": {
+                "type": "string",
+                "description": "Layout preset id to apply (e.g. 'default', 'focus', 'terminal-deck', 'quad', or a user/plugin preset id).",
+            },
+        },
+        "required": ["preset"],
+    },
+}
+
+
+registry.register(
+    name="apply_layout",
+    toolset="desktop_ui",
+    schema=APPLY_LAYOUT_SCHEMA,
+    handler=lambda args, **kw: apply_layout_tool(preset=args.get("preset", "")),
+    emoji="🧱",
+)
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import json  # noqa: F401,E402
+# ---- END PLUGIN-COMPAT ----
+

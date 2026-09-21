@@ -1,0 +1,570 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\google-workspace.md ===
+---
+sidebar_position: 2
+sidebar_label: "Google Workspace"
+title: "Google Workspace — Gmail、Calendar、Drive、Sheets 与 Docs"
+description: "通过 OAuth2 认证的 Google API，发送邮件、管理日历事件、搜索 Drive、读写 Sheets 并访问 Docs"
+---
+
+# Google Workspace Skill
+
+Gmail、Calendar、Drive、Contacts、Sheets 和 Docs 与 Hermes 的集成。使用 OAuth2 并支持自动刷新 token（令牌）。优先使用 [Google Workspace CLI（`gws`）](https://github.com/nicholasgasior/gws)（如已安装）以获得更广泛的覆盖，否则回退到 Google 的 Python 客户端库。
+
+**Skill 路径：** `skills/productivity/google-workspace/`
+
+## 配置
+
+配置流程完全由 Agent 驱动——让 Hermes 设置 Google Workspace，它会引导你完成每个步骤。流程如下：
+
+1. **创建 Google Cloud 项目**并启用所需 API（Gmail、Calendar、Drive、Sheets、Docs、People）
+2. **创建 OAuth 2.0 凭据**（Desktop app 类型）并下载客户端密钥 JSON
+3. **授权**——Hermes 生成授权 URL，你在浏览器中批准，然后将重定向 URL 粘贴回来
+4. **完成**——token 从此自动刷新
+
+:::tip 仅需邮件的用户
+如果你只需要邮件功能（无需 Calendar/Drive/Sheets），请改用 **himalaya** skill——它使用 Gmail 应用专用密码，只需 2 分钟即可完成配置，无需 Google Cloud 项目。
+:::
+
+## Gmail
+
+### 搜索
+
+```bash
+$GAPI gmail search "is:unread" --max 10
+$GAPI gmail search "from:boss@company.com newer_than:1d"
+$GAPI gmail search "has:attachment filename:pdf newer_than:7d"
+```
+
+返回 JSON，每条消息包含 `id`、`from`、`subject`、`date`、`snippet` 和 `labels` 字段。
+
+### 读取
+
+```bash
+$GAPI gmail get MESSAGE_ID
+```
+
+以文本形式返回完整消息正文（优先纯文本，回退到 HTML）。
+
+### 发送
+
+```bash
+# 基本发送
+$GAPI gmail send --to user@example.com --subject "Hello" --body "Message text"
+
+# HTML 邮件
+$GAPI gmail send --to user@example.com --subject "Report" \
+  --body "<h1>Q4 Results</h1><p>Details here</p>" --html
+
+# 自定义 From 头（显示名称 + 邮箱）
+$GAPI gmail send --to user@example.com --subject "Hello" \
+  --from '"Research Agent" <user@example.com>' --body "Message text"
+
+# 带 CC
+$GAPI gmail send --to user@example.com --cc "team@example.com" \
+  --subject "Update" --body "FYI"
+```
+
+### 自定义 From 头
+
+`--from` 标志允许你自定义外发邮件的发件人显示名称。当多个 Agent 共享同一个 Gmail 账户但希望收件人看到不同名称时，此功能非常有用：
+
+```bash
+# Agent 1
+$GAPI gmail send --to client@co.com --subject "Research Summary" \
+  --from '"Research Agent" <shared@company.com>' --body "..."
+
+# Agent 2  
+$GAPI gmail send --to client@co.com --subject "Code Review" \
+  --from '"Code Assistant" <shared@company.com>' --body "..."
+```
+
+**工作原理：** `--from` 的值会被设置为 MIME 消息的 RFC 5322 `From` 头。Gmail 允许在已认证的邮箱地址上自定义显示名称，无需任何额外配置。收件人看到的是自定义显示名称（如"Research Agent"），而邮箱地址保持不变。
+
+**重要提示：** 如果你在 `--from` 中使用*不同的邮箱地址*（非已认证账户），Gmail 要求该地址在 Gmail 设置 → 账户 → 以其他地址发送邮件中配置为 [Send As 别名](https://support.google.com/mail/answer/22370)。
+
+`--from` 标志同时适用于 `send` 和 `reply`：
+
+```bash
+$GAPI gmail reply MESSAGE_ID \
+  --from '"Support Bot" <shared@company.com>' --body "We're on it"
+```
+
+### 回复
+
+```bash
+$GAPI gmail reply MESSAGE_ID --body "Thanks, that works for me."
+```
+
+自动将回复归入同一会话（设置 `In-Reply-To` 和 `References` 头），并使用原始消息的 thread ID。
+
+### 标签
+
+```bash
+# 列出所有标签
+$GAPI gmail labels
+
+# 添加/移除标签
+$GAPI gmail modify MESSAGE_ID --add-labels LABEL_ID
+$GAPI gmail modify MESSAGE_ID --remove-labels UNREAD
+```
+
+## Calendar
+
+```bash
+# 列出事件（默认为未来 7 天）
+$GAPI calendar list
+$GAPI calendar list --start 2026-03-01T00:00:00Z --end 2026-03-07T23:59:59Z
+
+# 创建事件（必须指定时区）
+$GAPI calendar create --summary "Team Standup" \
+  --start 2026-03-01T10:00:00-07:00 --end 2026-03-01T10:30:00-07:00
+
+# 带地点和参与者
+$GAPI calendar create --summary "Lunch" \
+  --start 2026-03-01T12:00:00Z --end 2026-03-01T13:00:00Z \
+  --location "Cafe" --attendees "alice@co.com,bob@co.com"
+
+# 删除事件
+$GAPI calendar delete EVENT_ID
+```
+
+:::warning
+Calendar 时间**必须**包含时区偏移（如 `-07:00`）或使用 UTC（`Z`）。不带时区的裸日期时间（如 `2026-03-01T10:00:00`）存在歧义，将被视为 UTC 处理。
+:::
+
+## Drive
+
+```bash
+$GAPI drive search "quarterly report" --max 10
+$GAPI drive search "mimeType='application/pdf'" --raw-query --max 5
+```
+
+## Sheets
+
+```bash
+# 读取范围
+$GAPI sheets get SHEET_ID "Sheet1!A1:D10"
+
+# 写入范围
+$GAPI sheets update SHEET_ID "Sheet1!A1:B2" --values '[["Name","Score"],["Alice","95"]]'
+
+# 追加行
+$GAPI sheets append SHEET_ID "Sheet1!A:C" --values '[["new","row","data"]]'
+```
+
+## Docs
+
+```bash
+$GAPI docs get DOC_ID
+```
+
+返回文档标题和完整文本内容。
+
+## Contacts
+
+```bash
+$GAPI contacts list --max 20
+```
+
+## 输出格式
+
+所有命令均返回 JSON。各服务的关键字段：
+
+| 命令 | 字段 |
+|---------|--------|
+| `gmail search` | `id`、`threadId`、`from`、`to`、`subject`、`date`、`snippet`、`labels` |
+| `gmail get` | `id`、`threadId`、`from`、`to`、`subject`、`date`、`labels`、`body` |
+| `gmail send/reply` | `status`、`id`、`threadId` |
+| `calendar list` | `id`、`summary`、`start`、`end`、`location`、`description`、`htmlLink` |
+| `calendar create` | `status`、`id`、`summary`、`htmlLink` |
+| `drive search` | `id`、`name`、`mimeType`、`modifiedTime`、`webViewLink` |
+| `contacts list` | `name`、`emails`、`phones` |
+| `sheets get` | 单元格值的二维数组 |
+
+## 故障排查
+
+| 问题 | 解决方法 |
+|---------|-----|
+| `NOT_AUTHENTICATED` | 运行配置（让 Hermes 设置 Google Workspace） |
+| `REFRESH_FAILED` | Token 已被撤销——重新执行授权步骤 |
+| `HttpError 403: Insufficient Permission` | 缺少 scope（权限范围）——撤销并以正确的服务重新授权 |
+| `HttpError 403: Access Not Configured` | API 未在 Google Cloud Console 中启用 |
+| `ModuleNotFoundError` | 使用 `--install-deps` 运行配置脚本 |
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\apple\apple-apple-notes.md ===
+---
+title: "Apple Notes — 通过 memo CLI 管理 Apple Notes：创建、搜索、编辑"
+sidebar_label: "Apple Notes"
+description: "通过 memo CLI 管理 Apple Notes：创建、搜索、编辑"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Apple Notes
+
+通过 memo CLI 管理 Apple Notes：创建、搜索、编辑。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/apple/apple-notes` |
+| 版本 | `1.0.0` |
+| 作者 | Hermes Agent |
+| 许可证 | MIT |
+| 平台 | macos |
+| 标签 | `Notes`, `Apple`, `macOS`, `note-taking` |
+| 相关 skill | [`obsidian`](/user-guide/skills/bundled/note-taking/note-taking-obsidian) |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+:::
+
+# Apple Notes
+
+使用 `memo` 直接从终端管理 Apple Notes。笔记通过 iCloud 在所有 Apple 设备间同步。
+
+## 前置条件
+
+- **macOS** 并安装 Notes.app
+- 安装：`brew tap antoniorodr/memo && brew install antoniorodr/memo/memo`
+- 在提示时授予 Notes.app 的自动化访问权限（系统设置 → 隐私 → 自动化）
+
+## 使用时机
+
+- 用户要求创建、查看或搜索 Apple Notes
+- 将信息保存到 Notes.app 以实现跨设备访问
+- 将笔记整理到文件夹中
+- 将笔记导出为 Markdown/HTML
+
+## 不适用时机
+
+- Obsidian vault 管理 → 使用 `obsidian` skill
+- Bear Notes → 独立应用（此处不支持）
+- 仅供 agent 内部使用的快速笔记 → 改用 `memory` 工具
+
+## 快速参考
+
+### 查看笔记
+
+```bash
+memo notes                        # 列出所有笔记
+memo notes -f "Folder Name"       # 按文件夹筛选
+memo notes -s "query"             # 搜索笔记（模糊匹配）
+```
+
+### 创建笔记
+
+```bash
+memo notes -a                     # 交互式编辑器
+memo notes -a "Note Title"        # 快速添加并指定标题
+```
+
+### 编辑笔记
+
+```bash
+memo notes -e                     # 交互式选择并编辑
+```
+
+### 删除笔记
+
+```bash
+memo notes -d                     # 交互式选择并删除
+```
+
+### 移动笔记
+
+```bash
+memo notes -m                     # 将笔记移动到文件夹（交互式）
+```
+
+### 导出笔记
+
+```bash
+memo notes -ex                    # 导出为 HTML/Markdown
+```
+
+## 限制
+
+- 无法编辑包含图片或附件的笔记
+- 交互式提示需要终端访问权限（如有需要请使用 pty=true）
+- 仅限 macOS — 需要 Apple Notes.app
+
+## 规则
+
+1. 当用户需要跨设备同步（iPhone/iPad/Mac）时，优先使用 Apple Notes
+2. 对不需要同步的 agent 内部笔记，使用 `memory` 工具
+3. 对以 Markdown 为核心的知识管理，使用 `obsidian` skill
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\apple\apple-apple-reminders.md ===
+---
+title: "Apple Reminders — 通过 remindctl 管理 Apple Reminders：添加、列出、完成"
+sidebar_label: "Apple Reminders"
+description: "通过 remindctl 管理 Apple Reminders：添加、列出、完成"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Apple Reminders
+
+通过 remindctl 管理 Apple Reminders：添加、列出、完成。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/apple/apple-reminders` |
+| 版本 | `1.0.0` |
+| 作者 | Hermes Agent |
+| 许可证 | MIT |
+| 平台 | macos |
+| 标签 | `Reminders`, `tasks`, `todo`, `macOS`, `Apple` |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时所看到的指令内容。
+:::
+
+# Apple Reminders
+
+使用 `remindctl` 直接从终端管理 Apple Reminders。任务通过 iCloud 在所有 Apple 设备间同步。
+
+## 前提条件
+
+- 安装了 Reminders.app 的 **macOS**
+- 安装：`brew install steipete/tap/remindctl`
+- 在提示时授予 Reminders 权限
+- 检查：`remindctl status` / 请求授权：`remindctl authorize`
+
+## 何时使用
+
+- 用户提到"提醒"或"Reminders 应用"
+- 创建带有截止日期且需同步到 iOS 的个人待办事项
+- 管理 Apple Reminders 列表
+- 用户希望任务出现在其 iPhone/iPad 上
+
+## 何时不使用
+
+- 调度 agent 提醒 → 改用 cronjob 工具
+- 日历事件 → 使用 Apple Calendar 或 Google Calendar
+- 项目任务管理 → 使用 GitHub Issues、Notion 等
+- 用户说"提醒我"但意指 agent 提醒 → 先行确认
+
+## 快速参考
+
+### 查看提醒
+
+```bash
+remindctl                    # 今日提醒
+remindctl today              # 今天
+remindctl tomorrow           # 明天
+remindctl week               # 本周
+remindctl overdue            # 已逾期
+remindctl all                # 全部
+remindctl 2026-01-04         # 指定日期
+```
+
+### 管理列表
+
+```bash
+remindctl list               # 列出所有列表
+remindctl list Work          # 显示指定列表
+remindctl list Projects --create    # 创建列表
+remindctl list Work --delete        # 删除列表
+```
+
+### 创建提醒
+
+```bash
+remindctl add "Buy milk"
+remindctl add --title "Call mom" --list Personal --due tomorrow
+remindctl add --title "Meeting prep" --due "2026-02-15 09:00"
+```
+
+### 完成 / 删除
+
+```bash
+remindctl complete 1 2 3          # 按 ID 完成
+remindctl delete 4A83 --force     # 按 ID 删除
+```
+
+### 输出格式
+
+```bash
+remindctl today --json       # JSON 格式，用于脚本处理
+remindctl today --plain      # TSV 格式
+remindctl today --quiet      # 仅显示数量
+```
+
+## 日期格式
+
+`--due` 及日期筛选器接受以下格式：
+- `today`、`tomorrow`、`yesterday`
+- `YYYY-MM-DD`
+- `YYYY-MM-DD HH:mm`
+- ISO 8601（`2026-01-04T12:34:56Z`）
+
+## 规则
+
+1. 当用户说"提醒我"时，需确认：是 Apple Reminders（同步到手机）还是 agent cronjob 提醒
+2. 创建提醒前始终确认提醒内容和截止日期
+3. 使用 `--json` 进行程序化解析
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\apple\apple-findmy.md ===
+---
+title: "Findmy — 通过 FindMy 追踪 Apple 设备/AirTag"
+sidebar_label: "Findmy"
+description: "通过 FindMy 追踪 Apple 设备/AirTag"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Findmy
+
+在 macOS 上通过 FindMy.app 追踪 Apple 设备/AirTag。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/apple/findmy` |
+| 版本 | `1.0.0` |
+| 作者 | Hermes Agent |
+| 许可证 | MIT |
+| 平台 | macos |
+| 标签 | `FindMy`, `AirTag`, `location`, `tracking`, `macOS`, `Apple` |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时所看到的指令内容。
+:::
+
+# Find My（Apple）
+
+在 macOS 上通过 FindMy.app 追踪 Apple 设备和 AirTag。由于 Apple 未提供 FindMy 的 CLI，此 skill 使用 AppleScript 打开应用并通过截图读取设备位置。
+
+## 前提条件
+
+- **macOS**，已安装 Find My 应用并登录 iCloud
+- 设备/AirTag 已在 Find My 中注册
+- 终端已获得屏幕录制权限（系统设置 → 隐私与安全 → 屏幕录制）
+- **可选但推荐**：安装 `peekaboo` 以获得更好的 UI 自动化体验：
+  `brew install steipete/tap/peekaboo`
+
+## 使用场景
+
+- 用户询问"我的[设备/猫/钥匙/包]在哪里？"
+- 追踪 AirTag 位置
+- 查看设备位置（iPhone、iPad、Mac、AirPods）
+- 随时间监控宠物或物品的移动轨迹（AirTag 巡逻路线）
+
+## 方法一：AppleScript + 截图（基础方式）
+
+### 打开 FindMy 并导航
+
+```bash
+# 打开 Find My 应用
+osascript -e 'tell application "FindMy" to activate'
+
+# 等待加载
+sleep 3
+
+# 对 Find My 窗口截图
+screencapture -w -o /tmp/findmy.png
+```
+
+然后使用 `vision_analyze` 读取截图：
+```
+vision_analyze(image_url="/tmp/findmy.png", question="What devices/items are shown and what are their locations?")
+```
+
+### 切换标签页
+
+```bash
+# 切换到"设备"标签页
+osascript -e '
+tell application "System Events"
+    tell process "FindMy"
+        click button "Devices" of toolbar 1 of window 1
+    end tell
+end tell'
+
+# 切换到"物品"标签页（AirTag）
+osascript -e '
+tell application "System Events"
+    tell process "FindMy"
+        click button "Items" of toolbar 1 of window 1
+    end tell
+end tell'
+```
+
+## 方法二：Peekaboo UI 自动化（推荐）
+
+如果已安装 `peekaboo`，可使用它进行更可靠的 UI 交互：
+
+```bash
+# 打开 Find My
+osascript -e 'tell application "FindMy" to activate'
+sleep 3
+
+# 捕获并标注 UI
+peekaboo see --app "FindMy" --annotate --path /tmp/findmy-ui.png
+
+# 通过元素 ID 点击特定设备/物品
+peekaboo click --on B3 --app "FindMy"
+
+# 捕获详情视图
+peekaboo image --app "FindMy" --path /tmp/findmy-detail.png
+```
+
+然后使用 vision 进行分析：
+```
+vision_analyze(image_url="/tmp/findmy-detail.png", question="What is the location shown for this device/item? Include address and coordinates if visible.")
+```
+
+## 工作流：随时间追踪 AirTag 位置
+
+用于监控 AirTag（例如追踪猫的巡逻路线）：
+
+```bash
+# 1. 打开 FindMy 并切换到"物品"标签页
+osascript -e 'tell application "FindMy" to activate'
+sleep 3
+
+# 2. 点击 AirTag 物品（保持页面停留——AirTag 仅在页面处于活跃显示状态时才更新）
+
+# 3. 定期捕获位置
+while true; do
+    screencapture -w -o /tmp/findmy-$(date +%H%M%S).png
+    sleep 300  # 每 5 分钟一次
+done
+```
+
+使用 vision 分析每张截图以提取坐标，然后汇总成路线。
+
+## 限制
+
+- FindMy **没有 CLI 或 API**——必须使用 UI 自动化
+- AirTag 仅在 FindMy 页面处于活跃显示状态时才更新位置
+- 位置精度取决于 FindMy 网络中附近的 Apple 设备
+- 截图需要屏幕录制权限
+- AppleScript UI 自动化可能在不同 macOS 版本间失效
+
+## 规则
+
+1. 追踪 AirTag 时保持 FindMy 应用在前台（最小化后更新将停止）
+2. 使用 `vision_analyze` 读取截图内容——不要尝试直接解析像素
+3. 如需持续追踪，使用 cronjob 定期捕获并记录位置
+4. 尊重隐私——仅追踪用户本人拥有的设备/物品

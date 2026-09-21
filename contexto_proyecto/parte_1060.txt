@@ -1,0 +1,316 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\volume-generation.md ===
+# Volume Generation
+
+Three traditions for producing many ideas fast:
+- **Crazy 8s** — Google Ventures Sprint method. Codified in *Sprint* (Knapp et al., 2016).
+- **Brainwriting 6-3-5** — Bernd Rohrbach, 1968. German design-method literature.
+- **James Webb Young** — *A Technique for Producing Ideas* (1940). 60-page book; canonical advertising-copywriter manual.
+
+## When to use
+
+- Time pressure with a generative goal
+- Group ideation (brainwriting reliably outperforms verbal brainstorming)
+- Quantity-before-quality phase
+- You need to produce many to find the few good ones
+
+## Don't use when
+
+- You don't have material yet (Young's stage 1: gather first)
+- The right answer is rare and you'll know it when you see it (volume can paradoxically miss it)
+- Solo with no time pressure (use deliberative methods instead)
+
+## Crazy 8s
+
+1. Fold a sheet into 8 panels (or use a printed grid).
+2. Set a timer for **8 minutes**.
+3. Sketch one idea per panel — eight ideas, one minute each.
+4. Sketch, don't write. Visual format forces concretization.
+5. After timer: pick 1–3 strongest panels.
+6. Group share.
+
+The first 4–5 panels are usually slop; the last 3–4 are where surprises live (the easy ideas have been exhausted).
+
+## Brainwriting 6-3-5
+
+Outperforms verbal brainstorming consistently in academic creativity research (Diehl & Stroebe, 1987 + many replications). Verbal brainstorming has well-documented production blocking, evaluation apprehension, and social loafing. Brainwriting eliminates all three.
+
+1. **6 participants**, each with a sheet.
+2. Each writes **3 ideas** in **5 minutes**, in a row at the top.
+3. Papers rotate. Each participant now sees the previous 3 ideas; writes 3 *new* ones — building or fresh.
+4. Repeat until each sheet has been seen by all 6.
+5. Result: 6 × 6 × 3 = 108 ideas in 30 minutes.
+
+## James Webb Young — 5 stages
+
+Honest about the *temporal* structure of idea formation. Most methods assume ideas come on demand; Young's account is that they often don't, and the work is upstream.
+
+1. **Gather material.** Specific *and* general material. Most idea-generators fail here. *"Just one more idea about the product, just one more bit of factual material — many a time these have made all the difference."*
+2. **Mentally digest.** Turn the material over. Make tentative partial connections. Don't reach for a final idea.
+3. **Drop it.** Stop working. Sleep, walk, watch a movie. The unconscious works on it.
+4. **The idea arrives.** Often during a shower or walk. *"It will come to you when you are least expecting it."*
+5. **Shape and develop.** The arriving idea is half-formed. Subject it to actual scrutiny.
+
+The drop stage is non-negotiable. Compressing it back into 1→2→4 produces incomplete ideas.
+
+## When to use which
+
+| Time available | Group size | Use |
+|---|---|---|
+| 8 minutes | Solo | Crazy 8s |
+| 8 minutes | Group | Crazy 8s + share |
+| 30 minutes | Solo | Crazy 8s + 22 min elaboration |
+| 30 minutes | Group of 4–8 | Brainwriting 6-3-5 |
+| 1 hour | Group | Brainwriting + 30 min affinity diagram |
+| 1 day | Solo | Young stages 1–3 |
+| 1 week | Solo or small group | Full Young 5 stages |
+
+## Anti-slop notes
+
+- **Volume of equal quality is not volume.** Eight panels of identical structure is one idea drawn eight times. Force divergence by applying different generative methods to different panels.
+- Don't pad to round numbers. If only 5 of the 8 panels produced anything, surface 5.
+- Surface 1–3 to the user, not all 8 / all 108.
+- Don't conflate volume with depth. Volume is breadth-first; depth comes later with elaboration methods.
+- Respect Young's drop stage. Rushing from gather → idea in one session usually fails.
+
+Sources: Young, *A Technique for Producing Ideas* (Advertising Publications, 1940); Rohrbach, "Methode 635" (*Absatzwirtschaft* 12, 1968); Knapp et al., *Sprint* (Simon & Schuster, 2016).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\draw-your-font\SKILL.md ===
+---
+name: draw-your-font
+description: "Turn a handwriting photo into an installable TTF font."
+version: 0.1.0
+author: Danilo Znamerovszkij (https://github.com/danilo-znamerovszkij/draw-your-font), ported by Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
+required_commands: [node, npx]
+metadata:
+  hermes:
+    tags: [font, handwriting, typography, ttf, woff, vision, creative]
+    category: creative
+    homepage: https://github.com/danilo-znamerovszkij/draw-your-font
+    related_skills: [pixel-art]
+---
+
+# draw-your-font
+
+Photo of handwritten letters in → installable font out. You do the seeing
+(find and label letters, judge quality); the CLI does all geometry (trace,
+metrics, font assembly). Never edit SVG paths or coordinates yourself.
+
+## Setup in Hermes (once per session)
+
+The CLI is the pinned npm package `draw-your-font@0.1.0` — run it via npx (Node ≥ 18 required, no global install needed):
+
+```bash
+npx -y draw-your-font@0.1.0 --help
+```
+
+Wherever the examples below show `$DYF`, use `npx -y draw-your-font@0.1.0`. Shell variables do not persist between tool calls, so paste the full command each time. Everything runs locally; the user's handwriting never leaves the machine.
+
+Photos arrive in Hermes either as a file path in the message or via the gateway image cache — use the actual file path with the CLI. When a photo lands in the conversation with no path, ask the user for the file (the CLI needs a real file, not your memory of the image).
+
+Do the visual steps (contact sheets, previews, glyph sheets) by loading the PNGs with `vision_analyze`.
+
+## Decide the flow
+
+- **User has no photo yet** → offer the template: print, write, photograph.
+- **User shares photo(s) of handwriting** → main flow below.
+- **User pasted an image but there is no file path** → you can see it, but the
+  CLI needs a file. Ask them to drag the image file into the terminal (that
+  inserts its path) or give the path directly. Do not proceed from memory.
+- **User wants changes to a font built this session** → Refine section.
+
+## Template flow (best quality)
+
+```bash
+$DYF template -o template.pdf --charset minimal   # or: spanish
+```
+
+Tell the user: print it, write one character per box with a dark pen
+(0.5 mm+), keep the letter sitting on the solid line, then photograph each
+page from above in good light and share the file paths. The grid prints in
+light grey and vanishes during processing - only their ink survives.
+
+## Main flow: photo(s) → font
+
+**1. Segment.** Works for template pages and freeform photos alike:
+
+```bash
+$DYF segment photo1.jpg photo2.jpg -d work
+```
+
+**2. Look, then label.** Load `work/contact-1.png` with `vision_analyze` (one per photo): every
+detected blob is numbered. This is the step where your eyes matter - check:
+
+- Did every written character get exactly one box? A letter drawn with
+  separate strokes may appear as two boxes (relabel handles it: give the main
+  box the character and mark the fragment `""`), and two touching letters may
+  share one box (ask the user to re-shoot just those, or accept the gap).
+- Junk boxes (shadows, ruled lines, smudges, page edges) → label them `""`.
+
+Then write `work/labels.json` mapping blob id → character, e.g.
+`{"0": "A", "1": "B", "7": "", "8": "a"}`:
+
+- Template page: order is the charset order printed on the template - verify
+  against the sheet instead of trusting it blindly. minimal order: A–Z, a–z,
+  0–9, then `.,;:!?'"-()@#&+/$`; spanish appends `ÑñÁÉÍÓÚáéíóúü¿¡`.
+- Freeform: identify each letter from the contact sheet. Uppercase vs
+  lowercase for shape-twins (S/s, O/o, C/c, X/x…) is decided by relative size
+  and position - compare against neighbors you're sure of.
+- The user told you what they wrote (e.g. "ABC then abc")? Trust it, map in
+  reading order (top row first, left to right), and verify visually.
+- Same letter appears twice → label the better-drawn one, `""` the other.
+
+**3. Build.**
+
+```bash
+$DYF build -d work --labels work/labels.json --name "Dan's Hand"
+```
+
+Name the font after the user (ask if unclear - one short question max).
+
+**4. Judge before delivering.** Load `work/preview.png` and `work/glyphs.png` with `vision_analyze`
+and critique like an art director:
+
+- Broken or blotchy letters (bad trace) → often a faint pen stroke; try
+  `--weight 1`, or ask for a re-shoot of just that letter.
+- Everything too thin/thick → rebuild with `--weight 1` / `--weight -1`.
+- Jagged edges → rebuild with `--smooth 1.5` (up to 2).
+- A letter placed wrong (e.g. a `g` not descending) → usually a mislabel;
+  fix labels.json and rebuild.
+- Filled-in bowls (b, o, g look solid): should never happen - if it does,
+  the crop is smudged; ask for a re-shoot.
+
+Rebuilds are cheap and safe to iterate. Fix what you can yourself first;
+only bother the user for re-shoots when the source ink is the problem.
+
+**5. Deliver.** The font lands at `<workdir>/<NameWithoutSpaces>.ttf` (the
+build output prints the exact path). Give that path and how to install:
+macOS - double-click → "Install Font"; Windows - right-click → "Install".
+Mention what's missing (the build prints uncovered letters) and offer,
+without pushing:
+
+- Web formats + CSS: rebuild with `--formats ttf,woff,woff2,css`.
+- A legibility read (below).
+- Their next photo to fill missing characters: re-run segment with ALL
+  photos (old and new) into a fresh workdir - `$DYF segment p1.jpg p2.jpg -d
+  work2` - then relabel from the new contact sheets (blob ids renumber; the
+  old labels.json does not carry over) and build from the new workdir.
+
+## Refine (conversational iteration)
+
+| User says | Do |
+|---|---|
+| "smoother / rounder" | `build … --smooth 1.5` (max 2) |
+| "thicker / bolder" | `build … --weight 1` (max 2) |
+| "thinner / lighter" | `build … --weight=-1` (negative needs the `=` form) |
+| "the g looks bad" | show them `work/crops/<id>.png` for that letter; offer re-shoot or smooth |
+| "wrong letter" / swap | edit labels.json, rebuild |
+| "give me woff2 / web" | `build … --formats ttf,woff,woff2,css` |
+| custom preview text | `$DYF preview -d work --text "…"` (after a build) |
+
+All refine commands rebuild from the stored crops - no re-photographing
+needed unless the ink itself is the problem.
+
+## Legibility report (offer after delivering)
+
+```bash
+$DYF preview -d work --text "minimum mill rn m cl d I l 1 O 0 quick brown fox" -o work/legibility.png
+```
+
+Read it and give an honest, kind read: a score out of 10 for body-text use,
+the 2–3 letter pairs most likely to confuse (rn→m, cl→d, I/l/1, O/0), and one
+or two concrete fixes (rewrite those letters larger, more spacing). Note that
+display use (headings, notes) is more forgiving than paragraphs. Never gate
+delivery on this - it's advice, not a blocker.
+
+## Troubleshooting
+
+Segmentation found far too many / too few blobs, grey guide lines surviving,
+shadow blobs, faint ballpoint strokes → see
+`references/troubleshooting.md`.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\draw-your-font\references\troubleshooting.md ===
+# Troubleshooting capture & segmentation
+
+The binarizer is adaptive (local background estimate) with two knobs on
+`segment`/`make`:
+
+- `--delta N` (default 40): how much darker than the local paper a pixel must
+  be to count as ink. Lower = more sensitive (catches faint pens, also more
+  noise). Raise to 55–70 for photos with heavy shadows misread as ink.
+- `--cap N` (default 165): absolute grey ceiling for ink after contrast
+  normalization. Anything lighter is never ink - this is what erases the
+  template's grey guides. Lower to 140 if printed guides survive into blobs;
+  raise to 190 for a very faint pencil (expect more noise).
+
+Re-running segment rewrites blobs.json and renumbers every blob - discard
+any labels.json written earlier and relabel from the fresh contact sheet
+(prefer a fresh `-d` workdir).
+
+## Symptoms → fixes
+
+**Hundreds of tiny blobs** - noisy paper texture or aggressive delta. Re-run
+segment with `--delta 55`. If the photo is low light, ask for a brighter shot.
+
+**A huge blob spanning the page** - a shadow edge or the page border got
+thresholded. Crop the photo to just the paper (or re-shoot from directly
+above), or raise `--delta`.
+
+**Letters missing entirely** - pen too faint (pencil, gel on glossy paper).
+Try `--delta 25 --cap 190`. If still missing, the honest fix is rewriting
+with a darker pen; say so.
+
+**Strokes broken into fragments** - thin ballpoint. Try `--delta 30`, then
+`build --weight 1` to fatten what traced. Recommend a 0.5mm+ pen for the
+re-shoot.
+
+**Two letters in one box** - they touch on paper. No code fix; ask the user
+to re-write just those letters with space between them, segment the new
+photo, and merge via labels.
+
+**Template guides appear as blobs** - printer printed the grey too dark.
+Re-run with `--cap 140`. If their printer only does solid black, they can
+still use the template - the guides will show as long thin blobs; label them
+all `""`.
+
+**i/j dots detached as separate blobs** - normally auto-merged; if the dot is
+very far from the stem it may not be. Label the stem blob with the letter and
+the dot `""` - or better, relabel both after a re-shoot. (A dotless i still
+reads fine in most handwriting.)
+
+**Rotated/skewed photo** - mild angles are fine and become part of the font's
+character. A strongly rotated photo (>5°) will slant every glyph; ask for a
+straighter shot rather than trying to compensate.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\dream-loop\LICENSE.txt ===
+MIT License
+
+Copyright (c) 2026 Anshu Chimala
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+

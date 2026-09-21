@@ -1,0 +1,277 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_single_query_session_finalize.py ===
+from types import SimpleNamespace
+
+import pytest
+
+import cli
+
+
+@pytest.fixture(autouse=True)
+def reset_single_query_finalize_state(monkeypatch):
+    monkeypatch.setattr(cli, "_single_query_finalize_attempted_session_ids", set())
+    monkeypatch.setattr(cli, "_cleanup_done", False)
+
+
+
+
+def test_finalize_single_query_releases_session_when_cleanup_fails(monkeypatch):
+    calls = []
+    fake_cli = SimpleNamespace(_release_active_session=lambda: calls.append("release"))
+
+    def cleanup(**kwargs):
+        calls.append("cleanup")
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        cli,
+        "_notify_single_query_session_finalize",
+        lambda _cli: calls.append("finalize"),
+    )
+    monkeypatch.setattr(cli, "_run_cleanup", cleanup)
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        cli._finalize_single_query(fake_cli)
+
+    assert calls == ["finalize", "cleanup", "release"]
+
+
+def test_finalize_single_query_runs_cleanup_when_finalize_hook_fails(monkeypatch):
+    calls = []
+    fake_agent = SimpleNamespace(session_id="agent-session", platform="cli")
+    fake_cli = SimpleNamespace(
+        agent=fake_agent,
+        session_id="cli-session",
+        _release_active_session=lambda: calls.append("release"),
+    )
+
+    def invoke_hook(name, **kwargs):
+        calls.append("finalize")
+        raise RuntimeError("hook failed")
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **kwargs: calls.append("cleanup"))
+
+    cli._finalize_single_query(fake_cli)
+
+    assert calls == ["finalize", "cleanup", "release"]
+
+
+
+
+def test_notify_single_query_session_finalize_uses_agent_session(monkeypatch):
+    calls = []
+    fake_agent = SimpleNamespace(session_id="agent-session", platform="cli")
+    fake_cli = SimpleNamespace(agent=fake_agent, session_id="cli-session")
+
+    def invoke_hook(name, **kwargs):
+        calls.append((name, kwargs))
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+
+    cli._notify_single_query_session_finalize(fake_cli)
+
+    assert calls == [
+        (
+            "on_session_finalize",
+            {
+                "session_id": "agent-session",
+                "platform": "cli",
+                "reason": "shutdown",
+            },
+        )
+    ]
+
+
+def test_human_single_query_main_finalizes_after_query(monkeypatch):
+    calls = []
+
+    import cli as cli_mod
+
+    class _Console:
+        def print(self, *_args, **_kwargs):
+            calls.append("query-label")
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = _Console()
+            self.session_id = "single-query-session"
+            self.agent = SimpleNamespace(
+                session_id="single-query-session",
+                platform="cli",
+            )
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            calls.append(("claim", surface, stderr))
+            return True
+
+        def _show_security_advisories(self):
+            calls.append("advisories")
+
+        def chat(self, query, images=None):
+            calls.append(("chat", query, images))
+            self._last_turn_result = {"final_response": "done", "completed": True}
+            return "done"
+
+        def _print_exit_summary(self, clear_screen=True):
+            calls.append("summary")
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
+    )
+
+    # The non-quiet one-shot path exits with the turn's outcome (0 here), like ``-Q``.
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    assert exc_info.value.code == 0
+    assert calls == [
+        ("claim", "cli", False),
+        "query-label",
+        "advisories",
+        ("chat", "hello", None),
+        "summary",
+        ("finalize", "single-query-session"),
+    ]
+
+
+def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
+    calls = []
+
+    import cli as cli_mod
+
+    def run_conversation(*, user_message, conversation_history):
+        calls.append(("run", user_message, conversation_history))
+        return {
+            "final_response": "",
+            "error": "provider failed",
+            "failed": True,
+        }
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.provider = "test-provider"
+            self.model = "test-model"
+            self.session_id = "quiet-session"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same-route"
+            self.agent = SimpleNamespace(
+                session_id="quiet-session",
+                platform="cli",
+                quiet_mode=False,
+                suppress_status_output=False,
+                stream_delta_callback=object(),
+                tool_gen_callback=object(),
+                run_conversation=run_conversation,
+            )
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            calls.append(("claim", surface, stderr))
+            return True
+
+        def _ensure_runtime_credentials(self):
+            calls.append("credentials")
+            return True
+
+        def _resolve_turn_agent_config(self, effective_query):
+            calls.append(("resolve", effective_query))
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **kwargs):
+            calls.append(("init", kwargs))
+            return True
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=True, toolsets="terminal")
+
+    assert exc_info.value.code == 1
+    assert ("claim", "cli", True) in calls
+    assert ("run", "hello", []) in calls
+    assert calls[-1] == ("finalize", "quiet-session")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sizefmt.py ===
+"""Tests for the shared byte formatter (hermes_cli.sizefmt).
+
+Consolidates six near-identical formatters (backup, checkpoints, doctor,
+update_cmd, context_references, curator_backup). The contract below locks
+the shared behavior, including the one deliberate change vs the old
+copies: a real TB tier (doctor/context_references/curator_backup
+previously rendered 1 TiB as '1024.0 GB').
+"""
+
+import pytest
+
+from hermes_cli.sizefmt import format_bytes
+
+
+@pytest.mark.parametrize(
+    "n,expected",
+    [
+        (0, "0 B"),
+        (1, "1 B"),
+        (512, "512 B"),
+        (1023, "1023 B"),
+        (1024, "1.0 KB"),
+        (1536, "1.5 KB"),
+        (1024**2, "1.0 MB"),
+        (1234567, "1.2 MB"),
+        (1024**3, "1.0 GB"),
+        (1024**4, "1.0 TB"),
+        (2 * 1024**4, "2.0 TB"),
+    ],
+)
+def test_format_bytes_tiers(n, expected):
+    assert format_bytes(n) == expected
+
+
+def test_format_bytes_tb_tier_not_gb_overflow():
+    """The old doctor/context_references/curator_backup copies topped out at
+    GB and rendered 1 TiB as '1024.0 GB' — the shared helper must not."""
+    assert "TB" in format_bytes(1024**4)
+    assert "1024" not in format_bytes(1024**4)
+
+
+def test_format_bytes_never_raises():
+    """Doctor's stats dict tolerates None in every field; the formatter must
+    render (not raise) for None/garbage."""
+    assert format_bytes(None) == "?"
+    assert format_bytes("garbage") == "?"
+    assert format_bytes("2048") == "2.0 KB"  # numeric strings accepted
+
+
+def test_migrated_sites_render_through_the_shared_helper():
+    """Behavior contract for the aliased call sites: the module-local names
+    must render byte-identically to the shared helper (how they delegate is
+    an implementation detail — only the rendering is pinned)."""
+    from hermes_cli.backup import _format_size as backup
+    from hermes_cli.checkpoints import _fmt_bytes as checkpoints
+    from hermes_cli.sizefmt import format_bytes as doctor
+
+    for n in (0, 512, 2048, 1234567, 1024**3, 1024**4):
+        expected = format_bytes(n)
+        assert backup(n) == expected
+        assert checkpoints(n) == expected
+        assert doctor(n) == expected
+

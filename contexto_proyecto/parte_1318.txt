@@ -1,0 +1,303 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\oss-forensics\references\investigation-templates.md ===
+# Investigation Templates
+
+Pre-built hypothesis and investigation templates for common supply chain attack scenarios.
+Each template includes: attack pattern, key evidence to collect, and hypothesis starters.
+
+---
+
+## Template 1: Maintainer Account Compromise
+
+**Pattern**: Attacker gains access to a legitimate maintainer account (phishing, credential stuffing)
+and uses it to push malicious code, create backdoored releases, or exfiltrate CI secrets.
+
+**Real-world examples**: XZ Utils (2024), Codecov (2021), event-stream (2018)
+
+**Key Evidence to Collect**:
+- [ ] Push events from maintainer account outside normal working hours/timezone
+- [ ] Commits adding new dependencies, obfuscated code, or modified build scripts
+- [ ] Release creation immediately after suspicious push (to maximize package distribution)
+- [ ] MemberEvent adding unknown collaborators (attacker adding backup access)
+- [ ] WorkflowRunEvent with unexpected secret access or exfiltration-like behavior
+- [ ] Account login location changes (check social media, conference talks for corroboration)
+
+**Hypothesis Starters**:
+```
+[HYPOTHESIS] Actor <HANDLE>'s account was compromised on or around <DATE>, 
+based on anomalous commit timing [EV-XXXX] and geographic access patterns [EV-YYYY].
+```
+```
+[HYPOTHESIS] Release <VERSION> was published by the compromised account to push 
+malicious code to downstream users, evidenced by the malicious commit [EV-XXXX] 
+being added <N> hours before the release [EV-YYYY].
+```
+
+---
+
+## Template 2: Malicious Dependency Injection
+
+**Pattern**: A trusted package is modified to include malicious code in a dependency,
+or a new malicious dependency is injected into an existing package.
+
+**Key Evidence to Collect**:
+- [ ] Diff of `package.json`/`requirements.txt`/`go.mod` before and after suspicious commit
+- [ ] The new dependency's publication timestamp vs. the injection commit timestamp
+- [ ] Whether the new dependency exists on npm/PyPI and who owns it
+- [ ] Any obfuscation patterns in the injected dependency code
+- [ ] Install-time scripts (`postinstall`, `setup.py`, etc.) that execute code on install
+
+**Hypothesis Starters**:
+```
+[HYPOTHESIS] Commit <SHA> [EV-XXXX] introduced dependency <PACKAGE@VERSION> 
+which appears to be a malicious package published by actor <HANDLE> [EV-YYYY], 
+designed to execute <BEHAVIOR> during installation.
+```
+
+---
+
+## Template 3: CI/CD Pipeline Injection
+
+**Pattern**: Attacker modifies GitHub Actions workflows to steal secrets, exfiltrate code,
+or inject malicious artifacts into the build output.
+
+**Key Evidence to Collect**:
+- [ ] Diff of all `.github/workflows/*.yml` files before/after suspicious period
+- [ ] WorkflowRunEvents triggered by the modified workflows
+- [ ] Any `curl`, `wget`, or network calls added to workflow steps
+- [ ] New or modified `env:` sections referencing `secrets.*`
+- [ ] Artifacts produced by modified workflow runs
+
+**Hypothesis Starters**:
+```
+[HYPOTHESIS] Workflow file <FILE> was modified in commit <SHA> [EV-XXXX] to 
+exfiltrate repository secrets via <METHOD>, as evidenced by the added network 
+call pattern [EV-YYYY].
+```
+
+---
+
+## Template 4: Typosquatting / Dependency Confusion
+
+**Pattern**: Attacker registers a package with a name similar to a popular package
+(or an internal package name) to intercept installs from users who mistype.
+
+**Key Evidence to Collect**:
+- [ ] Registration timestamp of the suspicious package on the registry
+- [ ] Package content: does it contain malicious code or is it a stub?
+- [ ] Download statistics for the suspicious package
+- [ ] Names of internal packages that could be targeted (if private repo scope)
+- [ ] Any references to the legitimate package in the malicious one's metadata
+
+**Hypothesis Starters**:
+```
+[HYPOTHESIS] Package <MALICIOUS_NAME> was registered on <DATE> [EV-XXXX] to 
+typosquat on <LEGITIMATE_NAME>, targeting users who misspell the package name. 
+The package contains <BEHAVIOR> [EV-YYYY].
+```
+
+---
+
+## Template 5: Force-Push History Rewrite (Evidence Erasure)
+
+**Pattern**: After a malicious commit is detected (or before wider notice), the attacker
+force-pushes to remove the malicious commit from branch history.
+
+**Detection is key** — this template focuses on proving the erasure happened.
+
+**Key Evidence to Collect**:
+- [ ] GH Archive PushEvent with `distinct_size=0` (force push indicator) [EV-XXXX]
+- [ ] The SHA of the commit BEFORE the force push (from GH Archive `payload.before`)
+- [ ] Recovery of the erased commit via direct URL or `git fetch origin SHA`
+- [ ] Wayback Machine snapshot of the commit page before erasure
+- [ ] Timeline gap in git log (N commits visible in archive but M < N in current repo)
+
+**Hypothesis Starters**:
+```
+[HYPOTHESIS] Actor <HANDLE> force-pushed branch <BRANCH> on <DATE> [EV-XXXX] 
+to erase commit <SHA> [EV-YYYY], which contained <MALICIOUS_CONTENT>. 
+The erased commit was recovered via <METHOD> [EV-ZZZZ].
+```
+
+---
+
+## Cross-Cutting Investigation Checklist
+
+Apply to every investigation regardless of template:
+
+- [ ] Check all contributors for newly created accounts (< 30 days old at time of malicious activity)
+- [ ] Check if any maintainer account changed email in the period (sign of account takeover)
+- [ ] Verify GPG signatures on suspicious commits match known maintainer keys
+- [ ] Check if the repository changed ownership or transferred orgs near the incident
+- [ ] Look for "cleanup" commits immediately after the malicious commit (cover-up pattern)
+- [ ] Check related packages/repos by the same author for similar patterns
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\oss-forensics\references\recovery-techniques.md ===
+# Deleted Content Recovery Techniques
+
+## Key Insight: GitHub Never Fully Deletes Force-Pushed Commits
+
+Force-pushed commits are removed from the branch history but REMAIN on GitHub's servers until garbage collection runs (which can take weeks to months). This is the foundation of deleted commit recovery.
+
+---
+
+## Method 1: Direct GitHub URL (Fastest — No Auth Required)
+
+If you have a commit SHA, access it directly even if it was force-pushed off a branch:
+
+```bash
+# View commit metadata
+curl -s "https://github.com/OWNER/REPO/commit/SHA"
+
+# Download as patch (includes full diff)
+curl -s "https://github.com/OWNER/REPO/commit/SHA.patch" > recovered_commit.patch
+
+# Download as diff
+curl -s "https://github.com/OWNER/REPO/commit/SHA.diff" > recovered_commit.diff
+
+# Example (Istio credential leak - real incident):
+curl -s "https://github.com/istio/istio/commit/FORCE_PUSHED_SHA.patch"
+```
+
+**When this works**: SHA is known (from GH Archive, Wayback Machine, or `git fsck`)
+**When this fails**: GitHub has already garbage-collected the object (rare, typically 30–90 days post-force-push)
+
+---
+
+## Method 2: GitHub REST API
+
+```bash
+# Works for commits force-pushed off branches but still on server
+# Note: /commits/SHA may 404, but /git/commits/SHA often succeeds for orphaned commits
+curl -s "https://api.github.com/repos/OWNER/REPO/git/commits/SHA" | jq .
+
+# Get the tree (file listing) of a force-pushed commit
+curl -s "https://api.github.com/repos/OWNER/REPO/git/trees/SHA?recursive=1" | jq .
+
+# Get a specific file from a force-pushed commit
+curl -s "https://api.github.com/repos/OWNER/REPO/contents/PATH?ref=SHA" | jq .content | base64 -d
+```
+
+---
+
+## Method 3: Git Fetch by SHA (Local — Requires Clone)
+
+```bash
+# Fetch an orphaned commit directly by SHA into local repo
+cd target_repo
+git fetch origin SHA
+git log FETCH_HEAD -1   # view the commit
+git diff FETCH_HEAD~1 FETCH_HEAD  # view the diff
+
+# If the SHA was recently force-pushed it will still be fetchable
+# This stops working once GitHub GC runs
+```
+
+---
+
+## Method 4: Dangling Commits via git fsck
+
+```bash
+cd target_repo
+
+# Find all unreachable objects (includes force-pushed commits)
+git fsck --unreachable --no-reflogs 2>&1 | grep "unreachable commit" | awk '{print $3}' > dangling_shas.txt
+
+# For each dangling commit, get its metadata
+while read sha; do
+  echo "=== $sha ===" >> dangling_details.txt
+  git show --stat "$sha" >> dangling_details.txt 2>&1
+done < dangling_shas.txt
+
+# Note: dangling objects only exist in LOCAL clone — not the same as GitHub's copies
+# GitHub's copies are accessible via Methods 1-3 until GC runs
+```
+
+---
+
+## Recovering Deleted GitHub Issues and PRs
+
+### Via Wayback Machine CDX API
+
+```bash
+# Find all archived snapshots of a specific issue
+curl -s "https://web.archive.org/cdx/search/cdx?url=github.com/OWNER/REPO/issues/NUMBER&output=json&limit=50&fl=timestamp,statuscode,original" | python3 -m json.tool
+
+# Fetch the best snapshot
+# Use the timestamp from the CDX result:
+# https://web.archive.org/web/TIMESTAMP/https://github.com/OWNER/REPO/issues/NUMBER
+curl -s "https://web.archive.org/web/TIMESTAMP/https://github.com/OWNER/REPO/issues/NUMBER" > issue_NUMBER_archived.html
+
+# Find all snapshots of the repo in a date range
+curl -s "https://web.archive.org/cdx/search/cdx?url=github.com/OWNER/REPO*&output=json&from=20240101&to=20240201&limit=200&fl=timestamp,urlkey,statuscode" | python3 -m json.tool
+```
+
+### Via GitHub API (Limited — Only Non-Deleted Content)
+
+```bash
+# Closed issues (not deleted) are retrievable
+curl -s "https://api.github.com/repos/OWNER/REPO/issues?state=closed&per_page=100" | jq '.[].number'
+
+# Note: DELETED issues/PRs do NOT appear in the API. Use Wayback Machine or GH Archive for those.
+```
+
+### Via GitHub Archive (For Event History — Not Content)
+
+```sql
+-- Find all IssueEvents for a repo in a date range
+SELECT created_at, actor.login, payload.action, payload.issue.number, payload.issue.title
+FROM `githubarchive.day.*`
+WHERE _TABLE_SUFFIX BETWEEN '20240101' AND '20240201'
+  AND type = 'IssuesEvent'
+  AND repo.name = 'OWNER/REPO'
+ORDER BY created_at
+```
+
+---
+
+## Recovering Deleted Files from a Known Commit
+
+```bash
+# If you have the commit SHA (even force-pushed):
+git show SHA:path/to/file.py > recovered_file.py
+
+# Or via API (base64 encoded content):
+curl -s "https://api.github.com/repos/OWNER/REPO/contents/path/to/file.py?ref=SHA" | python3 -c "
+import sys, json, base64
+d = json.load(sys.stdin)
+print(base64.b64decode(d['content']).decode())
+"
+```
+
+---
+
+## Evidence Recording
+
+After recovering any deleted content, immediately record it:
+
+```bash
+python3 SKILL_DIR/scripts/evidence-store.py --store evidence.json add \
+  --source "git fetch origin FORCE_PUSHED_SHA" \
+  --content "Recovered commit: FORCE_PUSHED_SHA | Author: attacker@example.com | Date: 2024-01-15 | Added file: malicious.sh" \
+  --type git \
+  --actor "attacker-handle" \
+  --url "https://github.com/OWNER/REPO/commit/FORCE_PUSHED_SHA.patch" \
+  --timestamp "2024-01-15T00:00:00Z" \
+  --verification single_source \
+  --notes "Commit force-pushed off main branch on 2024-01-16. Recovered via direct fetch."
+```
+
+---
+
+## Recovery Failure Modes
+
+| Failure | Cause | Workaround |
+|---------|-------|------------|
+| `git fetch origin SHA` returns "not our ref" | GitHub GC already ran | Try Method 1/2, search Wayback Machine |
+| `github.com/OWNER/REPO/commit/SHA` returns 404 | GC ran or SHA is wrong | Verify SHA via GH Archive; try partial SHA search |
+| Wayback Machine has no snapshots | Page was never crawled by IA | Check `commoncrawl.org`, check Google Cache |
+| BigQuery shows event but no content | GH Archive stores event metadata, not file contents | Recovery only reveals the event occurred, not the content |
+

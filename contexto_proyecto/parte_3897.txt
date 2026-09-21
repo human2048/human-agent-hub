@@ -1,0 +1,369 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\model_providers\test_upstage_profile.py ===
+"""Unit tests for the Upstage Solar provider profile.
+
+Upstage Solar is a plain OpenAI-compatible api-key provider, so this verifies
+the profile is registered correctly and wires the expected identity, endpoint,
+auth, and catalog fields — the contract every downstream layer (auth, models,
+doctor, runtime_provider, transport) reads from.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.fixture
+def upstage_profile():
+    """Resolve the registered Upstage profile via the provider registry.
+
+    Importing ``model_tools`` triggers plugin discovery, which registers the
+    Upstage profile. Going through ``get_provider_profile`` keeps the test
+    honest about the actual registration path (name + alias resolution).
+    """
+    import model_tools  # noqa: F401
+    import providers
+
+    profile = providers.get_provider_profile("upstage")
+    assert profile is not None, "upstage provider profile must be registered"
+    return profile
+
+
+class TestUpstageProfile:
+    def test_identity_and_endpoint(self, upstage_profile):
+        assert upstage_profile.name == "upstage"
+        assert upstage_profile.api_mode == "chat_completions"
+        assert upstage_profile.auth_type == "api_key"
+        assert upstage_profile.base_url == "https://api.upstage.ai/v1"
+        assert upstage_profile.get_hostname() == "api.upstage.ai"
+
+    def test_solar_alias_resolves(self):
+        import model_tools  # noqa: F401
+        import providers
+
+        assert providers.get_provider_profile("solar") is upstage_profile_singleton()
+
+    def test_env_vars(self, upstage_profile):
+        # API key first, optional base-url override second (priority order).
+        assert upstage_profile.env_vars == ("UPSTAGE_API_KEY", "UPSTAGE_BASE_URL")
+
+    def test_fallback_models_are_agentic_pro_only(self, upstage_profile):
+        # Only the agentic, tool-calling Solar Pro models belong in the offline
+        # catalog — Mini is capable but not agentic, so it's never promoted as a
+        # default. Live /v1/models still surfaces everything when a key is set.
+        # Behavior contract (not a frozen list): non-empty, no denied families.
+        assert upstage_profile.fallback_models
+        for denied in ("solar-mini", "syn-pro"):
+            assert not any(
+                denied in m for m in upstage_profile.fallback_models
+            ), f"non-agentic family {denied!r} must not be a fallback default"
+
+    def test_default_model_is_solar_pro3(self, upstage_profile):
+        # Entry [0] is the setup default (get_default_model_for_provider).
+        assert upstage_profile.fallback_models[0] == "solar-pro3"
+
+    def test_aux_model_left_empty(self, upstage_profile):
+        # Unset → auxiliary side tasks fall back to the user's main model.
+        assert upstage_profile.default_aux_model == ""
+
+
+class TestUpstageReasoning:
+    """``build_api_kwargs_extras`` wires Solar's top-level ``reasoning_effort``.
+
+    Solar Pro accepts ``reasoning_effort`` (minimal|low|medium|high, default
+    minimal=off) and never requires echoing ``reasoning_content`` back, so only
+    the request field is emitted — always top-level, never in extra_body.
+    """
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    def test_pro_explicit_effort_passes_through(self, upstage_profile, effort):
+        extra_body, top_level = upstage_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort}, model="solar-pro3"
+        )
+        assert extra_body == {}
+        assert top_level == {"reasoning_effort": effort}
+
+
+    def test_unknown_future_effort_collapses_to_high(self, upstage_profile):
+        # Guard against the #62650 recurrence: a future effort level Hermes
+        # adds above "high" must collapse to Solar's strongest, not silently
+        # downgrade to the medium default.
+        _, top_level = upstage_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "hyperthink"},
+            model="solar-pro3",
+        )
+        assert top_level == {"reasoning_effort": "high"}
+
+
+    def test_disabled_omits_field(self, upstage_profile):
+        # `/reasoning none` → enabled False → explicitly off.
+        _, top_level = upstage_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False, "effort": "high"}, model="solar-pro3"
+        )
+        assert top_level == {}
+
+    @pytest.mark.parametrize(
+        "model", ["solar-pro3", "solar-pro", "solar-open2", "solar-mini4", "solar-mini4-preview"]
+    )
+    def test_no_config_defaults_reasoning_on(self, upstage_profile, model):
+        # Unset reasoning_config → default ON at medium (matches the /reasoning
+        # "medium (default)" label), not Solar's server default of minimal/off.
+        _, top_level = upstage_profile.build_api_kwargs_extras(model=model)
+        assert top_level == {"reasoning_effort": "medium"}
+
+
+    @pytest.mark.parametrize(
+        "model", ["solar-mini", "solar-mini-250422", "solar-mini-202610", "solar-mini@q4", "syn-pro"]
+    )
+    def test_deny_listed_models_never_send_reasoning(self, upstage_profile, model):
+        # solar-mini / syn-pro ignore reasoning_effort, so never send it —
+        # even when the user explicitly enables reasoning. Later mini
+        # generations (solar-mini4) do reason and are not deny-listed.
+        extra_body, top_level = upstage_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"}, model=model
+        )
+        assert extra_body == {}
+        assert top_level == {}
+
+
+    def test_none_model_defaults_to_reasoning(self, upstage_profile):
+        # No model in context → treated as reasoning-capable, consistent with
+        # the provider default (fallback_models[0] == "solar-pro3").
+        _, top_level = upstage_profile.build_api_kwargs_extras(model=None)
+        assert top_level == {"reasoning_effort": "medium"}
+
+
+def upstage_profile_singleton():
+    import providers
+
+    return providers.get_provider_profile("upstage")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\model_providers\test_zai_profile.py ===
+"""Unit tests for the Z.AI / GLM provider profile's reasoning wiring.
+
+Z.AI's GLM-4.5-and-later chat models default to thinking-mode ON when the
+request omits ``thinking``.  Before the profile emitted the parameter,
+``reasoning_config = {"enabled": False}`` was a silent no-op on the direct
+Z.AI route — users who turned thinking off kept burning thinking tokens on
+every turn (the desktop "thinking reverts to medium" report).
+
+GLM-5.2 additionally exposes a native ``reasoning_effort`` knob with two
+enabled levels (high / max) on the OpenAI-compatible ``/api/paas/v4``
+endpoint; the Hermes effort scale is collapsed onto those.
+
+These tests pin the profile's wire-shape contract so Z.AI requests stay
+correctly shaped without going live.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.fixture
+def zai_profile():
+    """Resolve the registered Z.AI profile through the real discovery path."""
+    # ``model_tools`` triggers plugin discovery on import, which is what
+    # registers the Z.AI profile in the global provider registry.
+    import model_tools  # noqa: F401
+    import providers
+
+    profile = providers.get_provider_profile("zai")
+    assert profile is not None, "zai provider profile must be registered"
+    return profile
+
+
+class TestZaiThinkingWireShape:
+    """``build_api_kwargs_extras`` produces Z.AI's exact wire format."""
+
+    def test_no_preference_omits_thinking(self, zai_profile):
+        """No reasoning_config → omit ``thinking`` so the server default
+        applies (matches prior behavior for users with no preference)."""
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config=None, model="glm-5"
+        )
+        assert extra_body == {}
+        assert top_level == {}
+
+    def test_enabled_sends_enabled_marker(self, zai_profile):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"}, model="glm-5"
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {}
+
+    def test_explicitly_disabled_sends_disabled_marker(self, zai_profile):
+        """``reasoning_config.enabled=False`` → ``thinking.type=disabled``.
+
+        The crucial bit is that the parameter is *sent* at all — GLM defaults
+        to thinking-on when ``thinking`` is absent, so an unsent disable
+        burns thinking tokens forever.
+        """
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False}, model="glm-5"
+        )
+        assert extra_body == {"thinking": {"type": "disabled"}}
+        assert top_level == {}
+
+
+class TestZaiGLM52ReasoningEffort:
+    """GLM-5.2's native ``reasoning_effort`` knob (two enabled levels)."""
+
+    def test_high_maps_to_high(self, zai_profile):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="glm-5.2",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "high"}
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "minimal"])
+    def test_lower_efforts_clamp_up_to_high(self, zai_profile, effort):
+        """GLM-5.2's minimum thinking level is high — lower Hermes levels
+        clamp onto it."""
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort},
+            model="glm-5.2",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "high"}
+
+    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    def test_strong_efforts_map_to_max(self, zai_profile, effort):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort},
+            model="glm-5.2",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "max"}
+
+    def test_disabled_sends_no_effort(self, zai_profile):
+        """Disabled reasoning still sends the thinking-off marker but never
+        an effort level."""
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False, "effort": "high"},
+            model="glm-5.2",
+        )
+        assert extra_body == {"thinking": {"type": "disabled"}}
+        assert top_level == {}
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "z-ai/glm-5.2",
+            "glm-5-2",
+            "glm-5p2",
+            "accounts/fireworks/models/glm-5p2",
+            "zai-org-glm-5-2",
+        ],
+    )
+    def test_alias_spellings_recognized(self, zai_profile, model):
+        _, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "max"},
+            model=model,
+        )
+        assert top_level == {"reasoning_effort": "max"}
+
+    @pytest.mark.parametrize(
+        "model",
+        ["glm-5.1", "glm-5", "glm-4.7", "glm-4-9b", "", None],
+    )
+    def test_non_glm_5_2_models_get_no_effort(self, zai_profile, model):
+        _, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model=model,
+        )
+        assert top_level == {}
+
+
+class TestZaiGLM53ReasoningEffort:
+    """GLM-5.3's graded low/medium/high/max effort scale (issue #91789).
+
+    Verified live on api.z.ai/api/coding/paas/v4: all four levels accepted
+    with monotonic reasoning-token scaling. Unlike 5.2, low and medium must
+    reach the wire instead of clamping up to high.
+    """
+
+    @pytest.mark.parametrize(
+        ("effort", "expected"),
+        [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("xhigh", "max"),
+            ("minimal", "low"),
+        ],
+    )
+    def test_graded_efforts_pass_through(self, zai_profile, effort, expected):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort},
+            model="glm-5.3",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": expected}
+
+    @pytest.mark.parametrize(
+        "model",
+        ["z-ai/glm-5.3", "glm-5-3", "glm-5p3", "zai-org-glm-5-3"],
+    )
+    def test_alias_spellings_get_graded_scale(self, zai_profile, model):
+        _, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "low"},
+            model=model,
+        )
+        assert top_level == {"reasoning_effort": "low"}
+
+    def test_glm_5_2_still_clamps_low_to_high(self, zai_profile):
+        """The 5.3 widening must not leak into 5.2's two-level wire."""
+        _, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "low"},
+            model="glm-5.2",
+        )
+        assert top_level == {"reasoning_effort": "high"}
+
+
+class TestZaiModelGating:
+    """GLM 4.5+ get thinking; earlier GLM models are left untouched."""
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "glm-4.5",
+            "glm-4.5-air",
+            "glm-4.5-flash",
+            "glm-4.6",
+            "glm-5",
+            "glm-5.2",
+            "GLM-5",  # case-insensitive
+        ],
+    )
+    def test_thinking_capable_models_emit_thinking(self, zai_profile, model):
+        extra_body, _ = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False}, model=model
+        )
+        assert extra_body == {"thinking": {"type": "disabled"}}
+
+
+class TestZaiFullKwargsIntegration:
+    """End-to-end: the transport's full kwargs carry the reasoning wiring."""
+
+
+    def test_glm_5_2_effort_reaches_top_level(self, zai_profile):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        kwargs = ChatCompletionsTransport().build_kwargs(
+            model="glm-5.2",
+            messages=[{"role": "user", "content": "ping"}],
+            tools=None,
+            provider_profile=zai_profile,
+            reasoning_config={"enabled": True, "effort": "max"},
+            base_url="https://api.z.ai/api/paas/v4",
+            provider_name="zai",
+        )
+        assert kwargs["reasoning_effort"] == "max"
+        assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+

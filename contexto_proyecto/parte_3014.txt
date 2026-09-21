@@ -1,0 +1,204 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_ws_dial_happy_eyeballs.py ===
+"""Cold-start WebSocket dials race IPv6/IPv4 (#114265).
+
+``websockets.connect`` forwards unknown kwargs to ``loop.create_connection``, whose
+``happy_eyeballs_delay`` defaults to ``None`` (serial walk over getaddrinfo results). On a
+network with an advertised-but-blackholed IPv6 route every AAAA record burns the full
+connect timeout before IPv4 answers — the same stall class the bootstrap racer closes for
+sync connects. Each Hermes ``websockets.connect`` call site must pass the RFC 8305 delay.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+pytest.importorskip("websockets")
+
+EXPECTED_DELAY = 0.25
+
+
+class _Recorder:
+    def __init__(self):
+        self.kwargs = None
+
+    async def __call__(self, *_args, **kwargs):
+        self.kwargs = kwargs
+        raise ConnectionRefusedError("recorded")
+
+
+@pytest.mark.asyncio
+async def test_relay_ws_transport_dial_races_ipv6_ipv4(monkeypatch):
+    import gateway.relay.ws_transport as mod
+
+    rec = _Recorder()
+    monkeypatch.setattr(mod.websockets, "connect", rec)
+    t = mod.WebSocketRelayTransport("ws://unused", "discord", "bot", reconnect=False)
+    with pytest.raises(ConnectionRefusedError):
+        await t._dial_and_start()
+    assert rec.kwargs["happy_eyeballs_delay"] == EXPECTED_DELAY
+
+
+@pytest.mark.asyncio
+async def test_yuanbao_dial_races_ipv6_ipv4():
+    from gateway.platforms.yuanbao import ConnectionManager, YuanbaoAdapter
+
+    adapter = MagicMock(spec=YuanbaoAdapter)
+    adapter.name = "yuanbao"
+    adapter._bot_id = "b"
+    adapter._ws_url = "wss://test.example.com/ws"
+    cm = ConnectionManager(adapter)
+    rec = _Recorder()
+    with patch("gateway.platforms.yuanbao.websockets.connect", rec), pytest.raises(ConnectionRefusedError):
+        await cm._dial({"bot_id": "b", "token": "t"})
+    assert rec.kwargs["happy_eyeballs_delay"] == EXPECTED_DELAY
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_yolo_command.py ===
+"""Tests for gateway /yolo session scoping."""
+
+import os
+
+import pytest
+
+import gateway.run as gateway_run
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
+from tools.approval import disable_session_yolo, is_session_yolo_enabled
+
+
+@pytest.fixture(autouse=True)
+def _clean_yolo_state(monkeypatch):
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    disable_session_yolo("agent:main:telegram:dm:chat-a")
+    disable_session_yolo("agent:main:telegram:dm:chat-b")
+    yield
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    disable_session_yolo("agent:main:telegram:dm:chat-a")
+    disable_session_yolo("agent:main:telegram:dm:chat-b")
+
+
+def _make_runner():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = None
+    runner.config = None
+    return runner
+
+
+def _make_event(chat_id: str) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=f"user-{chat_id}",
+        chat_id=chat_id,
+        user_name="tester",
+        chat_type="dm",
+    )
+    return MessageEvent(text="/yolo", source=source)
+
+
+@pytest.mark.asyncio
+async def test_yolo_command_toggles_only_current_session(monkeypatch):
+    runner = _make_runner()
+
+    event_a = _make_event("chat-a")
+    session_a = runner._session_key_for_source(event_a.source)
+    session_b = runner._session_key_for_source(_make_event("chat-b").source)
+
+    result_on = await runner._handle_yolo_command(event_a)
+
+    assert "ON" in result_on
+    assert is_session_yolo_enabled(session_a) is True
+    assert is_session_yolo_enabled(session_b) is False
+    assert os.environ.get("HERMES_YOLO_MODE") is None
+
+    result_off = await runner._handle_yolo_command(event_a)
+
+    assert "OFF" in result_off
+    assert is_session_yolo_enabled(session_a) is False
+    assert os.environ.get("HERMES_YOLO_MODE") is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_yuanbao_forwarded_heartbeat.py ===
+"""ForwardedRecordsParseMiddleware must actually send its loading heartbeat.
+
+``_send_loading_heartbeat`` is a coroutine function. Calling it without
+``await`` builds a coroutine object and drops it, so the RUNNING heartbeat is
+never sent and Python raises "coroutine was never awaited" at collection time.
+Forwarded-record parsing is the slow inbound path, which is exactly where the
+user needs the loading bubble.
+"""
+
+import warnings
+
+import pytest
+
+from gateway.platforms.yuanbao import (
+    ForwardedRecordsParseMiddleware,
+    InboundContext,
+    WS_HEARTBEAT_RUNNING,
+)
+
+
+class _Heartbeat:
+    def __init__(self):
+        self.calls = []
+
+    async def send_heartbeat_once(self, chat_id, state):
+        self.calls.append((chat_id, state))
+
+
+class _Outbound:
+    def __init__(self):
+        self.heartbeat = _Heartbeat()
+
+
+class _Adapter:
+    name = "yuanbao"
+
+    def __init__(self):
+        self._outbound = _Outbound()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_records_send_the_loading_heartbeat():
+    adapter = _Adapter()
+    ctx = InboundContext(adapter=adapter)
+    ctx.chat_id = "chat-1"
+    ctx.forwarded_records = [{"msgContent": {"text": "hello"}}]
+
+    called = []
+
+    async def _next():
+        called.append(True)
+
+    with warnings.catch_warnings():
+        # A dropped coroutine surfaces here as a RuntimeWarning rather than a
+        # failure; promote it so the regression cannot pass silently.
+        warnings.simplefilter("error", RuntimeWarning)
+        await ForwardedRecordsParseMiddleware().handle(ctx, _next)
+
+    assert adapter._outbound.heartbeat.calls == [("chat-1", WS_HEARTBEAT_RUNNING)]
+    assert called, "middleware must still call next_fn"
+
+
+@pytest.mark.asyncio
+async def test_no_forwarded_records_sends_no_heartbeat():
+    adapter = _Adapter()
+    ctx = InboundContext(adapter=adapter)
+    ctx.chat_id = "chat-1"
+
+    async def _next():
+        pass
+
+    await ForwardedRecordsParseMiddleware().handle(ctx, _next)
+
+    assert adapter._outbound.heartbeat.calls == []
+

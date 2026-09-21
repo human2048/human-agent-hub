@@ -1,0 +1,308 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_loading_indicator.py ===
+"""Regression tests for loading feedback on slow slash commands."""
+
+from unittest.mock import patch
+
+from cli import HermesCLI
+
+
+class TestCLILoadingIndicator:
+    def _make_cli(self):
+        cli_obj = HermesCLI.__new__(HermesCLI)
+        cli_obj._app = None
+        cli_obj._last_invalidate = 0.0
+        cli_obj._command_running = False
+        cli_obj._command_status = ""
+        return cli_obj
+
+    def test_skills_command_sets_busy_state_and_prints_status(self, capsys):
+        cli_obj = self._make_cli()
+        seen = {}
+
+        def fake_handle(cmd: str):
+            seen["cmd"] = cmd
+            seen["running"] = cli_obj._command_running
+            seen["status"] = cli_obj._command_status
+            print("skills done")
+
+        with patch.object(cli_obj, "_handle_skills_command", side_effect=fake_handle), \
+             patch.object(cli_obj, "_invalidate") as invalidate_mock:
+            assert cli_obj.process_command("/skills search kubernetes")
+
+        output = capsys.readouterr().out
+        assert "⏳ Searching skills..." in output
+        assert "skills done" in output
+        assert seen == {
+            "cmd": "/skills search kubernetes",
+            "running": True,
+            "status": "Searching skills...",
+        }
+        assert cli_obj._command_running is False
+        assert cli_obj._command_status == ""
+        assert invalidate_mock.call_count == 2
+
+    def test_reload_mcp_sets_busy_state_and_prints_status(self, capsys):
+        cli_obj = self._make_cli()
+        seen = {}
+
+        def fake_reload():
+            seen["running"] = cli_obj._command_running
+            seen["status"] = cli_obj._command_status
+            print("reload done")
+
+        # /reload-mcp now wraps the actual reload in a prompt-cache-invalidation
+        # confirmation prompt (commit 4d7fc0f37).  This test exercises the
+        # loading-indicator path, not the confirmation UX, so pre-approve the
+        # reload via config so the handler goes straight into _reload_mcp().
+        fake_cfg = {"approvals": {"mcp_reload_confirm": False}}
+
+        with patch.object(cli_obj, "_reload_mcp", side_effect=fake_reload), \
+             patch.object(cli_obj, "_invalidate") as invalidate_mock, \
+             patch("cli.load_cli_config", return_value=fake_cfg):
+            assert cli_obj.process_command("/reload-mcp")
+
+        output = capsys.readouterr().out
+        assert "⏳ Reloading MCP servers..." in output
+        assert "reload done" in output
+        assert seen == {
+            "running": True,
+            "status": "Reloading MCP servers...",
+        }
+        assert cli_obj._command_running is False
+        assert cli_obj._command_status == ""
+        assert invalidate_mock.call_count == 2
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_manual_compress.py ===
+from contextlib import nullcontext
+
+from agent.conversation_compression import (
+    _queue_context_engine_compression_notification,
+)
+from cli import HermesCLI
+
+
+class DummyAgent:
+    def __init__(self):
+        self.compression_enabled = True
+        self._cached_system_prompt = "FULL CACHED SYSTEM PROMPT SHOULD NOT BE NESTED"
+        self.session_id = "new-session"
+        self.calls = []
+        self.flush_calls = []
+        self.flush_error = None
+        self.host_events = []
+        self.boundary_calls = []
+        self.context_compressor = type("ContextEngineStub", (), {})()
+        self.context_compressor.on_session_start = self._record_boundary
+
+    def _record_boundary(self, session_id, **kwargs):
+        self.host_events.append("notify")
+        self.boundary_calls.append((session_id, kwargs))
+
+    def _flush_messages_to_session_db(self, messages, _session_id=None):
+        self.host_events.append("persist")
+        self.flush_calls.append((list(messages), _session_id))
+        if self.flush_error is not None:
+            raise self.flush_error
+
+    def _compress_context(
+        self,
+        messages,
+        system_message,
+        *,
+        approx_tokens=None,
+        focus_topic=None,
+        force=False,
+        defer_context_engine_notification=False,
+        task_id="default",
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "system_message": system_message,
+                "approx_tokens": approx_tokens,
+                "focus_topic": focus_topic,
+                "force": force,
+                "defer_context_engine_notification": (
+                    defer_context_engine_notification
+                ),
+            }
+        )
+        if defer_context_engine_notification:
+            _queue_context_engine_compression_notification(
+                self,
+                new_session_id=self.session_id,
+                old_session_id="old-session",
+            )
+        return ([{"role": "user", "content": "[CONTEXT SUMMARY]: compacted"}], "new system prompt")
+
+
+def test_manual_compress_does_not_pass_cached_system_prompt(monkeypatch):
+    """Manual /compress should rebuild the next prompt without nesting the old one."""
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.conversation_history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    cli.agent = DummyAgent()
+    cli.session_id = "old-session"
+    cli._pending_title = "old title"
+    cli._busy_command = lambda _message, **_kwargs: nullcontext()
+
+    monkeypatch.setattr(
+        "agent.manual_compression_feedback.summarize_manual_compression",
+        lambda *args, **kwargs: {
+            "noop": False,
+            "headline": "compressed",
+            "token_line": "tokens reduced",
+            "note": "",
+        },
+    )
+
+    cli._manual_compress("/compress database schema")
+
+    assert len(cli.agent.calls) == 1
+    call = cli.agent.calls[0]
+    assert call["system_message"] is None
+    assert call["system_message"] != cli.agent._cached_system_prompt
+    assert call["focus_topic"] == "database schema"
+    assert cli.session_id == "new-session"
+    assert cli._pending_title is None
+    assert len(cli.agent.flush_calls) == 1
+    assert cli.agent.host_events == ["persist", "notify"]
+    assert len(cli.agent.boundary_calls) == 1
+
+
+def test_manual_compress_flush_failure_discards_notification(monkeypatch):
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.conversation_history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    cli.agent = DummyAgent()
+    cli.agent.flush_error = RuntimeError("synthetic child flush failure")
+    cli.session_id = "old-session"
+    cli._pending_title = "old title"
+    cli._busy_command = lambda _message, **_kwargs: nullcontext()
+
+    cli._manual_compress("/compress")
+
+    assert len(cli.agent.flush_calls) == 1
+    assert cli.agent.host_events == ["persist"]
+    assert cli.agent.boundary_calls == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_markdown_rendering.py ===
+from io import StringIO
+
+from rich.console import Console
+from rich.markdown import Markdown
+
+from cli import _render_final_assistant_content
+
+
+def _render_to_text(renderable) -> str:
+    buf = StringIO()
+    Console(file=buf, width=80, force_terminal=False, color_system=None).print(renderable)
+    return buf.getvalue()
+
+
+def test_final_assistant_content_uses_markdown_renderable():
+    renderable = _render_final_assistant_content("# Title\n\n- one\n- two")
+
+    assert isinstance(renderable, Markdown)
+    output = _render_to_text(renderable)
+    assert "Title" in output
+    assert "one" in output
+    assert "two" in output
+
+
+
+
+def test_final_assistant_content_keeps_non_path_markdown_escapes():
+    renderable = _render_final_assistant_content(r"1\. Not an ordered list")
+
+    output = _render_to_text(renderable)
+    assert "1. Not an ordered list" in output
+    assert r"1\." not in output
+
+
+
+
+
+
+def test_strip_mode_preserves_lists():
+    renderable = _render_final_assistant_content(
+        "**Formatting**\n- Ran prettier\n- Files changed\n- Verified clean",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "- Ran prettier" in output
+    assert "- Files changed" in output
+    assert "- Verified clean" in output
+    assert "**" not in output
+
+
+
+
+def test_strip_mode_preserves_blockquotes():
+    renderable = _render_final_assistant_content(
+        "> This is quoted text\n> Another quoted line",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "> This is quoted" in output
+    assert "> Another quoted" in output
+
+
+
+
+
+
+def test_strip_mode_preserves_cron_asterisks_in_plain_text():
+    renderable = _render_final_assistant_content("* * * * *", mode="strip")
+
+    output = _render_to_text(renderable)
+    assert "* * * * *" in output
+
+    # Still treat the canonical 3-asterisk Markdown horizontal rule as decoration.
+    renderable = _render_final_assistant_content("* * *", mode="strip")
+    output = _render_to_text(renderable)
+    assert "* * *" not in output
+
+
+
+
+def test_strip_mode_preserves_intraword_underscores_in_snake_case_identifiers():
+    renderable = _render_final_assistant_content(
+        "Let me look at test_case_with_underscores and SOME_CONST "
+        "then /tmp/snake_case_dir/file_with_name.py",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "test_case_with_underscores" in output
+    assert "SOME_CONST" in output
+    assert "snake_case_dir" in output
+    assert "file_with_name" in output
+
+
+def test_strip_mode_still_strips_boundary_underscore_emphasis():
+    renderable = _render_final_assistant_content(
+        "say _hi_ and __bold__ now",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "say hi and bold now" in output
+

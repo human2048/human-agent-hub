@@ -1,0 +1,399 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\README.md ===
+# Model Provider Plugins
+
+Each subdirectory is a self-contained provider profile plugin. The
+directory layout mirrors `plugins/platforms/`:
+
+```
+plugins/model-providers/
+├── openrouter/
+│   ├── __init__.py      # registers the ProviderProfile
+│   └── plugin.yaml      # manifest: name, kind, version, description
+├── anthropic/
+│   ├── __init__.py
+│   └── plugin.yaml
+└── ...
+```
+
+## How discovery works
+
+`providers/__init__.py._discover_providers()` scans this directory (and
+`$HERMES_HOME/plugins/model-providers/`) the first time anything calls
+`get_provider_profile()` or `list_providers()`. Each `__init__.py` is
+imported and expected to call `providers.register_provider(profile)`.
+
+User plugins at `$HERMES_HOME/plugins/model-providers/<name>/` override
+bundled plugins of the same name — last-writer-wins in
+`register_provider()`. Drop a file there to replace a built-in.
+
+## Adding a new provider
+
+1. Create `plugins/model-providers/<your_provider>/__init__.py`:
+
+   ```python
+   from providers import register_provider
+   from providers.base import ProviderProfile
+
+   my_provider = ProviderProfile(
+       name="your-provider",
+       aliases=("alias1", "alias2"),
+       display_name="Your Provider",
+       description="One-line description shown in the setup picker",
+       signup_url="https://your-provider.example.com/keys",
+       env_vars=("YOUR_PROVIDER_API_KEY", "YOUR_PROVIDER_BASE_URL"),
+       base_url="https://api.your-provider.example.com/v1",
+       default_aux_model="your-cheap-model",
+   )
+
+   register_provider(my_provider)
+   ```
+
+2. Create `plugins/model-providers/<your_provider>/plugin.yaml`:
+
+   ```yaml
+   name: your-provider-profile
+   kind: model-provider
+   version: 1.0.0
+   description: Short sentence about the provider
+   author: Your Name
+   ```
+
+Nothing else needs to change. `auth.py`, `config.py`, `models.py`,
+`doctor.py`, `model_metadata.py`, `runtime_provider.py`, and the
+chat_completions transport all auto-wire from the registry.
+
+## Non-trivial profiles
+
+Override the `ProviderProfile` hooks in a subclass for per-provider
+quirks — see `plugins/model-providers/openrouter/__init__.py` for
+`build_extra_body` and `build_api_kwargs_extras` examples, and
+`plugins/model-providers/gemini/__init__.py` for `thinking_config`
+translation.
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\actual\__init__.py ===
+"""Actual Computer provider profile."""
+
+import os
+import sys
+from typing import Any
+from urllib.parse import urlparse
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+DEFAULT_ACTUAL_BASE_URL = "https://api.actual.inc/v1"
+
+
+class ActualProfile(ProviderProfile):
+    """Actual Computer: hosted at api.actual.inc; local (offline-mode client)
+    inference opted into via model.base_url in config.yaml."""
+
+    def build_client_kwargs_extras(self, **context: Any) -> dict[str, Any]:
+        base_url = str(context.get("base_url") or self.base_url or "")
+        try:
+            hostname = (urlparse(base_url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return {}
+        if sys.platform != "darwin" or hostname != "api.actual.inc":
+            return {}
+        if any(
+            os.getenv(key)
+            for key in (
+                "HERMES_CA_BUNDLE",
+                "SSL_CERT_FILE",
+                "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE",
+            )
+        ):
+            return {}
+        import certifi
+
+        return {"ssl_ca_cert": certifi.where()}
+
+    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...] | None:
+        from agent.reasoning_effort import ACTUAL_RELAY_EFFORTS
+
+        return ACTUAL_RELAY_EFFORTS
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, **context: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(reasoning_config, dict):
+            return {}, {}
+        from agent.reasoning_effort import thinking_toggle_extras
+
+        # The relay accepts ``none`` as a real effort level: it switches thinking off AND
+        # is echoed as reasoning_effort, unlike the Moonshot/DeepSeek wires.
+        effort_none = str(reasoning_config.get("effort") or "").strip().lower() == "none"
+        if reasoning_config.get("enabled") is not False and effort_none:
+            return {"thinking": {"type": "disabled"}}, {"reasoning_effort": "none"}
+        supported = self.supported_reasoning_efforts(context.get("model")) or ()
+        return thinking_toggle_extras(reasoning_config, supported, always_emit_toggle=True)
+
+    def fetch_models(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ) -> list[str] | None:
+        """Use the selected route, then config.yaml, then the legacy environment override."""
+        from hermes_cli.auth import (
+            normalize_actual_base_url,
+            resolve_api_key_provider_credentials,
+        )
+
+        base_url = normalize_actual_base_url(
+            base_url or resolve_api_key_provider_credentials("actual")["base_url"]
+        )
+        return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
+
+
+actual = ActualProfile(
+    name="actual",
+    aliases=("actual-computer", "actualcomputer", "aci"),
+    display_name="Actual Computer",
+    description="Actual Computer - hosted inference via api.actual.inc, or local "
+    "offline inference via model.base_url in config.yaml",
+    signup_url="https://actual.inc",
+    env_vars=("ACTUAL_API_KEY",),
+    base_url=DEFAULT_ACTUAL_BASE_URL,
+    auth_type="api_key",
+    api_mode="chat_completions",
+)
+
+register_provider(actual)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\ai-gateway\__init__.py ===
+"""Vercel AI Gateway provider profile: attribution headers + reasoning passthrough."""
+
+from typing import Any
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class VercelAIGatewayProfile(ProviderProfile):
+    """Vercel AI Gateway — attribution headers + reasoning passthrough."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, supports_reasoning: bool = True, **ctx: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not supports_reasoning:
+            return {}, {}
+        reasoning = dict(reasoning_config) if reasoning_config is not None else {"enabled": True, "effort": "medium"}
+        return {"reasoning": reasoning}, {}
+
+
+vercel = VercelAIGatewayProfile(
+    name="ai-gateway", aliases=("vercel", "vercel-ai-gateway", "ai_gateway", "aigateway"),
+    env_vars=("AI_GATEWAY_API_KEY",), base_url="https://ai-gateway.vercel.sh/v1",
+    default_headers={"HTTP-Referer": "https://hermes-agent.nousresearch.com", "X-Title": "Hermes Agent"},
+    default_aux_model="google/gemini-3-flash",
+)
+
+register_provider(vercel)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\alibaba\__init__.py ===
+"""Alibaba Cloud DashScope provider profiles (intl + CN, plus the Model Studio
+Token Plan flat-token tier with its own key/endpoints — one module per vendor).
+
+Profile names match models.dev catalog keys exactly so model metadata lines up
+and ``model.provider: alibaba-cn`` resolves at runtime.
+"""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+alibaba = ProviderProfile(
+    name="alibaba", aliases=("dashscope", "alibaba-cloud", "qwen-dashscope", "aliyun"), env_vars=("DASHSCOPE_API_KEY",),
+    base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+)
+
+alibaba_cn = ProviderProfile(
+    name="alibaba-cn", aliases=("dashscope-cn", "alibaba-cloud-cn"),
+    display_name="Alibaba Cloud DashScope (China)",
+    description="Alibaba Cloud DashScope, mainland-China endpoint",
+    env_vars=("DASHSCOPE_API_KEY", "DASHSCOPE_CN_BASE_URL"),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+
+alibaba_token_plan = ProviderProfile(
+    name="alibaba-token-plan", aliases=("dashscope-token-plan",), display_name="Alibaba Cloud (Token Plan)",
+    description="Alibaba Cloud Model Studio Token Plan (flat-token tier)",
+    signup_url="https://help.aliyun.com/zh/model-studio/",
+    env_vars=("ALIBABA_TOKEN_PLAN_API_KEY", "ALIBABA_TOKEN_PLAN_BASE_URL"),
+    base_url="https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", auth_type="api_key",
+)
+
+alibaba_token_plan_cn = ProviderProfile(
+    name="alibaba-token-plan-cn", aliases=("dashscope-token-plan-cn",),
+    display_name="Alibaba Cloud (Token Plan, China)",
+    description="Alibaba Cloud Model Studio Token Plan, mainland-China endpoint",
+    signup_url="https://help.aliyun.com/zh/model-studio/",
+    env_vars=("ALIBABA_TOKEN_PLAN_CN_API_KEY", "ALIBABA_TOKEN_PLAN_API_KEY", "ALIBABA_TOKEN_PLAN_CN_BASE_URL"),
+    base_url="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", auth_type="api_key",
+)
+
+register_provider(alibaba)
+register_provider(alibaba_cn)
+register_provider(alibaba_token_plan)
+register_provider(alibaba_token_plan_cn)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\alibaba-coding-plan\__init__.py ===
+"""Alibaba Cloud Coding Plan provider profiles (intl + CN): a dedicated endpoint
+and key tier separate from ``alibaba``. Names match models.dev catalog keys.
+
+The CN profile checks its own key first and keeps the shared vars as ordered
+fallbacks so existing CN users configured with the shared key keep working.
+"""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+alibaba_coding_plan = ProviderProfile(
+    name="alibaba-coding-plan", aliases=("alibaba_coding", "alibaba-coding", "dashscope-coding"),
+    display_name="Alibaba Cloud (Coding Plan)",
+    description="Alibaba Cloud Coding Plan (Dedicated coding tier)",
+    signup_url="https://help.aliyun.com/zh/model-studio/",
+    env_vars=("ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "ALIBABA_CODING_PLAN_BASE_URL"),
+    base_url="https://coding-intl.dashscope.aliyuncs.com/v1", auth_type="api_key",
+)
+
+alibaba_coding_plan_cn = ProviderProfile(
+    name="alibaba-coding-plan-cn", aliases=("alibaba-coding-cn", "dashscope-coding-cn"),
+    display_name="Alibaba Cloud (Coding Plan, China)",
+    description="Alibaba Cloud Coding Plan, mainland-China endpoint",
+    signup_url="https://help.aliyun.com/zh/model-studio/",
+    env_vars=("ALIBABA_CODING_PLAN_CN_API_KEY", "ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "ALIBABA_CODING_PLAN_CN_BASE_URL"),
+    base_url="https://coding.dashscope.aliyuncs.com/v1", auth_type="api_key",
+)
+
+register_provider(alibaba_coding_plan)
+register_provider(alibaba_coding_plan_cn)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\anthropic\__init__.py ===
+"""Native Anthropic provider profile."""
+
+import json
+import logging
+import urllib.request
+
+from hermes_cli.urllib_security import open_credentialed_url
+from providers import register_provider
+from providers.base import ProviderProfile
+
+logger = logging.getLogger(__name__)
+
+
+class AnthropicProfile(ProviderProfile):
+    """Native Anthropic — uses x-api-key header, not Bearer."""
+
+    def fetch_models(
+        self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
+    ) -> list[str] | None:
+        """Anthropic uses x-api-key header and anthropic-version. ``/v1/models`` is cursor-paginated
+        (default page 20, smaller than the live catalog), so follow ``has_more``/``last_id``."""
+        if not api_key:
+            return None
+        from hermes_cli.models import _ANTHROPIC_MODELS_MAX_PAGES, _anthropic_models_url, _anthropic_next_cursor
+
+        def _page(after_id: str | None):
+            req = urllib.request.Request(_anthropic_models_url(base_url, after_id=after_id))
+            for k, v in (("x-api-key", api_key), ("anthropic-version", "2023-06-01"), ("Accept", "application/json")):
+                req.add_header(k, v)
+            with open_credentialed_url(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+
+        try:
+            models: list[str] = []
+            seen_cursors: set[str] = set()
+            cursor: str | None = None
+            for _ in range(_ANTHROPIC_MODELS_MAX_PAGES):
+                data = _page(cursor)
+                models.extend(m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m)
+                cursor = _anthropic_next_cursor(data, seen_cursors)
+                if cursor is None:
+                    break
+            return list(dict.fromkeys(models))
+        except Exception as exc:
+            logger.debug("fetch_models(anthropic): %s", exc)
+            return None
+
+
+anthropic = AnthropicProfile(
+    name="anthropic", aliases=("claude", "claude-oauth", "claude-code"), api_mode="anthropic_messages",
+    env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+    base_url="https://api.anthropic.com", auth_type="api_key", default_aux_model="claude-haiku-4-5-20251001",
+)
+
+register_provider(anthropic)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\arcee\__init__.py ===
+"""Arcee AI provider profile."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+arcee = ProviderProfile(
+    name="arcee", aliases=("arcee-ai", "arceeai"), env_vars=("ARCEEAI_API_KEY",),
+    base_url="https://api.arcee.ai/api/v1",
+)
+
+register_provider(arcee)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\azure-foundry\__init__.py ===
+"""Microsoft Foundry provider profile: OpenAI-compatible, per-resource base URL
+supplied by the user at setup."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+azure_foundry = ProviderProfile(
+    name="azure-foundry", aliases=("azure", "azure-ai-foundry", "azure-ai"), display_name="Azure Foundry",
+    description="Microsoft Foundry - OpenAI-compatible endpoint (user-supplied base URL)",
+    signup_url="https://ai.azure.com/", env_vars=("AZURE_FOUNDRY_API_KEY", "AZURE_FOUNDRY_BASE_URL"),
+    base_url="",  # per-resource; user provides at setup
+    auth_type="api_key",
+)
+
+register_provider(azure_foundry)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\bedrock\__init__.py ===
+"""AWS Bedrock provider profile."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class BedrockProfile(ProviderProfile):
+    """AWS Bedrock — no REST /v1/models endpoint; uses AWS SDK."""
+
+
+bedrock = BedrockProfile(
+    name="bedrock", aliases=("aws", "aws-bedrock", "amazon-bedrock", "amazon"), api_mode="bedrock_converse",
+    env_vars=(),  # AWS SDK credentials — not env vars
+    base_url="https://bedrock-runtime.us-east-1.amazonaws.com", auth_type="aws_sdk",
+    supports_model_listing=False,  # listing goes through the AWS SDK, not a REST call
+)
+
+register_provider(bedrock)
+

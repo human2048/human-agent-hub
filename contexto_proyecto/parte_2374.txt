@@ -1,0 +1,256 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\conftest.py ===
+"""Cron-test fixtures.
+
+Provides a default ``HERMES_MODEL`` for cron run_job tests so each one
+doesn't have to spell out a model. The global conftest blanks
+HERMES_MODEL hermetically; without this autouse fixture every cron test
+that exercises ``run_job`` would hit the fail-fast guard added in
+``cron/scheduler.py`` (see issue #23979) and have to be rewritten.
+
+Tests that specifically need ``HERMES_MODEL`` unset — model-resolution
+edge cases — call ``monkeypatch.delenv("HERMES_MODEL", raising=False)``
+inside the test, which overrides this fixture's value for that scope.
+"""
+
+import pytest
+
+
+@pytest.fixture()
+def make_cron_provider():
+    """Factory for minimal CronScheduler test doubles.
+
+    ``make_cron_provider(register_job=...)`` returns a real ``CronScheduler``
+    subclass instance whose ``register_job`` is the given callable — so tests
+    exercising the creation-registration contract share one stub instead of
+    redefining inline spy/failing classes, and an ABC rename breaks them
+    loudly instead of silently passing a duck-type.
+    """
+    from cron.scheduler_provider import CronScheduler
+
+    def _make(register_job=None, name="stub"):
+        class _StubProvider(CronScheduler):
+            @property
+            def name(self):  # pragma: no cover - trivial
+                return name
+
+            def start(self, stop_event, **kw):  # pragma: no cover - unused
+                pass
+
+            def register_job(self, job):
+                if register_job is not None:
+                    return register_job(job)
+                return None
+
+        return _StubProvider()
+
+    return _make
+
+
+@pytest.fixture(autouse=True)
+def _default_cron_test_model(monkeypatch):
+    """Pin a default HERMES_MODEL so cron run_job tests have a resolvable model."""
+    monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_context_vars():
+    """Restore session ContextVars around cron tests that call run_job directly.
+
+    Production confines each cron run to a copied context, but direct unit tests
+    share the pytest context. ``run_job`` intentionally clears ordinary session
+    variables to explicit empty values, which would otherwise shadow legacy env
+    fallbacks used by later approval tests in the same process.
+    """
+    from gateway.session_context import _UNSET, _VAR_MAP
+
+    def _reset_all():
+        for var in _VAR_MAP.values():
+            var.set(_UNSET)
+
+    _reset_all()
+    yield
+    _reset_all()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_agent_scheduling_gate.py ===
+"""Behavior contract for the cron.allow_agent_scheduling config gate.
+
+``_resolve_cron_disabled_toolsets`` decides which toolsets a cron-spawned
+agent must never receive. Historically ``cronjob`` was hard-denied there as
+loop-prevention policy. The ``cron.allow_agent_scheduling`` gate (config.yaml,
+default off) makes that denial opt-out-able:
+
+  - gate off / absent: byte-exact current behavior — ``cronjob`` denied.
+  - gate on: ``cronjob`` dropped from the base denylist; ``messaging`` and
+    ``clarify`` (interactivity constraints) are ALWAYS denied regardless of
+    the gate.
+  - user-level ``agent.disabled_toolsets`` still layers on top, so a user who
+    denies ``cronjob`` globally keeps it denied even with the gate on
+    (per-job enabled_toolsets can never widen past the config denylist).
+"""
+
+import pytest
+
+from cron.scheduler import _resolve_cron_disabled_toolsets
+
+
+# The toolsets that must be denied in cron context no matter what the
+# agent-scheduling gate says: messaging/clarify are interactive-only.
+# ``memory`` is intentionally NOT here — cron agents get memory like any
+# other agent run.
+ALWAYS_DISABLED = ["messaging", "clarify"]
+
+
+class TestGateOffDefault:
+    def test_empty_config_denies_cronjob(self):
+        assert _resolve_cron_disabled_toolsets({}) == [
+            "cronjob", "messaging", "clarify",
+        ]
+
+    def test_none_config_denies_cronjob(self):
+        assert _resolve_cron_disabled_toolsets(None) == [
+            "cronjob", "messaging", "clarify",
+        ]
+
+    def test_cron_section_present_but_gate_absent(self):
+        cfg = {"cron": {"preflight": True}}
+        assert _resolve_cron_disabled_toolsets(cfg) == [
+            "cronjob", "messaging", "clarify",
+        ]
+
+    def test_explicit_false_matches_default(self):
+        cfg = {"cron": {"allow_agent_scheduling": False}}
+        assert _resolve_cron_disabled_toolsets(cfg) == \
+            _resolve_cron_disabled_toolsets({})
+
+    @pytest.mark.parametrize("falsy", [False, None, "", 0])
+    def test_falsy_values_keep_gate_off(self, falsy):
+        cfg = {"cron": {"allow_agent_scheduling": falsy}}
+        disabled = _resolve_cron_disabled_toolsets(cfg)
+        assert "cronjob" in disabled
+
+
+class TestGateOn:
+    def test_cronjob_dropped_from_denylist(self):
+        cfg = {"cron": {"allow_agent_scheduling": True}}
+        disabled = _resolve_cron_disabled_toolsets(cfg)
+        assert "cronjob" not in disabled
+
+    def test_interactivity_denials_survive_the_gate(self):
+        cfg = {"cron": {"allow_agent_scheduling": True}}
+        disabled = _resolve_cron_disabled_toolsets(cfg)
+        for name in ALWAYS_DISABLED:
+            assert name in disabled
+
+    def test_memory_not_denied(self):
+        # Cron agents run with memory enabled like any other agent run
+        # (skip_memory=False); the toolset must not be policy-denied.
+        for cfg in ({}, {"cron": {"allow_agent_scheduling": True}}):
+            assert "memory" not in _resolve_cron_disabled_toolsets(cfg)
+
+    def test_user_denylist_wins_over_gate(self):
+        # A user who denies cronjob in agent.disabled_toolsets keeps it
+        # denied even with the gate on — the gate only removes the built-in
+        # policy denial, never the user's own config denylist.
+        cfg = {
+            "cron": {"allow_agent_scheduling": True},
+            "agent": {"disabled_toolsets": ["cronjob"]},
+        }
+        assert "cronjob" in _resolve_cron_disabled_toolsets(cfg)
+
+    def test_unrelated_user_denylist_layers_without_reviving_cronjob(self):
+        cfg = {
+            "cron": {"allow_agent_scheduling": True},
+            "agent": {"disabled_toolsets": ["browser"]},
+        }
+        disabled = _resolve_cron_disabled_toolsets(cfg)
+        assert "browser" in disabled
+        assert "cronjob" not in disabled
+
+
+class TestUserLayerUnchanged:
+    def test_user_denylist_still_layers_when_gate_off(self):
+        cfg = {"agent": {"disabled_toolsets": ["browser", "cronjob"]}}
+        disabled = _resolve_cron_disabled_toolsets(cfg)
+        assert "browser" in disabled
+        # No duplicate when the user names an already-denied toolset.
+        assert disabled.count("cronjob") == 1
+
+    def test_user_can_still_deny_memory_for_cron(self):
+        # Memory is no longer policy-denied, but a user-level denylist
+        # entry still applies to cron runs.
+        cfg = {"agent": {"disabled_toolsets": ["memory"]}}
+        assert "memory" in _resolve_cron_disabled_toolsets(cfg)
+
+    def test_blank_and_whitespace_entries_ignored(self):
+        cfg = {
+            "cron": {"allow_agent_scheduling": True},
+            "agent": {"disabled_toolsets": ["", "  ", "browser"]},
+        }
+        disabled = _resolve_cron_disabled_toolsets(cfg)
+        assert "browser" in disabled
+        assert "" not in disabled
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_atomic_paused_creation.py ===
+"""Creation is either armed normally or durably paused before registration."""
+import json
+
+from cron import jobs
+from tools import cronjob_tools
+
+
+def test_paused_creation_is_inert_until_operator_action(tmp_path, monkeypatch, make_cron_provider):
+    registered, writes = [], []
+    provider = make_cron_provider(register_job=lambda job: registered.append(job["id"]))
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: provider)
+    save = jobs.save_jobs
+
+    def observe(rows):
+        writes.append(json.loads(json.dumps(rows)))
+        return save(rows)
+
+    monkeypatch.setattr(jobs, "save_jobs", observe)
+    with jobs.use_cron_store(tmp_path / "cron"):
+        def create(**kwargs):
+            return json.loads(cronjob_tools.registry.dispatch("cronjob_manage", {
+                "action": "create", "schedule": "every 1h", "prompt": "canary", **kwargs}))
+
+        active = create()
+        assert active["success"] and active["job"]["enabled"]
+        paused = create(paused=True)
+        assert paused["success"], paused
+        job_id = paused["job_id"]
+        first = next(row for rows in writes for row in rows if row["id"] == job_id)
+        assert first["enabled"] is False and first["state"] == "paused"
+        assert first["paused_at"] and first["paused_reason"] and first["next_run_at"] is None
+        assert registered == [active["job_id"]]
+        assert job_id not in {row["id"] for row in jobs.get_due_jobs()}
+        assert jobs.claim_job_for_fire(job_id) is False
+        resumed = jobs.resume_job(job_id)
+        assert resumed["enabled"] and resumed["next_run_at"] and resumed["paused_reason"] is None
+        forced = create(paused=True, paused_reason="canary review")
+        assert jobs.claim_job_for_fire(forced["job_id"], force=True) is True
+
+
+def test_invalid_creation_is_rejected_without_writes(tmp_path):
+    with jobs.use_cron_store(tmp_path / "cron"):
+        for flags in ({"paused": "yes"}, {"paused": None}, {"paused": 1},
+                      {"paused_reason": "orphan"}, {"paused": True, "paused_reason": 123}):
+            result = json.loads(cronjob_tools.registry.dispatch("cronjob_manage", {
+                "action": "create", "schedule": "every 1h", "prompt": "invalid", **flags}))
+            assert result["success"] is False, (flags, result)
+            assert jobs.load_jobs() == []
+        from types import SimpleNamespace
+        from hermes_cli.main import cmd_cron
+
+        args = SimpleNamespace(cron_command="create", schedule="every 1h", prompt="invalid",
+                               paused=False, paused_reason="orphan")
+        assert cmd_cron(args) == 1
+        assert jobs.load_jobs() == []
+

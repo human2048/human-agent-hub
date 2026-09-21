@@ -1,0 +1,285 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subagent_dock_surface.py ===
+"""A passive dock paints a bounded surface without acquiring the editor."""
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.mark.parametrize('columns,rows,skin', [(100, 30, 'default'), (80, 20, 'daylight')])
+def test_passive_dock_fills_rows_but_keeps_input_live(monkeypatch, columns, rows, skin):
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.layout import HSplit, Layout
+    from prompt_toolkit.output import DummyOutput
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.widgets import TextArea
+    from hermes_cli.cli_subagent_monitor import install_dock
+    from hermes_cli import skin_engine
+
+    monkeypatch.setattr(skin_engine, '_active_skin', skin_engine.load_skin(skin))
+    cli = SimpleNamespace(agent=None)
+    install_dock(cli)
+    cli._subagent_monitor.entries = [dict(goal=f'Worker {i}', elapsed=12,
+        last_tool='terminal', status='running') for i in range(6)]
+    submitted = []
+    editor = TextArea(height=1, multiline=False,
+                      accept_handler=lambda buffer: submitted.append(buffer.text))
+    output = DummyOutput()
+    output.get_size = lambda: Size(rows=rows, columns=columns)
+
+    async def run():
+        with create_pipe_input() as pipe:
+            app = Application(layout=Layout(HSplit([cli._subagent_dock_widget, editor]),
+                focused_element=editor), input=pipe, output=output,
+                style=Style.from_dict(skin_engine.get_prompt_toolkit_style_overrides()))
+            painted = asyncio.Event()
+            app.after_render += lambda _: painted.set()
+            task = asyncio.create_task(app.run_async())
+            await asyncio.wait_for(painted.wait(), 3)
+            try:
+                screen = app.renderer._last_screen
+                dock_height = screen.visible_windows_to_write_positions[editor.window].ypos
+                assert 2 <= dock_height <= 6
+                for y in range(dock_height):
+                    assert screen.data_buffer[y][0].char == ' '
+                    for x in (0, columns // 2, columns - 1):
+                        attrs = app._merged_style.get_attrs_for_style_str(screen.data_buffer[y][x].style)
+                        assert attrs.bgcolor, 'the entire dock row needs a background'
+                        assert attrs.color != attrs.bgcolor
+                painted.clear()
+                pipe.send_text('Follow up while workers run\r')
+                await asyncio.wait_for(painted.wait(), 3)
+                assert submitted == ['Follow up while workers run']
+                assert app.layout.has_focus(editor)
+            finally:
+                app.exit()
+                await task
+    asyncio.run(run())
+
+
+def test_expanded_roster_reserves_activity_before_long_task_names():
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    from prompt_toolkit.utils import get_cwidth
+    from hermes_cli.cli_subagent_monitor import SubagentMonitor, build_monitor_application
+
+    monitor = SubagentMonitor(SimpleNamespace())
+    monitor.entries = [dict(subagent_id=str(i), goal='Inspect 界 ' * 30,
+        elapsed=24, status='running', last_tool='terminal') for i in range(6)]
+    monitor.selected_id = '0'
+    output = DummyOutput()
+    with create_pipe_input() as pipe:
+        for columns, rows in [(100, 30), (80, 20)]:
+            output.get_size = lambda: Size(rows=rows, columns=columns)
+            app = build_monitor_application(monitor, input=pipe, output=output)
+            fragments = app.layout.current_control.text()
+            assert len(fragments) == len(monitor.entries)
+            for _, text in fragments:
+                assert '24s' in text and 'running' in text and 'last: terminal' in text
+                assert get_cwidth(text.rstrip('\n')) == columns
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subagent_monitor.py ===
+"""The dock is bounded, session-owned, and only repaints changing live work."""
+from types import SimpleNamespace
+
+
+def test_dock_scopes_children_and_fits_short_narrow_terminal(monkeypatch):
+    from hermes_cli import cli_subagent_monitor as monitor
+    from tools import delegate_tool_registry as registry
+    owner = SimpleNamespace(session_id='owner')
+    monkeypatch.setattr(registry, '_active_subagents', {})
+    for i in range(8):
+        registry._register_subagent(dict(subagent_id=str(i), owner_agent_session_id='owner',
+            goal='Check 界' * 20, started_at=10, status='running', last_tool='read_file'))
+    registry._register_subagent(dict(subagent_id='foreign', owner_agent_session_id='other', goal='SECRET'))
+    dock = monitor.SubagentMonitor(SimpleNamespace(agent=owner))
+    assert dock.refresh(now=20)
+    text = dock.dock_text(columns=32, rows=14)
+    from prompt_toolkit.utils import get_cwidth
+    assert '8 live' in text and 'Ctrl+T' in text and 'read_file' in text
+    assert 'SECRET' not in text
+    assert len(text.splitlines()) <= 3
+    assert all(get_cwidth(line) <= 32 for line in text.splitlines())
+    assert not dock.refresh(now=20)
+    registry._active_subagents.clear()
+    assert dock.refresh(now=21)
+    assert dock.dock_text(columns=32, rows=14) == ''
+    assert not dock.refresh(now=22)
+    from hermes_cli.cli_tui_mixin import CLITuiMixin
+    cli = SimpleNamespace(_subagent_dock_widget='dock', _get_extra_tui_widgets=lambda: [])
+    children = CLITuiMixin._build_tui_layout_children(cli, sudo_widget=None, secret_widget=None,
+        approval_widget=None, clarify_widget=None, spacer='spacer', status_bar='status',
+        input_rule_top='top', image_bar=None, input_area='composer', input_rule_bot='bottom',
+        voice_status_bar=None, completions_menu=None)
+    assert children.index('dock') < children.index('status') < children.index('composer')
+
+
+def test_monitor_controls_recheck_ownership_and_keep_selection(monkeypatch):
+    from hermes_cli.cli_subagent_monitor import SubagentMonitor
+    from tools import delegate_tool_registry as registry
+    monkeypatch.setattr(registry, '_active_subagents', {})
+    delivered = []
+    child = SimpleNamespace(steer=lambda text: delivered.append(text) or True)
+    owner = SimpleNamespace(session_id='owner')
+    registry._register_subagent(dict(subagent_id='mine', owner_agent_session_id='owner',
+        goal='Check module', started_at=10, status='running', agent=child))
+    dock = SubagentMonitor(SimpleNamespace(agent=owner))
+    dock.refresh(now=20)
+    dock.select(1)
+    assert dock.selected['subagent_id'] == 'mine'
+    assert dock.control('steer', 'Focus on tests')['status'] == 'queued'
+    assert delivered == ['Focus on tests']
+    owner.session_id = 'different'
+    assert 'error' in dock.control('steer', 'must not arrive')
+    assert delivered == ['Focus on tests']
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subagent_monitor_prompts.py ===
+"""Blocking prompts reclaim input from the nested monitor without a keypress."""
+import asyncio
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.mark.parametrize('paint_source', ['modal', 'tick'])
+def test_prompt_paint_yields_monitor_but_ordinary_paint_does_not(monkeypatch, paint_source):
+    from hermes_cli.cli_subagent_monitor import SubagentMonitor, build_monitor_application, install_dock
+    from hermes_cli.cli_terminal_mixin import CLITerminalMixin
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    async def run():
+        for name in ('_approval_state', '_clarify_state', '_secret_state', '_sudo_state',
+                     '_slash_confirm_state'):
+            dock_cli = SimpleNamespace(agent=None)
+            install_dock(dock_cli)
+            dock_cli._subagent_monitor.entries = [{}]
+            assert dock_cli._subagent_dock_widget.filter()
+            setattr(dock_cli, name, {'pending': True})
+            assert not dock_cli._subagent_dock_widget.filter(), 'dock crowds the blocking prompt'
+            cli = SimpleNamespace(_app=None)
+            monitor = SubagentMonitor(cli)
+            cli._subagent_monitor = monitor
+            with create_pipe_input() as pipe:
+                app = build_monitor_application(monitor, input=pipe, output=DummyOutput())
+                monitor.app = app
+                rendered = asyncio.Event()
+                app.after_render += lambda app: rendered.set()
+                task = asyncio.create_task(app.run_async())
+                await asyncio.wait_for(rendered.wait(), 3)
+                try:
+                    rendered.clear()
+                    await asyncio.to_thread(CLITerminalMixin._paint_now, cli)
+                    await asyncio.wait_for(rendered.wait(), 3)
+                    assert not task.done(), 'ordinary paints must not dismiss the monitor'
+                    loop = asyncio.get_running_loop()
+                    ui_thread = threading.get_ident()
+                    stopped = threading.Event()
+                    task.add_done_callback(lambda _: stopped.set())
+                    schedule = loop.call_soon_threadsafe
+
+                    def schedule_with_teardown(callback, *args, **kwargs):
+                        handle = schedule(callback, *args, **kwargs)
+                        if (callback == app.on_invalidate.fire
+                                and threading.get_ident() != ui_thread):
+                            # Let an already-queued frame see the modal and finish
+                            # teardown while the worker is still in invalidate().
+                            schedule(app._redraw)
+                            assert stopped.wait(3), 'monitor did not finish teardown'
+                        return handle
+
+                    setattr(cli, name, {'pending': True})
+                    with monkeypatch.context() as patch:
+                        patch.setattr(loop, 'call_soon_threadsafe', schedule_with_teardown)
+                        if paint_source == 'tick':
+                            patch.setattr(monitor, 'refresh', lambda: True)
+                            await asyncio.to_thread(monitor.tick)
+                        else:
+                            await asyncio.to_thread(CLITerminalMixin._paint_now, cli)
+                    done, _ = await asyncio.wait({task}, timeout=1)
+                    assert task in done, f'{name} remained hidden behind the monitor'
+                    await task
+                finally:
+                    if not task.done():
+                        app.exit()
+                        await task
+    asyncio.run(run())
+
+
+def test_secret_callback_yields_monitor_and_restores_composer():
+    from hermes_cli.cli_subagent_monitor import SubagentMonitor, build_monitor_application
+    from hermes_cli.cli_terminal_mixin import CLITerminalMixin
+    from hermes_cli.cli_modal_mixin import CLIModalMixin
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    class CLI(CLIModalMixin, CLITerminalMixin):
+        def _ring_bell(self, **kwargs):
+            pass
+
+    async def run():
+        cli = CLI()
+        draft = Document('keep my draft', 4)
+        buffer = Buffer(document=draft)
+        cli._app = SimpleNamespace(current_buffer=buffer, invalidate=lambda: None)
+        cli._modal_input_snapshot = None
+        monitor = cli._subagent_monitor = SubagentMonitor(cli)
+        with create_pipe_input() as pipe:
+            monitor.app = build_monitor_application(monitor, input=pipe, output=DummyOutput())
+            rendered = asyncio.Event()
+            monitor.app.after_render += lambda app: rendered.set()
+            task = asyncio.create_task(monitor.app.run_async())
+            await asyncio.wait_for(rendered.wait(), 3)
+            callback = asyncio.create_task(asyncio.to_thread(
+                cli._secret_capture_callback, 'FIXTURE_SECRET', 'Owned fixture'))
+            try:
+                done, _ = await asyncio.wait({task}, timeout=1)
+                assert task in done, 'secret arrival did not immediately reclaim input'
+                assert buffer.text == '', 'draft must not be submitted as a secret'
+                cli._submit_secret_response('')
+                result = await asyncio.wait_for(callback, 3)
+                assert result['skipped']
+                assert buffer.document == draft
+            finally:
+                if not task.done():
+                    monitor.app.exit()
+                await task
+                if not callback.done():
+                    cli._submit_secret_response('')
+                    await callback
+    asyncio.run(run())
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subagent_monitor_resize.py ===
+"""A queued composer resize must not erase the alternate-screen monitor."""
+from types import SimpleNamespace
+
+
+def test_debounced_resize_does_not_write_over_subagent_monitor():
+    from hermes_cli.cli_terminal_mixin import CLITerminalMixin
+    writes = []
+    cli = SimpleNamespace(
+        _subagent_monitor=SimpleNamespace(opening=True),
+        _get_tui_terminal_width=lambda: 32,
+        _last_resize_width=90,
+        _clear_prompt_toolkit_screen=lambda *a, **kw: writes.append('erase'),
+        _redraw_rebuilds_scrollback=lambda: False,
+        _pet_queue_kitty_frame=lambda: None,
+        _schedule_status_bar_unsuppress=lambda app: writes.append('unsuppress'),
+    )
+    CLITerminalMixin._recover_after_resize(cli, SimpleNamespace(), lambda: writes.append('resize'))
+    assert writes == []
+

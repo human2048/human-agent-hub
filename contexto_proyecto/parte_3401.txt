@@ -1,0 +1,321 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_switch_persist_default.py ===
+"""Tests for session-scoped-by-default model switching.
+
+Covers:
+- ``parse_model_flags`` recognises ``--session`` (and keeps ``--global``).
+- ``resolve_persist_behavior`` applies the config-gated default and the
+  ``--session`` / ``--global`` overrides.
+- The default (no flags) is session-only, which is the user-facing fix: a
+  plain ``/model <name>`` affects only the current session unless the user
+  passes ``--global`` or sets ``model.persist_switch_by_default: true``.
+"""
+
+from unittest.mock import patch
+
+from hermes_cli.model_switch import parse_model_flags, resolve_persist_behavior
+
+
+# ---------------------------------------------------------------------------
+# parse_model_flags
+# ---------------------------------------------------------------------------
+
+
+class TestParseModelFlagsSession:
+    def test_no_flags(self):
+        assert parse_model_flags("sonnet") == ("sonnet", "", False, False, False)
+
+
+    def test_unicode_dash_session_normalized(self):
+        # Telegram/iOS auto-converts -- to en/em dashes.
+        assert parse_model_flags("sonnet \u2013session") == (
+            "sonnet",
+            "",
+            False,
+            False,
+            True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# resolve_persist_behavior
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePersistBehavior:
+    def test_session_flag_always_session_only(self):
+        # --session opts out even if the config default is True.
+        with _config({"model": {"persist_switch_by_default": True}}):
+            assert resolve_persist_behavior(False, True) is False
+
+
+    def test_no_provider_uses_config_default(self):
+        # No --provider → respects config default (True).
+        with _config({"model": {"persist_switch_by_default": True}}):
+            assert resolve_persist_behavior(False, False, explicit_provider="") is True
+
+    def test_first_pick_persists_then_session_only(self):
+        # #90235 / #86414: the ONE policy every surface (CLI, gateway, Desktop
+        # picker) defers to. With no default ever configured, the first pick
+        # persists (even with --provider, which is how the Desktop picker
+        # always sends it) so resolve_provider never falls through to a stray
+        # env key on restart. Once a default exists, a plain pick is
+        # session-only unless --global / persist_switch_by_default.
+        with _config({"model": {}}):
+            assert resolve_persist_behavior(False, False, explicit_provider="anthropic") is True
+        with _config({"model": ""}):
+            assert resolve_persist_behavior(False, False) is True
+        with _config({"model": {"default": "gpt-5.6", "provider": "openai-codex"}}):
+            assert resolve_persist_behavior(False, False, explicit_provider="openai-api") is False
+            assert resolve_persist_behavior(False, False) is False
+            assert resolve_persist_behavior(True, False, explicit_provider="openai-api") is True
+        with _config({"model": "gpt-5.6"}):
+            assert resolve_persist_behavior(False, False) is False
+
+
+# ---------------------------------------------------------------------------
+# helper
+# ---------------------------------------------------------------------------
+
+
+class _config:
+    """Context manager that patches ``load_config`` to return a fixed dict."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+
+    def __enter__(self):
+        self._patch = patch(
+            "hermes_cli.config.load_config",
+            return_value=self.cfg,
+        )
+        # resolve_persist_behavior imports load_config lazily inside the
+        # function, so patching the source module is sufficient.
+        self._patch.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._patch.stop()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_switch_reasoning_flag.py ===
+"""``/model <name> --reasoning <level>`` — one request carries a model pick AND its effort.
+
+The parser is the single owner (hermes_cli.model_switch.parse_model_switch_args); the CLI and
+TUI-gateway commit steps apply the effort AFTER the agent swap, because ``agent.switch_model``
+re-resolves ``reasoning_config`` from config.yaml and would clobber an earlier write.
+"""
+
+from types import SimpleNamespace
+
+from hermes_cli.model_switch import (
+    MODEL_SWITCH_ERR_BAD_REASONING,
+    ModelSwitchResult,
+    parse_model_switch_args,
+)
+
+
+def test_reasoning_flag_rides_with_the_pick_and_validates():
+    req = parse_model_switch_args("sonnet --provider anthropic --reasoning high --session")
+    assert req.target == "sonnet"
+    assert req.explicit_provider == "anthropic"
+    assert req.reasoning_effort == "high"
+    assert req.scope == "session"
+    assert req.errors == ()
+
+    bad = parse_model_switch_args("sonnet --reasoning turbo")
+    assert MODEL_SWITCH_ERR_BAD_REASONING in bad.errors
+    # Unicode dash normalization (Telegram/iOS) covers the new flag too.
+    assert parse_model_switch_args("sonnet \u2014reasoning low").reasoning_effort == "low"
+
+
+def test_cli_commit_applies_effort_after_the_agent_swap(monkeypatch):
+    """The agent's switch_model resets reasoning_config from config; the ride-along effort must
+    win over that reset, on both the CLI and the live agent."""
+    import cli as cli_mod
+    from hermes_cli import cli_model_switch_mixin as mixin
+
+    class _Agent:
+        reasoning_config = {"enabled": True, "effort": "medium"}
+
+        def switch_model(self, **_kw):
+            # Mirrors agent_runtime_helpers._switch_model: re-resolve from config.yaml.
+            self.reasoning_config = {"enabled": True, "effort": "medium"}
+
+    agent = _Agent()
+    cli = SimpleNamespace(
+        model="old", provider="nous", requested_provider="nous", _explicit_api_key="", _explicit_base_url="",
+        api_key="", base_url="", api_mode="", agent=agent, reasoning_config=None,
+        _pending_one_turn_model_restore=None, _pending_model_switch_note="",
+        _snapshot_model_runtime=lambda: {}, _persist_model_switch_to_session=lambda *_a: None)
+    cli._stage_and_swap_model = lambda result, old: cli_mod.HermesCLI._stage_and_swap_model(cli, result, old)
+    monkeypatch.setattr(mixin, "_print_switch_summary", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli_mod.HermesCLI, "_persist_model_switch_to_session", lambda *_a: None)
+    saved = {}
+    monkeypatch.setattr(cli_mod, "save_config_value", lambda k, v: saved.setdefault(k, v) or True)
+
+    result = ModelSwitchResult(success=True, new_model="new", target_provider="nous")
+    mixin._commit_model_switch(cli, result, persist_global=False, reasoning_effort="high")
+
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    assert cli.reasoning_config == {"enabled": True, "effort": "high"}
+    assert "agent.reasoning_effort" not in saved  # session scope: no config write
+
+    mixin._commit_model_switch(cli, result, persist_global=True, reasoning_effort="none")
+    assert saved.get("agent.reasoning_effort") == "none"
+    assert agent.reasoning_config == {"enabled": False}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_switch_reasoning_reresolve.py ===
+"""The CLI-level ``reasoning_config`` follows the model on every path that moves ``cli.model``.
+
+Startup resolves the effort once for the launch model; a lazily built agent (first message after
+``/model``, ``--resume``, ``/new``) inherits ``cli.reasoning_config`` verbatim. Leaving it stale sends
+the launch model's effort to the new model — always-thinking models that accept only their own level
+set reject that with a non-retryable HTTP 400 (#112921, #96012).
+"""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+
+_CFG = {
+    "agent": {"reasoning_effort": "medium", "reasoning_overrides": {"glm-5.3-flash": "high"}},
+    "model": {"provider": "custom:ark", "default": "deepseek-v4-flash"},
+}
+_MEDIUM = {"enabled": True, "effort": "medium"}
+_HIGH = {"enabled": True, "effort": "high"}
+
+
+def _cli(model, reasoning_config, agent=None):
+    return SimpleNamespace(
+        model=model, provider="custom:ark", requested_provider="custom:ark", api_key="k",
+        base_url="https://ark.example/v3", api_mode="chat_completions", _explicit_api_key=None,
+        _explicit_base_url=None, agent=agent, _explicit_model_override=False, _credential_pool=None,
+        reasoning_config=reasoning_config, _console_print=lambda *_a, **_k: None)
+
+
+def _result(model):
+    return SimpleNamespace(new_model=model, target_provider="custom:ark", api_key="k",
+                           base_url="https://ark.example/v3", api_mode="chat_completions", success=True)
+
+
+def test_switch_and_session_restore_re_resolve_effort_before_the_agent_exists():
+    import cli as cli_mod
+
+    with patch.dict(cli_mod.CLI_CONFIG, _CFG):
+        # /model glm-5.3-flash before the first message: per-model override wins.
+        cli = _cli("deepseek-v4-flash", _MEDIUM)
+        assert CLIModelSwitchMixin._stage_and_swap_model(cli, _result("glm-5.3-flash"), "deepseek-v4-flash")
+        assert cli.reasoning_config == _HIGH
+
+        # Control: switching back to a model without an override lands on the global effort.
+        assert CLIModelSwitchMixin._stage_and_swap_model(cli, _result("deepseek-v4-flash"), "glm-5.3-flash")
+        assert cli.reasoning_config == _MEDIUM
+
+        # --resume of a session stored on the override model, agent not built yet.
+        cli = _cli("deepseek-v4-flash", _MEDIUM)
+        CLIModelSwitchMixin._restore_session_model(
+            cli, {"model": "glm-5.3-flash", "model_config": {"gateway_runtime": {
+                "provider": "custom:ark", "base_url": "https://ark.example/v3", "api_mode": "chat_completions"}}},
+            quiet=True)
+        assert cli.model == "glm-5.3-flash"
+        assert cli.reasoning_config == _HIGH
+
+
+def test_failed_swap_and_new_session_keep_the_effort_with_the_route():
+    import cli as cli_mod
+    from hermes_cli.cli_session_mixin import CLISessionMixin
+
+    def _boom(**_kw):
+        raise RuntimeError("boom")
+
+    with patch.dict(cli_mod.CLI_CONFIG, _CFG):
+        # A failed in-place swap rolls reasoning_config back with the rest of the CLI route.
+        cli = _cli("deepseek-v4-flash", _MEDIUM, agent=SimpleNamespace(switch_model=_boom))
+        assert not CLIModelSwitchMixin._stage_and_swap_model(cli, _result("glm-5.3-flash"), "deepseek-v4-flash")
+        assert (cli.model, cli.reasoning_config) == ("deepseek-v4-flash", _MEDIUM)
+
+        # /new on a session whose config default carries an override: the default model's effort,
+        # not the bare global key, and a /reasoning session override does not carry over.
+        with patch.dict(cli_mod.CLI_CONFIG["model"], {"default": "glm-5.3-flash"}):
+            cli = _cli("glm-5.3-flash", {"enabled": False})
+            cli.conversation_history, cli.session_id, cli._session_db, cli._pending_title = [], "old", None, None
+            cli._resumed, cli._notify_session_boundary = False, lambda *_a, **_k: None
+            CLISessionMixin.new_session(cli, silent=True)
+        assert cli.reasoning_config == _HIGH
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_switch_user_provider_slug_verbatim.py ===
+"""A model the user selected on their own ``providers.<key>`` endpoint survives ``/model``
+verbatim — whether the slug arrives as ``custom:<key>`` or as the bare config key the Desktop
+picker rows carry. Its ``/v1/models`` listing is a hint: an id it lacks (a newer release, a dated
+snapshot) is soft-accepted, never rejected or swapped for a listed sibling (the Desktop picker
+kept "going back to deepseek 0731" because the bare-key spelling fell into the built-in
+live-listing branch, whose near-miss auto-correct rewrote ``deepseek-v4.1-flash``).
+
+Loopback ``/v1/models`` server; no mocks on the validation chain.
+"""
+
+import json
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.model_switch import switch_model
+
+LISTING = ["deepseek-v4-flash-0731", "deepseek-v4-flash", "deepseek-v4-pro"]
+
+
+class _Listing(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"data": [{"id": m} for m in LISTING]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+@pytest.fixture
+def endpoint(monkeypatch):
+    """Loopback listing + the ``providers.hyper`` block on disk (credential resolution reads
+    config.yaml, exactly as the gateway does)."""
+    srv = HTTPServer(("127.0.0.1", 0), _Listing)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base_url = f"http://127.0.0.1:{srv.server_port}/v1"
+    monkeypatch.setenv("HYPER_KEY", "test-key-12345")
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "model:\n  provider: custom:hyper\n  default: deepseek-v4-flash-0731\n"
+        f"providers:\n  hyper:\n    base_url: {base_url}\n    api_key_env: HYPER_KEY\n")
+    try:
+        yield base_url
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize("explicit_provider", ["hyper", "custom:hyper"])
+def test_unlisted_id_on_user_provider_is_kept_verbatim(endpoint, explicit_provider):
+    from hermes_cli.config import get_compatible_custom_providers, load_config
+
+    cfg = load_config()
+    result = switch_model(
+        raw_input="deepseek-v4.1-flash", explicit_provider=explicit_provider,
+        current_provider="custom:hyper", current_model=LISTING[0],
+        current_base_url=endpoint, current_api_key="test-key-12345",
+        user_providers=cfg["providers"], custom_providers=get_compatible_custom_providers(cfg))
+    assert result.success is True, result.error_message
+    assert result.new_model == "deepseek-v4.1-flash"
+    assert result.base_url == endpoint
+    assert "not found" in result.warning_message  # warned, not rewritten
+

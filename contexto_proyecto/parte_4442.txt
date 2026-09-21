@@ -1,0 +1,237 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_entry_picker_prewarm.py ===
+"""Regression test: the stdio TUI entry point prewarms the /model picker cache.
+
+The classic CLI run() loop calls ``prewarm_picker_cache_async()`` during the
+idle window after the banner, so the first ``/model`` open hits a warm
+provider-models disk cache. The stdio TUI entry point (``entry.main()``) never
+did — the first ``/model`` open in a TUI session blocked on serial /v1/models
+fetches for every authenticated provider (#72021).
+
+These tests pin the entrypoint wiring itself (the helper's own worker/once
+guard is covered in ``tests/hermes_cli/test_picker_prewarm.py``):
+
+- ``main()`` invokes ``hermes_cli.model_switch_providers.prewarm_picker_cache_async``
+  exactly once, AFTER the ``gateway.ready`` event is written (banner shown,
+  user about to type — the idle window the prewarm is meant to fill).
+- The startup path stays non-blocking: with the prewarm spied out, ``main()``
+  proceeds into the stdin read loop and returns normally on EOF.
+- A prewarm import/start failure is swallowed (fire-and-forget contract) and
+  must not prevent ``main()`` from reaching the read loop.
+
+Harness: same style as tests/tui_gateway/test_tui_entry_mcp_owner.py — import
+``tui_gateway.entry`` and monkeypatch its module attributes, running the real
+``main()`` with stubbed I/O collaborators (no subprocess, no real gateway).
+"""
+
+from __future__ import annotations
+
+import io
+
+import hermes_cli.model_switch as ms
+from tui_gateway import entry
+import hermes_cli.model_switch_providers
+from hermes_cli import model_switch_providers
+
+
+def _run_main(monkeypatch, events, *, prewarm=None):
+    """Run entry.main() with stubbed collaborators, recording ordering.
+
+    ``events`` receives ``("write", <event type>)`` for every write_json call
+    and ``("prewarm",)`` when the spy fires, in call order.
+    """
+    monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+    monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
+    monkeypatch.setattr(entry, "resolve_skin", lambda: "default")
+    monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(entry, "_log_exit", lambda reason: None)
+    # Genuine EOF, no fd-0 forensics in the test process.
+    monkeypatch.setattr(entry, "handle_spurious_eof", lambda *a: False)
+
+    def _write_json(payload):
+        params = payload.get("params") or {}
+        events.append(("write", params.get("type") or payload.get("method")))
+        return True
+
+    monkeypatch.setattr(entry, "write_json", _write_json)
+
+    # entry.main() imports the helper lazily from hermes_cli.model_switch,
+    # so the spy must live on that module, not on entry.
+    if prewarm is None:
+        def prewarm():
+            events.append(("prewarm",))
+            return None  # fire-and-forget handle; never blocks
+
+    monkeypatch.setattr(model_switch_providers, "prewarm_picker_cache_async", prewarm)
+
+    # Empty stdin -> immediate EOF -> main() returns after entering the loop.
+    monkeypatch.setattr(entry.sys, "stdin", io.StringIO(""))
+
+    entry.main()
+
+
+def test_main_prewarms_picker_cache_after_gateway_ready(monkeypatch):
+    """main() must call the prewarm helper once, after gateway.ready is
+    written, and still reach the stdin loop (returns on EOF = non-blocking)."""
+    events: list[tuple] = []
+
+    _run_main(monkeypatch, events)  # returning at all proves the loop was reached
+
+    prewarm_calls = [e for e in events if e[0] == "prewarm"]
+    assert len(prewarm_calls) == 1, (
+        f"main() must invoke prewarm_picker_cache_async exactly once, got {events!r}"
+    )
+
+    ready_idx = events.index(("write", "gateway.ready"))
+    prewarm_idx = events.index(("prewarm",))
+    assert ready_idx < prewarm_idx, (
+        "prewarm must fire AFTER the gateway.ready write (idle window, "
+        f"banner already shown); order was {events!r}"
+    )
+
+
+def test_main_survives_prewarm_failure(monkeypatch):
+    """Fire-and-forget contract: a prewarm that raises at start must be
+    swallowed and main() must still reach the read loop and exit cleanly."""
+    events: list[tuple] = []
+
+    def _boom():
+        events.append(("prewarm",))
+        raise RuntimeError("provider registry exploded")
+
+    _run_main(monkeypatch, events, prewarm=_boom)  # must not raise
+
+    assert ("prewarm",) in events
+    assert ("write", "gateway.ready") in events
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_entry_rpc_stdin_cloexec.py ===
+"""Regression coverage for the stdio gateway's child-process boundary."""
+
+import os
+import sys
+
+import pytest
+
+from tui_gateway import entry
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX close-on-exec semantics")
+def test_rpc_stdin_is_closed_before_a_bare_child_executes(monkeypatch):
+    """A child with no explicit stdin must not be able to consume RPC bytes."""
+    original_stdin = os.dup(0)
+    original_inheritable = os.get_inheritable(0)
+    reader, writer = os.pipe()
+    try:
+        os.dup2(reader, 0)
+        os.write(writer, b'{"method":"prompt.submit"}\n')
+        monkeypatch.setattr(entry.sys, "stdin", type("RpcStdin", (), {"fileno": lambda _: 0})())
+
+        entry._close_rpc_stdin_on_exec()
+
+        output_reader, output_writer = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.dup2(output_writer, 1)
+            os.close(output_reader)
+            os.close(output_writer)
+            os.execv(
+                sys.executable,
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; "
+                    "\ntry: os.read(0, 1)\n"
+                    "except OSError: print('stdin-closed')\n"
+                    "else: print('stdin-inherited')",
+                ],
+            )
+
+        os.close(output_writer)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert os.read(output_reader, 100) == b"stdin-closed\n"
+        os.close(output_reader)
+    finally:
+        os.dup2(original_stdin, 0, inheritable=original_inheritable)
+        os.close(original_stdin)
+        os.close(reader)
+        os.close(writer)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_entry_sys_path.py ===
+"""Tests for tui_gateway/entry.py sys.path hardening (issues #15989, #51286).
+
+When the TUI backend is spawned by Node.js, the launch directory may shadow
+Hermes's own top-level modules (``utils``, ``proxy``, ``ui``).  entry.py must
+neutralize this before any non-stdlib import is resolved, by delegating to the
+shared ``hermes_bootstrap.harden_import_path`` guard.
+
+These tests assert the entry point wires up the real guard (rather than
+re-implementing it inline) and that the guard's behavior covers both the
+relative-cwd form and the absolute-cwd-path form that was the actual #51286
+failure.
+"""
+
+import ast
+import pathlib
+
+import hermes_bootstrap
+
+
+def _entry_source() -> str:
+    here = pathlib.Path(__file__).resolve()
+    repo_root = here.parent.parent.parent  # tests/tui_gateway/ -> repo root
+    return (repo_root / "tui_gateway" / "entry.py").read_text(encoding="utf-8")
+
+
+def test_entry_calls_shared_harden_guard_before_heavy_imports():
+    """entry.py must call hermes_bootstrap.harden_import_path() before it
+    imports tui_gateway.server (which pulls ``from utils import ...``)."""
+    source = _entry_source()
+    tree = ast.parse(source)
+
+    harden_call_line = None
+    server_import_line = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "harden_import_path"
+        ):
+            harden_call_line = node.lineno
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+            "tui_gateway"
+        ):
+            if server_import_line is None:
+                server_import_line = node.lineno
+
+    assert harden_call_line is not None, (
+        "entry.py must call hermes_bootstrap.harden_import_path()"
+    )
+    assert server_import_line is not None, "entry.py must import from tui_gateway"
+    assert harden_call_line < server_import_line, (
+        "harden_import_path() must run before tui_gateway.server is imported"
+    )
+
+
+def test_guard_handles_absolute_cwd_path():
+    """The #51286 case: the launch dir is on sys.path as its own absolute
+    path, ahead of the Hermes root.  harden_import_path must relocate the
+    Hermes root to the front so ``from utils import ...`` resolves to Hermes."""
+    import sys
+
+    original = sys.path[:]
+    try:
+        sys.path[:] = ["/home/user/tg-ws-proxy", "/opt/hermes", "/usr/lib"]
+        hermes_bootstrap.harden_import_path(src_root="/opt/hermes")
+        assert sys.path[0] == "/opt/hermes"
+        assert sys.path.index("/opt/hermes") < sys.path.index(
+            "/home/user/tg-ws-proxy"
+        )
+    finally:
+        sys.path[:] = original
+

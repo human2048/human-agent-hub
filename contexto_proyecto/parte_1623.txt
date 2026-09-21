@@ -1,0 +1,481 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\analysis-framework.md ===
+# Infographic Content Analysis Framework
+
+Deep analysis framework applying instructional design principles to infographic creation.
+
+## Purpose
+
+Before creating an infographic, thoroughly analyze the source material to:
+- Understand the content at a deep level
+- Identify clear learning objectives for the viewer
+- Structure information for maximum clarity and retention
+- Match content to optimal layout×style combinations
+- Preserve all source data verbatim
+
+## Instructional Design Mindset
+
+Approach content analysis as a **world-class instructional designer**:
+
+| Principle | Application |
+|-----------|-------------|
+| **Deep Understanding** | Read the entire document before analyzing any part |
+| **Learner-Centered** | Focus on what the viewer needs to understand |
+| **Visual Storytelling** | Use visuals to communicate, not just decorate |
+| **Cognitive Load** | Simplify complex ideas without losing accuracy |
+| **Data Integrity** | Never alter, summarize, or paraphrase source facts |
+
+## Analysis Dimensions
+
+### 1. Content Type Classification
+
+| Type | Characteristics | Best Layout | Best Style |
+|------|-----------------|-------------|------------|
+| **Timeline/History** | Sequential events, dates, progression | linear-progression | craft-handmade, aged-academia |
+| **Process/Tutorial** | Step-by-step instructions, how-to | linear-progression, winding-roadmap | ikea-manual, technical-schematic |
+| **Comparison** | A vs B, pros/cons, before-after | binary-comparison, comparison-matrix | corporate-memphis, bold-graphic |
+| **Hierarchy** | Levels, priorities, pyramids | hierarchical-layers, tree-branching | craft-handmade, corporate-memphis |
+| **Relationships** | Connections, overlaps, influences | venn-diagram, hub-spoke, jigsaw | craft-handmade, subway-map |
+| **Data/Metrics** | Statistics, KPIs, measurements | dashboard, periodic-table | corporate-memphis, technical-schematic |
+| **Cycle/Loop** | Recurring processes, feedback loops | circular-flow | craft-handmade, technical-schematic |
+| **System/Structure** | Components, architecture, anatomy | structural-breakdown, bento-grid | technical-schematic, ikea-manual |
+| **Journey/Narrative** | Stories, user flows, milestones | winding-roadmap, story-mountain | storybook-watercolor, comic-strip |
+| **Overview/Summary** | Multiple topics, feature highlights | bento-grid, periodic-table, dense-modules | chalkboard, bold-graphic |
+| **Product/Buying Guide** | Multi-dimension comparisons, specs, pitfalls | dense-modules | morandi-journal, pop-laboratory, retro-pop-grid |
+
+### 2. Learning Objective Identification
+
+Every infographic should have 1-3 clear learning objectives.
+
+**Good Learning Objectives**:
+- Specific and measurable
+- Focus on what the viewer will understand, not just see
+- Written from the viewer's perspective
+
+**Format**: "After viewing this infographic, the viewer will understand..."
+
+| Content Aspect | Objective Type |
+|----------------|----------------|
+| Core concept | "...what [topic] is and why it matters" |
+| Process | "...how to [accomplish something]" |
+| Comparison | "...the key differences between [A] and [B]" |
+| Relationships | "...how [elements] connect to each other" |
+| Data | "...the significance of [key statistics]" |
+
+### 3. Audience Analysis
+
+| Factor | Questions | Impact |
+|--------|-----------|--------|
+| **Knowledge Level** | What do they already know? | Determines complexity depth |
+| **Context** | Why are they viewing this? | Determines emphasis points |
+| **Expectations** | What do they hope to learn? | Determines success criteria |
+| **Visual Preferences** | Professional, playful, technical? | Influences style choice |
+
+### 4. Complexity Assessment
+
+| Level | Indicators | Layout Recommendation |
+|-------|------------|----------------------|
+| **Simple** (3-5 points) | Few main concepts, clear relationships | sparse layouts, single focus |
+| **Moderate** (6-8 points) | Multiple concepts, some relationships | balanced layouts, clear sections |
+| **Complex** (9+ points) | Many concepts, intricate relationships | dense layouts, multiple sections |
+
+### 5. Visual Opportunity Mapping
+
+Identify what can be shown rather than told:
+
+| Content Element | Visual Treatment |
+|-----------------|------------------|
+| Numbers/Statistics | Large, highlighted numerals |
+| Comparisons | Side-by-side, split screen |
+| Processes | Arrows, numbered steps, flow |
+| Hierarchies | Pyramids, layers, size differences |
+| Relationships | Lines, connections, overlapping shapes |
+| Categories | Color coding, grouping, sections |
+| Timelines | Horizontal/vertical progression |
+| Quotes | Callout boxes, quotation marks |
+
+### 6. Data Verbatim Extraction
+
+**Critical**: All factual information must be preserved exactly as written in the source.
+
+| Data Type | Handling Rule |
+|-----------|---------------|
+| **Statistics** | Copy exactly: "73%" not "about 70%" |
+| **Quotes** | Copy word-for-word with attribution |
+| **Names** | Preserve exact spelling |
+| **Dates** | Keep original format |
+| **Technical Terms** | Do not simplify or substitute |
+| **Lists** | Preserve order and wording |
+
+**Never**:
+- Round numbers
+- Paraphrase quotes
+- Substitute simpler words
+- Add implied information
+- Remove context that affects meaning
+
+## Output Format
+
+Save analysis results to `analysis.md`:
+
+```yaml
+---
+title: "[Main topic title]"
+topic: "[educational/technical/business/creative/etc.]"
+data_type: "[timeline/hierarchy/comparison/process/etc.]"
+complexity: "[simple/moderate/complex]"
+point_count: [number of main points]
+source_language: "[detected language]"
+user_language: "[user's language]"
+---
+
+## Main Topic
+[1-2 sentence summary of what this content is about]
+
+## Learning Objectives
+After viewing this infographic, the viewer should understand:
+1. [Primary objective]
+2. [Secondary objective]
+3. [Tertiary objective if applicable]
+
+## Target Audience
+- **Knowledge Level**: [Beginner/Intermediate/Expert]
+- **Context**: [Why they're viewing this]
+- **Expectations**: [What they hope to learn]
+
+## Content Type Analysis
+- **Data Structure**: [How information relates to itself]
+- **Key Relationships**: [What connects to what]
+- **Visual Opportunities**: [What can be shown rather than told]
+
+## Key Data Points (Verbatim)
+[All statistics, quotes, and critical facts exactly as they appear in source]
+- "[Exact data point 1]"
+- "[Exact data point 2]"
+- "[Exact quote with attribution]"
+
+## Layout × Style Signals
+- Content type: [type] → suggests [layout]
+- Tone: [tone] → suggests [style]
+- Audience: [audience] → suggests [style]
+- Complexity: [level] → suggests [layout density]
+
+## Design Instructions (from user input)
+[Any style, color, layout, or visual preferences extracted from user's steering prompt]
+
+## Recommended Combinations
+1. **[Layout] + [Style]** (Recommended): [Brief rationale]
+2. **[Layout] + [Style]**: [Brief rationale]
+3. **[Layout] + [Style]**: [Brief rationale]
+```
+
+## Analysis Checklist
+
+Before proceeding to structured content generation:
+
+- [ ] Have I read the entire source document?
+- [ ] Can I summarize the main topic in 1-2 sentences?
+- [ ] Have I identified 1-3 clear learning objectives?
+- [ ] Do I understand the target audience?
+- [ ] Have I classified the content type correctly?
+- [ ] Have I extracted all data points verbatim?
+- [ ] Have I identified visual opportunities?
+- [ ] Have I extracted design instructions from user input?
+- [ ] Have I recommended 3 layout×style combinations?
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\base-prompt.md ===
+Create a professional infographic following these specifications:
+
+## Image Specifications
+
+- **Type**: Infographic
+- **Layout**: {{LAYOUT}}
+- **Style**: {{STYLE}}
+- **Aspect Ratio**: {{ASPECT_RATIO}}
+- **Language**: {{LANGUAGE}}
+
+## Core Principles
+
+- Follow the layout structure precisely for information architecture
+- Apply style aesthetics consistently throughout
+- If content involves sensitive or copyrighted figures, create stylistically similar alternatives
+- Keep information concise, highlight keywords and core concepts
+- Use ample whitespace for visual clarity
+- Maintain clear visual hierarchy
+
+## Text Requirements
+
+- All text must match the specified style treatment
+- Main titles should be prominent and readable
+- Key concepts should be visually emphasized
+- Labels should be clear and appropriately sized
+- Use the specified language for all text content
+
+## Layout Guidelines
+
+{{LAYOUT_GUIDELINES}}
+
+## Style Guidelines
+
+{{STYLE_GUIDELINES}}
+
+---
+
+Generate the infographic based on the content below:
+
+{{CONTENT}}
+
+Text labels (in {{LANGUAGE}}):
+{{TEXT_LABELS}}
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\structured-content-template.md ===
+# Structured Content Template
+
+Template for generating structured infographic content that informs the visual designer.
+
+## Purpose
+
+This document bridges content analysis and visual design:
+- Transforms source material into designer-ready format
+- Organizes learning objectives into visual sections
+- Preserves all source data verbatim
+- Separates content from design instructions
+
+## Instructional Design Process
+
+### Phase 1: High-Level Outline
+
+1. **Title**: Capture the essence in a compelling headline
+2. **Overview**: Brief description (1-2 sentences)
+3. **Learning Objectives**: List what the viewer will understand
+
+### Phase 2: Section Development
+
+For each learning objective:
+
+1. **Key Concept**: One-sentence summary of the section
+2. **Content**: Points extracted verbatim from source
+3. **Visual Element**: What should be shown visually
+4. **Text Labels**: Exact text for headlines, subheads, labels
+
+### Phase 3: Data Integrity Check
+
+Verify all source data is:
+- Copied exactly (no paraphrasing)
+- Attributed correctly (for quotes)
+- Formatted consistently
+
+## Critical Rules
+
+| Rule | Requirement | Example |
+|------|-------------|---------|
+| **Output format** | Markdown only | Use proper headers, lists, code blocks |
+| **Tone** | Expert trainer | Knowledgeable, clear, encouraging |
+| **No new information** | Only source content | Don't add examples not in source |
+| **Verbatim data** | Exact copies | "73% increase" not "significant increase" |
+
+## Structured Content Format
+
+```markdown
+# [Infographic Title]
+
+## Overview
+[Brief description of what this infographic conveys - 1-2 sentences]
+
+## Learning Objectives
+The viewer will understand:
+1. [Primary objective]
+2. [Secondary objective]
+3. [Tertiary objective if applicable]
+
+---
+
+## Section 1: [Section Title]
+
+**Key Concept**: [One-sentence summary of this section]
+
+**Content**:
+- [Point 1 - verbatim from source]
+- [Point 2 - verbatim from source]
+- [Point 3 - verbatim from source]
+
+**Visual Element**: [Description of what to show visually]
+- Type: [icon/chart/illustration/diagram/photo]
+- Subject: [what it depicts]
+- Treatment: [how it should be presented]
+
+**Text Labels**:
+- Headline: "[Exact text for headline]"
+- Subhead: "[Exact text for subhead]"
+- Labels: "[Label 1]", "[Label 2]", "[Label 3]"
+
+---
+
+## Section 2: [Section Title]
+
+**Key Concept**: [One-sentence summary]
+
+**Content**:
+- [Point 1]
+- [Point 2]
+
+**Visual Element**: [Description]
+
+**Text Labels**:
+- Headline: "[text]"
+- Labels: "[Label 1]", "[Label 2]"
+
+---
+
+[Continue for each section...]
+
+---
+
+## Data Points (Verbatim)
+
+All statistics, numbers, and quotes exactly as they appear in source:
+
+### Statistics
+- "[Exact statistic 1]"
+- "[Exact statistic 2]"
+- "[Exact statistic 3]"
+
+### Quotes
+- "[Exact quote]" — [Attribution]
+
+### Key Terms
+- **[Term 1]**: [Definition from source]
+- **[Term 2]**: [Definition from source]
+
+---
+
+## Design Instructions
+
+Extracted from user's steering prompt:
+
+### Style Preferences
+- [Any color preferences]
+- [Any mood/aesthetic preferences]
+- [Any artistic style preferences]
+
+### Layout Preferences
+- [Any structure preferences]
+- [Any organization preferences]
+
+### Other Requirements
+- [Any other visual requirements from user]
+- [Target platform if specified]
+- [Brand guidelines if any]
+```
+
+## Section Types by Content
+
+### For Process/Steps
+
+```markdown
+## Section N: Step N - [Step Title]
+
+**Key Concept**: [What this step accomplishes]
+
+**Content**:
+- Action: [What to do]
+- Details: [How to do it]
+- Note: [Important consideration]
+
+**Visual Element**:
+- Type: numbered step icon
+- Subject: [visual representing the action]
+- Arrow: leads to next step
+
+**Text Labels**:
+- Headline: "Step N: [Title]"
+- Action: "[Imperative verb + object]"
+```
+
+### For Comparison
+
+```markdown
+## Section N: [Item A] vs [Item B]
+
+**Key Concept**: [What distinguishes them]
+
+**Content**:
+| Aspect | [Item A] | [Item B] |
+|--------|----------|----------|
+| [Factor 1] | [Value] | [Value] |
+| [Factor 2] | [Value] | [Value] |
+
+**Visual Element**:
+- Type: split comparison
+- Left: [Item A representation]
+- Right: [Item B representation]
+
+**Text Labels**:
+- Headline: "[Item A] vs [Item B]"
+- Left label: "[Item A name]"
+- Right label: "[Item B name]"
+```
+
+### For Hierarchy
+
+```markdown
+## Section N: [Level Name]
+
+**Key Concept**: [What this level represents]
+
+**Content**:
+- Position: [Top/Middle/Bottom]
+- Priority: [Importance level]
+- Contains: [Elements at this level]
+
+**Visual Element**:
+- Type: layer/tier
+- Size: [relative to other levels]
+- Position: [where in hierarchy]
+
+**Text Labels**:
+- Level title: "[Name]"
+- Description: "[Brief description]"
+```
+
+### For Data/Statistics
+
+```markdown
+## Section N: [Metric Name]
+
+**Key Concept**: [What this data shows]
+
+**Content**:
+- Value: [Exact number/percentage]
+- Context: [What it means]
+- Comparison: [Benchmark if any]
+
+**Visual Element**:
+- Type: [chart/number highlight/gauge]
+- Emphasis: [how to draw attention]
+
+**Text Labels**:
+- Main number: "[Exact value]"
+- Label: "[Metric name]"
+- Context: "[Brief context]"
+```
+
+## Quality Checklist
+
+Before finalizing structured content:
+
+- [ ] Title captures the main message
+- [ ] Learning objectives are clear and measurable
+- [ ] Each section maps to an objective
+- [ ] All content is verbatim from source
+- [ ] Visual elements are clearly described
+- [ ] Text labels are specified exactly
+- [ ] Data points are collected and verified
+- [ ] Design instructions are separated
+- [ ] No new information has been added
+

@@ -1,0 +1,292 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\turn_api_request.py ===
+"""Per-attempt request assembly for the conversation turn's retry loop: re-apply the
+reasoning echo pad and prompt-cache decoration for the CURRENT provider (a fallback may
+differ from the primary), build ``api_kwargs``, run the surrogate/ASCII chokepoints, Codex
+preflight, OpenRouter cache bypass, Copilot ``x-initiator``, the LLM request middleware,
+the ``pre_api_request`` hook and the debug dump. Nothing here imports
+``agent.conversation_loop`` at module level.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import logging
+from typing import Any
+
+from agent.message_sanitization import sanitize_outbound_kwargs
+from utils import env_var_enabled
+
+logger = logging.getLogger("agent.conversation_loop")
+
+
+@dataclass
+class ApiRequestBuild:
+    """Always ``action == "fallthrough"``; the fields are the request-local values the caller
+    rebinds for the attempt."""
+
+    action: str
+    api_messages: Any
+    _moa_prepared_request: Any
+    tools_for_api: Any
+    api_kwargs: Any
+    _original_api_kwargs: Any
+    _llm_middleware_trace: Any
+
+
+def _set_extra_header(api_kwargs: Any, key: str, value: str) -> None:
+    """Copy-on-write header set (the dict may be shared with the transport's defaults)."""
+    _xh = dict(api_kwargs.get("extra_headers") or {})
+    _xh[key] = value
+    api_kwargs["extra_headers"] = _xh
+
+
+def _fire_pre_api_request_hook(
+    agent: Any, api_kwargs: Any, api_messages: Any, _llm_middleware_trace: Any, *, messages: Any,
+    original_user_message: Any, approx_tokens: Any, total_chars: Any, retry_count: Any,
+    api_call_count: Any, api_request_id: Any, api_start_time: Any, effective_task_id: Any,
+    turn_id: Any,
+) -> None:
+    from agent.conversation_loop import _system_prompt_for_hooks
+
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook as _invoke_hook
+        if has_hook("pre_api_request"):
+            request_messages = api_kwargs.get("messages")
+            if not isinstance(request_messages, list):
+                request_messages = api_kwargs.get("input")
+            if not isinstance(request_messages, list):
+                request_messages = api_messages
+            # Shallow copies: plugins may retain the lists; deepcopy is costly.
+            # ``request_messages``/``conversation_history`` are raw langfuse passthroughs.
+            # Anthropic (``system``) and Responses/Codex (``instructions``) move the system
+            # prompt out of messages; pass it for observability.
+            _invoke_hook(
+                "pre_api_request",
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                session_id=agent.session_id or "",
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                platform=agent.platform or "",
+                model=agent.model,
+                provider=agent.provider,
+                base_url=agent.base_url,
+                api_mode=agent.api_mode,
+                api_call_count=api_call_count,
+                retry_count=retry_count,
+                request_messages=list(request_messages) if isinstance(request_messages, list) else [],
+                system_prompt=_system_prompt_for_hooks(api_kwargs, request_messages),
+                message_count=len(api_messages),
+                tool_count=len(agent.tools or []),
+                approx_input_tokens=approx_tokens,
+                request_char_count=total_chars,
+                max_tokens=agent.max_tokens,
+                started_at=api_start_time,
+                middleware_trace=list(_llm_middleware_trace),
+                request=agent._api_request_payload_for_hook(api_kwargs),
+            )
+    except Exception:
+        pass
+
+
+def build_api_request(
+    agent: Any, *, api_messages: Any, _moa_prepared_request: Any, tools_for_api: Any,
+    system_message: Any, messages: Any, original_user_message: Any, approx_tokens: Any,
+    total_chars: Any, retry_count: Any, api_call_count: Any, api_request_id: Any,
+    api_start_time: Any, effective_task_id: Any, turn_id: Any,
+) -> ApiRequestBuild:
+    """Assemble the attempt's request in the original order (every mutation happens BEFORE
+    middleware/hooks/debug dumps observe the payload)."""
+    from agent.conversation_loop import (
+        _moa_client_consumes_prepared_request, _redecorate_prompt_cache_for_provider,
+    )
+
+    agent._reset_stream_delivery_tracking()
+    # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
+    agent._last_api_first_chunk_at = None
+    # api_messages was built for the primary; a fallback (DeepSeek / Kimi / MiMo) may
+    # require reasoning_content — re-apply the echo-back pad (idempotent) and re-render
+    # the prompt-cache decoration for the current provider.
+    agent._reapply_reasoning_echo_for_provider(api_messages)
+    api_messages, _moa_prepared_request, tools_for_api = (
+        _redecorate_prompt_cache_for_provider(
+            agent, api_messages, system_message=system_message, moa_prepared=_moa_prepared_request,
+            tools_for_api=tools_for_api,
+        )
+    )
+    if tools_for_api == agent.tools:
+        api_kwargs = agent._build_api_kwargs(api_messages)
+    else:
+        api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    # Messages were scrubbed above; this walk covers the rest of the payload (tool descriptions,
+    # extra_body, kwargs strings) — see sanitize_outbound_kwargs for the #50959 rationale.
+    sanitize_outbound_kwargs(agent, api_kwargs)
+    if agent.api_mode == "codex_responses":
+        api_kwargs = agent._get_transport().preflight_kwargs(
+            api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
+            sanitize_harmony_tokens=agent._is_codex_backend(),
+        )
+    # OpenRouter caching replays identical responses, even empty ones; an empty-response
+    # retry must bypass the cache.
+    if agent._empty_content_retries > 0 and agent._is_openrouter_url():
+        _set_extra_header(api_kwargs, "X-OpenRouter-Cache", "false")
+    # Copilot x-initiator: first call of a user turn is "user" (billed premium);
+    # tool-loop follow-ups keep the default "agent".
+    if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
+        _set_extra_header(api_kwargs, "x-initiator", "user")
+        agent._is_user_initiated_turn = False
+    try:
+        from hermes_cli.middleware import apply_llm_request_middleware
+
+        _llm_request_mw = apply_llm_request_middleware(
+            api_kwargs, task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
+            api_call_count=api_call_count,
+        )
+        api_kwargs = _llm_request_mw.payload
+        _original_api_kwargs = _llm_request_mw.original_payload
+        _llm_middleware_trace = _llm_request_mw.trace
+    except Exception:
+        _original_api_kwargs = dict(api_kwargs)
+        _llm_middleware_trace = []
+
+    _fire_pre_api_request_hook(
+        agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
+        original_user_message=original_user_message, approx_tokens=approx_tokens,
+        total_chars=total_chars, retry_count=retry_count, api_call_count=api_call_count,
+        api_request_id=api_request_id, api_start_time=api_start_time,
+        effective_task_id=effective_task_id, turn_id=turn_id,
+    )
+
+    if env_var_enabled("HERMES_DUMP_REQUESTS"):
+        agent._dump_api_request_debug(api_kwargs, reason="preflight")
+
+    # Private to the in-process MoA facade; added after middleware/hooks/debug dumps so
+    # none serializes it into the provider payload. Re-read the live client:
+    # rotation/fallback/cleanup rebuild agent.client between attempts; a native OpenAI
+    # client rejects this key (TypeError).
+    if _moa_prepared_request is not None and agent.provider == "moa":
+        if _moa_client_consumes_prepared_request(agent.client):
+            api_kwargs["_moa_prepared_request"] = _moa_prepared_request
+        else:
+            logger.warning(
+                "MoA client replaced mid-turn (client=%s); sending the "
+                "prepared prompt without the MoA handshake",
+                type(agent.client).__name__,
+            )
+    return ApiRequestBuild(
+        "fallthrough", api_messages, _moa_prepared_request, tools_for_api, api_kwargs,
+        _original_api_kwargs, _llm_middleware_trace,
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\turn_author.py ===
+"""Who wrote the user side of a turn, carried from the dispatcher into the recipient's turn.
+
+The dispatcher sets ``HERMES_TURN_AUTHOR`` on the recipient's one-shot subprocess only. A cached
+gateway agent sees several authors over its lifetime, so the author is read per turn, never per agent.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import unicodedata
+from typing import Any, Dict, Mapping, MutableMapping, Optional
+
+TURN_AUTHOR_ENV = "HERMES_TURN_AUTHOR"
+
+_MAX_FIELD_LEN = 200
+
+
+_DROPPED_CATEGORIES = frozenset({"Cc", "Cs", "Cn", "Co"})
+_TRUTHY = frozenset({"true", "1", "yes"})
+
+
+def _clean_text(value: Any) -> Optional[str]:
+    """Strip whitespace, control and unassigned characters, then cap the length. None when nothing is left.
+    Format characters and non-breaking spaces stay so emoji sequences and display names survive."""
+    if not isinstance(value, str):
+        return None
+    text = "".join(ch for ch in value if unicodedata.category(ch) not in _DROPPED_CATEGORIES).strip()
+    if not text:
+        return None
+    return text[:_MAX_FIELD_LEN]
+
+
+def _bot_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY
+    return isinstance(value, (bool, int)) and bool(value)
+
+
+def bot_author_id(profile: str, origin: Optional[str] = None) -> str:
+    """``bot:<profile>`` for a bot on the recipient's own install, ``bot:<origin>/<profile>`` for one on another
+    install. The origin is the Desktop's connection id on a relayed dm and the sender's hostname on a peer dm."""
+    origin = (origin or "").strip()
+    return f"bot:{origin}/{profile}" if origin else f"bot:{profile}"
+
+
+def local_origin() -> str:
+    """This machine's hostname as an author-id origin, cleaned like any author field. Empty when unknown."""
+    try:
+        host = socket.gethostname()
+    except Exception:
+        return ""
+    # A slash would split the id into a different origin and profile at parse time.
+    return (_clean_text(host) or "").replace("/", "")
+
+
+def parse_turn_author(raw: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a dict or JSON string into ``{"id", "name", "is_bot"}``; None for anything else or without id and name.
+    The id is whatever the transport knows the sender by: ``bot:<profile>`` on a bot-mode delivery inside one
+    install, ``bot:<connection>/<profile>`` when the Desktop relayed it from another machine,
+    ``bot:<hostname>/<profile>`` on a peer dm, the platform user id elsewhere.
+    An ``origin`` field qualifies a bare ``bot:<profile>`` id the same way."""
+    try:
+        if isinstance(raw, (str, bytes)):
+            raw = json.loads(raw)
+        if not isinstance(raw, Mapping):
+            return None
+        author = {
+            "id": _clean_text(raw.get("id")),
+            "name": _clean_text(raw.get("name")),
+            "is_bot": _bot_flag(raw.get("is_bot")),
+        }
+        if author["id"] is None and author["name"] is None:
+            return None
+        origin = _clean_text(raw.get("origin"))
+        if origin and author["id"] and author["id"].startswith("bot:") and "/" not in author["id"]:
+            author["id"] = _clean_text(bot_author_id(author["id"][len("bot:"):], origin))
+        return author
+    except Exception:
+        return None
+
+
+def turn_author_from_env(environ: Mapping[str, str] = os.environ) -> Optional[Dict[str, Any]]:
+    """The author the dispatcher placed in ``HERMES_TURN_AUTHOR``, or None."""
+    return parse_turn_author(environ.get(TURN_AUTHOR_ENV))
+
+
+def take_turn_author_from_env(environ: MutableMapping[str, str] = os.environ) -> Optional[Dict[str, Any]]:
+    """Read and remove ``HERMES_TURN_AUTHOR`` so subprocesses started during the turn do not inherit it."""
+    return parse_turn_author(environ.pop(TURN_AUTHOR_ENV, None))
+
+
+def turn_author_env(author: Dict[str, Any]) -> Dict[str, str]:
+    """The environment entry a dispatcher merges into a child's env."""
+    return {TURN_AUTHOR_ENV: json.dumps(author, separators=(",", ":"))}
+
+
+def a2a_key(author: Optional[Dict[str, Any]]) -> Optional[str]:
+    """``a2a:<bot id>``, the shared name for a bot author's turns. None for a human or an id-less bot."""
+    if not isinstance(author, dict) or not author.get("is_bot") or not author.get("id"):
+        return None
+    return f"a2a:{author['id']}"
+

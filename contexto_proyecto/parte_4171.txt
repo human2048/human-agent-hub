@@ -1,0 +1,358 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_local_interrupt_cleanup.py ===
+"""Regression tests for _wait_for_process subprocess cleanup on exception exit.
+
+When the poll loop exits via KeyboardInterrupt or SystemExit (SIGTERM via
+cli.py signal handler, SIGINT on the main thread in non-interactive -q mode,
+or explicit sys.exit from some caller), the child subprocess must be killed
+before the exception propagates — otherwise the local backend's use of
+os.setsid leaves an orphan with PPID=1.
+
+The live repro that motivated this: hermes chat -q ... 'sleep 300', SIGTERM
+to the python process, sleep 300 survived with PPID=1 for the full 300 s
+because _wait_for_process never got to call _kill_process before python
+died.  See commit message for full context.
+"""
+import os
+import signal
+import subprocess
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from tools.environments import local as local_mod
+from tools.environments.local import LocalEnvironment
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hermes_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "logs").mkdir(exist_ok=True)
+
+
+def _pgid_still_alive(pgid: int) -> bool:
+    """Return True if any process in the given process group is still alive."""
+    try:
+        os.killpg(pgid, 0)  # signal 0 = existence check
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _process_group_snapshot(pgid: int) -> str:
+    """Return a process-table snapshot for diagnostics."""
+    return subprocess.run(
+        ["ps", "-o", "pid,ppid,pgid,stat,cmd", "-g", str(pgid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+
+
+def _wait_for_pgid_exit(pgid: int, timeout: float = 60.0) -> bool:
+    """Wait for a process group to disappear under loaded xdist hosts.
+
+    The cleanup chain is: SIGTERM → 3s TimeoutStopSec → SIGKILL → reap.
+    Under heavy xdist load (40 parallel workers, 6-shard CI), the full
+    sequence can exceed 10s. Default timeout is generous to avoid CI
+    flakes; in practice the wait returns in <1s on quiet hosts.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pgid_still_alive(pgid):
+            return True
+        time.sleep(0.1)
+    return not _pgid_still_alive(pgid)
+
+
+def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
+    """If the shell wrapper exits before cleanup, still kill its process group.
+
+    Without the cached pgid fallback, ``os.getpgid(proc.pid)`` raises for the
+    dead wrapper and cleanup falls back to ``proc.kill()``, which cannot reach
+    orphaned grandchildren still running in the original process group.
+    """
+    env = object.__new__(LocalEnvironment)
+    proc = SimpleNamespace(
+        pid=12345,
+        _hermes_pgid=67890,
+        poll=lambda: 0,
+        kill=lambda: None,
+    )
+    killpg_calls = []
+
+    def fake_getpgid(_pid):
+        raise ProcessLookupError
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(os, "killpg", fake_killpg)
+
+    env._kill_process(proc)
+
+    assert killpg_calls == [(67890, signal.SIGTERM), (67890, 0)]
+
+
+def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
+    """When KeyboardInterrupt arrives mid-poll, the subprocess group must be
+    killed before the exception is re-raised."""
+    env = LocalEnvironment(cwd="/tmp")
+    try:
+        result_holder = {}
+        proc_holder = {}
+        started = threading.Event()
+        raise_at = [None]  # set by the main thread to tell worker when
+
+        # Drive execute() on a separate thread so we can SIGNAL-interrupt it
+        # via a thread-targeted exception without killing our test process.
+        def worker():
+            # Spawn a subprocess that will definitely be alive long enough
+            # to observe the cleanup, via env.execute(...) — the normal path
+            # that goes through _wait_for_process.
+            try:
+                result_holder["result"] = env.execute("sleep 30", timeout=60)
+            except BaseException as e:  # noqa: BLE001 — we want to observe it
+                result_holder["exception"] = type(e).__name__
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        # Wait until the subprocess actually exists.  LocalEnvironment.execute
+        # does init_session() (one spawn) before the real command, so we need
+        # to wait until a sleep 30 is visible.  Use pgrep-style lookup via
+        # /proc to find the bash process running our sleep.
+        deadline = time.monotonic() + 20.0  # generous: init_session + spawn dilate under CI load
+        target_pid = None
+        while time.monotonic() < deadline:
+            # Walk our children and grand-children to find one running 'sleep 30'
+            try:
+                import psutil  # optional — fall back if absent
+                for p in psutil.Process(os.getpid()).children(recursive=True):
+                    try:
+                        if "sleep 30" in " ".join(p.cmdline()):
+                            target_pid = p.pid
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except ImportError:
+                # Fall back to ps
+                ps = subprocess.run(
+                    ["ps", "-eo", "pid,ppid,pgid,cmd"], capture_output=True, text=True,
+                )
+                for line in ps.stdout.splitlines():
+                    if "sleep 30" in line and "grep" not in line:
+                        parts = line.split()
+                        if parts and parts[0].isdigit():
+                            target_pid = int(parts[0])
+                            break
+            if target_pid:
+                break
+            time.sleep(0.1)
+
+        assert target_pid is not None, (
+            "test setup: couldn't find 'sleep 30' subprocess after 5 s"
+        )
+        pgid = os.getpgid(target_pid)
+        assert _pgid_still_alive(pgid), "sanity: subprocess should be alive"
+
+        # Now inject a KeyboardInterrupt into the worker thread the same
+        # way CPython's signal machinery would.  We use ctypes.PyThreadState_SetAsyncExc
+        # which is how signal delivery to non-main threads is simulated.
+        import ctypes
+        # py-thread-state exception targets need the ident, not the Thread
+        tid = t.ident
+        assert tid is not None
+        # Fire KeyboardInterrupt into the worker thread
+        ret = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(tid), ctypes.py_object(KeyboardInterrupt),
+        )
+        assert ret == 1, f"SetAsyncExc returned {ret}, expected 1"
+
+        # Give the worker a moment to: hit the exception at the next poll,
+        # run the except-block cleanup (_kill_process), and exit.  Under
+        # xdist load the SIGTERM → 3s wait → SIGKILL chain can take longer
+        # than 5s before the worker's join() returns; bumped to 15s.
+        t.join(timeout=30.0)
+        assert not t.is_alive(), "worker didn't exit within 30 s of the interrupt"
+
+        # The critical assertion: the subprocess GROUP must be dead.  Not
+        # just the bash wrapper — the 'sleep 30' child too. Under xdist load,
+        # process-group disappearance can lag briefly after the worker exits,
+        # especially if the process is already dying or waiting to be reaped.
+        assert _wait_for_pgid_exit(pgid), (
+            f"subprocess group {pgid} is STILL ALIVE after worker received "
+            f"KeyboardInterrupt — orphan bug regressed.  This is the "
+            f"sleep-300-survives-SIGTERM scenario from Physikal's Apr 2026 "
+            f"report.  See tools/environments/base.py _wait_for_process "
+            f"except-block.\n{_process_group_snapshot(pgid)}"
+        )
+        # And the worker should have observed the KeyboardInterrupt (i.e.
+        # it re-raised cleanly, not silently swallowed).
+        assert result_holder.get("exception") == "KeyboardInterrupt", (
+            f"worker result: {result_holder!r} — expected KeyboardInterrupt "
+            f"propagation after cleanup"
+        )
+    finally:
+        try:
+            env.cleanup()
+        except Exception:
+            pass
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_local_setsid_descendant_sweep.py ===
+"""Regression tests for #85125 Phase 4b (terminal flavor of the #71148 class).
+
+LocalEnvironment._kill_process kills the process GROUP (SIGTERM -> wait ->
+SIGKILL).  A descendant that called ``setsid`` escapes the group and survives
+the group-kill — the local sibling of issue #84967.  The fix snapshots the
+descendant set via psutil BEFORE the first signal (children reparent to init
+after the parent dies, so a later parent walk finds nothing — same rationale
+as agent/deadline.py kill_process_tree) and sweeps any snapshotted survivor
+outside the (now-dead) group with SIGKILL afterwards.
+"""
+
+import os
+import signal
+import textwrap
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from tools.environments.local import LocalEnvironment
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hermes_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "logs").mkdir(exist_ok=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _wait_for_pid_exit(pid: int, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_alive(pid)
+
+
+@pytest.mark.live_system_guard_bypass
+def test_timeout_kill_reaps_setsid_grandchild(tmp_path):
+    """A grandchild that setsid's out of the group must not survive the
+    timeout kill path."""
+    pytest.importorskip("psutil")
+
+    pid_file = tmp_path / "grandchild.pid"
+    script = textwrap.dedent(
+        """
+        import os, sys, time
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()  # escape the command's process group/session
+            with open(sys.argv[1], "w") as f:
+                f.write(str(os.getpid()))
+            time.sleep(30)
+            os._exit(0)
+        time.sleep(30)
+        """
+    ).strip()
+
+    env = LocalEnvironment(cwd=str(tmp_path))
+    try:
+        import sys as _sys
+
+        cmd = f"{_sys.executable} -c {_sh_quote(script)} {_sh_quote(str(pid_file))}"
+        result = env.execute(cmd, timeout=3)
+
+        # The command must have hit the timeout/kill path.
+        assert "timed out" in result.get("output", "").lower() or result.get(
+            "returncode"
+        ) not in (0,), f"expected timeout, got: {result!r}"
+
+        # The grandchild wrote its pid before the kill.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not pid_file.exists():
+            time.sleep(0.05)
+        assert pid_file.exists(), "grandchild never wrote its pid file"
+        grandchild_pid = int(pid_file.read_text().strip())
+
+        assert _wait_for_pid_exit(grandchild_pid), (
+            f"setsid grandchild {grandchild_pid} SURVIVED the timeout "
+            f"group-kill — the #84967/#71148 orphan class (terminal flavor). "
+            f"_kill_process must sweep snapshotted descendants outside the "
+            f"group after the group-kill."
+        )
+    finally:
+        # Belt and braces: never leak the sleeper into the test host.
+        try:
+            if pid_file.exists():
+                os.kill(int(pid_file.read_text().strip()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+        try:
+            env.cleanup()
+        except Exception:
+            pass
+
+
+def _sh_quote(s: str) -> str:
+    import shlex
+
+    return shlex.quote(s)
+
+
+def test_kill_process_survives_psutil_snapshot_failure(monkeypatch):
+    """A broken psutil snapshot must never break the kill path — the
+    group-kill escalation still runs to completion."""
+    psutil = pytest.importorskip("psutil")
+
+    env = object.__new__(LocalEnvironment)
+    proc = SimpleNamespace(
+        pid=12345,
+        _hermes_pgid=67890,
+        poll=lambda: 0,
+        wait=lambda timeout=None: 0,
+        kill=lambda: None,
+    )
+    killpg_calls = []
+
+    def fake_getpgid(_pid):
+        return 67890
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError  # group is gone after the first signal
+
+    def boom(*_a, **_k):
+        raise RuntimeError("psutil exploded")
+
+    monkeypatch.setattr(os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(os, "killpg", fake_killpg)
+    monkeypatch.setattr(psutil, "Process", boom)
+
+    env._kill_process(proc)  # must not raise
+
+    # SIGTERM was delivered to the group and the alive-probe ran: the
+    # escalation path completed despite the snapshot failure.
+    assert killpg_calls[0] == (67890, signal.SIGTERM)
+    assert (67890, 0) in killpg_calls
+

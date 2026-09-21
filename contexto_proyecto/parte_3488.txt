@@ -1,0 +1,229 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_prune_spares_pinned.py ===
+"""Regression tests: pinned sessions survive bulk prune/archive (round-3 SES-01).
+
+Pinning is a durable "keep" flag. Before this fix `_prune_filter_where` had no
+pinned exclusion, so `hermes sessions prune`/`archive` with a filter silently
+destroyed pinned conversations. These drive the real SessionDB (temp file DB).
+"""
+
+import time
+
+import pytest
+
+from hermes_state import SessionDB
+
+
+@pytest.fixture()
+def db(tmp_path):
+    d = SessionDB(tmp_path / "state.db")
+    yield d
+    try:
+        d.close()
+    except Exception:
+        pass
+
+
+def _mk(db, sid, title, pinned=False):
+    db.create_session(sid, source="cli")
+    db.set_session_title(sid, title)
+    # mark ended + old so it is prune-eligible
+    with db._lock:
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, started_at=?, message_count=1 WHERE id=?",
+            (time.time() - 100 * 86400, time.time() - 100 * 86400, sid),
+        )
+        db._conn.commit()
+    if pinned:
+        db.set_session_pinned(sid, True)
+
+
+def test_prune_spares_pinned_by_default(db):
+    _mk(db, "20260101_000000_aaaaaa", "keep me", pinned=True)
+    _mk(db, "20260101_000001_bbbbbb", "delete me", pinned=False)
+
+    # Filter matches both by title substring "me"; default must spare pinned.
+    cands = db.list_prune_candidates(title_like="me")
+    ids = {c["id"] for c in cands}
+    assert "20260101_000001_bbbbbb" in ids
+    assert "20260101_000000_aaaaaa" not in ids  # pinned excluded
+
+    deleted = db.prune_sessions(older_than_days=None, title_like="me")
+    assert deleted == 1
+    assert db.get_session("20260101_000000_aaaaaa") is not None  # pinned survived
+    assert db.get_session("20260101_000001_bbbbbb") is None
+
+
+def test_prune_include_pinned_opts_in(db):
+    _mk(db, "20260101_000000_aaaaaa", "keep me", pinned=True)
+
+    # With the opt-in, the pinned row IS eligible.
+    cands = db.list_prune_candidates(title_like="me", include_pinned=True)
+    assert {c["id"] for c in cands} == {"20260101_000000_aaaaaa"}
+
+    deleted = db.prune_sessions(older_than_days=None, title_like="me", include_pinned=True)
+    assert deleted == 1
+    assert db.get_session("20260101_000000_aaaaaa") is None
+
+
+def test_count_prune_matches_reflects_pinned_flag(db):
+    _mk(db, "20260101_000000_aaaaaa", "keep me", pinned=True)
+    _mk(db, "20260101_000001_bbbbbb", "delete me", pinned=False)
+
+    assert db.count_prune_matches(title_like="me", include_pinned=False) == 1
+    assert db.count_prune_matches(title_like="me", include_pinned=True) == 2
+
+
+def test_archive_spares_pinned(db):
+    _mk(db, "20260101_000000_aaaaaa", "keep me", pinned=True)
+    _mk(db, "20260101_000001_bbbbbb", "arch me", pinned=False)
+
+    archived = db.archive_sessions(older_than_days=None, title_like="me")
+    assert archived == 1  # only the unpinned one
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_psutil_android_extract.py ===
+"""Regression tests for the Android psutil compatibility installer."""
+
+from __future__ import annotations
+
+import io
+import shutil
+import tarfile
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli.psutil_android import (
+    MARKER,
+    REPLACEMENT,
+    PSUTIL_URL,
+    PsutilAndroidInstallError,
+    prepare_patched_psutil_sdist,
+)
+from hermes_cli import update_cmd
+
+
+def _add_dir(tf: tarfile.TarFile, name: str) -> None:
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o755
+    tf.addfile(info)
+
+
+def _add_file(tf: tarfile.TarFile, name: str, content: str) -> None:
+    payload = content.encode("utf-8")
+    info = tarfile.TarInfo(name)
+    info.size = len(payload)
+    info.mode = 0o644
+    tf.addfile(info, io.BytesIO(payload))
+
+
+def _build_psutil_archive(archive: Path, *, malicious_symlink: bool) -> None:
+    with tarfile.open(archive, "w:gz") as tf:
+        _add_dir(tf, "psutil-7.2.2")
+        if malicious_symlink:
+            link = tarfile.TarInfo("psutil-7.2.2/psutil")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../outside"
+            tf.addfile(link)
+        else:
+            _add_dir(tf, "psutil-7.2.2/psutil")
+        _add_file(
+            tf,
+            "psutil-7.2.2/psutil/_common.py",
+            f"{MARKER}\n",
+        )
+
+
+def test_prepare_patched_psutil_sdist_rejects_symlink_member(tmp_path):
+    """A symlink member must be rejected before any file payload is written."""
+    archive = tmp_path / "evil.tar.gz"
+    _build_psutil_archive(archive, malicious_symlink=True)
+
+    destination = tmp_path / "extract"
+    with pytest.raises(PsutilAndroidInstallError, match="Unsupported archive member type"):
+        prepare_patched_psutil_sdist(archive, destination)
+
+    assert not (tmp_path / "outside" / "_common.py").exists()
+
+
+def test_prepare_patched_psutil_sdist_rejects_traversal_member(tmp_path):
+    """A ``..`` member must be refused the same way the shared archive guard refuses it
+    (one traversal check for every tar.gz we extract), surfaced as the installer's own error."""
+    archive = tmp_path / "evil.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        _add_dir(tf, "psutil-7.2.2")
+        _add_file(tf, "psutil-7.2.2/../escaped.py", "x")
+
+    with pytest.raises(PsutilAndroidInstallError, match="Unsafe archive member path"):
+        prepare_patched_psutil_sdist(archive, tmp_path / "extract")
+
+    assert not (tmp_path / "escaped.py").exists()
+
+
+def test_install_psutil_android_compat_uses_patched_tree(tmp_path):
+    """Updater path should install from the patched temporary sdist tree."""
+    archive = tmp_path / "psutil.tar.gz"
+    _build_psutil_archive(archive, malicious_symlink=False)
+
+    from hermes_cli import main as hermes_main
+
+    captured: dict[str, object] = {}
+
+    def fake_urlretrieve(url: str, dest: Path):
+        assert url == PSUTIL_URL
+        shutil.copyfile(archive, dest)
+        return str(dest), None
+
+    def fake_run_install(cmd: list[str], *, env=None):
+        src_root = Path(cmd[-1])
+        captured["cmd"] = cmd
+        captured["env"] = env
+        captured["common_py"] = (src_root / "psutil" / "_common.py").read_text(
+            encoding="utf-8"
+        )
+
+    with patch("urllib.request.urlretrieve", side_effect=fake_urlretrieve), \
+         patch.object(hermes_main, "_run_install_with_heartbeat", side_effect=fake_run_install):
+        update_cmd._install_psutil_android_compat(
+            ["uv", "pip"],
+            env={"HERMES_TEST": "1"},
+        )
+
+    assert captured["cmd"][:4] == ["uv", "pip", "install", "--no-build-isolation"]
+    assert captured["env"] == {"HERMES_TEST": "1"}
+    assert REPLACEMENT in str(captured["common_py"])
+
+
+def test_install_psutil_android_script_uses_patched_tree(tmp_path, monkeypatch, capsys):
+    """Standalone installer script should reuse the same safe patched tree."""
+    archive = tmp_path / "psutil.tar.gz"
+    _build_psutil_archive(archive, malicious_symlink=False)
+
+    import scripts.install_psutil_android as installer
+
+    def fake_urlretrieve(url: str, dest: Path):
+        assert url == PSUTIL_URL
+        shutil.copyfile(archive, dest)
+        return str(dest), None
+
+    def fake_subprocess_run(cmd: list[str]):
+        src_root = Path(cmd[-1])
+        patched = (src_root / "psutil" / "_common.py").read_text(encoding="utf-8")
+        assert REPLACEMENT in patched
+        return type("RunResult", (), {"returncode": 0})()
+
+    monkeypatch.setattr(installer.sys, "argv", ["install_psutil_android.py"])
+    monkeypatch.setattr(installer, "_resolve_install_cmd", lambda *_args: ["python", "-m", "pip"])
+
+    with patch("urllib.request.urlretrieve", side_effect=fake_urlretrieve), \
+         patch.object(installer.subprocess, "run", side_effect=fake_subprocess_run):
+        assert installer.main() == 0
+
+    captured = capsys.readouterr()
+    assert "psutil installed via Android compatibility shim" in captured.out
+

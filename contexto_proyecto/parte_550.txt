@@ -1,0 +1,336 @@
+
+
+=== ARCHIVO: .\hermes-agent\gateway\relay\auth.py ===
+"""Gateway-side relay authentication primitives. EXPERIMENTAL.
+
+WS upgrade auth (gateway -> connector): ``Authorization: Bearer <token>`` on the
+``/relay`` upgrade, ``token = make_upgrade_token(gateway_id, secret)``. Wire bytes
+must match the connector's ``relayAuthToken.ts`` ``makeToken`` exactly:
+``base64url(f"{payload}:{exp}:{sig}")`` with ``sig = HMAC_SHA256(f"{payload}:{exp}",
+secret).hexdigest()``. The connector verifies against a multi-secret rotation list.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import time
+
+_DEFAULT_UPGRADE_TTL_SECONDS = 300  # connector makeUpgradeToken default
+
+
+def sign(payload: str, secret: str) -> str:
+    """HMAC-SHA256 hex digest (UTF-8) — the connector's ``sign``."""
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_token(payload: str, secret: str, ttl_seconds: int = 0) -> str:
+    """``base64url(f"{payload}:{exp}:{sig}")``; ``exp`` unix seconds (0 = never).
+
+    base64url is unpadded to match Node's ``Buffer.toString("base64url")``.
+    """
+    exp = int(time.time()) + ttl_seconds if ttl_seconds > 0 else 0
+    signed = f"{payload}:{exp}"
+    raw = f"{signed}:{sign(signed, secret)}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def make_upgrade_token(
+    gateway_id: str, secret: str, ttl_seconds: int = _DEFAULT_UPGRADE_TTL_SECONDS
+) -> str:
+    """WS-upgrade bearer: ``payload = gateway_id`` (the connector peeks it to index its verify list)."""
+    return make_token(gateway_id, secret, ttl_seconds)
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from typing import Optional  # noqa: F401,E402
+from typing import Sequence  # noqa: F401,E402
+
+DELIVERY_SIG_HEADER = "x-relay-signature"
+
+DELIVERY_TS_HEADER = "x-relay-timestamp"
+
+_DEFAULT_MAX_SKEW_SECONDS = 300
+
+def _hmac_hex(payload: str, secret: str) -> str:
+    """HMAC-SHA256 hex digest of ``payload`` under ``secret`` (UTF-8)."""
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def verify_signature(payload: str, sig_hex: str, secrets: Sequence[str]) -> bool:
+    """Constant-time check that ``sig_hex`` is a valid HMAC of ``payload`` under
+    ANY of ``secrets`` (rotation window). Length-mismatched candidates are
+    skipped without a timing leak. Mirrors ``verifySignature``.
+    """
+    try:
+        sig_buf = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(sig_buf) == 0:
+        return False
+    for secret in secrets:
+        if not secret:
+            continue
+        expected = bytes.fromhex(_hmac_hex(payload, secret))
+        if len(expected) != len(sig_buf):
+            continue
+        if hmac.compare_digest(sig_buf, expected):
+            return True
+    return False
+
+def _delivery_payload(ts: int, body_json: str) -> str:
+    """Signed material for an inbound delivery: ``f"{ts}.{body_json}"``."""
+    return f"{ts}.{body_json}"
+
+def verify_delivery_signature(
+    body_json: str,
+    timestamp: Optional[str],
+    signature: Optional[str],
+    verify_keys: Sequence[str],
+    max_skew_seconds: int = _DEFAULT_MAX_SKEW_SECONDS,
+    *,
+    now: Optional[int] = None,
+) -> bool:
+    """Verify a connector→gateway inbound delivery signature.
+
+    ``body_json`` MUST be the exact request body bytes decoded as UTF-8 — the
+    connector signs over the literal serialized body, so the gateway verifies
+    over the literal received body (no re-serialization). Checks the timestamp
+    is within ``max_skew_seconds`` of now and the HMAC matches any key in the
+    rotation verify list. Mirrors the connector's ``verifyDeliverySignature``.
+    """
+    if not timestamp or not signature:
+        return False
+    try:
+        ts = int(timestamp)
+    except (ValueError, TypeError):
+        return False
+    current = now if now is not None else int(time.time())
+    if abs(current - ts) > max_skew_seconds:
+        return False
+    return verify_signature(_delivery_payload(ts, body_json), signature, verify_keys)
+
+def verify_token(token: str, secrets: Sequence[str]) -> Optional[str]:
+    """Verify a token built by ``make_token``; return the payload or None.
+
+    Splits from the right so a payload may itself contain colons (mirrors the
+    connector's ``verifyToken``). Rejects an expired token and any signature
+    that doesn't match a secret in the verify list.
+    """
+    try:
+        # base64url decode with padding restored.
+        padded = token + "=" * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, TypeError):
+        return None
+    parts = decoded.split(":")
+    if len(parts) < 3:
+        return None
+    sig = parts[-1]
+    try:
+        exp = int(parts[-2])
+    except ValueError:
+        return None
+    payload = ":".join(parts[:-2])
+    if exp != 0 and int(time.time()) > exp:
+        return None
+    signed = f"{payload}:{exp}"
+    return payload if verify_signature(signed, sig, secrets) else None
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\gateway\relay\command_manifest.py ===
+"""Gateway-declared Discord slash-command manifest for the relay lane (Phase 4).
+
+The CONNECTOR holds the Discord token, so the gateway declares its command set on
+the ``hello`` frame and the connector reconciles Discord's registration (idempotent,
+best-effort). MIRRORS the native tree (plugins/platforms/discord/adapter.py
+``_register_slash_commands``) — same names, same descriptions; interactions return
+via the passthrough plane as ordinary "/name args" COMMAND events, so a new entry
+needs NO new handler. Wire shape per entry: {name, description, options?} with
+Discord option objects verbatim; names must match ``[a-z0-9_-]{1,32}`` (the
+connector drops invalid entries, never the whole manifest).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+# Discord option type 3 = STRING.
+_STR = 3
+
+
+def _opt(name: str, description: str, *, choices: List[str] | None = None) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "type": _STR,
+        "name": name,
+        "description": description,
+        "required": False,
+    }
+    if choices:
+        row["choices"] = [{"name": c, "value": c} for c in choices]
+    return row
+
+
+def _cmd(name: str, description: str, *options: Dict[str, Any]) -> Dict[str, Any]:
+    row: Dict[str, Any] = {"name": name, "description": description}
+    if options:
+        row["options"] = list(options)
+    return row
+
+
+_REASONING_CHOICES = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    "reset", "show", "hide",
+]
+
+
+def build_relay_command_manifest() -> List[Dict[str, Any]]:
+    """The relay lane's Discord slash-command manifest (native-tree mirror)."""
+    return [
+        _cmd("new", "Start a new conversation"),
+        _cmd("reset", "Reset your Hermes session"),
+        _cmd("model", "Show or change the model",
+             _opt("name", "Model name. Leave empty to see current.")),
+        _cmd("reasoning", "Show/change reasoning effort, or toggle showing it",
+             _opt("effort", "Level, reset, or show/hide. Leave empty to see current.",
+                  choices=_REASONING_CHOICES)),
+        _cmd("personality", "Set a personality",
+             _opt("name", "Personality name. Leave empty to list.")),
+        _cmd("retry", "Retry your last message"),
+        _cmd("undo", "Remove the last exchange"),
+        _cmd("status", "Show Hermes session status"),
+        _cmd("sethome", "Set this chat as the home channel"),
+        _cmd("stop", "Stop the running Hermes agent"),
+        _cmd("steer", "Inject a message after the next tool call (no interrupt)",
+             _opt("text", "What to tell the agent")),
+        _cmd("compress", "Compress conversation context"),
+        _cmd("title", "Set or show the session title",
+             _opt("text", "New title. Leave empty to show.")),
+        _cmd("resume", "Resume a previously-named session",
+             _opt("name", "Session title or id")),
+        _cmd("usage", "Show token usage for this session"),
+        _cmd("help", "Show available commands"),
+        _cmd("insights", "Show usage insights and analytics"),
+        _cmd("reload-mcp", "Reload MCP servers from config"),
+        _cmd("reload-skills", "Re-scan skills for new or removed entries"),
+        _cmd("voice", "Toggle voice reply mode"),
+        _cmd("update", "Update Hermes Agent to the latest version"),
+        _cmd("restart", "Gracefully restart the Hermes gateway"),
+        _cmd("approve", "Approve a pending dangerous command",
+             _opt("scope", "Approval scope", choices=["once", "session", "always", "all"])),
+        _cmd("deny", "Deny a pending dangerous command",
+             _opt("reason", "Why (relayed to the agent)")),
+        _cmd("thread", "Create a new thread and start a Hermes session in it",
+             _opt("name", "Thread name")),
+        _cmd("queue", "Queue a prompt for the next turn (doesn't interrupt)",
+             _opt("text", "The prompt to queue")),
+        _cmd("bg", "Run a prompt in a separate background session",
+             _opt("text", "The prompt to run")),
+        _cmd("btw", "Ask a side question about the current conversation",
+             _opt("text", "The question to answer")),
+    ]
+
+
+
+=== ARCHIVO: .\hermes-agent\gateway\relay\descriptor.py ===
+"""CapabilityDescriptor — the relay handshake payload. EXPERIMENTAL.
+
+The connector hands one to the gateway's ``RelayAdapter`` at handshake: which
+platform it fronts and which capabilities to advertise to the stream consumer
+(char limit, draft streaming, edit/threading, markdown dialect, length unit), so
+one adapter serves every platform without per-platform branching. Schema evolution
+is additive-only, gated by ``contract_version`` (website/docs/developer-guide/relay-connector-contract.md).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+
+# Bump additively (never reinterpret an existing field); a breaking change
+# requires updating both repos in lockstep.
+CONTRACT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class CapabilityDescriptor:
+    """Immutable capability profile negotiated at relay handshake (frozen: fixed for the connection)."""
+
+    contract_version: int
+    platform: str
+    label: str
+    max_message_length: int
+    supports_draft_streaming: bool
+    supports_edit: bool
+    supports_threads: bool
+    markdown_dialect: str
+    len_unit: str  # "chars" | "utf16"
+    emoji: str = "\U0001f50c"  # 🔌 (matches PlatformEntry default)
+    platform_hint: str = ""
+    pii_safe: bool = False
+    # Optional bits default False/empty so an older connector that never sends
+    # them reads as "not supported" — additive within contract_version 1
+    # (from_json drops unknown keys, so newer connectors are safe against older gateways).
+    # Connector can supply surrounding channel/group CONTEXT for an addressed turn.
+    supports_context: bool = False
+    # Platform can host a FLAT continuable cron surface (native Slack's
+    # ``cron_continuable_surface: in_channel``); the scheduler fails safe to
+    # thread mode when False (D6 gate).
+    supports_inchannel_continuable: bool = False
+    # Platform sender renders block-level formatting from raw markdown; when True
+    # AND the operator enables rich_blocks/markdown_blocks, the gateway stamps
+    # ``format_hints`` on outbound send/edit metadata.
+    supports_block_formatting: bool = False
+    # Outbound op names the connector implements for this platform. Empty = the
+    # connector predates the field; callers MUST treat that as LEGACY_OPS, not
+    # "nothing supported". Tuple keeps the frozen dataclass hashable.
+    supported_ops: tuple = ()
+
+    # Assumed capability set when a legacy connector sends no supported_ops.
+    LEGACY_OPS = ("send", "edit", "typing", "follow_up")
+
+    def supports_op(self, op: str) -> bool:
+        """Whether the connector advertises ``op`` (legacy set when none advertised).
+
+        A NEW op is therefore only True when explicitly advertised — capability
+        can be probed without trying the op and parsing an error.
+        """
+        return op in (self.supported_ops or self.LEGACY_OPS)
+
+    def to_json(self) -> str:
+        """Compact, stable JSON for the handshake frame."""
+        return json.dumps(asdict(self), sort_keys=True, ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, data: str) -> "CapabilityDescriptor":
+        """Deserialize a handshake JSON string; unknown keys ignored, missing keys default.
+
+        Trust-boundary normalization (malformed input never breaks the handshake):
+        a non-positive/garbage ``max_message_length`` ("no limit", or hostile)
+        maps to the documented 4096 default so the adapter can always chunk;
+        ``supported_ops`` becomes a tuple of non-empty strings, or () (legacy
+        fallback) when malformed.
+        """
+        raw = json.loads(data)
+        known = cls.__dataclass_fields__  # type: ignore[attr-defined]
+        filtered = {k: v for k, v in raw.items() if k in known}
+        if "max_message_length" in filtered:
+            try:
+                if int(filtered["max_message_length"]) <= 0:
+                    filtered["max_message_length"] = 4096
+            except (TypeError, ValueError):
+                filtered["max_message_length"] = 4096
+        if "supported_ops" in filtered:
+            raw_ops = filtered["supported_ops"]
+            filtered["supported_ops"] = (
+                tuple(str(op) for op in raw_ops if isinstance(op, str) and op)
+                if isinstance(raw_ops, (list, tuple))
+                else ()
+            )
+        return cls(**filtered)
+

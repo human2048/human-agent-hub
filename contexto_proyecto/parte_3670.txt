@@ -1,0 +1,375 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_profile_delete_settlement.py ===
+"""``DELETE /api/profiles/{name}``: a settle-pending delete reports a partial success, not a 500.
+
+Deleting a profile can end with the directory gone and the durable session/routing identity
+settlement still pending (#112727, delete side of #111926); ``delete_profile`` reports that as
+``ProfileIdentitySettlementPending`` *after* the filesystem half completed. Flattened by the
+router's generic exception mapping into HTTP 500, it read as "delete failed" — a dashboard client
+then retried into a 404. The endpoint owns the partial-success shape; a genuine filesystem
+failure (rmtree) must keep the 500.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+@pytest.fixture()
+def profile_env(tmp_path, monkeypatch):
+    """Path.home() and HERMES_HOME both point into the temp dir (profile ops are HOME-anchored)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return tmp_path
+
+
+@pytest.fixture()
+def client(profile_env):
+    from hermes_cli import web_server
+
+    with TestClient(web_server.app, raise_server_exceptions=False) as c:
+        c.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
+        yield c
+
+
+def test_settle_pending_delete_reports_partial_success(client, monkeypatch):
+    """The profile really is deleted; only the identity settlement is missing — report both."""
+    from hermes_cli import profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **k: None)
+    # A live multiplexer owns the routing index and none is reachable here, so the settlement
+    # stays pending — the exact state delete_profile reports after the directory is gone.
+    monkeypatch.setattr(profiles_mod, "_live_default_multiplexer", lambda: True)
+    profiles_mod.create_profile("gone", no_alias=True)
+    gone_dir = profiles_mod.get_profile_dir("gone")
+
+    resp = client.delete("/api/profiles/gone")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["settlement_pending"] is True
+    assert body["identity_settled"] is False
+    assert body["retry_command"] == "hermes profile purge-identity gone"
+    assert body["path"] == str(gone_dir)
+    # Not lying about the filesystem half: the directory is really gone.
+    assert not gone_dir.exists()
+
+
+def test_filesystem_remove_failure_still_reports_500(client, monkeypatch):
+    """A plain rmtree failure keeps the generic 500 — not every delete error is a partial success."""
+    from hermes_cli import profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **k: None)
+
+    def boom(profile_dir, onexc_handler):
+        raise OSError("device busy")
+
+    monkeypatch.setattr(profiles_mod, "_rmtree_with_retry", boom)
+    profiles_mod.create_profile("gone", no_alias=True)
+
+    resp = client.delete("/api/profiles/gone")
+
+    assert resp.status_code == 500
+    assert "Could not remove profile directory" in resp.json()["detail"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_profile_soul_writes.py ===
+"""``PUT /api/profiles/{name}/soul`` must not destroy an existing SOUL.md.
+
+The dashboard persona editor replaces the whole document on every Save. A bare
+``write_text()`` truncates SOUL.md before the new body lands, and the paired
+``GET`` reports an unreadable file as ``{"content": "", "exists": False}`` — so
+an interrupted save presents as "your persona was never set" and the editor's
+next Save persists that empty document over the original.
+
+Lives in its own module rather than ``test_web_server.py`` to keep the harness
+small and focused on this one endpoint pair.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import stat
+import sys
+from pathlib import Path
+
+import pytest
+
+fastapi = pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+SOUL = "# Persona\n\nYou are a careful, terse assistant.\n"
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
+    from hermes_cli import web_server
+
+    with TestClient(web_server.app, raise_server_exceptions=False) as c:
+        # web_server resolves _SESSION_TOKEN once, at import. Read it back from
+        # the module instead of assuming the env var above won the race — any
+        # test file that imports web_server earlier in the session fixes the
+        # token before this fixture runs.
+        c.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
+        yield c
+
+
+@pytest.fixture()
+def profile_dir(tmp_path, monkeypatch) -> Path:
+    """Create a real profile directory under the test HERMES_HOME."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli import profiles as profiles_mod
+
+    d = profiles_mod.get_profile_dir("demo")
+    d.mkdir(parents=True, exist_ok=True)
+    # Identity marker (SOUL.md is one too, but these tests own SOUL.md; config.yaml is neutral).
+    (d / "config.yaml").write_text("{}\n")
+    return d
+
+
+class TestSoulWriteDurability:
+    def test_put_replaces_soul(self, client, profile_dir: Path):
+        """Happy path: the editor's Save still works."""
+        (profile_dir / "SOUL.md").write_text(SOUL, encoding="utf-8")
+
+        r = client.put("/api/profiles/demo/soul", json={"content": "# New\n"})
+
+        assert r.status_code == 200, r.text
+        assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == "# New\n"
+
+    def test_put_creates_soul_when_absent(self, client, profile_dir: Path):
+        """A first save has no prior file to preserve permissions from."""
+        assert not (profile_dir / "SOUL.md").exists()
+
+        r = client.put("/api/profiles/demo/soul", json={"content": SOUL})
+
+        assert r.status_code == 200, r.text
+        assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == SOUL
+
+    def test_existing_soul_survives_an_interrupted_save(
+        self, client, profile_dir: Path
+    ):
+        soul = profile_dir / "SOUL.md"
+        soul.write_text(SOUL, encoding="utf-8")
+        original = soul.read_bytes()
+
+        def boom(fd):
+            raise OSError("simulated crash mid-write")
+
+        # Scoped context so restoring os.fsync doesn't also undo the
+        # HERMES_HOME patch the client/profile_dir fixtures installed.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "fsync", boom)
+            r = client.put(
+                "/api/profiles/demo/soul", json={"content": "# clobbered\n"}
+            )
+
+        assert r.status_code == 500
+        # The persona the user already had must survive verbatim...
+        assert soul.read_bytes() == original
+        # ...and the paired GET must not report it as never-set, which is what
+        # would make the next Save persist an empty document.
+        g = client.get("/api/profiles/demo/soul")
+        assert g.status_code == 200, g.text
+        assert g.json()["exists"] is True
+        assert g.json()["content"] == SOUL
+        # No temp file left behind in the profile directory.
+        assert list(profile_dir.glob("*.tmp")) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_existing_file_mode_is_preserved(self, client, profile_dir: Path):
+        """Profile SOUL.md is created 0644 and never run through
+        ``_secure_file``; saving from the dashboard must not change that."""
+        soul = profile_dir / "SOUL.md"
+        soul.write_text(SOUL, encoding="utf-8")
+        os.chmod(soul, 0o644)
+
+        r = client.put("/api/profiles/demo/soul", json={"content": "# New\n"})
+
+        assert r.status_code == 200, r.text
+        mode = stat.S_IMODE(soul.stat().st_mode)
+        assert mode == 0o644, f"mode changed to {oct(mode)}"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_created_file_mode_is_not_tightened(self, client, profile_dir: Path):
+        """The first-ever Save must not leave SOUL.md owner-only.
+
+        There is no prior file to copy permissions from, and
+        ``atomic_write_text`` swaps in a ``tempfile.mkstemp`` file (0600).
+        Profile creation seeds SOUL.md with a plain ``write_text()`` and
+        chmods only ``.env`` to 0600, so routing this endpoint through the
+        atomic writer must not tighten the persona document as a side effect.
+        """
+        soul = profile_dir / "SOUL.md"
+        assert not soul.exists()
+
+        r = client.put("/api/profiles/demo/soul", json={"content": SOUL})
+
+        assert r.status_code == 200, r.text
+        mode = stat.S_IMODE(soul.stat().st_mode)
+        assert mode == 0o644, f"first save created SOUL.md as {oct(mode)}"
+
+
+class TestSoulIoIsOffTheEventLoop:
+    """Neither half of the persona editor may run its I/O on the ASGI loop.
+
+    The durability the tests above buy comes from ``atomic_write_text``, which
+    fsyncs before replacing — so the save blocks for as long as the filesystem
+    takes to commit. These handlers sit in the same router as the profile
+    delete and describe-auto paths; the rest of that sweep is covered by
+    ``tests/hermes_cli/test_web_profiles_off_loop.py``.
+    """
+
+    @staticmethod
+    def _probe(seen, tag):
+        """Record whether the caller's thread is running an event loop."""
+        try:
+            asyncio.get_running_loop()
+            seen.append((tag, True))
+        except RuntimeError:
+            seen.append((tag, False))
+
+    def test_get_soul_reads_off_loop(self, client, profile_dir: Path, monkeypatch):
+        (profile_dir / "SOUL.md").write_text(SOUL, encoding="utf-8")
+        seen: list[tuple[str, bool]] = []
+        real_read_text = Path.read_text
+
+        def probing_read_text(self, *args, **kwargs):
+            if self.name == "SOUL.md":
+                TestSoulIoIsOffTheEventLoop._probe(seen, "read")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", probing_read_text)
+
+        r = client.get("/api/profiles/demo/soul")
+
+        assert r.status_code == 200, r.text
+        assert r.json()["content"] == SOUL
+        assert ("read", False) in seen, (
+            f"SOUL.md must be read off the event loop; proof: {seen}"
+        )
+
+    def test_put_soul_writes_off_loop(self, client, profile_dir: Path, monkeypatch):
+        seen: list[tuple[str, bool]] = []
+        import utils
+
+        real_write = utils.atomic_write_text
+
+        def probing_write(*args, **kwargs):
+            TestSoulIoIsOffTheEventLoop._probe(seen, "write")
+            return real_write(*args, **kwargs)
+
+        monkeypatch.setattr(utils, "atomic_write_text", probing_write)
+
+        r = client.put("/api/profiles/demo/soul", json={"content": SOUL})
+
+        assert r.status_code == 200, r.text
+        assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == SOUL
+        assert ("write", False) in seen, (
+            f"SOUL.md must be written off the event loop; proof: {seen}"
+        )
+
+    def test_missing_soul_is_still_reported_absent(self, client, profile_dir: Path):
+        """The offloaded reader must keep distinguishing "no file" from
+        "empty file" — the whole point of the durability tests above."""
+        assert not (profile_dir / "SOUL.md").exists()
+
+        r = client.get("/api/profiles/demo/soul")
+
+        assert r.status_code == 200, r.text
+        assert r.json() == {"content": "", "exists": False}
+
+    def test_empty_soul_is_still_reported_present(self, client, profile_dir: Path):
+        (profile_dir / "SOUL.md").write_text("", encoding="utf-8")
+
+        r = client.get("/api/profiles/demo/soul")
+
+        assert r.status_code == 200, r.text
+        assert r.json() == {"content": "", "exists": True}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_read_coalescing.py ===
+"""GET /api/profiles coalesces a poll burst before AnyIO threadpool admission (#105179)."""
+import asyncio
+import threading
+from functools import wraps
+
+import pytest
+
+
+async def wait_until(predicate):
+    async with asyncio.timeout(3):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+def async_test(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        return asyncio.run(fn(*args, **kwargs))
+    return run
+
+
+@async_test
+async def test_profiles_burst_leaves_threadpool_status_responsive(monkeypatch):
+    import anyio.to_thread
+    import httpx
+    from fastapi import FastAPI
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli.web_routers import profiles
+    from starlette.concurrency import run_in_threadpool
+    release = threading.Event()
+    calls = []
+
+    def slow_profiles(**_kwargs):  # the router passes ``lazy_skill_count=True``
+        calls.append(1)
+        assert release.wait(3)
+        return ["example"]
+
+    monkeypatch.setattr(profiles_mod, "list_profiles", slow_profiles)
+    monkeypatch.setattr(profiles, "_profile_to_dict", lambda p: {"name": p})
+    monkeypatch.setattr(profiles, "run_in_threadpool", run_in_threadpool)
+    app = FastAPI()
+    app.include_router(profiles.router)
+
+    @app.get("/api/status")
+    def status():
+        return {"ok": True}
+
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    previous = limiter.total_tokens
+    limiter.total_tokens = 2
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            tasks = [asyncio.create_task(client.get("/api/profiles")) for _ in range(12)]
+            try:
+                await wait_until(lambda: calls)
+                await asyncio.sleep(0.05)
+                response = await asyncio.wait_for(client.get("/api/status"), 0.5)
+                assert response.status_code == 200
+                assert response.json() == {"ok": True}
+                assert calls == [1]
+                assert limiter.borrowed_tokens == 1
+            finally:
+                release.set()
+                responses = await asyncio.gather(*tasks)
+            assert all(r.status_code == 200 for r in responses)
+            assert all(r.json() == {"profiles": [{"name": "example"}]} for r in responses)
+    finally:
+        limiter.total_tokens = previous
+

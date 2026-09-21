@@ -1,0 +1,197 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_mid_tool_call_drop.py ===
+"""The Anthropic streaming path must not accept a tool_use block whose stream
+died before its input arrived (#80498 sibling).
+
+The chat_completions accumulator flags zero-byte tool-call arguments on a
+clean no-finish_reason stream end and routes them through the
+partial-stream-stub retry path. The Anthropic path had the same gap in a
+different shape: a clean SSE close after ``content_block_start(tool_use)``
+but before any ``input_json_delta``/``message_delta`` yields an SDK
+final-message snapshot whose content is NON-empty (the tool_use block is
+there, ``input={}``) and whose ``stop_reason`` is None — which sailed past
+both empty-stream guards and executed the tool with empty input, no retry.
+
+The fix raises EmptyStreamError for a tool_use-bearing message with no
+stop_reason, riding the same bounded stream-retry the eventless case uses.
+"""
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+
+def _make_anthropic_agent(**kwargs):
+    from run_agent import AIAgent
+
+    defaults = dict(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="claude-opus-4-7",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    defaults.update(kwargs)
+    agent = AIAgent(**defaults)
+    agent.api_mode = "anthropic_messages"
+    agent._anthropic_client = MagicMock()
+    agent._anthropic_api_key = "test-anthropic-key"
+    agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
+    return agent
+
+
+def _stream_cm(final_message, events=()):
+    cm = MagicMock()
+    stream = MagicMock()
+    stream.__iter__ = MagicMock(return_value=iter(list(events)))
+    stream.get_final_message = MagicMock(return_value=final_message)
+    cm.__enter__ = MagicMock(return_value=stream)
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
+def _tool_use_block(name="write_file", input_obj=None):
+    return SimpleNamespace(
+        type="tool_use",
+        id="toolu_x",
+        name=name,
+        input=input_obj if input_obj is not None else {},
+    )
+
+
+def _tool_use_start_event(name="write_file"):
+    return SimpleNamespace(
+        type="content_block_start",
+        content_block=SimpleNamespace(type="tool_use", name=name),
+    )
+
+
+class TestAnthropicMidToolCallStreamDrop:
+    def test_tool_use_without_stop_reason_raises_empty_stream(self):
+        """The #80498-sibling shape: tool_use block present, stop_reason None."""
+        from agent.chat_completion_helpers import EmptyStreamError
+
+        dropped = MagicMock()
+        dropped.content = [_tool_use_block()]
+        dropped.stop_reason = None
+        dropped.usage = SimpleNamespace(input_tokens=10, output_tokens=2)
+
+        agent = _make_anthropic_agent()
+        agent._anthropic_client.messages.stream = MagicMock(
+            return_value=_stream_cm(dropped, events=[_tool_use_start_event()])
+        )
+
+        with pytest.raises(EmptyStreamError, match="tool_use"):
+            agent._interruptible_streaming_api_call({"model": "claude-opus-4-7"})
+
+    def test_completed_tool_use_with_stop_reason_passes(self):
+        """A legitimate tool_use completion (stop_reason set) is untouched."""
+        done = MagicMock()
+        done.content = [_tool_use_block(input_obj={"path": "a.txt"})]
+        done.stop_reason = "tool_use"
+        done.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+
+        agent = _make_anthropic_agent()
+        agent._anthropic_client.messages.stream = MagicMock(
+            return_value=_stream_cm(done, events=[_tool_use_start_event()])
+        )
+
+        response = agent._interruptible_streaming_api_call(
+            {"model": "claude-opus-4-7"}
+        )
+        assert response is done
+
+    def test_text_only_message_without_stop_reason_passes(self):
+        """No tool_use block -> the new gate stays out of the way (text-only
+        no-stop_reason handling keeps its pre-existing behavior)."""
+        text_only = MagicMock()
+        text_only.content = [SimpleNamespace(type="text", text="partial answer")]
+        text_only.stop_reason = None
+        text_only.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+
+        agent = _make_anthropic_agent()
+        agent._anthropic_client.messages.stream = MagicMock(
+            return_value=_stream_cm(text_only)
+        )
+
+        response = agent._interruptible_streaming_api_call(
+            {"model": "claude-opus-4-7"}
+        )
+        assert response is text_only
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_model_cooldowns.py ===
+"""A generic Anthropic 429 benches only the model that was rate-limited (#111769, #61451).
+
+Real ``agent.credential_pool`` against a real temp auth store: one API-key credential,
+one ``mark_exhausted_and_rotate(status_code=429, model=A)``.
+"""
+import json
+
+import pytest
+
+KEY = "sk-ant-api03-synthetic-test-key-0000"
+MODEL_A = "claude-sonnet-4-5"
+MODEL_B = "claude-haiku-4-5"
+
+
+@pytest.fixture
+def pool(tmp_path, monkeypatch):
+    root = tmp_path / "hermes-root"
+    root.mkdir()
+    (tmp_path / "fakehome").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "fakehome"))
+    for var in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    import hermes_constants
+    hermes_constants._default_hermes_root_memo = None  # type: ignore[attr-defined]
+    (root / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [{
+        "id": "seat", "label": "seat", "auth_type": "api_key", "priority": 0,
+        "source": "manual", "access_token": KEY,
+    }]}}))
+    from agent.credential_pool import load_pool
+    return load_pool("anthropic")
+
+
+def test_generic_429_benches_only_the_rate_limited_model(pool, monkeypatch):
+    from agent.anthropic_credentials import resolve_anthropic_token
+    from agent.credential_pool import load_pool
+
+    ctx = {"message": "This request would exceed your account's rate limit. Please try again later."}
+    assert pool.mark_exhausted_and_rotate(
+        status_code=429, error_context=ctx, api_key_hint=KEY, failure_reason="rate_limit", model=MODEL_A,
+    ) is None  # a sole credential has nothing to rotate to for model A
+
+    assert pool.entries()[0].last_status is None  # credential-wide state untouched
+    assert pool.select(model=MODEL_A) is None
+    assert pool.select(model=MODEL_B) is not None
+    assert pool.select() is None  # a caller that names no model honours every active cooldown
+    assert pool.next_available_at(model=MODEL_A) is not None
+    assert pool.next_available_at(model=MODEL_B) is None
+
+    # The cooldown is persisted, so another process (and the env/borrowed token resolver,
+    # which reads the store fresh) sees the same per-model verdict.
+    fresh = load_pool("anthropic")
+    assert fresh.select(model=MODEL_A) is None and fresh.select(model=MODEL_B) is not None
+    monkeypatch.setenv("ANTHROPIC_API_KEY", KEY)
+    assert resolve_anthropic_token(model=MODEL_A) is None
+    assert resolve_anthropic_token(model=MODEL_B) == KEY
+    assert resolve_anthropic_token() == KEY  # model-less diagnostics keep the key
+
+
+@pytest.mark.parametrize("status_code, failure_reason", [(401, None), (402, "billing"), (429, "billing")])
+def test_auth_and_billing_failures_stay_credential_wide(pool, status_code, failure_reason):
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    pool.mark_exhausted_and_rotate(
+        status_code=status_code, api_key_hint=KEY, failure_reason=failure_reason, model=MODEL_A,
+    )
+    assert pool.entries()[0].last_status == STATUS_EXHAUSTED
+    assert not pool.entries()[0].model_cooldowns
+    assert pool.select(model=MODEL_B) is None
+

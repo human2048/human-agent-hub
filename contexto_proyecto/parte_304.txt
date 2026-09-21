@@ -1,0 +1,547 @@
+
+
+=== ARCHIVO: .\hermes-agent\apps\desktop\src\app\wake-indicator\wake-indicator.css ===
+.wake-indicator-surface {
+  align-items: flex-start;
+  background: transparent;
+  display: flex;
+  height: 100vh;
+  justify-content: center;
+  padding-top: 5px;
+  pointer-events: none;
+  width: 100vw;
+}
+
+.wake-indicator-light {
+  backdrop-filter: blur(20px) saturate(1.2);
+  background: rgba(124, 58, 237, 0.62);
+  border: 1px solid rgba(216, 180, 254, 0.82);
+  border-radius: 999px;
+  box-shadow:
+    0 0 10px rgba(124, 58, 237, 0.7),
+    0 0 24px rgba(168, 85, 247, 0.48);
+  height: 28px;
+  opacity: 0;
+  transform: scale(0.96);
+  transition:
+    opacity 500ms ease-out,
+    transform 500ms ease-out;
+  width: 120px;
+}
+
+.wake-indicator-surface[data-state='detected'] .wake-indicator-light {
+  animation: wake-indicator-breathe 2.5s ease-in-out infinite;
+}
+
+.wake-indicator-surface[data-state='capturing'] .wake-indicator-light {
+  opacity: 1;
+  transform: scale(1);
+}
+
+@keyframes wake-indicator-breathe {
+  0%,
+  100% {
+    opacity: 0.34;
+    transform: scale(0.96);
+  }
+
+  50% {
+    opacity: 0.94;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wake-indicator-light {
+    transition: opacity 200ms ease-out;
+  }
+
+  .wake-indicator-surface[data-state='detected'] .wake-indicator-light {
+    animation: none;
+    opacity: 0.72;
+    transform: scale(1);
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\apps\desktop\src\components\assistant-ui\thread\timeline.css ===
+.thread-timeline-ticks {
+  width: 3rem;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-width: none;
+}
+
+.thread-timeline-ticks::-webkit-scrollbar {
+  display: none;
+}
+
+.thread-timeline-track {
+  position: relative;
+  width: 100%;
+}
+
+.thread-timeline-tick {
+  position: absolute;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+
+  height: 0.4375rem;
+  width: 100%;
+  padding: 0 0.375rem 0 0;
+  cursor: pointer;
+  outline: none;
+}
+
+.thread-timeline-tick [data-slot='timeline-bar'] {
+  display: block;
+  flex: none;
+  width: 0.5rem;
+  height: 0.0625rem;
+  border-radius: 999px;
+  background: var(--ui-text-tertiary);
+  opacity: 0.65;
+  transition: width 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.thread-timeline-tick[aria-current='location'] [data-slot='timeline-bar'] {
+  background: var(--theme-primary);
+  opacity: 1;
+}
+
+.thread-timeline-tick:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--ui-stroke-secondary);
+  border-radius: 0.25rem;
+}
+
+.thread-timeline-tick[aria-busy='true'] [data-slot='timeline-bar'] {
+  animation: timeline-loading 700ms ease-in-out infinite alternate;
+}
+
+@keyframes timeline-loading {
+  to {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread-timeline-tick [data-slot='timeline-bar'] {
+    transition: none;
+    animation: none;
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\apps\desktop\src\components\chat\status-stack.css ===
+/* Shared columns: action, state glyph, content, optional trailing actions. */
+[data-slot='composer-status-stack'] {
+  --status-nest: 0.25rem;
+  --status-section-indent: 0rem;
+  --status-action-width: 0.75rem;
+  --status-icon-width: 0.8rem;
+  --status-gap: 0.375rem;
+}
+
+[data-slot='composer-status-stack'] .status-section-body {
+  --status-section-indent: var(--status-nest);
+  padding: 0;
+}
+
+[data-slot='composer-status-stack'] .status-row {
+  --status-inset: calc(0.5rem + var(--status-section-indent) + var(--status-row-depth, 0) * var(--status-nest));
+  display: grid;
+  grid-template-columns: var(--status-action-width) var(--status-icon-width) minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--status-gap);
+  padding: 0.25rem 0.625rem 0.25rem var(--status-inset);
+  border-radius: 0;
+}
+
+[data-slot='composer-status-stack'] .status-row-icon {
+  grid-column: 2;
+  grid-row: 1;
+  width: var(--status-icon-width);
+  height: 1rem;
+}
+
+[data-slot='composer-status-stack'] .status-row-content {
+  grid-column: 3;
+  grid-row: 1;
+  align-items: start;
+}
+
+[data-slot='composer-status-stack'] .status-row-dismiss {
+  grid-column: 1;
+  grid-row: 1;
+  display: flex;
+  justify-content: center;
+  height: 1rem;
+}
+
+.status-dismiss-button {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+}
+
+.status-dismiss-button > .codicon {
+  transform: translateY(-0.03125rem);
+}
+
+[data-slot='composer-status-stack'] .status-row-actions {
+  grid-column: 4;
+  grid-row: 1;
+  align-self: start;
+}
+
+[data-slot='composer-status-stack'] .status-row-actions > button {
+  margin-top: -0.125rem;
+}
+
+[data-slot='composer-status-stack'] .status-section-icon {
+  width: var(--status-icon-width);
+  justify-content: center;
+}
+
+[data-slot='composer-status-stack'] .status-section-body > .status-row:last-child {
+  padding-bottom: 0.375rem;
+}
+
+[data-slot='composer-status-stack'] .status-artifacts > .status-row:first-child {
+  padding-top: 0.375rem;
+}
+
+[data-slot='composer-status-stack'] .status-artifacts > .status-row:last-child {
+  padding-bottom: 0.375rem;
+}
+
+/* The first row owns the extra inset so its hover fill still reaches the shell. */
+[data-slot='status-stack-section']:first-child > [data-slot='status-section'] > .status-section-header > button,
+[data-slot='status-stack-section']:first-child > :first-child > [data-slot='status-section'] > .status-section-header > button {
+  padding-top: 0.5rem;
+}
+
+[data-slot='status-stack-section']:first-child > [data-slot='status-section'] > .status-section-header > div,
+[data-slot='status-stack-section']:first-child > :first-child > [data-slot='status-section'] > .status-section-header > div {
+  align-self: start;
+  padding-top: 0.25rem;
+}
+
+[data-slot='status-stack-section']:first-child > .status-artifacts > .status-row:first-child,
+[data-slot='status-stack-section']:first-child > .status-row {
+  padding-top: 0.625rem;
+}
+
+[data-slot='composer-status-stack'] .status-control-row {
+  min-height: 0;
+  padding-top: 0.125rem;
+  padding-bottom: 0.125rem;
+}
+
+[data-slot='composer-status-stack'] .status-control-row:first-child {
+  padding-top: 0.25rem;
+}
+
+[data-slot='composer-status-stack'] .status-control-row:last-child {
+  padding-bottom: 0.375rem;
+}
+
+[data-slot='composer-status-stack'] .status-control-row .status-row-content {
+  display: block;
+}
+
+[data-slot='composer-status-stack'] .status-control-row:not([data-status-icon]) {
+  background: none;
+}
+
+[data-slot='composer-status-stack'] .status-subagent-detail {
+  padding-left: calc(0.5rem + var(--status-nest) * 2 + var(--status-action-width) + var(--status-icon-width) + var(--status-gap) * 2);
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\apps\desktop\src\components\intro-reveal\intro-reveal.css ===
+@keyframes intro-caret {
+  0%,
+  55% {
+    opacity: 1;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes intro-dot {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes intro-float-a {
+  from {
+    transform: translateY(-5px);
+  }
+  to {
+    transform: translateY(6px);
+  }
+}
+@keyframes intro-float-b {
+  from {
+    transform: translateY(4px);
+  }
+  to {
+    transform: translateY(-7px);
+  }
+}
+@keyframes intro-float-c {
+  from {
+    transform: translateY(-3px);
+  }
+  to {
+    transform: translateY(5px);
+  }
+}
+@keyframes intro-hover-a {
+  from {
+    translate: 0 -4px;
+  }
+  to {
+    translate: 0 5px;
+  }
+}
+@keyframes intro-hover-b {
+  from {
+    translate: 0 4px;
+  }
+  to {
+    translate: 0 -6px;
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\apps\desktop\src\components\intro-reveal\README.md ===
+# Intro reveal
+
+A scripted chat types a request, runs tool rows beside a cube viewport, streams a
+reply, expands into parallel agents, then ends on the brand. The seven beats take
+22 seconds of wall time, followed by a 900 ms dissolve. Reduced motion shows the
+brand briefly instead. Sound is on by default and respects the haptics mute
+preference. Fonts are the existing Collapse and JetBrains Mono faces.
+
+Eligibility is `guestOnboardingEnabled && !firstRunSkipped && !hasSeenIntroReveal()`.
+Electron sets the flag from `HERMES_GUEST_ONBOARDING=1` or `--guest-onboarding`.
+The gate queues the guided chat on completion; the chat gate acknowledges the
+free-tier notice as the cinematic starts. With the flag off, neither gate starts.
+`HERMES_SKIP_INTRO=1` turns the film off but keeps the guided chat: the gate
+records the film as watched and queues the guide directly.
+
+| Piece | Path |
+| --- | --- |
+| Main-window gate and phase timers | `index.tsx` |
+| Phase, seen key and IPC listeners | `../../store/intro-reveal.ts` |
+| Overlay boot and surface | `intro-root.tsx`, `intro-reveal-surface.tsx` |
+| Clock, score, cube and synthesized sound | `use-intro-clock.ts`, `timeline.ts`, `viewport-cube.ts`, `sound.ts` |
+| Constellation, brand and text effects | `scenes/` |
+| Native window and preload bridge | `../../../electron/intro-reveal-window.ts`, `../../../electron/preload.ts` |
+
+The transparent native window (`?win=intro`) covers the primary display while the
+main app is hidden. The clock runs in the overlay because the hidden main
+renderer's animation frames are throttled. The phase and the seen key live in the
+main renderer.
+
+The screen must always come back. Four independent layers:
+
+1. Normal completion: the overlay clock finishes → main renderer closes it.
+2. Esc/click: local close with a 1.2s fallback that bypasses the main renderer.
+3. Local deadman: the overlay force-closes itself `INTRO_DEADMAN_MS` after
+   mount, even with all IPC dead.
+4. Main-process watchdog (34s) destroys the window unconditionally.
+
+Rehearsal with isolated state: see [Desktop Engineering Guide](../../../AGENTS.md#rehearsing-the-guided-onboarding).
+
+
+
+=== ARCHIVO: .\hermes-agent\apps\desktop\src\components\particles\particle-field.css ===
+/* ── Particle field ─────────────────────────────────────────────────────────
+   Reusable float-up emitter. Three nested layers, each owning ONE transform so
+   they never fight:
+     .particle          — full-height track: vertical rise + fade (linear)
+     .particle__sway    — horizontal weave + bank/tilt on its OWN period
+                          (ease-in-out, alternating), so the path desyncs from
+                          the rise and never repeats — the organic-motion trick
+     .particle__glyph   — one-shot springy pop-in scale
+   The track is full-height and anchored at the field bottom, so the rise's
+   `translateY(-rise%)` measures against the field height, not the glyph's. All
+   tuning arrives as inline `--particle-*` custom properties. */
+.particle-field {
+  pointer-events: none;
+  overflow: visible;
+}
+
+.particle {
+  position: absolute;
+  inset-block: 0;
+  left: var(--particle-left);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  width: var(--particle-size);
+  margin-left: calc(var(--particle-size) / -2);
+  will-change: transform, opacity;
+  animation: particle-rise var(--particle-duration) linear var(--particle-delay) both;
+}
+
+.particle__sway {
+  display: block;
+  will-change: transform;
+  animation: particle-sway var(--particle-sway-duration) ease-in-out var(--particle-sway-delay)
+    infinite alternate;
+}
+
+.particle__glyph {
+  display: block;
+  width: var(--particle-size);
+  color: var(--particle-color);
+  will-change: transform;
+  animation: particle-pop 260ms cubic-bezier(0.34, 1.56, 0.64, 1) var(--particle-delay) both;
+}
+
+.particle__glyph > svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Rise: straight up the field, holds opacity through most of the climb, fades
+   near the top. */
+@keyframes particle-rise {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 0, 0);
+  }
+
+  6% {
+    opacity: 1;
+    transform: translate3d(0, calc(var(--particle-rise) * -0.06%), 0);
+  }
+
+  70% {
+    opacity: 1;
+    transform: translate3d(0, calc(var(--particle-rise) * -0.7%), 0);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate3d(0, calc(var(--particle-rise) * -1%), 0);
+  }
+}
+
+/* Sway + bank: swings left↔right and tilts INTO the direction of travel, like a
+   leaf on a breeze. Runs on its own clock. */
+@keyframes particle-sway {
+  from {
+    transform: translateX(calc(var(--particle-sway) * -1)) rotate(calc(var(--particle-bank) * -1));
+  }
+
+  to {
+    transform: translateX(var(--particle-sway)) rotate(var(--particle-bank));
+  }
+}
+
+/* Pop: a springy scale-in overshoot (the bezier is a spring, not a path wobble). */
+@keyframes particle-pop {
+  0% {
+    transform: scale(0.3);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .particle {
+    inset-block: auto 0;
+    height: var(--particle-size);
+    animation: particle-flash 650ms ease-out var(--particle-delay) both;
+  }
+
+  .particle__sway,
+  .particle__glyph {
+    animation: none;
+  }
+
+  @keyframes particle-flash {
+    0% {
+      opacity: 0;
+      transform: translate3d(0, 0, 0) scale(0.6);
+    }
+
+    20% {
+      opacity: 1;
+      transform: translate3d(0, -0.5rem, 0) scale(1.1);
+    }
+
+    100% {
+      opacity: 0;
+      transform: translate3d(0, -1rem, 0) scale(1);
+    }
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\apps\desktop\src\components\tips\tips.css ===
+/* THE POINTED-AT THING.
+
+   A tip has no scrim and no spotlight — the arrow is the whole mechanism — so
+   the subject gets marked rather than the rest of the app getting dimmed. The
+   host hangs `data-tip-target` on the subject — the arrow's anchor, or the
+   region that anchor defers to — and takes it off when the tip goes. Nothing
+   here knows what that element is.
+
+   `outline` and not a border, ring or glow: it draws outside the box without
+   taking part in layout, so nothing shifts when a tip lands, and it inherits
+   whatever `border-radius` the target already has instead of imposing one.
+   A glow was the first attempt and read as noise at every intensity — the
+   targets sit on busy surfaces, and a soft accent haze looks like more of the
+   same. A hard line does not. */
+
+[data-tip-target] {
+  outline: 2px solid var(--dt-primary);
+  outline-offset: 3px;
+  animation: hermes-tip-outline-pulse 1.8s ease-in-out infinite;
+}
+
+/* A region is a whole area — a nav row, the sidebar, the composer — and those
+   are the elements sitting flush against a scroller or an `overflow-hidden`
+   parent, where an outline drawn 3px OUTSIDE the box is the outline you can't
+   see. Inset it and it always lands on its own surface. Applies whether the
+   region was deferred to or anchored directly. */
+[data-tip-target][data-tip-region] {
+  outline-offset: -2px;
+}
+
+@keyframes hermes-tip-outline-pulse {
+  50% {
+    outline-color: color-mix(in srgb, var(--dt-primary) 45%, transparent);
+  }
+}
+
+/* Marked, not breathing. The outline is the signal; the pulse is only flavour. */
+@media (prefers-reduced-motion: reduce) {
+  [data-tip-target] {
+    animation: none;
+  }
+}
+

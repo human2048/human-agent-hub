@@ -1,0 +1,343 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_delivery_silence_filter.py ===
+"""Tests for the outbound silence-narration filter (anti-loop control).
+
+See the gateway delivery path: hallucinated "silence" tokens like ``*(silent)*``
+are dropped pre-send so bot-to-bot channels can't mirror them into a token-burning
+loop that crashes a model with "no content after all retries".
+"""
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform
+from gateway.delivery import (
+    DeliveryRouter,
+    DeliveryTarget,
+    _is_silence_narration,
+)
+
+
+# --- Truth table -----------------------------------------------------------
+
+POSITIVE_CASES = [
+    "*(silent)*",
+    "*Silence.*",
+    "🔇",
+    ".",
+    "…",
+    "...",
+    "(silent)",
+    "_silent_",
+    "silent",
+    " *(silent)* ",
+    "`silent`",
+    "~silent~",
+    "Silence",
+    "no response",
+    "No Reply.",
+]
+
+NEGATIVE_CASES = [
+    "Silence is golden — here is the plan...",
+    "Silent install completed",
+    "The deployment ran silently in the background",
+    "ok",
+    "👍",
+    "Here is the result:\n\n- item one\n- item two",
+    "I have nothing to add, but here is why: the build is green.",
+    "silently",  # word boundary — trailing letters mean it isn't a bare token
+    "no responses were collected from the survey",
+    # A 64+ char string that opens with a silence token must not be dropped.
+    "silent " + "x" * 70,
+    "",
+    "   ",
+]
+
+
+@pytest.mark.parametrize("content", POSITIVE_CASES)
+def test_is_silence_narration_positive(content):
+    assert _is_silence_narration(content) is True
+
+
+def test_length_guard_rejects_long_strings():
+    # Exactly 65 chars of dots — over the 64-char guard, so not treated as narration.
+    assert _is_silence_narration("." * 65) is False
+    assert _is_silence_narration("." * 64) is True
+
+
+# --- Integration through DeliveryRouter ------------------------------------
+
+class RecordingAdapter:
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        return {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_silence_narration_dropped_pre_send(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_FILTER_SILENCE_NARRATION", raising=False)
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:99887766")
+
+    result = await router._deliver_to_platform(target, "*(silent)*", metadata=None)
+
+    assert adapter.calls == []  # adapter.send never invoked
+    assert result == {
+        "success": True,
+        "filtered": "silence_narration",
+        "delivered": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_config_opt_out_lets_silence_through(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_FILTER_SILENCE_NARRATION", raising=False)
+    adapter = RecordingAdapter()
+    config = GatewayConfig(filter_silence_narration=False)
+    router = DeliveryRouter(config, adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:99887766")
+
+    result = await router._deliver_to_platform(target, "*(silent)*", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["content"] == "*(silent)*"
+    assert result == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_env_override_enables_filter_over_config(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_FILTER_SILENCE_NARRATION", "1")
+    adapter = RecordingAdapter()
+    # Config says off, env override forces on.
+    config = GatewayConfig(filter_silence_narration=False)
+    router = DeliveryRouter(config, adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:99887766")
+
+    result = await router._deliver_to_platform(target, "*(silent)*", metadata=None)
+
+    assert adapter.calls == []
+    assert result["filtered"] == "silence_narration"
+
+
+# --- Cron artifacts are exempt ----------------------------------------------
+#
+# The filter exists to stop bot-to-bot mirror loops of *model chatter*. Cron
+# output is an artifact: a job that legitimately emits "..." (a quiet script,
+# a terse digest) has no loop partner, and dropping it while returning
+# {"success": True} produced a cron the scheduler logged as delivered and the
+# user never received (#77763). Cron sends carry job_id in metadata.
+
+
+@pytest.mark.asyncio
+async def test_cron_job_id_metadata_bypasses_the_filter(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_FILTER_SILENCE_NARRATION", raising=False)
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:99887766")
+
+    result = await router._deliver_to_platform(
+        target, "*(silent)*", metadata={"job_id": "92e639af907f"},
+    )
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["content"] == "*(silent)*"
+    assert result.get("filtered") is None
+    assert result.get("delivered") is not False
+
+
+@pytest.mark.asyncio
+async def test_non_cron_metadata_still_filters(tmp_path, monkeypatch):
+    """The exemption keys on job_id alone — everything else is unchanged."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_FILTER_SILENCE_NARRATION", raising=False)
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:99887766")
+
+    result = await router._deliver_to_platform(
+        target, "*(silent)*", metadata={"thread_id": "42", "user_id": "u1"},
+    )
+
+    assert adapter.calls == []
+    assert result["filtered"] == "silence_narration"
+
+
+# --- Config round-trip ------------------------------------------------------
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_delivery_unknown_target.py ===
+"""Unknown destinations must not acknowledge a successful local delivery."""
+
+from pathlib import Path
+
+import pytest
+
+from gateway.config import GatewayConfig
+from gateway.delivery import DeliveryRouter, DeliveryTarget
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ["MisspelledPlatform:ChatID:ThreadID", "", "   "])
+async def test_unknown_destination_fails_without_writing_and_local_still_works(tmp_path, monkeypatch, raw):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    router = DeliveryRouter(GatewayConfig())
+    target = DeliveryTarget.parse(raw)
+    raw = raw.strip()
+    result = await router.deliver("must not save", [target], job_id="bad")
+    assert not any(receipt["success"] for receipt in result.values()), result
+    assert raw in result
+    assert result[raw]["error"] == f"unknown_platform: {raw}"
+    assert not list(tmp_path.rglob("*.txt"))
+    assert not list(tmp_path.rglob("*.md"))
+    result = await router.deliver("explicit local marker", [DeliveryTarget.parse("local")], job_id="good")
+    assert result["local"]["success"]
+    assert "explicit local marker" in Path(result["local"]["result"]["path"]).read_text(encoding="utf-8")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_destructive_slash_always_persist_report.py ===
+"""Answering "Always Approve" must not claim an opt-out that was not saved.
+
+``save_config_value`` swallows its own errors and reports the outcome through
+its return value, so the caller's ``try``/``except`` never sees a failed write.
+``_on_confirm`` ignored that return value and appended "Future /clear, /new,
+/reset, and /undo will run without confirmation" unconditionally, so on any
+install whose ``config.yaml`` is not writable (read-only bind mount, container
+recreation) the user was told the preference stuck when it had not. The prompt
+comes back on the next restart with no explanation.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+
+import pytest
+
+import gateway.run as gw
+
+
+class _Source:
+    platform = "telegram"
+
+
+class _Event:
+    source = _Source()
+
+
+def _runner():
+    """Bare object carrying only what _maybe_confirm_destructive_slash touches."""
+    obj = types.SimpleNamespace()
+    obj._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    obj._session_key_for_source = lambda source: "sess-1"
+    obj._typed_command_prefix_for = lambda platform: "/"
+    captured = {}
+
+    async def _request_slash_confirm(*, event, command, title, message, handler):
+        captured["handler"] = handler
+        return "prompted"
+
+    obj._request_slash_confirm = _request_slash_confirm
+    obj._captured = captured
+    return obj
+
+
+async def _resolve(runner, choice, *, result="🧹 Conversation cleared."):
+    """Drive the gate, then invoke the captured handler with *choice*."""
+    async def _execute():
+        return result
+
+    await gw.GatewayRunner._maybe_confirm_destructive_slash(
+        runner,
+        event=_Event(),
+        command="clear",
+        title="Clear conversation",
+        detail="This discards history.",
+        execute=_execute,
+    )
+    return await runner._captured["handler"](choice)
+
+
+@pytest.fixture
+def fake_cli(monkeypatch):
+    """Install a stub `cli` module whose save_config_value outcome is settable."""
+    calls = []
+
+    module = types.ModuleType("cli")
+
+    def save_config_value(key_path, value):
+        calls.append((key_path, value))
+        return module._outcome
+
+    module.save_config_value = save_config_value
+    module._outcome = True
+    monkeypatch.setitem(sys.modules, "cli", module)
+    module.calls = calls
+    return module
+
+
+@pytest.mark.asyncio
+async def test_failed_persist_is_reported_as_failed(fake_cli):
+    fake_cli._outcome = False
+
+    out = await _resolve(_runner(), "always")
+
+    assert fake_cli.calls == [("approvals.destructive_slash_confirm", False)]
+    # The action the user approved still ran.
+    assert out.startswith("🧹 Conversation cleared.")
+    # ...but the message must not promise an opt-out that was never written.
+    assert "will run without confirmation" not in out
+    assert "Could not save that preference" in out
+
+
+@pytest.mark.asyncio
+async def test_successful_persist_still_reports_success(fake_cli):
+    fake_cli._outcome = True
+
+    out = await _resolve(_runner(), "always")
+
+    assert fake_cli.calls == [("approvals.destructive_slash_confirm", False)]
+    assert "will run without confirmation" in out
+    assert "Could not save that preference" not in out
+
+
+@pytest.mark.asyncio
+async def test_raising_persist_is_also_reported_as_failed(fake_cli):
+    def _boom(key_path, value):
+        raise OSError(30, "Read-only file system")
+
+    fake_cli.save_config_value = _boom
+
+    out = await _resolve(_runner(), "always")
+
+    assert out.startswith("🧹 Conversation cleared.")
+    assert "will run without confirmation" not in out
+
+
+@pytest.mark.asyncio
+async def test_once_neither_persists_nor_annotates(fake_cli):
+    out = await _resolve(_runner(), "once")
+
+    assert fake_cli.calls == []
+    assert out == "🧹 Conversation cleared."
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_persist(fake_cli):
+    out = await _resolve(_runner(), "cancel")
+
+    assert fake_cli.calls == []
+    assert "cancelled" in out.lower()
+

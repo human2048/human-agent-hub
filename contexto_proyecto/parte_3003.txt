@@ -1,0 +1,335 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_weixin_secret_scope.py ===
+"""Weixin adapter secret-scope regression tests.
+
+The adapter's WEIXIN_* credential reads must follow the Slack pattern
+(#59739): under multiplexing a SCOPED miss is authoritative (no borrow from
+``os.environ`` — that would be a cross-profile leak), while an UNSCOPED read
+(default-profile startup/send path) falls back to ``os.environ``, which is
+that profile's own value, instead of raising ``UnscopedSecretError``.
+"""
+
+import pytest
+
+from agent import secret_scope
+from gateway.config import PlatformConfig
+from gateway.platforms.weixin import WeixinAdapter, _wx_secret
+
+
+@pytest.fixture()
+def multiplex_on():
+    previous = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        yield
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+
+class TestWxSecretHelper:
+    def test_scoped_read_uses_scope_value(self, multiplex_on, monkeypatch):
+        monkeypatch.setenv("WEIXIN_TOKEN", "default-profile-token")
+        token = secret_scope.set_secret_scope({"WEIXIN_TOKEN": "scoped-token"})
+        try:
+            assert _wx_secret("WEIXIN_TOKEN") == "scoped-token"
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    def test_scoped_miss_does_not_borrow_environ(self, multiplex_on, monkeypatch):
+        """A secondary profile without WEIXIN_TOKEN must NOT inherit the
+        default profile's process-env token."""
+        monkeypatch.setenv("WEIXIN_TOKEN", "default-profile-token")
+        token = secret_scope.set_secret_scope({"OTHER_KEY": "x"})
+        try:
+            assert _wx_secret("WEIXIN_TOKEN", "") == ""
+            assert _wx_secret("WEIXIN_TOKEN") is None
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    def test_unscoped_read_falls_back_to_environ(self, multiplex_on, monkeypatch):
+        """The default profile's adapter runs unscoped under multiplexing;
+        os.environ is its own value — fall back instead of raising."""
+        monkeypatch.setenv("WEIXIN_TOKEN", "default-profile-token")
+        token = secret_scope.set_secret_scope(None)
+        try:
+            assert _wx_secret("WEIXIN_TOKEN") == "default-profile-token"
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+
+class TestWeixinAdapterConstructionScope:
+    def test_multiplex_scoped_construction_reads_scope_not_environ(
+        self, multiplex_on, monkeypatch
+    ):
+        monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "env-account")
+        monkeypatch.setenv("WEIXIN_TOKEN", "env-token")
+        token = secret_scope.set_secret_scope(
+            {
+                "WEIXIN_ACCOUNT_ID": "scoped-account",
+                "WEIXIN_TOKEN": "scoped-token",
+            }
+        )
+        try:
+            adapter = WeixinAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._account_id == "scoped-account"
+        assert adapter._token == "scoped-token"
+
+    def test_multiplex_scoped_miss_yields_empty_not_environ_borrow(
+        self, multiplex_on, monkeypatch
+    ):
+        monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "env-account")
+        monkeypatch.setenv("WEIXIN_TOKEN", "env-token")
+        token = secret_scope.set_secret_scope({"SOMETHING_ELSE": "x"})
+        try:
+            adapter = WeixinAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._account_id == ""
+        assert adapter._token == ""
+
+    def test_multiplex_unscoped_construction_falls_back_to_environ(
+        self, multiplex_on, monkeypatch
+    ):
+        """Regression for the bare get_secret reads: default-profile adapter
+        construction under multiplexing must not raise UnscopedSecretError."""
+        monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "env-account")
+        monkeypatch.setenv("WEIXIN_TOKEN", "env-token")
+        token = secret_scope.set_secret_scope(None)
+        try:
+            adapter = WeixinAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._account_id == "env-account"
+        assert adapter._token == "env-token"
+
+
+class TestWeixinAdapterAuthzScope:
+    """Authorization reads (dm_policy/allowlists) must follow the same
+    scoped-secret rules as the credential reads above (#93522): a secondary
+    profile's own scope is authoritative, and the default profile's
+    process-env values must not leak into it."""
+
+    def test_scoped_construction_reads_authz_from_scope_not_environ(
+        self, multiplex_on, monkeypatch
+    ):
+        monkeypatch.setenv("WEIXIN_DM_POLICY", "pairing")
+        monkeypatch.setenv("WEIXIN_ALLOWED_USERS", "default-user")
+        monkeypatch.setenv("WEIXIN_GROUP_ALLOWED_USERS", "default-group-user")
+        token = secret_scope.set_secret_scope(
+            {
+                "WEIXIN_DM_POLICY": "allowlist",
+                "WEIXIN_ALLOWED_USERS": "scoped-user",
+                "WEIXIN_GROUP_ALLOWED_USERS": "scoped-group-user",
+            }
+        )
+        try:
+            adapter = WeixinAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._dm_policy == "allowlist"
+        assert adapter._allow_from == ["scoped-user"]
+        assert adapter._group_allow_from == ["scoped-group-user"]
+        assert adapter._is_dm_allowed("scoped-user") is True
+        assert adapter._is_dm_allowed("default-user") is False
+
+    def test_scoped_miss_does_not_admit_default_profiles_allow_all(
+        self, multiplex_on, monkeypatch
+    ):
+        """A secondary profile with no allowlist of its own must fail closed,
+        not inherit the default profile's env-only allowlist/opt-in."""
+        monkeypatch.setenv("WEIXIN_DM_POLICY", "allowlist")
+        monkeypatch.setenv("WEIXIN_ALLOWED_USERS", "default-user")
+        token = secret_scope.set_secret_scope({"SOMETHING_ELSE": "x"})
+        try:
+            adapter = WeixinAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._dm_policy == "pairing"
+        assert adapter._allow_from == []
+        assert adapter._is_dm_allowed("default-user") is False
+
+
+class TestWeixinAdapterSplitMultilineScope:
+    """``split_multiline_messages`` must follow the same scoped-secret rules
+    as every other WEIXIN_* tunable in this block (missed by the
+    scoped-reader retrofit): a secondary profile's own scope is
+    authoritative, and the default profile's process-env value must not
+    leak into it."""
+
+    def test_scoped_construction_reads_split_multiline_from_scope_not_environ(
+        self, multiplex_on, monkeypatch
+    ):
+        monkeypatch.setenv("WEIXIN_SPLIT_MULTILINE_MESSAGES", "false")
+        token = secret_scope.set_secret_scope(
+            {"WEIXIN_SPLIT_MULTILINE_MESSAGES": "true"}
+        )
+        try:
+            adapter = WeixinAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._split_multiline_messages is True
+
+    def test_scoped_miss_does_not_borrow_default_profiles_split_multiline(
+        self, multiplex_on, monkeypatch
+    ):
+        """A secondary profile with no split_multiline_messages of its own
+        must fall back to the coded default, not inherit the default
+        profile's env-only value."""
+        monkeypatch.setenv("WEIXIN_SPLIT_MULTILINE_MESSAGES", "true")
+        token = secret_scope.set_secret_scope({"SOMETHING_ELSE": "x"})
+        try:
+            adapter = WeixinAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._split_multiline_messages is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_weixin_typing.py ===
+"""Tests for WeChat iLink typing ticket refresh logic (issue #38085)."""
+
+import asyncio
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture
+def weixin_adapter():
+    """Create a minimal WeixinAdapter with mocked internals for typing tests."""
+    from gateway.platforms.weixin import WeixinAdapter, TypingTicketCache
+
+    config = MagicMock()
+    config.extra = {"account_id": "test-account"}
+    config.name = "weixin"
+
+    with patch.object(WeixinAdapter, "__init__", lambda self, cfg: None):
+        adapter = WeixinAdapter.__new__(WeixinAdapter)
+        adapter._send_session = AsyncMock()
+        adapter._token = "test-token"
+        adapter._base_url = "https://ilinkai.weixin.qq.com"
+        adapter._account_id = "test-account"
+        adapter._typing_cache = TypingTicketCache(ttl_seconds=600.0)
+        adapter._token_store = MagicMock()
+        adapter._token_store.get.return_value = None  # no stored context_token
+        adapter.platform = MagicMock()
+        mock_value = MagicMock()
+        mock_value.title.return_value = "Weixin"
+        adapter.platform.value = mock_value
+
+    return adapter
+
+
+class TestEnsureTypingTicket:
+    """Tests for _ensure_typing_ticket — the fix for stuck typing indicator."""
+
+
+    @pytest.mark.asyncio
+    async def test_refreshes_when_ticket_expired(self, weixin_adapter):
+        """When the cached ticket has expired, fetch a new one via getConfig."""
+        # Insert an expired ticket directly (bypass TTL check)
+        weixin_adapter._typing_cache._cache["user-123"] = (
+            "old-ticket",
+            time.time() - 601,  # expired (TTL is 600s)
+        )
+
+        mock_response = {"typing_ticket": "fresh-ticket-xyz"}
+        with patch("gateway.platforms.weixin._get_config", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_response
+            ticket = await weixin_adapter._ensure_typing_ticket("user-123")
+
+        assert ticket == "fresh-ticket-xyz"
+        mock_get.assert_called_once_with(
+            weixin_adapter._send_session,
+            base_url=weixin_adapter._base_url,
+            token=weixin_adapter._token,
+            user_id="user-123",
+            context_token=None,
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_uses_stored_context_token_when_available(self, weixin_adapter):
+        """Pass the stored context_token to getConfig when available."""
+        weixin_adapter._token_store.get.return_value = "stored-ctx-token"
+
+        mock_response = {"typing_ticket": "ticket-with-ctx"}
+        with patch("gateway.platforms.weixin._get_config", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_response
+            ticket = await weixin_adapter._ensure_typing_ticket("user-789")
+
+        assert ticket == "ticket-with-ctx"
+        mock_get.assert_called_once_with(
+            weixin_adapter._send_session,
+            base_url=weixin_adapter._base_url,
+            token=weixin_adapter._token,
+            user_id="user-789",
+            context_token="stored-ctx-token",
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_getconfig_fails(self, weixin_adapter):
+        """Return None when getConfig raises an exception."""
+        with patch("gateway.platforms.weixin._get_config", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = Exception("network error")
+            ticket = await weixin_adapter._ensure_typing_ticket("user-123")
+
+        assert ticket is None
+
+
+class TestTypingTicketCache:
+    """Tests for the TypingTicketCache TTL logic."""
+
+    def test_returns_ticket_when_fresh(self):
+        from gateway.platforms.weixin import TypingTicketCache
+        cache = TypingTicketCache(ttl_seconds=600.0)
+        cache.set("user-1", "ticket-1")
+        assert cache.get("user-1") == "ticket-1"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_weixin_voice_warning_policy.py ===
+"""Voice downgrade diagnostic is optional; the actual attachment is not."""
+import json
+from unittest.mock import AsyncMock
+
+import pytest
+from gateway.config import PlatformConfig
+from gateway.platforms import weixin as wx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", [None, False, True])
+@pytest.mark.parametrize("caption", [None, "Warning: requested caption"])
+async def test_real_voice_file_send_filters_only_generated_caption(tmp_path, monkeypatch, setting, caption):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    config = {} if setting is None else {"display": {"suppress_warning_notifications": setting}}
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    adapter = wx.WeixinAdapter(PlatformConfig(token="fixture-token", extra={"account_id": "fixture"}))
+    adapter._send_session = object()
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"fixture bytes")
+    posts = []
+    async def post(*args, **kwargs):
+        posts.append(kwargs["payload"])
+        return {"ret": 0}
+    monkeypatch.setattr(wx, "_get_upload_url", AsyncMock(return_value={"upload_full_url": "https://example.invalid/upload"}))
+    upload = AsyncMock(return_value="upload-reference")
+    monkeypatch.setattr(wx, "_upload_ciphertext", upload)
+    monkeypatch.setattr(wx, "_api_post", post)
+    result = await adapter.send_voice("recipient", str(audio), caption=caption)
+    assert result.success and result.message_id
+    upload.assert_awaited_once()
+    items = [item for payload in posts for item in payload["msg"]["item_list"]]
+    text = [item["text_item"]["text"] for item in items if "text_item" in item]
+    assert text == ([caption] if caption else [] if setting is True else ["[voice message as attachment]"])
+    assert len([item for item in items if "file_item" in item]) == 1
+

@@ -1,0 +1,274 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_phantom_tool_references.py ===
+"""Phantom tool references: system-prompt blocks must not name tools the
+session can't call (Blank Slate audit, Aug 2026).
+
+Covers:
+  * HERMES_AGENT_HELP_GUIDANCE degrades to the docs-only variant when the
+    skill tools aren't loaded.
+  * execution_guidance_text() never names a web tool (guidance is toolset-neutral).
+  * The coding operating brief drops the `todo` sentence when the todo tool
+    isn't loaded.
+  * ESSENTIAL_SKILLS can't be disabled via config, and the CLI writer strips
+    them from persisted disabled lists.
+"""
+
+from pathlib import Path
+
+
+class TestHermesAgentHelpGuidance:
+    def test_skill_variant_used_when_skill_view_present(self):
+        from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE
+        assert "skill_view(name='hermes-agent')" in HERMES_AGENT_HELP_GUIDANCE
+
+    def test_no_skills_variant_has_no_skill_view_reference(self):
+        from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS
+        assert "skill_view" not in HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS
+        assert "hermes-agent.nousresearch.com/docs" in HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS
+
+
+class TestExecutionGuidanceText:
+    def test_no_web_tool_named_without_web_tools(self):
+        # #39797: naming web_search here overrode SOUL.md and dangled when the web toolset was off.
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE, execution_guidance_text
+        text = execution_guidance_text()
+        assert text == OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert "web_search" not in text and "web_extract" not in text
+        # The surrounding structure survives.
+        assert "<mandatory_tool_use>" in text
+        assert "<missing_context>" in text
+
+
+class TestCodingBriefTodoGating:
+    def _brief(self, valid_tool_names):
+        from agent.coding_context import CODING_PROFILE, RuntimeMode
+        mode = RuntimeMode(
+            profile=CODING_PROFILE, surface="cli", cwd=Path.cwd(),
+        )
+        prefix, _ws, _tr = mode.system_prompt_parts(
+            valid_tool_names=valid_tool_names
+        )
+        assert prefix, "coding profile must emit an operating brief"
+        return prefix[0]
+
+    def test_todo_kept_when_tool_available(self):
+        brief = self._brief({"todo_list", "terminal", "read_file"})
+        assert "Track multi-step work with `todo_list`" in brief
+
+    def test_todo_dropped_when_tool_missing(self):
+        brief = self._brief({"terminal", "read_file"})
+        assert "`todo`" not in brief
+        # The path:line half of the merged bullet survives.
+        assert "path:line" in brief
+
+    def test_unknown_toolset_keeps_full_brief(self):
+        brief = self._brief(None)
+        assert "Track multi-step work with `todo_list`" in brief
+
+
+class TestEssentialSkillsUndisableable:
+    def test_agent_side_reader_strips_essential(self, monkeypatch, tmp_path):
+        import agent.skill_utils as su
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "skills:\n  disabled:\n    - hermes-agent\n    - some-other-skill\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(su, "get_config_path", lambda: cfg)
+        su._RAW_CONFIG_CACHE.clear()
+        disabled = su.get_disabled_skill_names(platform="cli")
+        assert "hermes-agent" not in disabled
+        assert "some-other-skill" in disabled
+
+    def test_cli_side_reader_strips_essential(self):
+        from hermes_cli.skills_config import get_disabled_skills
+        cfg = {"skills": {"disabled": ["hermes-agent", "other"]}}
+        disabled = get_disabled_skills(cfg)
+        assert "hermes-agent" not in disabled
+        assert "other" in disabled
+
+    def test_cli_side_writer_strips_essential(self, monkeypatch):
+        import hermes_cli.skills_config as sc
+        saved = {}
+        monkeypatch.setattr(sc, "save_config", lambda cfg: saved.update(cfg))
+        cfg = {}
+        sc.save_disabled_skills(cfg, {"hermes-agent", "other"})
+        assert cfg["skills"]["disabled"] == ["other"]
+
+    def test_skill_manage_delete_refused(self):
+        from tools.skill_manager_guards import _pinned_guard
+        msg = _pinned_guard("hermes-agent")
+        assert msg is not None
+        assert "essential" in msg.lower()
+
+
+class TestEssentialOnlySync:
+    def test_opted_out_sync_seeds_only_essential(self, monkeypatch, tmp_path):
+        """A profile with .no-bundled-skills still gets the hermes-agent skill."""
+        import tools.skills_sync as ss
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / ss.NO_BUNDLED_SKILLS_MARKER).write_text("", encoding="utf-8")
+
+        bundled = tmp_path / "bundled"
+        for cat, name in [
+            ("autonomous-ai-agents", "hermes-agent"),
+            ("media", "gif-search"),
+        ]:
+            d = bundled / cat / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: x\n---\nbody\n",
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(ss, "_hermes_home", lambda: home)
+        monkeypatch.setattr(ss, "_get_bundled_dir", lambda: bundled)
+        monkeypatch.setattr(ss, "_build_external_skill_index", lambda: set())
+
+        result = ss.sync_skills(quiet=True)
+
+        assert result["skipped_opt_out"] is True
+        assert result["copied"] == ["hermes-agent"]
+        assert (home / "skills" / "autonomous-ai-agents" / "hermes-agent" / "SKILL.md").exists()
+        assert not (home / "skills" / "media").exists()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_plan_prompt.py ===
+"""Tests for the built-in /plan command (formerly the bundled `plan` skill).
+
+Covers the shared prompt builder (agent.plan_prompt.build_plan_prompt) and the
+registry wiring that makes /plan a first-class command on every surface —
+CLI, gateway messengers, and TUI. The skill-to-builtin move exists precisely
+so /plan survives the Telegram/Discord command-menu caps that trimmed it as
+an alphabetical skill entry.
+"""
+
+from agent.plan_prompt import build_plan_prompt
+
+
+class TestBuildPlanPrompt:
+    def test_task_is_included_verbatim(self):
+        task = "migrate the auth provider to OIDC with zero downtime"
+        prompt = build_plan_prompt(task)
+        assert task in prompt
+
+    def test_empty_task_infers_from_conversation(self):
+        prompt = build_plan_prompt("")
+        assert "infer the task from the current conversation context" in prompt
+        # Whitespace-only behaves the same.
+        assert "infer the task" in build_plan_prompt("   ")
+
+    def test_plan_mode_ground_rules_always_present(self):
+        for arg in ("", "build a REST API"):
+            prompt = build_plan_prompt(arg)
+            assert "PLAN MODE" in prompt
+            assert "Do not implement code" in prompt
+            assert "Do not run mutating terminal commands" in prompt
+            assert "read-only" in prompt
+
+    def test_save_location_contract(self):
+        prompt = build_plan_prompt("anything")
+        assert ".hermes/plans/" in prompt
+        assert "YYYY-MM-DD_HHMMSS-<slug>.md" in prompt
+
+    def test_authoring_craft_travels_with_every_prompt(self):
+        prompt = build_plan_prompt("x")
+        assert "bite-sized" in prompt
+        assert "exact file paths" in prompt.lower()
+        assert "TDD" in prompt
+        assert "YAGNI" in prompt
+
+    def test_no_execution_handoff_in_same_turn(self):
+        prompt = build_plan_prompt("x")
+        assert "do not start executing in this turn" in prompt
+
+
+class TestPlanRegistryWiring:
+    def test_plan_is_registered_and_resolves(self):
+        from hermes_cli.commands import resolve_command
+
+        cmd = resolve_command("plan")
+        assert cmd is not None
+        assert cmd.name == "plan"
+
+    def test_plan_is_not_cli_only(self):
+        # /plan must reach messaging gateways — the whole point of the
+        # builtin conversion is menu visibility on Telegram/Discord.
+        from hermes_cli.commands import resolve_command
+
+        assert not resolve_command("plan").cli_only
+
+    def test_plan_reaches_gateway_dispatch(self):
+        from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS
+
+        assert "plan" in GATEWAY_KNOWN_COMMANDS
+
+    def test_plan_in_telegram_bot_commands(self):
+        from hermes_cli.commands_platforms import telegram_bot_commands
+
+        names = {n for n, _ in telegram_bot_commands()}
+        assert "plan" in names
+
+    def test_no_bundled_plan_skill_remains(self):
+        # The bundled skill was removed with the builtin conversion; a
+        # leftover copy would collide with the core command at scan time
+        # (scan_skill_commands skips core-colliding skill slugs with a
+        # warning, so the skill would be silently unreachable).
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[2]
+        assert not (repo_root / "skills" / "software-development" / "plan").exists()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_platform_hint_cron_delivery.py ===
+"""A cron agent's system prompt carries its delivery channel's hint.
+
+Cron agents run as platform ``cron`` but the final response lands on the job's ``deliver``
+channel. Without the destination hint the model never learns that MEDIA: tags become native
+attachments there, and ``platform_hints.<channel>.append`` never reached scheduled jobs
+(community report: Slack-delivered cron jobs stopped sending attachments).
+"""
+
+import types
+
+import pytest
+
+from agent.prompt_builder import PLATFORM_HINTS
+from agent.system_prompt import platform_hint
+from gateway.session_context import _VAR_MAP
+
+EXTRA = "Always attach the report as a .pdf."
+
+
+def _agent(platform, overrides=None):
+    return types.SimpleNamespace(platform=platform, _platform_hint_overrides=overrides or {})
+
+
+@pytest.fixture
+def deliver_to(monkeypatch):
+    var = _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"]
+    token = var.set("slack")
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
+    yield
+    var.reset(token)
+
+
+def test_cron_agent_gets_delivery_channel_hint_with_its_override(deliver_to):
+    hint = platform_hint(_agent("cron", {"slack": {"append": EXTRA}}))
+    assert hint.startswith(PLATFORM_HINTS["cron"])
+    assert PLATFORM_HINTS["slack"] in hint
+    assert EXTRA in hint
+    # The cron hint's own override channel is untouched by the destination's.
+    assert platform_hint(_agent("cron", {"cron": {"replace": "X"}})).startswith("X\n\n")
+
+
+def test_delivery_target_only_applies_to_cron_agents(deliver_to):
+    assert platform_hint(_agent("telegram")) == PLATFORM_HINTS["telegram"]
+    _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set("")
+    assert platform_hint(_agent("cron")) == PLATFORM_HINTS["cron"]
+

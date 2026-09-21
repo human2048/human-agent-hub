@@ -1,0 +1,336 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\references\sources\wikipedia.md ===
+# Wikipedia + Wikidata
+
+## 1. Summary
+
+Wikipedia is the canonical narrative-bio source for notable people, places,
+and organizations. Wikidata is its structured-data counterpart: ~110M
+items, each with claims, dates, identifiers, and cross-references to
+external authorities (VIAF, ISNI, ORCID, GRID, etc.).
+
+Together they're a high-precision entity-resolution layer — the bar for
+inclusion is real, but anything past that bar is well-cross-referenced.
+
+## 2. Access Methods
+
+- **Wikipedia OpenSearch:** `https://en.wikipedia.org/w/api.php?action=opensearch`
+- **Wikipedia REST summary:** `https://en.wikipedia.org/api/rest_v1/page/summary/<title>`
+- **Wikidata Action API:** `https://www.wikidata.org/w/api.php?action=wbgetentities`
+- **Wikidata SPARQL:** `https://query.wikidata.org/sparql` (more powerful but aggressively rate-limited)
+- **Auth:** None, but **a meaningful User-Agent is required**
+
+Set `HERMES_OSINT_UA` to something identifying (e.g. `your-app/1.0 (you@example.com)`).
+Wikimedia returns HTTP 429 to generic UAs.
+
+## 3. Data Schema
+
+Key fields emitted by `fetch_wikipedia.py`:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `source` | str | `wikipedia` or `wikipedia+wikidata` |
+| `label` | str | Wikipedia article title |
+| `description` | str | Short Wikidata description |
+| `qid` | str | Wikidata QID (e.g. Q2283 for Microsoft) |
+| `wikipedia_title`, `wikipedia_url` | str | Article identifier + URL |
+| `wikidata_url` | str | Wikidata entity URL |
+| `instance_of` | str | What kind of thing it is (P31) |
+| `country` | str | Country (P17 for orgs/places, P27 for people) |
+| `occupation` | str | P106 |
+| `employer` | str | P108 |
+| `date_of_birth` | str | P569, YYYY-MM-DD |
+| `place_of_birth` | str | P19 |
+| `summary` | str | Wikipedia REST extract (~1000 chars) |
+
+The fetch script uses Wikidata's Action API (NOT SPARQL) for structured
+facts — far more lenient on rate limits.
+
+## 4. Coverage
+
+- Wikipedia EN: ~7M articles
+- Wikidata: ~110M items, ~1.5B statements
+- Updated continuously; abuse filters and bots run constantly
+- High notability bar — most private individuals are not in Wikipedia
+
+## 5. Cross-Reference Potential
+
+- **All sources** ↔ `label` (entity identity resolution)
+- **SEC EDGAR** ↔ `label` (public companies)
+- **CourtListener** ↔ `label` (parties to notable litigation)
+- **Wikidata external identifiers** (not currently in this fetcher's output)
+  link to VIAF, ISNI, ORCID, GRID, GitHub, Twitter, IMDb, ...
+
+Join key: Wikidata QID is canonical. Wikipedia titles are stable for
+most articles but can be renamed.
+
+## 6. Data Quality
+
+- Notability filter — only notable entities (criteria vary by topic)
+- Recency lag — current events take days to weeks to be reflected
+- POV / vandalism — moderated, but edits between sweeps can be bad
+- Living-persons biographies have stricter sourcing requirements
+- Wikidata claims have qualifiers and references — the fetch script
+  doesn't currently export them
+
+## 7. Acquisition Script
+
+Path: `scripts/fetch_wikipedia.py`
+
+```bash
+# Look up a notable entity
+python3 SKILL_DIR/scripts/fetch_wikipedia.py --query "Microsoft" --out data/wp.csv
+
+# A specific person
+python3 SKILL_DIR/scripts/fetch_wikipedia.py --query "Bill Gates" --out data/wp_bg.csv
+
+# Skip the Wikidata enrichment for speed
+python3 SKILL_DIR/scripts/fetch_wikipedia.py --query "Microsoft" --no-wikidata \
+    --limit 5 --out data/wp.csv
+```
+
+The OpenSearch is fuzzy — `--limit 5` returns the top 5 Wikipedia article
+matches. Each is enriched with the QID + structured facts unless
+`--no-wikidata` is passed.
+
+## 8. Legal & Licensing
+
+- Wikipedia text: CC-BY-SA-3.0 / GFDL
+- Wikidata claims: CC0 (public domain)
+- API ToS: respect rate limits, identify your agent
+- Commercial use allowed with attribution
+
+## 9. References
+
+- Wikipedia OpenSearch: https://www.mediawiki.org/wiki/API:Opensearch
+- Wikipedia REST: https://en.wikipedia.org/api/rest_v1/
+- Wikidata Action API: https://www.wikidata.org/wiki/Wikidata:Data_access
+- Wikidata SPARQL: https://www.wikidata.org/wiki/Wikidata:SPARQL_query_service
+- User-Agent policy: https://meta.wikimedia.org/wiki/User-Agent_policy
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\scripts\build_findings.py ===
+#!/usr/bin/env python3
+"""Build a structured findings.json with evidence chains (stdlib-only).
+
+Aggregates cross_links.csv (entity_resolution output) and an optional
+timing.json (timing_analysis output) into a single evidence-chain document.
+
+Output structure:
+    {
+      "metadata": {...},
+      "findings": [
+        {
+          "id": "F0001",
+          "title": "...",
+          "severity": "HIGH|MEDIUM|LOW",
+          "confidence": "high|medium|low",
+          "summary": "...",
+          "evidence": [
+            {"source": "cross_links.csv", "row": 12, "fields": {...}},
+            ...
+          ],
+          "sources": ["cross_links.csv", "timing.json"]
+        }
+      ]
+    }
+
+Every finding traces to specific source rows. No naked claims.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from collections import defaultdict
+from pathlib import Path
+
+CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
+SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+
+def _read_cross_links(path: str) -> list[dict[str, str]]:
+    with open(path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def build_findings(
+    cross_links_path: str,
+    timing_path: str | None = None,
+    out_path: str = "findings.json",
+    bundled_threshold: int = 3,
+) -> dict:
+    findings: list[dict] = []
+    next_id = 1
+
+    # 1. Match-based findings, grouped by (left_normalized, right_normalized).
+    matches = _read_cross_links(cross_links_path)
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for i, row in enumerate(matches):
+        row["__row__"] = str(i)
+        grouped[(row.get("left_normalized", ""), row.get("right_normalized", ""))].append(row)
+
+    for (left_norm, right_norm), rows in grouped.items():
+        if not left_norm or not right_norm:
+            continue
+        # Use the highest-confidence match for the finding's overall confidence.
+        best = min(rows, key=lambda r: CONFIDENCE_ORDER.get(r.get("confidence", "low"), 2))
+        finding_id = f"F{next_id:04d}"
+        next_id += 1
+        evidence = [
+            {
+                "source": "cross_links.csv",
+                "row": int(r["__row__"]),
+                "fields": {
+                    "match_type": r.get("match_type", ""),
+                    "confidence": r.get("confidence", ""),
+                    "left_name": r.get("left_name", ""),
+                    "right_name": r.get("right_name", ""),
+                    "overlap_ratio": r.get("overlap_ratio", ""),
+                    "shared_tokens": r.get("shared_tokens", ""),
+                },
+            }
+            for r in rows
+        ]
+        findings.append(
+            {
+                "id": finding_id,
+                "title": f"Entity match: {best.get('left_name', '')} ↔ {best.get('right_name', '')}",
+                "severity": "MEDIUM" if best.get("confidence") == "high" else "LOW",
+                "confidence": best.get("confidence", "low"),
+                "summary": (
+                    f"{len(rows)} cross-link record(s) tie "
+                    f"'{best.get('left_name', '')}' to "
+                    f"'{best.get('right_name', '')}' "
+                    f"(best tier: {best.get('match_type', '')})."
+                ),
+                "evidence": evidence,
+                "sources": ["cross_links.csv"],
+            }
+        )
+
+    # 2. Bundled-donations findings (if cross_links carries donor↔candidate pattern).
+    #    Heuristic: many distinct left names sharing the same right name.
+    by_right: dict[str, set[str]] = defaultdict(set)
+    by_right_rows: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for r in matches:
+        right = r.get("right_normalized", "")
+        left_raw = r.get("left_name", "").strip()
+        if right and left_raw:
+            by_right[right].add(left_raw)
+            by_right_rows[right].append(r)
+    for right_norm, lefts in by_right.items():
+        if len(lefts) < bundled_threshold:
+            continue
+        rows = by_right_rows[right_norm]
+        right_raw = rows[0].get("right_name", "")
+        findings.append(
+            {
+                "id": f"F{next_id:04d}",
+                "title": f"Bundled cross-links: {len(lefts)} distinct left entities ↔ '{right_raw}'",
+                "severity": "HIGH",
+                "confidence": "medium",
+                "summary": (
+                    f"{len(lefts)} distinct left-side entities link to "
+                    f"'{right_raw}'. Pattern suggests coordinated relationship "
+                    f"(e.g. bundled donations, multi-vendor employer)."
+                ),
+                "evidence": [
+                    {
+                        "source": "cross_links.csv",
+                        "row": int(r.get("__row__", "0")),
+                        "fields": {
+                            "left_name": r.get("left_name", ""),
+                            "match_type": r.get("match_type", ""),
+                        },
+                    }
+                    for r in rows
+                ],
+                "sources": ["cross_links.csv"],
+            }
+        )
+        next_id += 1
+
+    # 3. Timing-based findings.
+    if timing_path and Path(timing_path).exists():
+        timing = json.loads(Path(timing_path).read_text(encoding="utf-8"))
+        for r in timing.get("results", []):
+            if not r.get("significant"):
+                continue
+            findings.append(
+                {
+                    "id": f"F{next_id:04d}",
+                    "title": (
+                        f"Donation timing significantly clusters near awards: "
+                        f"{r['donor']} ↔ {r['recipient']}"
+                    ),
+                    "severity": "HIGH" if r["p_value"] < 0.01 else "MEDIUM",
+                    "confidence": "medium",
+                    "summary": (
+                        f"Mean nearest-award distance {r['observed_mean_days']} days "
+                        f"(null {r['null_mean_days']} days). p={r['p_value']}, "
+                        f"effect size {r['effect_size_sd']} SD. "
+                        f"{r['n_donations']} donations, {r['n_award_dates']} awards."
+                    ),
+                    "evidence": [
+                        {
+                            "source": "timing.json",
+                            "row": None,
+                            "fields": r,
+                        }
+                    ],
+                    "sources": ["timing.json"],
+                }
+            )
+            next_id += 1
+
+    # Sort: severity → confidence → id.
+    findings.sort(
+        key=lambda f: (
+            SEVERITY_ORDER.get(f["severity"], 3),
+            CONFIDENCE_ORDER.get(f["confidence"], 3),
+            f["id"],
+        )
+    )
+
+    payload = {
+        "metadata": {
+            "n_findings": len(findings),
+            "cross_links_path": cross_links_path,
+            "timing_path": timing_path,
+            "bundled_threshold": bundled_threshold,
+        },
+        "findings": findings,
+    }
+    Path(out_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--cross-links", required=True)
+    p.add_argument("--timing", help="Optional timing.json from timing_analysis.py")
+    p.add_argument("--out", default="findings.json")
+    p.add_argument(
+        "--bundled-threshold",
+        type=int,
+        default=3,
+        help="Minimum distinct left entities to flag as bundled (default 3)",
+    )
+    a = p.parse_args()
+
+    payload = build_findings(
+        cross_links_path=a.cross_links,
+        timing_path=a.timing,
+        out_path=a.out,
+        bundled_threshold=a.bundled_threshold,
+    )
+    print(f"Wrote {payload['metadata']['n_findings']} findings to {a.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

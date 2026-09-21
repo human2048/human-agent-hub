@@ -1,0 +1,376 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_plugin_dispatch.py ===
+"""Tests for TTS plugin dispatch in tools/tts_tool.py (issue #30398).
+
+Covers the three core invariants of the plugin dispatcher:
+
+1. Built-in provider names short-circuit — plugins NEVER win over a
+   built-in. Even if a plugin somehow ended up in the registry with a
+   built-in name (which the registry already blocks), the dispatcher
+   re-checks defensively.
+2. Command-type providers declared under ``tts.providers.<name>: type:
+   command`` (PR #17843) win over a plugin with the same name. Config
+   is more local than plugin install.
+3. Plugin dispatch fires only when the configured provider is neither
+   a built-in nor a command-type entry, AND a plugin is registered
+   under that name. Unknown names fall through.
+
+Also exercises:
+- Plugin exceptions surface to the outer error envelope (don't crash)
+- Plugin returning a different path is honored
+- voice_compatible: True triggers ffmpeg opus conversion path
+- voice_compatible: False keeps the file as-is
+
+The dispatcher is exercised in isolation — we don't actually call
+``text_to_speech_tool`` because that would require real audio file
+writes. Each test directly calls
+``tools.tts_tool._dispatch_to_plugin_provider`` / the predicate
+helpers.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import pytest
+
+from agent import tts_registry
+from agent.tts_provider import TTSProvider
+from tools import tts_tool
+
+
+class _FakeTTSProvider(TTSProvider):
+    def __init__(
+        self,
+        name: str,
+        voice_compat: bool = False,
+        raise_exc: Optional[BaseException] = None,
+        return_path: Optional[str] = None,
+    ):
+        self._name = name
+        self._voice_compat = voice_compat
+        self._raise_exc = raise_exc
+        self._return_path = return_path
+        # Recorded for assertions
+        self.last_call: Optional[dict] = None
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def voice_compatible(self) -> bool:
+        return self._voice_compat
+
+    def synthesize(self, text, output_path, **kw):
+        self.last_call = {
+            "text": text,
+            "output_path": output_path,
+            "kwargs": dict(kw),
+        }
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return self._return_path if self._return_path is not None else output_path
+
+
+@pytest.fixture(autouse=True)
+def _reset_registry():
+    tts_registry._reset_for_tests()
+    yield
+    tts_registry._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Resolution invariants
+# ---------------------------------------------------------------------------
+
+
+class TestBuiltinAlwaysWins:
+    """Built-in TTS provider names short-circuit the dispatcher.
+
+    Even with a plugin registered (which the registry would reject —
+    but the dispatcher is defensive), built-in names return None so
+    the caller's elif chain handles them natively.
+    """
+
+    @pytest.mark.parametrize(
+        "builtin",
+        ["edge", "openai", "elevenlabs", "minimax", "gemini",
+         "mistral", "xai", "piper", "kittentts", "neutts"],
+    )
+    def test_dispatcher_short_circuits_builtin(self, builtin):
+        result = tts_tool._dispatch_to_plugin_provider(
+            text="hello",
+            output_path="/tmp/out.mp3",
+            provider=builtin,
+            tts_config={},
+        )
+        assert result is None, (
+            f"Built-in {builtin!r} must short-circuit plugin dispatch. "
+            "If this test fails, the dispatcher would silently let a "
+            "plugin with a built-in name shadow the native handler — "
+            "violating the precedence rule from PR #17843."
+        )
+
+    def test_dispatcher_short_circuits_builtin_case_insensitive(self):
+        for variant in ("EDGE", "Edge", "  edge  ", "eDgE"):
+            assert (
+                tts_tool._dispatch_to_plugin_provider(
+                    text="hello", output_path="/tmp/x.mp3",
+                    provider=variant, tts_config={},
+                ) is None
+            )
+
+
+class TestCommandProviderWins:
+    """A same-name ``tts.providers.<name>: type: command`` config beats a plugin.
+
+    Locality: a user's command-provider config is more specific than
+    whichever plugin happens to be installed.
+    """
+
+    def test_command_config_beats_plugin(self):
+        tts_registry.register_provider(_FakeTTSProvider(name="my-tts"))
+
+        result = tts_tool._dispatch_to_plugin_provider(
+            text="hello",
+            output_path="/tmp/out.mp3",
+            provider="my-tts",
+            tts_config={
+                "providers": {
+                    "my-tts": {
+                        "type": "command",
+                        "command": "echo 'hi' > {output_path}",
+                    },
+                },
+            },
+        )
+        # Plugin path returns None → caller falls back to command
+        # provider dispatch (handled by the outer text_to_speech_tool
+        # via _resolve_command_provider_config).
+        assert result is None
+
+
+class TestPluginDispatch:
+    """Happy path: configured name matches a registered plugin, dispatcher fires."""
+
+    def test_registered_plugin_called(self):
+        provider = _FakeTTSProvider(name="cartesia")
+        tts_registry.register_provider(provider)
+
+        result = tts_tool._dispatch_to_plugin_provider(
+            text="hello world",
+            output_path="/tmp/out.mp3",
+            provider="cartesia",
+            tts_config={},
+        )
+        assert result == "/tmp/out.mp3"
+        assert provider.last_call is not None
+        assert provider.last_call["text"] == "hello world"
+        assert provider.last_call["output_path"] == "/tmp/out.mp3"
+
+    def test_unregistered_name_returns_none(self):
+        result = tts_tool._dispatch_to_plugin_provider(
+            text="hello",
+            output_path="/tmp/out.mp3",
+            provider="unknown-tts",
+            tts_config={},
+        )
+        assert result is None
+
+
+    def test_provider_exception_bubbles_up(self):
+        """Plugin exceptions are NOT swallowed by the dispatcher — they bubble
+        up so the outer ``text_to_speech_tool`` try/except converts them to
+        the standard error envelope. Matches command-provider failure
+        behavior."""
+        provider = _FakeTTSProvider(
+            name="cartesia",
+            raise_exc=RuntimeError("network down"),
+        )
+        tts_registry.register_provider(provider)
+
+        with pytest.raises(RuntimeError, match="network down"):
+            tts_tool._dispatch_to_plugin_provider(
+                text="hi",
+                output_path="/tmp/out.mp3",
+                provider="cartesia",
+                tts_config={},
+            )
+
+
+# ---------------------------------------------------------------------------
+# voice_compatible flag
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceCompatibleHelper:
+    def test_voice_compatible_true(self):
+        tts_registry.register_provider(
+            _FakeTTSProvider(name="cartesia", voice_compat=True)
+        )
+        assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is True
+
+
+    def test_unregistered_provider_returns_false(self):
+        assert tts_tool._plugin_provider_is_voice_compatible("unknown") is False
+
+
+    def test_provider_property_exception_returns_false(self):
+        """A buggy ``voice_compatible`` property raising must not crash the
+        TTS pipeline."""
+
+        class _ExplodingProvider(_FakeTTSProvider):
+            @property
+            def voice_compatible(self) -> bool:
+                raise RuntimeError("boom")
+
+        tts_registry.register_provider(_ExplodingProvider(name="cartesia"))
+        assert tts_tool._plugin_provider_is_voice_compatible("cartesia") is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_prepare_spoken.py ===
+"""Unit tests for the shared TTS text cleaner (tools/tts_text_normalize).
+
+Covers the consolidated preprocessing pipeline: <think> reasoning blocks
+(#34213), emoji strip (#13311/#18598), file-mutation verifier footer
+(#40772), newline flattening for newline-sensitive providers (#9004), and
+the wiring of the ONE shared cleaner into both the text_to_speech tool
+path and the voice-mode paths.
+"""
+
+import json
+
+from tools.tts_text_normalize import (
+    flatten_newlines_for_payload,
+    prepare_spoken_text,
+    strip_nonspoken_blocks,
+)
+
+
+class TestThinkBlockStrip:
+    def test_think_block_removed(self):
+        raw = "<think>\nsecret reasoning here\n</think>\nThe answer is 42."
+        spoken = prepare_spoken_text(raw)
+        assert "secret reasoning" not in spoken
+        assert "42" in spoken
+
+    def test_think_block_with_attributes_removed(self):
+        raw = "<think budget=high>chain of thought</think>Visible."
+        spoken = prepare_spoken_text(raw)
+        assert "chain of thought" not in spoken
+        assert "Visible" in spoken
+
+    def test_unterminated_think_block_removed(self):
+        raw = "Answer first. <think>\ntruncated reasoning stream"
+        spoken = prepare_spoken_text(raw)
+        assert "truncated reasoning" not in spoken
+        assert "Answer first" in spoken
+
+    def test_multiple_think_blocks(self):
+        raw = "<think>a</think>one<think>b</think> two"
+        spoken = strip_nonspoken_blocks(raw)
+        assert "a" not in spoken.replace("one", "").replace("two", "")
+        assert "one" in spoken and "two" in spoken
+
+
+class TestVerifierFooterStrip:
+    FOOTER = (
+        "⚠️ File-mutation verifier: 2 file(s) were NOT modified this turn "
+        "despite any wording above that may suggest otherwise. Run `git "
+        "status` or `read_file` to confirm.\n"
+        "  • `tools/foo.py` — [patch] old_string not found\n"
+        "  • `bar.md` — [write_file] failed"
+    )
+
+    def test_footer_removed(self):
+        raw = "I fixed the file.\n\n" + self.FOOTER
+        spoken = prepare_spoken_text(raw)
+        assert "File-mutation verifier" not in spoken
+        assert "NOT modified" not in spoken
+        assert "fixed the file" in spoken
+
+
+    def test_text_without_footer_untouched(self):
+        raw = "Just a normal reply about files."
+        assert strip_nonspoken_blocks(raw).strip() == raw
+
+
+class TestEmojiStrip:
+    def test_emoji_removed(self):
+        spoken = prepare_spoken_text("Done! 🎉🚀 All tests pass ✅")
+        assert "🎉" not in spoken
+        assert "🚀" not in spoken
+        assert "✅" not in spoken
+        assert "All tests pass" in spoken
+
+
+class TestNewlineFlattening:
+    def test_no_newlines_in_output(self):
+        raw = "First line\nSecond line\n\nThird paragraph"
+        spoken = prepare_spoken_text(raw)
+        assert "\n" not in spoken
+        assert "First line" in spoken
+        assert "Third paragraph" in spoken
+
+
+    def test_existing_punctuation_not_doubled(self):
+        out = flatten_newlines_for_payload("Alpha.\nBeta!")
+        assert ".." not in out
+        assert "Alpha." in out and "Beta!" in out
+
+
+class TestSharedCleanerWiring:
+    """The ONE cleaner must be applied on every TTS entry path."""
+
+    def test_tool_path_strips_think_blocks(self):
+        from tools.tts_text_normalize import _strip_markdown_for_tts
+
+        cleaned = _strip_markdown_for_tts("<think>hidden</think>**Loud** and clear 🎉")
+        assert "hidden" not in cleaned
+        assert "**" not in cleaned
+        assert "🎉" not in cleaned
+        assert "Loud and clear" in cleaned
+
+    def test_tool_rejects_text_empty_after_cleanup(self):
+        from tools.tts_tool import text_to_speech_tool
+
+        result = json.loads(text_to_speech_tool(text="<think>only reasoning</think>"))
+        assert result["success"] is False
+
+    def test_streaming_helper_uses_shared_cleaner(self):
+        from tools.tts_text_normalize import _strip_markdown_for_tts
+
+        cleaned = _strip_markdown_for_tts("Temp is 14°C today\nand rising")
+        assert "degrees Celsius" in cleaned
+        assert "\n" not in cleaned
+
+    def test_gateway_prepare_tts_text_strips_think_blocks(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter
+
+        class _DummyAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(
+                    PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM
+                )
+
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, chat_id, content, **kwargs):
+                raise AssertionError("not used")
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id, "type": "dm"}
+
+        adapter = _DummyAdapter()
+        spoken = adapter.prepare_tts_text("<think>plan</think>Hello there")
+        assert "plan" not in spoken
+        assert "Hello there" in spoken
+

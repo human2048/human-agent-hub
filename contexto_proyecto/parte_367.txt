@@ -1,0 +1,255 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\desktop-pane-fixture\README.md ===
+# Saved-pane fixture import-delay control
+
+From a root `npm ci` installation, run in `apps/desktop`:
+
+```sh
+npx vitest run --config ../../evals/desktop-pane-fixture/vitest.config.mts --reporter verbose
+npx vitest run --project ui src/store/session-pane-focus.test.ts --sequence.shuffle.tests --sequence.seed=12345 --reporter verbose
+```
+
+The Vite plugin appends an 11-second asynchronous wait to the real pane-tree
+store's evaluation. It does not mock pane functions, inspect source text in an
+assertion, lower a deadline, or alter the two test bodies. The UI test deadline
+remains 15 seconds and the default hook deadline remains 10 seconds. This is a
+scheduling-controlled reproduction of import latency, not a claim that a local
+machine reproduced the original CI load unassisted. It is opt-in, not a slow CI
+test.
+
+For A/B, apply this eval directory to the parent revision and run the same
+command, then run on the fixture fix. Base evaluates the graph inside each
+`beforeEach`; fixed evaluates it once during test collection. The delay marker
+appears twice on base and once on fixed. Expected: base fails with `Hook timed
+out in 10000ms`; fixed runs both behavioral assertions successfully.
+
+Measured on the initial base `fb3446a281e`:
+
+| Control | Result |
+| --- | --- |
+| Base + evaluation delay | 2 hook timeouts, 20.04s test phase |
+| Fixed + identical delay | 2 passed, 5ms test phase; 11.84s import phase |
+| Fixed normal and reversed test order (seed 12345) | 2 passed in each order |
+| Store directory, 8 workers | 123 files / 1491 tests passed |
+| Complete UI project, 8 workers | 753 files / 7355 assertions passed, but exit 1 from an unrelated Radix focus-scope timer's wrong-realm Event in `statusbar-visibility.test.tsx` |
+
+Mutation controls, applied separately to `session-states.ts` and then restored:
+
+- Remove `revealTreePane(paneId)` in `focusOpenSession`: the overlay re-adoption
+  case fails (`null` instead of `canonical-chat`); the miss case passes.
+- Make `focusWorkspaceOwnerSessionTile` return the stored id regardless of
+  `focusOpenSession`'s result: the miss case fails (`canonical-chat` instead of
+  `null`); the overlay case passes.
+
+The fixture uses the real registry, tree watcher, pane mirror, overlay, tile
+store, and focus helpers. Install app-lifetime watchers once per isolated Vitest
+file graph. Discard the fixture tile through the real action to clear both the
+reactive source and its persisted in-memory bucket; reset layout, focus, preset,
+selection, read baseline, and localStorage between cases. The mirror observes the
+discard and unregisters its contribution. No production API needs a test-only
+reset or disposer.
+
+If the host has exhausted inotify watches, prefix commands with
+`CHOKIDAR_USEPOLLING=true`; this changes file watching, not test deadlines. The
+recorded store/full-suite and final focused controls used that workaround.
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\desktop_bug_campaign\async-report-probe.html ===
+<!doctype html><html><head><meta charset="utf-8"></head><body><div id="root"></div><script type="module" src="FIXTURE_ENTRY"></script></body></html>
+
+
+=== ARCHIVO: .\hermes-agent\evals\desktop_bug_campaign\async-report-producer.py ===
+"""Real offline completion producers -> durable SQLite rows; never run a model."""
+import asyncio
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+
+repo = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(repo))
+output = Path(sys.argv[1])
+with tempfile.TemporaryDirectory(prefix="async-report-producer-") as temporary:
+    home = Path(temporary)
+    for key in list(os.environ):
+        if key.startswith("HERMES_") or key.endswith(("_API_KEY", "_TOKEN")):
+            os.environ.pop(key, None)
+    os.environ.update(HOME=str(home), HERMES_HOME=str(home / ".hermes"))
+    from cron.jobs import create_job, save_job_output
+    from gateway.wake import persist_delegation_delivery
+    from hermes_state import SessionDB
+    from tools.cronjob_tools import _manual_run_completion
+    from tools.process_registry_notifications import format_process_notification
+
+    report = "# Generated inspection\n\n**Conclusion:** attention needed.\n\n| Strategy | Status |\n|---|---|\n| Canary | running |\n\nFirst line  \nSecond line\n\n```python\nvalue = 1  \nvalue = 2 \n```"
+    job = create_job(prompt="Offline fixture; never run", schedule="0 0 * * *", name="Markdown probe", deliver="local")
+    save_job_output(job["id"], report)
+    result = _manual_run_completion({"success": True}, job["id"], job["name"], "local", time.time())
+    common = dict(type="async_delegation", delegation_id="report-probe", goal="PRIVATE GOAL", context="PRIVATE CONTEXT")
+    events = {
+        "cron": dict(common, **result),
+        "process": dict(common, status="completed", summary=report),
+        "batch": dict(common, is_batch=True, goals=["PRIVATE FIRST", "PRIVATE SECOND\nPRIVATE CONTINUATION"], results=[
+            dict(task_index=0, status="completed", summary=report, live_transcript="/private/transcript"),
+            dict(task_index=1, status="completed", summary="Plain batch result"),
+        ]),
+        "legacy": dict(common, status="completed", summary=report),
+        "plain": dict(common, status="completed", summary="Plain result"),
+        "malformed": dict(common, status="completed"),
+    }
+    db = SessionDB(db_path=home / "delivery.db")
+
+    class DeliveryStore:
+        def _ensure_session_db(self):
+            return db
+
+    cases = {}
+    for name, event in events.items():
+        envelope = format_process_notification(event)
+        assert envelope is not None
+        if name == "legacy":
+            envelope = report
+        elif name == "malformed":
+            envelope = "[ASYNC DELEGATION COMPLETE — malformed]\nPRIVATE INSTRUCTIONS"
+        db.create_session(session_id=name, source="desktop")
+        asyncio.run(persist_delegation_delivery(DeliveryStore(), text=envelope, session_id=name, evt=event))
+        rows = db.get_messages_as_conversation(name, include_row_ids=True)
+        cases[name] = dict(envelope=envelope, rows=rows, stored_exactly=rows[0]["content"] == envelope)
+    output.write_text(json.dumps({"report": report, "cases": cases}, indent=2), encoding="utf-8")
+    print(json.dumps({"cases": len(cases), "stored_exactly": all(c["stored_exactly"] for c in cases.values()), "producer": "cron save/formatter -> process formatter -> durable delivery -> SQLite readback", "model_requests": 0}))
+    db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\desktop_bug_campaign\async-report-README.md ===
+# Async report rendering probe
+
+Offline integration proof for Desktop async completion reports. The producer creates
+synthetic output, passes it through the real cron manual-completion formatter,
+process notification formatter, durable delivery and SQLite, then reads actual rows.
+The browser imports production hydration, runtime, SystemMessage and Desktop CSS.
+No model, scheduled job or user configuration is used.
+
+From the repository root with the normal Python and npm dependencies installed:
+
+```sh
+export HOME=$(mktemp -d)
+export HERMES_HOME="$HOME/.hermes"
+export ASYNC_REPORT_ARTIFACT_DIR=$(mktemp -d)
+# If Chromium is installed outside the temporary HOME, set
+# PLAYWRIGHT_BROWSERS_PATH to that installation's browser cache.
+.venv/bin/python evals/desktop_bug_campaign/async-report-producer.py "$ASYNC_REPORT_ARTIFACT_DIR/producer.json"
+node evals/desktop_bug_campaign/async-report-vite.mjs
+# In another shell with the same environment:
+node evals/desktop_bug_campaign/async-report-live.mjs before
+node evals/desktop_bug_campaign/async-report-live.mjs after
+```
+
+The Vite probe binds loopback port 18164. Stop it after verification. The pinned
+baseline hydration is from commit `a688e7d5ff9aeaaa9c97d28c316467f89ab8c943`;
+all other renderer modules are the current checkout. Compare the emitted JSON and
+screenshots: cron/delegation/batch/legacy Markdown headings and tables are absent
+before and present after, plain results survive, malformed envelopes remain compact,
+and task goals/context/transcript footer paths do not render. Batch goals include a
+multiline case because the producer does not flatten them.
+
+This is producer/store integration plus live Chromium rendering, **not** scheduled
+execution, completion-poller/HTTP/WebSocket E2E, Bot Chat routing, or native macOS QA.
+The `process` case means an async-delegation event through the process notification
+formatter, not a terminal-process completion event. All fixtures are synthetic.
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\desktop_bug_campaign\history_live.py ===
+"""Real serve/HTTP/WS history witness. No provider calls; seeded SQLite data."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--repo', required=True)
+parser.add_argument('--output', required=True)
+parser.add_argument('--port', type=int, default=18146)
+args = parser.parse_args()
+repo, tag = str(Path(args.repo).resolve()), 'run'
+sys.path.insert(0, repo)
+out = Path(args.output).resolve()
+out.mkdir(parents=True, exist_ok=False)
+home = Path(tempfile.mkdtemp(prefix='history-'+tag+'-', dir=out))
+os.environ['HOME'] = str(home)
+os.environ['HERMES_HOME'] = str(home)
+from hermes_state import SessionDB
+from websockets.sync.client import connect
+
+items = [{'type': 'message', 'role': 'assistant', 'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': 'HISTORY_SIDECAR_REPLY'}]}]
+with SessionDB(db_path=home/'state.db') as db:
+    db.create_session('history-witness', source='desktop')
+    db.append_message('history-witness', 'user', 'HISTORY_USER_PROMPT')
+    db.append_message('history-witness', 'assistant', '', codex_message_items=items, reasoning='THINKING_BEFORE_TOOL', tool_calls=[{'id':'call-1','type':'function','function':{'name':'terminal','arguments':'{}'}}])
+    db.append_message('history-witness', 'tool', 'TOOL_OUTPUT', tool_call_id='call-1')
+    db.create_session('history-control', source='desktop')
+    db.append_message('history-control', 'user', 'CONTROL_USER')
+    db.append_message('history-control', 'assistant', 'CONTROL_REPLY')
+env = {k: v for k, v in os.environ.items() if k in ['PATH', 'HOME', 'LANG', 'USER', 'VIRTUAL_ENV']}
+env.update(HOME=str(home), HERMES_HOME=str(home), HERMES_DASHBOARD_SESSION_TOKEN='history-fixture-token', PYTHONPATH=repo, HERMES_NONINTERACTIVE='1')
+cmd=[sys.executable, '-m', 'hermes_cli.main', 'serve', '--host', '127.0.0.1', '--port', str(args.port), '--isolated']
+log=open(out/(tag+'-serve.log'),'w',encoding='utf-8')
+p=subprocess.Popen(cmd,cwd=repo,env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT)
+frames=[]
+try:
+    for _ in range(120):
+        try:
+            req=urllib.request.Request(f'http://127.0.0.1:{args.port}/api/status',headers={'X-Hermes-Token':'history-fixture-token'})
+            status=json.load(urllib.request.urlopen(req,timeout=2));break
+        except Exception:
+            if p.poll() is not None: raise RuntimeError('serve exited')
+            time.sleep(.5)
+    else: raise RuntimeError('serve never healthy')
+    def rpc(ws,method,params):
+        rid=len(frames)+1
+        request={'jsonrpc':'2.0','id':rid,'method':method,'params':params}
+        frames.append({'sent':request});ws.send(json.dumps(request))
+        while True:
+            reply=json.loads(ws.recv(timeout=30));frames.append({'received':reply})
+            if reply.get('id')==rid:
+                if 'error' in reply: raise RuntimeError(reply)
+                return reply['result']
+    results={}
+    for sid in ['history-witness','history-control']:
+        with connect(f'ws://127.0.0.1:{args.port}/api/ws?token=history-fixture-token') as ws:
+            first=rpc(ws,'session.resume',{'session_id':sid,'lazy':True})
+            rid=first['session_id']
+            history=rpc(ws,'session.history',{'session_id':rid})
+        with connect(f'ws://127.0.0.1:{args.port}/api/ws?token=history-fixture-token') as ws:
+            resumed=rpc(ws,'session.resume',{'session_id':sid,'lazy':True})
+            activated=rpc(ws,'session.activate',{'session_id':resumed['session_id']})
+            after=rpc(ws,'session.history',{'session_id':resumed['session_id']})
+        results[sid]={'first':first,'history':history,'resumed':resumed,'activated':activated,'after':after}
+    receipt={'tag':tag,'sha':subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,stdin=subprocess.DEVNULL,text=True).strip(),'command':cmd,'home':str(home),'results':results}
+    (out/(tag+'-rpc.json')).write_text(json.dumps(receipt,indent=2))
+    (out/(tag+'-frames.json')).write_text(json.dumps(frames,indent=2))
+    for sid, responses in results.items():
+        for method, value in responses.items():
+            messages = value['messages']
+            assert len(messages) == (3 if sid == 'history-witness' else 2), (sid, method)
+            if sid == 'history-witness':
+                assert 'HISTORY_SIDECAR_REPLY' in json.dumps(messages[1]), method
+            else:
+                assert 'CONTROL_REPLY' in json.dumps(messages[1]), method
+    print('10 real RPC history controls passed; receipts saved:', out)
+finally:
+    p.terminate()
+    try:p.wait(timeout=15)
+    except subprocess.TimeoutExpired:p.kill();p.wait()
+    log.close()
+

@@ -1,0 +1,474 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\optional\research\research-duckduckgo-search.md ===
+---
+title: "Duckduckgo Search — 通过 DuckDuckGo 免费搜索网络 — 文本、新闻、图片、视频"
+sidebar_label: "Duckduckgo Search"
+description: "通过 DuckDuckGo 免费搜索网络 — 文本、新闻、图片、视频"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Duckduckgo Search
+
+通过 DuckDuckGo 免费搜索网络 — 文本、新闻、图片、视频。无需 API 密钥。已安装时优先使用 `ddgs` CLI；仅在确认当前运行时中 `ddgs` 可用后，才使用 Python DDGS 库。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 可选 — 使用 `hermes skills install official/research/duckduckgo-search` 安装 |
+| 路径 | `optional-skills/research/duckduckgo-search` |
+| 版本 | `1.3.0` |
+| 作者 | gamedevCloudy |
+| 许可证 | MIT |
+| 平台 | linux, macos, windows |
+| 标签 | `search`, `duckduckgo`, `web-search`, `free`, `fallback` |
+| 相关 skill | [`arxiv`](/user-guide/skills/bundled/research/research-arxiv) |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+:::
+
+# DuckDuckGo Search
+
+使用 DuckDuckGo 进行免费网络搜索。**无需 API 密钥。**
+
+当 `web_search` 不可用或不适用时（例如未设置 `FIRECRAWL_API_KEY`），优先使用此 skill。也可在明确需要 DuckDuckGo 结果时作为独立搜索路径使用。
+
+## 检测流程
+
+在选择方案前，先检查实际可用的工具：
+
+```bash
+# Check CLI availability
+command -v ddgs >/dev/null && echo "DDGS_CLI=installed" || echo "DDGS_CLI=missing"
+```
+
+决策树：
+1. 若 `ddgs` CLI 已安装，优先使用 `terminal` + `ddgs`
+2. 若 `ddgs` CLI 未安装，不要假设 `execute_code` 能导入 `ddgs`
+3. 若用户明确需要 DuckDuckGo，先在相关环境中安装 `ddgs`
+4. 否则回退到内置的 web/browser 工具
+
+重要运行时说明：
+- Terminal 与 `execute_code` 是独立的运行时
+- shell 中安装成功不代表 `execute_code` 能导入 `ddgs`
+- 永远不要假设 `execute_code` 内已预装第三方 Python 包
+
+## 安装
+
+仅在明确需要 DuckDuckGo 搜索且运行时尚未提供时，才安装 `ddgs`。
+
+```bash
+# Python package + CLI entrypoint
+pip install ddgs
+
+# Verify CLI
+ddgs --help
+```
+
+若工作流依赖 Python 导入，请在使用 `from ddgs import DDGS` 前，先验证该运行时能否导入 `ddgs`。
+
+## 方法一：CLI 搜索（推荐）
+
+当 `ddgs` 命令存在时，通过 `terminal` 使用它。这是推荐路径，因为它避免了假设 `execute_code` 沙箱中已安装 `ddgs` Python 包。
+
+```bash
+# Text search
+ddgs text -q "python async programming" -m 5
+
+# News search
+ddgs news -q "artificial intelligence" -m 5
+
+# Image search
+ddgs images -q "landscape photography" -m 10
+
+# Video search
+ddgs videos -q "python tutorial" -m 5
+
+# With region filter
+ddgs text -q "best restaurants" -m 5 -r us-en
+
+# Recent results only (d=day, w=week, m=month, y=year)
+ddgs text -q "latest AI news" -m 5 -t w
+
+# JSON output for parsing
+ddgs text -q "fastapi tutorial" -m 5 -o json
+```
+
+### CLI 参数
+
+| 参数 | 说明 | 示例 |
+|------|-------------|---------|
+| `-q` | 查询词 — **必填** | `-q "search terms"` |
+| `-m` | 最大结果数 | `-m 5` |
+| `-r` | 地区 | `-r us-en` |
+| `-t` | 时间范围 | `-t w`（一周） |
+| `-s` | 安全搜索 | `-s off` |
+| `-o` | 输出格式 | `-o json` |
+
+## 方法二：Python API（仅在验证后使用）
+
+仅在确认 `ddgs` 已安装于该运行时后，才在 `execute_code` 或其他 Python 运行时中使用 `DDGS` 类。不要默认认为 `execute_code` 包含第三方包。
+
+正确表述：
+- "在安装或确认包可用后，在 `execute_code` 中使用 `ddgs`"
+
+避免表述：
+- "`execute_code` 包含 `ddgs`"
+- "DuckDuckGo 搜索在 `execute_code` 中默认可用"
+
+**重要：** `max_results` 必须始终以**关键字参数**形式传入 — 所有方法中以位置参数传入均会报错。
+
+### 文本搜索
+
+适用场景：通用研究、公司信息、文档查询。
+
+```python
+from ddgs import DDGS
+
+with DDGS() as ddgs:
+    for r in ddgs.text("python async programming", max_results=5):
+        print(r["title"])
+        print(r["href"])
+        print(r.get("body", "")[:200])
+        print()
+```
+
+返回字段：`title`、`href`、`body`
+
+### 新闻搜索
+
+适用场景：时事动态、突发新闻、最新更新。
+
+```python
+from ddgs import DDGS
+
+with DDGS() as ddgs:
+    for r in ddgs.news("AI regulation 2026", max_results=5):
+        print(r["date"], "-", r["title"])
+        print(r.get("source", ""), "|", r["url"])
+        print(r.get("body", "")[:200])
+        print()
+```
+
+返回字段：`date`、`title`、`body`、`url`、`image`、`source`
+
+### 图片搜索
+
+适用场景：视觉参考、产品图片、示意图。
+
+```python
+from ddgs import DDGS
+
+with DDGS() as ddgs:
+    for r in ddgs.images("semiconductor chip", max_results=5):
+        print(r["title"])
+        print(r["image"])
+        print(r.get("thumbnail", ""))
+        print(r.get("source", ""))
+        print()
+```
+
+返回字段：`title`、`image`、`thumbnail`、`url`、`height`、`width`、`source`
+
+### 视频搜索
+
+适用场景：教程、演示、讲解视频。
+
+```python
+from ddgs import DDGS
+
+with DDGS() as ddgs:
+    for r in ddgs.videos("FastAPI tutorial", max_results=5):
+        print(r["title"])
+        print(r.get("content", ""))
+        print(r.get("duration", ""))
+        print(r.get("provider", ""))
+        print(r.get("published", ""))
+        print()
+```
+
+返回字段：`title`、`content`、`description`、`duration`、`provider`、`published`、`statistics`、`uploader`
+
+### 快速参考
+
+| 方法 | 适用场景 | 关键字段 |
+|--------|----------|------------|
+| `text()` | 通用研究、公司信息 | title, href, body |
+| `news()` | 时事动态、最新更新 | date, title, source, body, url |
+| `images()` | 视觉内容、示意图 | title, image, thumbnail, url |
+| `videos()` | 教程、演示 | title, content, duration, provider |
+
+## 工作流：先搜索后提取
+
+DuckDuckGo 返回标题、URL 和摘要，而非完整页面内容。如需获取完整页面内容，先搜索，再用 `web_extract`、browser 工具或 curl 提取最相关的 URL。
+
+CLI 示例：
+
+```bash
+ddgs text -q "fastapi deployment guide" -m 3 -o json
+```
+
+Python 示例，仅在确认该运行时已安装 `ddgs` 后使用：
+
+```python
+from ddgs import DDGS
+
+with DDGS() as ddgs:
+    results = list(ddgs.text("fastapi deployment guide", max_results=3))
+    for r in results:
+        print(r["title"], "->", r["href"])
+```
+
+然后使用 `web_extract` 或其他内容获取工具提取最佳 URL 的内容。
+
+## 限制
+
+- **频率限制**：大量快速请求后，DuckDuckGo 可能进行限流。如有需要，在多次搜索之间添加短暂延迟。
+- **无内容提取**：`ddgs` 返回摘要，而非完整页面内容。如需完整文章/页面，请使用 `web_extract`、browser 工具或 curl。
+- **结果质量**：总体良好，但可配置性不如 Firecrawl 的搜索。
+- **可用性**：DuckDuckGo 可能屏蔽来自部分云 IP 的请求。若搜索返回空结果，请尝试不同关键词或等待几秒后重试。
+- **字段可变性**：不同结果或 `ddgs` 版本间返回字段可能有所不同。对可选字段使用 `.get()` 以避免 `KeyError`。
+- **独立运行时**：在 terminal 中成功安装 `ddgs` 不代表 `execute_code` 能自动导入它。
+
+## 故障排查
+
+| 问题 | 可能原因 | 处理方式 |
+|---------|--------------|------------|
+| `ddgs: command not found` | CLI 未安装在 shell 环境中 | 安装 `ddgs`，或改用内置 web/browser 工具 |
+| `ModuleNotFoundError: No module named 'ddgs'` | Python 运行时未安装该包 | 在准备好该运行时之前，不要在其中使用 Python DDGS |
+| 搜索无结果 | 临时限流或查询词不佳 | 等待几秒后重试，或调整查询词 |
+| CLI 正常但 `execute_code` 导入失败 | Terminal 与 `execute_code` 是不同的运行时 | 继续使用 CLI，或单独准备 Python 运行时 |
+
+## 常见陷阱
+
+- **`max_results` 仅支持关键字参数**：`ddgs.text("query", 5)` 会报错，请使用 `ddgs.text("query", max_results=5)`。
+- **不要假设 CLI 已存在**：使用前先检查 `command -v ddgs`。
+- **不要假设 `execute_code` 能导入 `ddgs`**：除非该运行时已单独准备，否则 `from ddgs import DDGS` 可能抛出 `ModuleNotFoundError`。
+- **包名**：该包名为 `ddgs`（原名 `duckduckgo-search`），使用 `pip install ddgs` 安装。
+- **不要混淆 `-q` 和 `-m`**（CLI）：`-q` 用于查询词，`-m` 用于最大结果数。
+- **空结果**：若 `ddgs` 返回空结果，可能是被限流。等待几秒后重试。
+
+## 验证版本
+
+已针对 `ddgs==9.11.2` 语义验证示例。Skill 指南现将 CLI 可用性与 Python 导入可用性视为独立问题，以确保文档化的工作流与实际运行时行为一致。
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\optional\research\research-gitnexus-explorer.md ===
+---
+title: "Gitnexus Explorer"
+sidebar_label: "Gitnexus Explorer"
+description: "使用 GitNexus 为代码库建立索引，并通过 Web UI + Cloudflare 隧道提供交互式知识图谱服务"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Gitnexus Explorer
+
+使用 GitNexus 为代码库建立索引，并通过 Web UI + Cloudflare 隧道提供交互式知识图谱服务。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 可选 — 使用 `hermes skills install official/research/gitnexus-explorer` 安装 |
+| 路径 | `optional-skills/research/gitnexus-explorer` |
+| 版本 | `1.0.0` |
+| 作者 | Hermes Agent + Teknium |
+| 许可证 | MIT |
+| 平台 | linux, macos, windows |
+| 标签 | `gitnexus`, `code-intelligence`, `knowledge-graph`, `visualization` |
+| 相关 skill | [`hermes-agent`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent), [`codebase-inspection`](/user-guide/skills/bundled/github/github-codebase-inspection) |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+:::
+
+# GitNexus Explorer
+
+将任意代码库索引为知识图谱，并提供交互式 Web UI，用于探索符号、调用链、聚类和执行流。通过 Cloudflare 隧道实现远程访问。
+
+## 适用场景
+
+- 用户希望可视化探索代码库架构
+- 用户请求生成某个仓库的知识图谱/依赖图
+- 用户希望与他人共享交互式代码库浏览器
+
+## 前置条件
+
+- **Node.js**（v18+）— GitNexus 和代理所需
+- **git** — 仓库必须包含 `.git` 目录
+- **cloudflared** — 用于隧道（如缺失，自动安装至 `~/.local/bin`）
+
+## 规模警告
+
+Web UI 在浏览器中渲染所有节点。文件数不超过约 5,000 的仓库运行良好。大型仓库（30k+ 节点）会导致浏览器标签页卡顿或崩溃。CLI/MCP 工具在任何规模下均可正常工作——仅 Web 可视化存在此限制。
+
+## 步骤
+
+### 1. 克隆并构建 GitNexus（一次性设置）
+
+```bash
+GITNEXUS_DIR="${GITNEXUS_DIR:-$HOME/.local/share/gitnexus}"
+
+if [ ! -d "$GITNEXUS_DIR/gitnexus-web/dist" ]; then
+  git clone https://github.com/abhigyanpatwari/GitNexus.git "$GITNEXUS_DIR"
+  cd "$GITNEXUS_DIR/gitnexus-shared" && npm install && npm run build
+  cd "$GITNEXUS_DIR/gitnexus-web" && npm install
+fi
+```
+
+### 2. 为远程访问修补 Web UI
+
+Web UI 默认使用 `localhost:4747` 进行 API 调用。将其修补为使用同源地址，以便通过隧道/代理正常工作：
+
+**文件：`$GITNEXUS_DIR/gitnexus-web/src/config/ui-constants.ts`**
+将：
+```typescript
+export const DEFAULT_BACKEND_URL = 'http://localhost:4747';
+```
+改为：
+```typescript
+export const DEFAULT_BACKEND_URL = typeof window !== 'undefined' && window.location.hostname !== 'localhost' ? window.location.origin : 'http://localhost:4747';
+```
+
+**文件：`$GITNEXUS_DIR/gitnexus-web/vite.config.ts`**
+在 `server: { }` 块内添加 `allowedHosts: true`（仅在使用开发模式而非生产构建时需要）：
+```typescript
+server: {
+    allowedHosts: true,
+    // ... existing config
+},
+```
+
+然后构建生产包：
+```bash
+cd "$GITNEXUS_DIR/gitnexus-web" && npx vite build
+```
+
+### 3. 为目标仓库建立索引
+
+```bash
+cd /path/to/target-repo
+npx gitnexus analyze --skip-agents-md
+rm -rf .claude/    # remove Claude Code-specific artifacts
+```
+
+添加 `--embeddings` 可启用语义搜索（速度较慢——需要数分钟而非数秒）。
+
+索引存储在仓库内的 `.gitnexus/` 目录中（已自动加入 `.gitignore`）。
+
+### 4. 创建代理脚本
+
+将以下内容写入文件（例如 `$GITNEXUS_DIR/proxy.mjs`）。它提供生产 Web UI 服务，并将 `/api/*` 代理至 GitNexus 后端——同源，无 CORS 问题，无需 sudo，无需 nginx。
+
+```javascript
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const API_PORT = parseInt(process.env.API_PORT || '4747');
+const DIST_DIR = process.argv[2] || './dist';
+const PORT = parseInt(process.argv[3] || '8888');
+
+const MIME = {
+  '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',
+  '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.woff': 'font/woff',
+  '.wasm': 'application/wasm',
+};
+
+function proxyToApi(req, res) {
+  const opts = {
+    hostname: '127.0.0.1', port: API_PORT,
+    path: req.url, method: req.method, headers: req.headers,
+  };
+  const proxy = http.request(opts, (upstream) => {
+    res.writeHead(upstream.statusCode, upstream.headers);
+    upstream.pipe(res, { end: true });
+  });
+  proxy.on('error', () => { res.writeHead(502); res.end('Backend unavailable'); });
+  req.pipe(proxy, { end: true });
+}
+
+function serveStatic(req, res) {
+  let filePath = path.join(DIST_DIR, req.url === '/' ? 'index.html' : req.url.split('?')[0]);
+  if (!fs.existsSync(filePath)) filePath = path.join(DIST_DIR, 'index.html');
+  const ext = path.extname(filePath);
+  const mime = MIME[ext] || 'application/octet-stream';
+  try {
+    const data = fs.readFileSync(filePath);
+    res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600' });
+    res.end(data);
+  } catch { res.writeHead(404); res.end('Not found'); }
+}
+
+http.createServer((req, res) => {
+  if (req.url.startsWith('/api')) proxyToApi(req, res);
+  else serveStatic(req, res);
+}).listen(PORT, () => console.log(`GitNexus proxy on http://localhost:${PORT}`));
+```
+
+### 5. 启动服务
+
+```bash
+# Terminal 1: GitNexus backend API
+npx gitnexus serve &
+
+# Terminal 2: Proxy (web UI + API on one port)
+node "$GITNEXUS_DIR/proxy.mjs" "$GITNEXUS_DIR/gitnexus-web/dist" 8888 &
+```
+
+验证：`curl -s http://localhost:8888/api/repos` 应返回已索引的仓库。
+
+### 6. 通过 Cloudflare 建立隧道（可选——用于远程访问）
+
+```bash
+# Install cloudflared if needed (no sudo)
+if ! command -v cloudflared &>/dev/null; then
+  mkdir -p ~/.local/bin
+  curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+    -o ~/.local/bin/cloudflared
+  chmod +x ~/.local/bin/cloudflared
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+
+# Start tunnel (--config /dev/null avoids conflicts with existing named tunnels)
+cloudflared tunnel --config /dev/null --url http://localhost:8888 --no-autoupdate --protocol http2
+```
+
+隧道 URL（例如 `https://random-words.trycloudflare.com`）将输出至 stderr。分享该链接——任何拥有链接的人均可探索图谱。
+
+### 7. 清理
+
+```bash
+# Stop services
+pkill -f "gitnexus serve"
+pkill -f "proxy.mjs"
+pkill -f cloudflared
+
+# Remove index from the target repo
+cd /path/to/target-repo
+npx gitnexus clean
+rm -rf .claude/
+```
+
+## 注意事项
+
+- **`cloudflared` 必须使用 `--config /dev/null`**：若用户在 `~/.cloudflared/config.yml` 中存在已命名的隧道配置，则不加此参数时，配置中的兜底 ingress 规则会对所有快速隧道请求返回 404。
+
+- **隧道必须使用生产构建。** Vite 开发服务器默认阻止非 localhost 主机（`allowedHosts`）。使用生产构建 + Node 代理可完全规避此问题。
+
+- **Web UI 不会创建 `.claude/` 或 `CLAUDE.md`。** 这些文件由 `npx gitnexus analyze` 创建。使用 `--skip-agents-md` 可抑制 markdown 文件的生成，再用 `rm -rf .claude/` 清除其余内容。这些是 Claude Code 集成产物，Hermes Agent 用户无需使用。
+
+- **浏览器内存限制。** Web UI 将整个图谱加载至浏览器内存。文件数超过 5k 的仓库可能出现卡顿，超过 30k 文件的仓库很可能导致标签页崩溃。
+
+- **Embedding（嵌入）为可选项。** `--embeddings` 可启用语义搜索，但在大型仓库上需要数分钟。如需快速探索可跳过；若希望通过 AI 对话面板进行自然语言查询，则可添加此选项。
+
+- **多仓库支持。** `gitnexus serve` 会服务所有已索引的仓库。可先为多个仓库建立索引，再启动一次 serve，Web UI 支持在各仓库间切换。

@@ -1,0 +1,308 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_sudo_command_context.py ===
+"""Sudo questions carry the original, redacted command through the real request path."""
+
+import sys
+import threading
+
+
+def test_sudo_request_preserves_command_without_leaking_prompt_context(monkeypatch):
+    from hermes_cli import banner
+
+    # The real server binds callbacks on import; isolate only its process-wide side effects.
+    monkeypatch.setattr(banner, "prefetch_update_check", lambda: None)
+    monkeypatch.setattr(sys, "stdout", sys.stdout)
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    from tui_gateway import server, server_requests
+    from tui_gateway.contracts.registry import SERVER_REQUESTS
+    from gateway.run import _redact_approval_command
+    from agent import redact
+    from agent.vault_backends import unlock
+    from tools import project_tools, skills_tool, terminal_tool, terminal_tool_sudo
+
+    # Restore the real registrations, including unrelated callbacks wired by the gateway.
+    monkeypatch.setattr(terminal_tool, "_callback_tls", threading.local())
+    monkeypatch.setattr(unlock, "_callback_tls", threading.local())
+    monkeypatch.setattr(unlock, "_current_session_tls", threading.local())
+    monkeypatch.setattr(project_tools, "_workspace_callback", None)
+    monkeypatch.setattr(skills_tool, "_secret_capture_callback", None)
+    monkeypatch.setattr(terminal_tool_sudo, "_sudo_password_cache", {})
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+
+    sid, session_key = "sudo-dialog", "sudo-conversation"
+    monkeypatch.setitem(server._sessions, sid, {"session_key": session_key, "source": "desktop"})
+    command = (
+        "printf '%s\\n' '" + "full context Ω " * 1000 + "' &&\n"
+        "sudo env API_TOKEN=ghp_" + "X" * 36 + " first-command | sort;\n"
+        "sudo second-command --keep-final-argument"
+    )
+    expected = _redact_approval_command(command)
+    assert expected != command
+    frames, replays = [], []
+
+    def refuse(frame):
+        frames.append(frame)
+        replays.append(server_requests.open_requests(sid))
+        assert server_requests.resolve_response(
+            {"jsonrpc": "2.0", "id": frame["id"], "result": {"value": ""}}
+        )
+        return True
+
+    monkeypatch.setattr(server, "write_json", refuse)
+    tokens = server._set_session_context(session_key, ui_session_id=sid)
+    try:
+        server._wire_callbacks(sid)
+        assert terminal_tool_sudo._transform_sudo_command(command) == (command, None)
+        assert len(frames) == 1
+        frame = frames[0]
+        assert frame["method"] == "sudo"
+        assert frame["params"] == {"session_id": sid, "command": expected}
+        assert replays == [[{key: frame[key] for key in ("id", "method", "params")}]]
+        assert server_requests.open_requests(sid) == []
+        assert terminal_tool_sudo._get_cached_sudo_password() == ""
+        assert terminal_tool_sudo.get_sudo_prompt_command() == ""
+
+        # A legacy zero-argument caller must not inherit the preceding command.
+        assert terminal_tool._get_sudo_password_callback()() == ""
+        assert frames[-1]["params"] == {"session_id": sid, "command": ""}
+        assert terminal_tool_sudo._prompt_for_sudo_password() == ""
+        assert frames[-1]["params"] == {"session_id": sid, "command": ""}
+        assert SERVER_REQUESTS["sudo"].params(session_id=sid).command == ""
+
+        def failed_legacy_callback():
+            assert terminal_tool_sudo.get_sudo_prompt_command() == command
+            raise RuntimeError("prompt unavailable")
+
+        terminal_tool.set_sudo_password_callback(failed_legacy_callback)
+        assert terminal_tool_sudo._prompt_for_sudo_password(command=command) == ""
+        assert terminal_tool_sudo.get_sudo_prompt_command() == ""
+    finally:
+        server._clear_session_context(tokens)
+        server_requests.reset_for_tests()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_todo_state_events.py ===
+"""Todo snapshots bypass optional tool-progress display settings."""
+
+import json
+
+import tui_gateway.server as server
+
+
+def test_todo_completion_always_emits_snapshot_and_compat_event(monkeypatch):
+    sid = "todo-state-test"
+    events = []
+    session = {
+        "agent": None,
+        "edit_snapshots": {},
+        "tool_started_at": {},
+        "tool_progress_mode": "off",
+    }
+    monkeypatch.setitem(server._sessions, sid, session)
+    monkeypatch.setattr(server, "_tool_progress_enabled", lambda _sid: False)
+    monkeypatch.setattr(server, "_tool_lifecycle_required_for_ui", lambda _name: False)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, event_sid, payload=None: events.append(
+            (event, event_sid, payload)
+        ),
+    )
+
+    state = {
+        "todos": [{"id": "1", "content": "Work", "status": "in_progress"}],
+        "revision": 9,
+    }
+    server._on_tool_complete(sid, "call-1", "todo", {}, json.dumps(state))
+
+    assert [event[0] for event in events] == ["tool.complete", "todo.updated"]
+    assert events[-1] == ("todo.updated", sid, state)
+    assert session["todo_state"] == state
+
+
+def test_non_todo_completion_stays_suppressed_when_progress_is_off(monkeypatch):
+    sid = "ordinary-tool-test"
+    events = []
+    monkeypatch.setitem(
+        server._sessions,
+        sid,
+        {
+            "agent": None,
+            "edit_snapshots": {},
+            "tool_started_at": {},
+            "tool_progress_mode": "off",
+        },
+    )
+    monkeypatch.setattr(server, "_tool_progress_enabled", lambda _sid: False)
+    monkeypatch.setattr(server, "_tool_lifecycle_required_for_ui", lambda _name: False)
+    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
+
+    server._on_tool_complete(sid, "call-1", "terminal", {}, "ok")
+
+    assert events == []
+
+
+def test_live_snapshot_prefers_the_highest_revision():
+    class Store:
+        @staticmethod
+        def snapshot():
+            return {"todos": [], "revision": 4}
+
+    class Agent:
+        _todo_store = Store()
+
+    session = {
+        "agent": Agent(),
+        "todo_state": {
+            "todos": [{"id": "1", "content": "Current", "status": "pending"}],
+            "revision": 5,
+        },
+    }
+
+    payload = server._attach_todo_state({}, session)
+
+    assert payload["todo_state"]["revision"] == 5
+
+
+def test_unused_store_is_not_attached():
+    class Store:
+        @staticmethod
+        def snapshot():
+            return {"todos": [], "revision": 0}
+
+    class Agent:
+        _todo_store = Store()
+
+    payload = server._attach_todo_state({}, {"agent": Agent()})
+
+    assert "todo_state" not in payload
+
+
+def test_empty_list_at_nonzero_revision_is_a_real_clear():
+    state = server._normalize_todo_state({"todos": [], "revision": 2})
+
+    assert state == {"todos": [], "revision": 2}
+
+
+def test_subagent_lifecycle_bypasses_tool_progress_off(monkeypatch):
+    """Subagent rows feed the Desktop status stack / TUI spawn tree — application state, not
+    tool-progress chrome — so display.tool_progress=off must not swallow them."""
+    sid = "subagent-progress-off"
+    events = []
+    monkeypatch.setitem(server._sessions, sid, {"agent": None, "tool_progress_mode": "off"})
+    monkeypatch.setattr(server, "_tool_progress_enabled", lambda _sid: False)
+    monkeypatch.setattr(server, "_emit", lambda event, event_sid, payload=None: events.append(event))
+
+    server._on_tool_progress(sid, "subagent.start", "delegate_task", "goal", None, goal="goal", subagent_id="s1")
+    server._on_tool_progress(sid, "reasoning.available", "_thinking", "hmm", None)
+
+    assert events == ["subagent.start"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_tour_bridge_fail_fast.py ===
+"""A desktop client that cannot answer the ``tour`` server request must not cost a full
+bridge timeout per call.
+
+The renderer's handler ships in the desktop bundle; the tool is offered by the
+backend. An app build older than the tour tool has no branch for the event, so
+nothing ever answers the request and the agent blocks for the whole deadline
+— once per action the model tries. See tui_gateway.server._tour_request.
+"""
+
+import json
+
+import pytest
+
+import tui_gateway.server as server
+
+
+@pytest.fixture
+def session(monkeypatch):
+    record = {}
+    monkeypatch.setitem(server._sessions, "s1", record)
+    return record
+
+
+@pytest.fixture
+def bridge(monkeypatch):
+    """Record every ``_ask`` (server request) call and serve canned answers."""
+    calls = []
+
+    def fake_block(event, sid, payload, timeout=None, **_kw):
+        answer = fake_block.answers.pop(0) if fake_block.answers else ""
+        calls.append({"event": event, "sid": sid, "payload": payload, "timeout": timeout})
+        return answer
+
+    fake_block.answers = []
+    fake_block.calls = calls
+    monkeypatch.setattr(server, "_ask", fake_block)
+    return fake_block
+
+
+def test_first_action_is_probed_on_a_short_deadline(session, bridge):
+    bridge.answers = [json.dumps({"success": True})]
+    server._tour_request("s1", {"action": "targets"})
+
+    assert bridge.calls[0]["event"] == "tour"
+    assert bridge.calls[0]["timeout"] == server._TOUR_PROBE_TIMEOUT_S
+    assert server._TOUR_PROBE_TIMEOUT_S < server._TOUR_TIMEOUT_S
+
+
+def test_a_client_that_answers_gets_the_full_deadline_back(session, bridge):
+    """The generous deadline exists for a preview tour injecting into a live
+    page; only an unproven client is held to the probe."""
+    bridge.answers = [json.dumps({"success": True}), json.dumps({"success": True})]
+    server._tour_request("s1", {"action": "targets"})
+    server._tour_request("s1", {"action": "show", "selector": "#composer"})
+
+    assert bridge.calls[1]["timeout"] == server._TOUR_TIMEOUT_S
+
+
+def test_unanswered_probe_explains_the_real_problem(session, bridge):
+    result = json.loads(server._tour_request("s1", {"action": "targets"}))
+
+    assert result["success"] is False
+    assert "desktop" in result["error"].lower()
+    assert "update" in result["error"].lower()
+
+
+def test_later_actions_short_circuit_instead_of_stalling_again(session, bridge):
+    """The regression: a "give me a tour" turn stacks one timeout per action."""
+    server._tour_request("s1", {"action": "targets"})
+    for action in ("show", "start", "next", "stop"):
+        assert json.loads(server._tour_request("s1", {"action": action}))["success"] is False
+
+    assert len(bridge.calls) == 1
+
+
+def test_a_proven_client_is_not_condemned_by_one_slow_action(session, bridge):
+    """A transient miss on a live renderer must not disable the tour."""
+    bridge.answers = [json.dumps({"success": True})]
+    server._tour_request("s1", {"action": "targets"})
+    server._tour_request("s1", {"action": "show", "selector": "#composer"})
+
+    bridge.answers = [json.dumps({"success": True})]
+    assert json.loads(server._tour_request("s1", {"action": "next"}))["success"] is True
+    assert len(bridge.calls) == 3
+
+
+def test_a_new_session_reprobes(bridge, monkeypatch):
+    """The verdict lives on the session record, so it dies with the session."""
+    monkeypatch.setitem(server._sessions, "dead", {})
+    monkeypatch.setitem(server._sessions, "fresh", {})
+
+    server._tour_request("dead", {"action": "targets"})
+    bridge.answers = [json.dumps({"success": True})]
+
+    assert json.loads(server._tour_request("fresh", {"action": "targets"}))["success"] is True
+
+
+def test_a_session_with_no_record_still_bridges(bridge):
+    """Detached callers have no session dict; they keep the plain bridge."""
+    bridge.answers = [json.dumps({"success": True})]
+    assert json.loads(server._tour_request("gone", {"action": "targets"}))["success"] is True
+

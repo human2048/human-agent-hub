@@ -1,0 +1,340 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_switch_model_reapplies_headers.py ===
+"""Regression tests for #61099: switch_model must reapply provider-specific
+default headers when it rebuilds _client_kwargs from scratch.
+
+Without _apply_client_headers_for_base_url() in the rebuild path, a /model
+switch drops OpenRouter attribution headers (HTTP-Referer / X-Title → logs
+show "Unknown") and, worse, functional headers like Kimi's User-Agent
+sentinel (403 without it).
+"""
+
+from unittest.mock import MagicMock, patch
+
+from run_agent import AIAgent
+from agent.context_compressor import ContextCompressor
+
+
+def _make_agent(provider="copilot", base_url="https://api.githubcopilot.com") -> AIAgent:
+    """Minimal AIAgent with a context_compressor, skipping __init__."""
+    agent = AIAgent.__new__(AIAgent)
+
+    agent.model = "claude-opus-4.8"
+    agent.provider = provider
+    agent.base_url = base_url
+    agent.api_key = "sk-primary"
+    agent.api_mode = "chat_completions"
+    agent.client = MagicMock()
+    agent.quiet_mode = True
+    agent._config_context_length = None
+    agent._client_kwargs = {"api_key": "sk-primary", "base_url": base_url}
+
+    compressor = ContextCompressor(
+        model=agent.model,
+        threshold_percent=0.50,
+        base_url=base_url,
+        api_key="sk-primary",
+        provider=provider,
+        quiet_mode=True,
+        config_context_length=None,
+    )
+    agent.context_compressor = compressor
+    agent._primary_runtime = {}
+
+    return agent
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=131_072)
+def test_switch_to_openrouter_reapplies_attribution_headers(mock_ctx_len):
+    """Switching to an openrouter.ai base_url must attach the OpenRouter
+    attribution headers (HTTP-Referer / X-Title) to the rebuilt client
+    kwargs — not ship a bare api_key+base_url client (#61099)."""
+    agent = _make_agent(provider="copilot", base_url="https://api.githubcopilot.com")
+
+    agent.switch_model(
+        "deepseek/deepseek-chat",
+        "openrouter",
+        api_key="sk-or-new",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    headers = agent._client_kwargs.get("default_headers") or {}
+    assert "HTTP-Referer" in headers
+    assert headers.get("X-Title")
+
+
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=131_072)
+def test_switch_away_from_headered_provider_clears_stale_headers(mock_ctx_len):
+    """Switching FROM a headered provider TO one with no URL-specific headers
+    must not carry the old provider's headers along."""
+    agent = _make_agent(provider="openrouter", base_url="https://openrouter.ai/api/v1")
+    agent._client_kwargs["default_headers"] = {
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+    }
+
+    agent.switch_model(
+        "MiniMax-M3",
+        "custom:minimax",
+        api_key="sk-minimax",
+        base_url="https://api.minimax.io/v1",
+    )
+
+    headers = agent._client_kwargs.get("default_headers") or {}
+    assert "HTTP-Referer" not in headers
+    assert "X-Title" not in headers
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_switch_model_reasoning_override.py ===
+"""Tests for per-model reasoning_effort override during /model switch.
+
+Tests that switch_model:
+1. Re-resolves reasoning_config when switching to a model with an override
+2. Falls back to global when switching to a model without an override
+3. Saves reasoning_config into _primary_runtime for fallback recovery
+"""
+
+import pytest
+from unittest.mock import MagicMock, patch
+
+
+class TestSwitchModelReasoningOverride:
+    """Test switch_model re-resolves reasoning_config on model switch."""
+
+    def _make_fake_agent(self, model="gpt-5", provider="openai"):
+        """Create a minimal fake agent for switch_model testing."""
+        agent = MagicMock()
+        agent.model = model
+        agent.provider = provider
+        agent.base_url = "https://api.openai.com/v1"
+        agent.api_mode = "openai"
+        agent.api_key = "test-key"
+        agent._client_kwargs = {"api_key": "test-key", "base_url": "https://api.openai.com/v1"}
+        agent._use_prompt_caching = False
+        agent._use_native_cache_layout = False
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent._fallback_activated = False
+        agent._fallback_index = 0
+        agent._fallback_chain = []
+        agent._fallback_model = None
+        agent._config_context_length = None
+        agent._transport_cache = {}
+        agent.context_compressor = None
+        agent._cached_system_prompt = None
+        agent._anthropic_api_key = ""
+        agent._anthropic_base_url = None
+        agent._is_anthropic_oauth = False
+        agent._anthropic_prompt_cache_policy = MagicMock(
+            return_value=(False, False)
+        )
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent._create_openai_client = MagicMock(return_value=MagicMock())
+        return agent
+
+    def test_primary_runtime_includes_reasoning_config(self):
+        """After switch_model, _primary_runtime should contain reasoning_config key."""
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = self._make_fake_agent()
+
+        fake_cfg = {
+            "model": {"default": "claude-opus-4.5"},
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {
+                    "claude-opus-4.5": "xhigh",
+                },
+            },
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=fake_cfg):
+            try:
+                switch_model(
+                    agent,
+                    new_model="claude-opus-4.5",
+                    new_provider="anthropic",
+                    base_url="https://api.anthropic.com",
+                    api_mode="anthropic_messages",
+                )
+            except Exception:
+                # Client creation may fail in test env; check _primary_runtime was set
+                pass
+
+        assert hasattr(agent, "_primary_runtime")
+        assert "reasoning_config" in agent._primary_runtime
+
+
+
+    def test_restore_primary_runtime_restores_reasoning(self):
+        """restore_primary_runtime should restore reasoning_config from snapshot."""
+        from agent.agent_runtime_helpers import restore_primary_runtime
+
+        agent = MagicMock()
+        agent._primary_runtime = {
+            "model": "claude-opus-4.5",
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+            "api_key": "key",
+            "client_kwargs": {},
+            "use_prompt_caching": True,
+            "use_native_cache_layout": False,
+            "reasoning_config": {"enabled": True, "effort": "xhigh"},
+            "compressor_model": "claude-opus-4.5",
+            "compressor_base_url": "",
+            "compressor_api_key": "",
+            "compressor_provider": "",
+            "compressor_context_length": 0,
+            "compressor_api_mode": "",
+            "compressor_threshold_tokens": 0,
+            "anthropic_api_key": "key",
+            "anthropic_base_url": "https://api.anthropic.com",
+            "is_anthropic_oauth": False,
+        }
+        agent._fallback_activated = True
+        agent._fallback_index = 0
+        agent._fallback_chain = []
+        agent._fallback_model = None
+        agent._transport_cache = {}
+        agent._config_context_length = None
+        agent._rate_limited_until = 0
+        agent.model = "fallback-model"
+        agent.provider = "openai"
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent.context_compressor = MagicMock()
+        agent.base_url = ""
+        # Mock the methods restore_primary_runtime calls
+        agent._anthropic_prompt_cache_policy = MagicMock(return_value=(True, False))
+        agent._create_openai_client = MagicMock(return_value=MagicMock())
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+
+        result = restore_primary_runtime(agent)
+        assert result is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_switch_model_request_overrides.py ===
+"""Regression tests for the in-place /model switch (CLI/TUI) carrying a custom
+provider's request_overrides (extra_body) — _apply_switched_provider_request_overrides.
+
+Before the fix, agent_runtime_helpers.switch_model() swapped model/provider/
+base_url/api_key in place but never touched request_overrides, so a /model
+switch to a thinking-enabled custom provider in the TUI/CLI kept the old
+provider's extra_body.
+
+The switched-to entry is matched by provider key + base_url + model (the same
+condition agent_init._merge_custom_provider_extra_body uses at build time), so a
+*different* model selected at the same named endpoint does not inherit an
+extra_body configured for another model.
+"""
+
+import agent.agent_runtime_helpers as arh
+
+
+class _Agent:
+    pass
+
+
+# Two entries share the same named endpoint / base_url but pin different models —
+# the exact case a name-only match got wrong.
+CUSTOM_PROVIDERS = [
+    {
+        "name": "main-think",
+        "base_url": "http://10.0.0.1:8000/v1",
+        "model": "think-model",
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+    },
+    {
+        "name": "main-plain",
+        "base_url": "http://10.0.0.1:8000/v1",
+        "model": "plain-model",
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    },
+]
+
+
+def _agent(*, model, base_url, request_overrides, custom_providers=CUSTOM_PROVIDERS):
+    a = _Agent()
+    # switch_model() sets these on the live agent before calling the helper.
+    a.model = model
+    a.base_url = base_url
+    a.provider = "custom"
+    a.request_overrides = request_overrides
+    a._custom_providers = custom_providers  # init-time cache the helper reads
+    return a
+
+
+def test_switch_applies_matched_provider_extra_body():
+    """Switching to the matching provider+model applies its extra_body and
+    preserves non-provider overrides (service_tier/speed from /fast)."""
+    a = _agent(
+        model="think-model",
+        base_url="http://10.0.0.1:8000/v1",
+        request_overrides={"service_tier": "priority"},
+    )
+    arh._apply_switched_provider_request_overrides(a, "custom:main-think")
+    assert a.request_overrides["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+    assert a.request_overrides["service_tier"] == "priority"  # preserved
+
+
+def test_switch_to_noncustom_clears_stale_extra_body():
+    """Switching to a built-in provider clears the previous provider's extra_body."""
+    a = _agent(
+        model="claude-x",
+        base_url="https://api.anthropic.com",
+        request_overrides={
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+            "service_tier": "priority",
+        },
+    )
+    arh._apply_switched_provider_request_overrides(a, "anthropic")
+    assert "extra_body" not in a.request_overrides  # stale extra_body cleared
+    assert a.request_overrides["service_tier"] == "priority"  # preserved
+
+
+def test_switch_from_none_overrides():
+    """A None request_overrides is handled and gets the matched extra_body."""
+    a = _agent(
+        model="plain-model",
+        base_url="http://10.0.0.1:8000/v1",
+        request_overrides=None,
+    )
+    arh._apply_switched_provider_request_overrides(a, "custom:main-plain")
+    assert a.request_overrides == {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+
+
+def test_switch_to_different_model_same_endpoint_does_not_inherit():
+    """Review regression: selecting a *different* model while naming a custom
+    provider must NOT inherit that provider's extra_body when the models differ.
+
+    'main-think' pins 'think-model'. Selecting 'plain-model' under
+    custom:main-think must not carry enable_thinking=True — the model-aware
+    matcher rejects the mismatch and the stale extra_body is cleared. (A
+    name-only match would have wrongly carried it over.)
+    """
+    a = _agent(
+        model="plain-model",  # differs from main-think's pinned 'think-model'
+        base_url="http://10.0.0.1:8000/v1",
+        request_overrides={"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}},
+    )
+    arh._apply_switched_provider_request_overrides(a, "custom:main-think")
+    assert "extra_body" not in a.request_overrides  # not inherited; stale cleared
+
+
+def test_switch_endpoint_mismatch_does_not_inherit():
+    """A matching provider *name* but a different base_url must not match either
+    (endpoint identity is part of the condition)."""
+    a = _agent(
+        model="think-model",
+        base_url="http://10.9.9.9:8000/v1",  # different endpoint than the entry
+        request_overrides={"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}},
+    )
+    arh._apply_switched_provider_request_overrides(a, "custom:main-think")
+    assert "extra_body" not in a.request_overrides  # base_url mismatch -> cleared
+

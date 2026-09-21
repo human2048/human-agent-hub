@@ -1,0 +1,310 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_slack_send_message_media.py ===
+"""Slack media delivery for send_message.
+
+Covers ``plugins/platforms/slack/adapter.py::_standalone_send`` media path:
+text+file, media-only, caption-on-upload, missing-file warnings.
+
+``slack_sdk`` is optional in CI, so tests inject a fake module into
+``sys.modules`` (same pattern as ``tests/gateway/test_slack.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import sys
+import tempfile
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from plugins.platforms.slack.adapter import _standalone_send
+
+
+def _pconfig(token: str = "xoxb-test"):
+    return SimpleNamespace(token=token, extra={})
+
+
+def _tmpfile(suffix: str) -> str:
+    f = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    f.write(b"%PDF-1.4 test")
+    f.close()
+    return f.name
+
+
+def _mock_client(*, post_ok=True, upload_ok=True):
+    client = MagicMock()
+    client.chat_postMessage = AsyncMock(
+        return_value={
+            "ok": post_ok,
+            "ts": "111.222",
+            "error": None if post_ok else "channel_not_found",
+        }
+    )
+    if upload_ok:
+        client.files_upload_v2 = AsyncMock(
+            return_value={
+                "ok": True,
+                "file": {
+                    "id": "F123",
+                    "timestamp": 1234567890,
+                    "shares": {"public": {"C012AB3CD": [{"ts": "333.444"}]}},
+                },
+            }
+        )
+    else:
+        client.files_upload_v2 = AsyncMock(
+            return_value={"ok": False, "error": "not_in_channel"}
+        )
+    return client
+
+
+@contextlib.contextmanager
+def _fake_slack_sdk(client):
+    """Make ``from slack_sdk.web.async_client import AsyncWebClient`` resolve to a factory."""
+    sdk = ModuleType("slack_sdk")
+    web = ModuleType("slack_sdk.web")
+    async_client = ModuleType("slack_sdk.web.async_client")
+    async_client.AsyncWebClient = MagicMock(return_value=client)
+    sdk.web = web
+    web.async_client = async_client
+
+    modules = {
+        "slack_sdk": sdk,
+        "slack_sdk.web": web,
+        "slack_sdk.web.async_client": async_client,
+    }
+    old = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, prev in old.items():
+            if prev is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prev
+
+
+def test_text_plus_pdf_uploads_via_files_upload_v2():
+    pdf = _tmpfile(".pdf")
+    client = _mock_client()
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(
+                _standalone_send(
+                    _pconfig(),
+                    "C012AB3CD",
+                    "Here is the report",
+                    media_files=[(pdf, False)],
+                )
+            )
+        assert result["success"] is True
+        assert result["platform"] == "slack"
+        client.chat_postMessage.assert_awaited_once()
+        client.files_upload_v2.assert_awaited_once()
+        upload_kwargs = client.files_upload_v2.await_args.kwargs
+        assert upload_kwargs["channel"] == "C012AB3CD"
+        assert upload_kwargs["file"] == pdf
+        assert upload_kwargs["filename"] == os.path.basename(pdf)
+        assert upload_kwargs["initial_comment"] == ""
+    finally:
+        os.unlink(pdf)
+
+
+def test_media_only_skips_text_post():
+    pdf = _tmpfile(".pdf")
+    client = _mock_client()
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(
+                _standalone_send(
+                    _pconfig(),
+                    "C012AB3CD",
+                    "",
+                    media_files=[(pdf, False)],
+                )
+            )
+        assert result["success"] is True
+        client.chat_postMessage.assert_not_awaited()
+        client.files_upload_v2.assert_awaited_once()
+    finally:
+        os.unlink(pdf)
+
+
+def test_send_to_platform_routes_slack_media():
+    """_send_to_platform must call Slack standalone_sender with media_files."""
+    import httpx
+
+    if not hasattr(httpx, "Proxy") or not hasattr(httpx, "URL"):
+        pytest.skip("httpx type annotations incompatible with telegram library")
+
+    from gateway.config import Platform
+    from hermes_cli.plugins import discover_plugins
+    from gateway.platform_registry import platform_registry
+    from tools.send_message_tool import _send_to_platform
+
+    pdf = _tmpfile(".pdf")
+    discover_plugins()
+    entry = platform_registry.get("slack")
+    assert entry is not None and entry.standalone_sender_fn is not None
+    original = entry.standalone_sender_fn
+    mock_sender = AsyncMock(
+        return_value={"success": True, "platform": "slack", "message_id": "1.2"}
+    )
+    entry.standalone_sender_fn = mock_sender
+    try:
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.SLACK,
+                _pconfig(),
+                "C012AB3CD",
+                "Here is the report",
+                media_files=[(pdf, False)],
+            )
+        )
+        assert result["success"] is True
+        mock_sender.assert_awaited()
+        call_kwargs = mock_sender.await_args.kwargs
+        assert call_kwargs.get("media_files") == [(pdf, False)]
+        # Single captionable file + short text → caption rides the upload.
+        assert call_kwargs.get("caption") == "Here is the report"
+        assert not result.get("warnings")
+    finally:
+        entry.standalone_sender_fn = original
+        os.unlink(pdf)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_slash_confirm.py ===
+"""Tests for tools/slash_confirm.py — the generic slash-command confirmation primitive.
+
+Covers register/resolve/clear lifecycle, stale-entry behavior, confirm_id
+mismatch, handler exceptions, and async resolution.
+"""
+
+import asyncio
+import time
+
+import pytest
+
+from tools import slash_confirm
+
+
+@pytest.fixture(autouse=True)
+def _clean_pending():
+    """Every test gets a clean primitive state."""
+    slash_confirm._pending.clear()
+    yield
+    slash_confirm._pending.clear()
+
+
+class TestRegisterAndGetPending:
+    def test_register_stores_entry(self):
+        async def handler(choice):
+            return f"got {choice}"
+
+        slash_confirm.register("sess1", "cid1", "reload-mcp", handler)
+
+        pending = slash_confirm.get_pending("sess1")
+        assert pending is not None
+        assert pending["confirm_id"] == "cid1"
+        assert pending["command"] == "reload-mcp"
+        assert pending["handler"] is handler
+        assert "created_at" in pending
+
+
+    def test_get_pending_returns_copy_not_reference(self):
+        async def h(choice):
+            return "x"
+
+        slash_confirm.register("sess1", "cid1", "cmd", h)
+
+        p1 = slash_confirm.get_pending("sess1")
+        p1["command"] = "mutated"
+
+        p2 = slash_confirm.get_pending("sess1")
+        assert p2["command"] == "cmd"
+
+
+class TestResolve:
+    @pytest.mark.asyncio
+    async def test_resolve_runs_handler_and_pops_entry(self):
+        calls = []
+
+        async def handler(choice):
+            calls.append(choice)
+            return f"resolved {choice}"
+
+        slash_confirm.register("sess1", "cid1", "reload-mcp", handler)
+
+        result = await slash_confirm.resolve("sess1", "cid1", "once")
+        assert result == "resolved once"
+        assert calls == ["once"]
+
+        # Entry should be popped.
+        assert slash_confirm.get_pending("sess1") is None
+
+    @pytest.mark.asyncio
+    async def test_resolve_no_pending_returns_none(self):
+        result = await slash_confirm.resolve("sess1", "cid1", "once")
+        assert result is None
+
+
+    @pytest.mark.asyncio
+    async def test_resolve_double_click_only_runs_handler_once(self):
+        calls = []
+
+        async def handler(choice):
+            calls.append(choice)
+            return "ran"
+
+        slash_confirm.register("sess1", "cid1", "cmd", handler)
+
+        # Simulate two near-simultaneous button clicks.
+        r1, r2 = await asyncio.gather(
+            slash_confirm.resolve("sess1", "cid1", "once"),
+            slash_confirm.resolve("sess1", "cid1", "once"),
+        )
+        # Exactly one should have run the handler.
+        assert calls == ["once"]
+        assert (r1 == "ran") ^ (r2 == "ran")
+
+
+class TestClear:
+    def test_clear_removes_entry(self):
+        async def h(c):
+            return "x"
+
+        slash_confirm.register("sess1", "cid1", "cmd", h)
+        assert slash_confirm.get_pending("sess1") is not None
+
+        slash_confirm.clear("sess1")
+        assert slash_confirm.get_pending("sess1") is None
+
+    def test_clear_missing_is_noop(self):
+        # Should not raise.
+        slash_confirm.clear("nobody")
+
+
+class TestClearIfStale:
+    def test_clears_stale_entry(self):
+        async def h(c):
+            return "x"
+
+        slash_confirm.register("sess1", "cid1", "cmd", h)
+        slash_confirm._pending["sess1"]["created_at"] = time.time() - 10000
+
+        cleared = slash_confirm.clear_if_stale("sess1", timeout=300)
+        assert cleared is True
+        assert slash_confirm.get_pending("sess1") is None
+
+
+    def test_returns_false_for_missing_entry(self):
+        cleared = slash_confirm.clear_if_stale("nobody")
+        assert cleared is False
+

@@ -1,0 +1,400 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_long_context_tier_429.py ===
+"""Tests for Anthropic Sonnet long-context tier 429 handling.
+
+When Claude Max users without "extra usage" hit the 1M context tier
+on Sonnet, Anthropic returns HTTP 429 "Extra usage is required for long
+context requests."  This is NOT a transient rate limit — the agent should
+reduce context_length to 200k and compress instead of retrying.
+
+Only Sonnet is affected — Opus 1M is general access.
+"""
+
+from types import SimpleNamespace
+
+
+# ---------------------------------------------------------------------------
+# Detection logic
+# ---------------------------------------------------------------------------
+
+
+class TestLongContextTierDetection:
+    """Verify the detection heuristic matches the Anthropic error."""
+
+    @staticmethod
+    def _is_long_context_tier_error(status_code, error_msg, model="claude-sonnet-4.6"):
+        error_msg = error_msg.lower()
+        return (
+            status_code == 429
+            and "extra usage" in error_msg
+            and "long context" in error_msg
+            and "sonnet" in model.lower()
+        )
+
+    def test_matches_anthropic_error(self):
+        assert self._is_long_context_tier_error(
+            429,
+            "Extra usage is required for long context requests.",
+        )
+
+
+
+
+
+
+
+
+    def test_rejects_partial_match(self):
+        """Both 'extra usage' AND 'long context' must be present."""
+        assert not self._is_long_context_tier_error(
+            429, "extra usage required"
+        )
+        assert not self._is_long_context_tier_error(
+            429, "long context requests not supported"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Context reduction
+# ---------------------------------------------------------------------------
+
+
+class TestContextReduction:
+    """When the long-context tier error fires, context_length should
+    drop to 200k and the reduced flag should be set correctly."""
+
+    def _make_compressor(self, context_length=1_000_000, threshold_percent=0.5):
+        c = SimpleNamespace(
+            context_length=context_length,
+            threshold_percent=threshold_percent,
+            threshold_tokens=int(context_length * threshold_percent),
+            _context_probed=False,
+            _context_probe_persistable=False,
+        )
+        return c
+
+    def test_reduces_1m_to_200k(self):
+        comp = self._make_compressor(1_000_000)
+        reduced_ctx = 200_000
+
+        if comp.context_length > reduced_ctx:
+            comp.context_length = reduced_ctx
+            comp.threshold_tokens = int(reduced_ctx * comp.threshold_percent)
+            comp._context_probed = True
+            comp._context_probe_persistable = False
+
+        assert comp.context_length == 200_000
+        assert comp.threshold_tokens == 100_000
+        assert comp._context_probed is True
+        # Must NOT persist — subscription tier, not model capability
+        assert comp._context_probe_persistable is False
+
+    def test_no_reduction_when_already_200k(self):
+        comp = self._make_compressor(200_000)
+        reduced_ctx = 200_000
+
+        original = comp.context_length
+        if comp.context_length > reduced_ctx:
+            comp.context_length = reduced_ctx
+
+        assert comp.context_length == original  # unchanged
+
+
+
+# ---------------------------------------------------------------------------
+# Integration: agent error handler path
+# ---------------------------------------------------------------------------
+
+
+class TestAgentErrorPath:
+    """Verify the long-context 429 doesn't hit the generic rate-limit
+    or client-error handlers."""
+
+    def test_long_context_429_not_treated_as_rate_limit(self):
+        """The error should be intercepted before the generic
+        is_rate_limited check fires a fallback switch."""
+        error_msg = "extra usage is required for long context requests."
+        status_code = 429
+        model = "claude-sonnet-4.6"
+
+        _is_long_context_tier_error = (
+            status_code == 429
+            and "extra usage" in error_msg
+            and "long context" in error_msg
+            and "sonnet" in model.lower()
+        )
+        assert _is_long_context_tier_error
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_malformed_tool_args_no_fallback.py ===
+"""A 400 for the model's own malformed tool-call JSON must not walk the fallback chain (#12770)."""
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from agent.error_classifier import FailoverReason, classify_api_error
+from agent.turn_api_error import settle_unrecovered_error
+
+
+class _Err(Exception):
+    status_code = 400
+    response = None
+
+    def __init__(self, message, body=None):
+        super().__init__(message)
+        self.body = body or {"error": {"message": message, "type": "invalid_request_error"}}
+
+
+@pytest.mark.parametrize("wording", ["invalid tool call arguments", "Invalid function_call arguments"])
+def test_malformed_tool_args_400_is_terminal_without_fallback(wording):
+    """Large session included: the bare-ish message must not read as context overflow either."""
+    verdict = classify_api_error(_Err(f"Error code: 400 - {wording}"), provider="ollama",
+                                 approx_tokens=90_000, context_length=128_000, num_messages=120)
+    assert verdict.reason is FailoverReason.format_error
+    assert (verdict.retryable, verdict.should_compress, verdict.should_fallback) == (False, False, False)
+
+    # Unrelated request-shape 400s keep their fallback (another provider may accept the request).
+    assert classify_api_error(_Err("Unsupported parameter: 'max_tokens'")).should_fallback is True
+
+
+class _Agent:
+    """Only the fallback seam is real; every other helper the terminal path touches is a no-op."""
+    log_prefix = ""
+    verbose = False
+    provider = "ollama"
+    _fallback_chain = [object()]
+    _fallback_index = 0
+    _credential_pool = None
+
+    def __init__(self):
+        self.activated = []
+
+    def _has_pending_fallback(self):
+        return True
+
+    def _try_activate_fallback(self, **kwargs):
+        self.activated.append(True)
+        return True
+
+    def _summarize_api_error(self, error):
+        return str(error)
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+def _settle(agent, err, provider, status_code):
+    retry = SimpleNamespace(copilot_stale_cred_retry_attempted=False, primary_recovery_attempted=False)
+    classified = classify_api_error(err, provider=provider)
+    with patch("agent.conversation_loop._is_copilot_provider", lambda a: False):
+        return settle_unrecovered_error(
+            agent, api_error=err, classified=classified, _retry=retry, status_code=status_code, error_msg=str(err),
+            is_context_length_error=False, is_rate_limited=False, _is_zai_coding_overload=False,
+            _provider=provider, _base="http://127.0.0.1:11434/v1", _model="glm", messages=[], api_messages=[],
+            api_kwargs={}, active_system_prompt="", conversation_history=None, approx_tokens=10,
+            retry_count=0, max_retries=3, compression_attempts=0, api_call_count=1,
+        )
+
+
+def test_client_error_settlement_skips_fallback_when_classifier_says_so():
+    agent = _Agent()
+    verdict = _settle(agent, _Err("invalid tool call arguments"), "ollama", 400)
+    assert verdict.action == "return"
+    assert verdict.result["failure_reason"] == FailoverReason.format_error.value
+    assert agent.activated == []
+
+
+def test_fallback_free_verdict_wins_over_local_valueerror_shape():
+    """A recognised no-fallback verdict raised as a ValueError subclass (MoA preset missing,
+    #55933) must not sneak through the unclassified-local-error fallback allowance; a truly
+    unclassified ValueError keeps it."""
+    from agent.errors import MoAPresetNotFoundError
+
+    agent = _Agent()
+    verdict = _settle(agent, MoAPresetNotFoundError("MoA preset 'old' was not found"), "moa", None)
+    assert verdict.action == "return"
+    assert agent.activated == []
+
+    agent = _Agent()
+    verdict = _settle(agent, ValueError("some local bug"), "openai", None)
+    assert verdict.action == "break"
+    assert agent.activated == [True]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_malformed_tool_arguments.py ===
+"""Malformed model tool arguments are rejected at the dispatch boundary."""
+
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from run_agent import AIAgent
+
+
+def _make_agent() -> AIAgent:
+    tool_defs = [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "search",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    with (
+        patch("model_tools.get_tool_definitions", return_value=tool_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    agent._flush_messages_to_session_db = MagicMock()
+    return agent
+
+
+def _tool_call(call_id: str, arguments: str):
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name="web_search", arguments=arguments),
+    )
+
+
+@pytest.mark.parametrize("dispatch_mode", ["sequential", "concurrent"])
+@pytest.mark.parametrize(
+    "bad_arguments",
+    [
+        pytest.param("not-json", id="malformed-json"),
+        pytest.param('"scalar"', id="scalar"),
+        pytest.param("[]", id="list"),
+        pytest.param("", id="empty"),
+        pytest.param('{"query": "cut off', id="truncated"),
+    ],
+)
+def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(
+    dispatch_mode: str,
+    bad_arguments: str,
+):
+    agent = _make_agent()
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[
+            _tool_call("call-bad", bad_arguments),
+            _tool_call("call-good", '{"query": "valid"}'),
+        ],
+    )
+    messages = []
+    executed = []
+
+    def fake_dispatch(name, args, task_id, *positional, **kwargs):
+        call_id = kwargs.get("tool_call_id") or (positional[0] if positional else None)
+        executed.append((name, args, call_id))
+        return json.dumps({"ok": args["query"]})
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=fake_dispatch),
+        patch.object(agent, "_invoke_tool", side_effect=fake_dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        execute = getattr(agent, f"_execute_tool_calls_{dispatch_mode}")
+        execute(assistant_message, messages, "task-1")
+
+    assert executed == [("web_search", {"query": "valid"}, "call-good")]
+    assert [message["tool_call_id"] for message in messages] == ["call-bad", "call-good"]
+    assert len([message for message in messages if message["tool_call_id"] == "call-bad"]) == 1
+
+    assert '"error": "Invalid tool arguments"' in messages[0]["content"]
+    assert "JSON object" in messages[0]["content"]
+    assert json.loads(messages[1]["content"]) == {"ok": "valid"}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_manual_compression_feedback.py ===
+"""Behavioral coverage for manual compression status messages."""
+
+from types import SimpleNamespace
+
+from agent.manual_compression_feedback import (
+    describe_compression_lock_skip,
+    summarize_manual_compression,
+)
+
+
+def _messages(count: int) -> list[dict[str, str]]:
+    return [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": str(index)}
+        for index in range(count)
+    ]
+
+
+
+
+def test_failure_reason_redaction_is_forced_at_ui_boundary(monkeypatch):
+    messages = _messages(12)
+    fake_secret = "sk-proj-" + "X" * 40
+    state = SimpleNamespace(
+        _last_compress_aborted=True,
+        _last_summary_fallback_used=False,
+        _last_summary_error=f"provider rejected OPENAI_API_KEY={fake_secret}",
+    )
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False, raising=False)
+
+    feedback = summarize_manual_compression(
+        messages,
+        list(messages),
+        120_000,
+        120_000,
+        compression_state=state,
+    )
+
+    assert fake_secret not in feedback["note"]
+    assert "OPENAI_API_KEY=" in feedback["note"]
+
+
+def test_fallback_compression_reports_dropped_message_count():
+    before = _messages(12)
+    after = before[:2] + before[-2:]
+    state = SimpleNamespace(
+        _last_compress_aborted=False,
+        _last_summary_fallback_used=True,
+        _last_summary_dropped_count=8,
+        _last_summary_error="summary provider returned an invalid response",
+    )
+
+    feedback = summarize_manual_compression(
+        before,
+        after,
+        120_000,
+        40_000,
+        compression_state=state,
+    )
+
+    assert feedback["aborted"] is False
+    assert feedback["fallback_used"] is True
+    assert feedback["headline"] == "Compressed with fallback: 12 → 4 messages"
+    assert "removed 8 message(s)" in feedback["note"]
+    assert "invalid response" in feedback["note"]
+
+
+
+
+

@@ -1,0 +1,203 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_unit_client_budget.py ===
+"""Update clients cover unit transactions without hiding manager failures."""
+import subprocess
+
+import pytest
+
+from hermes_cli import update_cmd_fleet as fleet
+
+
+@pytest.mark.parametrize("graceful,retry", [(False, False), (False, True), (True, False), ("catchup", False)])
+def test_unit_transaction_budget_preserves_scope_and_health(monkeypatch, graceful, retry):
+    catchup = graceful == "catchup"
+    scope = ["systemctl", "--user"] if catchup else ["systemctl", "--no-ask-password"]
+    manage = scope if catchup else ["sudo", "-n", *scope]
+    calls = []
+
+    def systemctl(cmd, *, timeout):
+        calls.append((cmd, timeout))
+        if "list-units" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "hermes-serve-test.service loaded active running", "")
+        if "show" in cmd:
+            assert cmd[:len(scope)] == scope
+            output = "42" if "--property=MainPID" in cmd else "TimeoutStopUSec=70s\nTimeoutStartUSec=90s"
+            return subprocess.CompletedProcess(cmd, 0, output, "")
+        if "restart" in cmd or "start" in cmd:
+            assert cmd[:len(manage)] == manage
+            assert timeout > (90 if graceful else 160)
+        return subprocess.CompletedProcess(cmd, 0, "active", "")
+
+    monkeypatch.setattr(fleet, "_systemctl", systemctl)
+    if catchup:
+        monkeypatch.setattr(fleet, "_SYSTEMD_SCOPES", (("user", scope),))
+        failed = []
+        fleet._restart_systemd_gateway_units_best_effort(failed, list(fleet._systemd_gateway_unit_listings()))
+        assert not failed
+        assert sum("restart" in cmd for cmd, _ in calls) == 1
+        return
+    monkeypatch.setattr(fleet, "_drain_or_signal_gateway_for_update", lambda *a: True)
+    health = iter([False, True] if retry else [True])
+    monkeypatch.setattr(fleet, "_wait_for_service_active", lambda *a, **kw: next(health))
+    name = "hermes-gateway-test" if graceful else "hermes-serve-test"
+    restarted, failed = [], []
+    fleet._restart_one_systemd_gateway_unit(
+        name, scope="system", scope_cmd=scope, drain_budget=45,
+        _manage_cmd_cache={"system": manage}, restarted_services=restarted,
+        failed_or_stale_units=failed,
+    )
+    assert restarted == [name] and not failed
+    assert sum("restart" in cmd or "start" in cmd for cmd, _ in calls) == (2 if retry else 1)
+
+
+@pytest.mark.parametrize("limits", ["", "TimeoutStopUSec=infinity\nTimeoutStartUSec=invalid", "TimeoutStopUSec=70000000\nTimeoutStartUSec=90s"])
+@pytest.mark.parametrize("outcome", [0, 7, "timeout"])
+def test_budget_fallback_keeps_real_errors(monkeypatch, limits, outcome):
+    def systemctl(cmd, *, timeout):
+        if "show" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, limits, "")
+        if "restart" in cmd:
+            assert 160 < timeout < 2**31 / 1000
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            return subprocess.CompletedProcess(cmd, outcome, "", "manager diagnostic")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(fleet, "_systemctl", systemctl)
+    if outcome == "timeout":
+        with pytest.raises(subprocess.TimeoutExpired):
+            fleet._systemctl_reset_and_restart(["systemctl"], "hermes-serve-test")
+    else:
+        result = fleet._systemctl_reset_and_restart(["systemctl"], "hermes-serve-test")
+        assert result.returncode == outcome
+        assert result.stderr == "manager diagnostic"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_upstream_prompt_noninteractive.py ===
+"""The fork-upstream prompt must never block a non-interactive update (#60240).
+
+`_sync_with_upstream_if_needed` asks "Add official repo as 'upstream' remote?"
+on fork checkouts with no upstream remote. In unattended contexts (CI, cron,
+the desktop updater hand-off) stdin is open but nobody answers, so a bare
+``input()`` blocks forever. These tests pin the gate: under ``assume_yes`` or
+a non-TTY stdio pair the prompt is skipped as a decline WITHOUT persisting the
+skip marker or touching git remotes, and both update call sites forward the
+interaction state.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli import update_cmd
+
+
+@pytest.fixture
+def fork_without_upstream(tmp_path):
+    with patch.object(
+        update_cmd, "_has_upstream_remote", return_value=False
+    ), patch.object(
+        update_cmd, "_should_skip_upstream_prompt", return_value=False
+    ), patch.object(
+        update_cmd, "_add_upstream_remote", return_value=True
+    ) as add_remote, patch.object(
+        update_cmd, "_mark_skip_upstream_prompt"
+    ) as mark_skip, patch("builtins.input") as stdin_input:
+        yield SimpleNamespace(
+            cwd=tmp_path,
+            add_remote=add_remote,
+            mark_skip=mark_skip,
+            stdin_input=stdin_input,
+        )
+
+
+def _tty(stdin: bool, stdout: bool):
+    return (
+        patch.object(update_cmd.sys.stdin, "isatty", return_value=stdin),
+        patch.object(update_cmd.sys.stdout, "isatty", return_value=stdout),
+    )
+
+
+class TestUpstreamPromptNonInteractive:
+    def test_assume_yes_skips_prompt_without_touching_remotes(
+        self, fork_without_upstream, capsys
+    ):
+        p_in, p_out = _tty(True, True)
+        with p_in, p_out:
+            checked = update_cmd._sync_with_upstream_if_needed(
+                ["git"], fork_without_upstream.cwd, assume_yes=True
+            )
+
+        assert checked is False
+        fork_without_upstream.stdin_input.assert_not_called()
+        fork_without_upstream.add_remote.assert_not_called()
+        fork_without_upstream.mark_skip.assert_not_called()
+        assert "Skipping upstream setup" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "stdin_tty,stdout_tty", [(False, False), (False, True), (True, False)]
+    )
+    def test_non_tty_skips_prompt_without_persisting_decline(
+        self, fork_without_upstream, capsys, stdin_tty, stdout_tty
+    ):
+        p_in, p_out = _tty(stdin_tty, stdout_tty)
+        with p_in, p_out:
+            checked = update_cmd._sync_with_upstream_if_needed(
+                ["git"], fork_without_upstream.cwd
+            )
+
+        assert checked is False
+        fork_without_upstream.stdin_input.assert_not_called()
+        fork_without_upstream.add_remote.assert_not_called()
+        fork_without_upstream.mark_skip.assert_not_called()
+        assert "Skipping upstream setup" in capsys.readouterr().out
+
+    def test_gateway_prompt_routes_through_input_fn(self, fork_without_upstream):
+        prompts = []
+
+        def gw_input(prompt, default=""):
+            prompts.append((prompt, default))
+            return "n"
+
+        p_in, p_out = _tty(False, False)
+        with p_in, p_out:
+            update_cmd._sync_with_upstream_if_needed(
+                ["git"], fork_without_upstream.cwd, input_fn=gw_input
+            )
+
+        assert prompts == [("Add official repo as 'upstream' remote? [y/N]", "n")]
+        fork_without_upstream.stdin_input.assert_not_called()
+        fork_without_upstream.add_remote.assert_not_called()
+        fork_without_upstream.mark_skip.assert_called_once_with()
+
+    def test_interactive_decline_still_persists_marker(self, fork_without_upstream):
+        fork_without_upstream.stdin_input.return_value = "n"
+        p_in, p_out = _tty(True, True)
+        with p_in, p_out:
+            update_cmd._sync_with_upstream_if_needed(
+                ["git"], fork_without_upstream.cwd
+            )
+
+        fork_without_upstream.stdin_input.assert_called_once()
+        fork_without_upstream.add_remote.assert_not_called()
+        fork_without_upstream.mark_skip.assert_called_once_with()
+
+    def test_interactive_accept_adds_upstream(self, fork_without_upstream):
+        fork_without_upstream.stdin_input.return_value = "y"
+        with patch.object(
+            update_cmd, "_count_commits_between", return_value=-1
+        ), patch.object(update_cmd.subprocess, "run"):
+            p_in, p_out = _tty(True, True)
+            with p_in, p_out:
+                update_cmd._sync_with_upstream_if_needed(
+                    ["git"], fork_without_upstream.cwd
+                )
+
+        fork_without_upstream.add_remote.assert_called_once_with(
+            ["git"], fork_without_upstream.cwd
+        )
+        fork_without_upstream.mark_skip.assert_not_called()
+

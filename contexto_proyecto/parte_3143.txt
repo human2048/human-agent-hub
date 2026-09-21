@@ -1,0 +1,401 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_save_config_value.py ===
+"""Tests for save_config_value() in cli.py — atomic write behavior."""
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import yaml
+
+import pytest
+
+
+class TestSaveConfigValueAtomic:
+    """save_config_value() must use atomic round-trip YAML updates."""
+
+    @pytest.fixture
+    def config_env(self, tmp_path, monkeypatch):
+        """Isolated config environment with a writable config.yaml."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(yaml.dump({
+            "model": {"default": "test-model", "provider": "openrouter"},
+            "display": {"skin": "default"},
+        }))
+        # save_config_value resolves the target live via get_hermes_home(), so
+        # point HERMES_HOME at the temp dir (the _hermes_home import-time
+        # constant is no longer consulted).
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("cli._hermes_home", hermes_home)
+        return config_path
+
+    def test_calls_roundtrip_yaml_update(self, config_env, monkeypatch):
+        """save_config_value must preserve user-edited YAML structure."""
+        mock_update = MagicMock()
+        monkeypatch.setattr("utils.atomic_roundtrip_yaml_update", mock_update)
+
+        from cli import save_config_value
+        save_config_value("display.skin", "mono")
+
+        mock_update.assert_called_once_with(config_env, "display.skin", "mono")
+
+
+    def test_creates_nested_keys(self, config_env):
+        """Dot-separated paths create intermediate dicts as needed."""
+        from cli import save_config_value
+        save_config_value("auxiliary.compression.model", "google/gemini-3-flash-preview")
+
+        result = yaml.safe_load(config_env.read_text())
+        assert result["auxiliary"]["compression"]["model"] == "google/gemini-3-flash-preview"
+
+
+
+    def test_model_write_runs_shared_cron_drift_warning(self, config_env, monkeypatch):
+        warning = MagicMock()
+        monkeypatch.setattr(
+            "hermes_cli.config.warn_unpinned_cron_jobs_after_model_config_change",
+            warning,
+        )
+
+        from cli import save_config_value
+
+        assert save_config_value("model.default", "new-model") is True
+        warning.assert_called_once_with("model.default", "new-model")
+
+
+
+    def test_file_not_truncated_on_error(self, config_env, monkeypatch):
+        """If atomic_yaml_write raises, the original file is untouched."""
+        original_content = config_env.read_text()
+
+        def exploding_write(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("utils.atomic_roundtrip_yaml_update", exploding_write)
+
+        from cli import save_config_value
+        result = save_config_value("display.skin", "broken")
+
+        assert result is False
+        assert config_env.read_text() == original_content
+
+
+class TestSaveConfigValueTargetsUserConfig:
+    """Regression: persisted runtime settings must land in HERMES_HOME/config.yaml
+    (which config readers actually read), never the repo's cli-config.yaml.
+
+    This was the "wake-word ear reverts to disabled after restart" bug: on an
+    install whose HERMES_HOME/config.yaml did not exist yet, save_config_value
+    fell back to the checked-in cli-config.yaml. The toggle reported success, but
+    startup read HERMES_HOME/config.yaml and never saw the setting."""
+
+    def test_creates_user_config_when_absent(self, tmp_path, monkeypatch):
+        # Fresh HERMES_HOME with NO config.yaml (managed/desktop first launch).
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        from cli import save_config_value
+
+        assert save_config_value("wake_word.enabled", True) is True
+
+        config_path = hermes_home / "config.yaml"
+        assert config_path.exists(), "user config.yaml must be created, not skipped"
+        result = yaml.safe_load(config_path.read_text())
+        assert result["wake_word"]["enabled"] is True
+
+    def test_does_not_write_repo_cli_config(self, tmp_path, monkeypatch):
+        # Even when the repo's cli-config.yaml exists, the write goes to the
+        # user config, so a runtime setting is never buried in the shipped file.
+        import cli as cli_module
+
+        repo_cli_config = Path(cli_module.__file__).parent / "cli-config.yaml"
+        before = repo_cli_config.read_text() if repo_cli_config.exists() else None
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        from cli import save_config_value
+
+        save_config_value("wake_word.enabled", True)
+
+        # The repo template is untouched…
+        after = repo_cli_config.read_text() if repo_cli_config.exists() else None
+        assert after == before
+        # …and the value landed in the user config.
+        result = yaml.safe_load((hermes_home / "config.yaml").read_text())
+        assert result["wake_word"]["enabled"] is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_secret_capture.py ===
+import queue
+import threading
+import time
+from unittest.mock import patch
+
+import cli as cli_module
+import tools.skills_tool as skills_tool_module
+from cli import HermesCLI
+from hermes_cli.callbacks import prompt_for_secret
+from tools.skills_tool import set_secret_capture_callback
+
+
+class _FakeBuffer:
+    def __init__(self):
+        self.reset_called = False
+
+    def reset(self):
+        self.reset_called = True
+
+
+class _FakeApp:
+    def __init__(self):
+        self.invalidated = False
+        self.current_buffer = _FakeBuffer()
+
+    def invalidate(self):
+        self.invalidated = True
+
+
+def _make_cli_stub(with_app=False):
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._app = _FakeApp() if with_app else None
+    cli._last_invalidate = 0.0
+    cli._secret_state = None
+    cli._secret_deadline = 0
+    return cli
+
+
+def test_secret_capture_callback_can_be_completed_from_cli_state_machine():
+    cli = _make_cli_stub(with_app=True)
+    results = []
+
+    with patch("hermes_cli.callbacks.save_env_value_secure") as save_secret:
+        save_secret.return_value = {
+            "success": True,
+            "stored_as": "TENOR_API_KEY",
+            "validated": False,
+        }
+
+        thread = threading.Thread(
+            target=lambda: results.append(
+                cli._secret_capture_callback("TENOR_API_KEY", "Tenor API key")
+            )
+        )
+        thread.start()
+
+        deadline = time.time() + 2
+        while cli._secret_state is None and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert cli._secret_state is not None
+        cli._submit_secret_response("super-secret-value")
+        thread.join(timeout=2)
+
+    assert results[0]["success"] is True
+    assert results[0]["stored_as"] == "TENOR_API_KEY"
+    assert results[0]["skipped"] is False
+
+
+def test_cancel_secret_capture_marks_setup_skipped():
+    cli = _make_cli_stub()
+    cli._secret_state = {
+        "response_queue": queue.Queue(),
+        "var_name": "TENOR_API_KEY",
+        "prompt": "Tenor API key",
+        "metadata": {},
+    }
+    cli._secret_deadline = 123
+
+    cli._cancel_secret_capture()
+
+    assert cli._secret_state is None
+    assert cli._secret_deadline == 0
+
+
+def test_secret_capture_uses_masked_prompt_without_tui():
+    cli = _make_cli_stub()
+
+    with patch("hermes_cli.callbacks.masked_secret_prompt", return_value="secret-value"), patch(
+        "hermes_cli.callbacks.save_env_value_secure"
+    ) as save_secret:
+        save_secret.return_value = {
+            "success": True,
+            "stored_as": "TENOR_API_KEY",
+            "validated": False,
+        }
+        result = prompt_for_secret(cli, "TENOR_API_KEY", "Tenor API key")
+
+    assert result["success"] is True
+    assert result["stored_as"] == "TENOR_API_KEY"
+    assert result["skipped"] is False
+
+
+def test_secret_capture_timeout_clears_hidden_input_buffer():
+    cli = _make_cli_stub(with_app=True)
+    cleared = {"value": False}
+
+    def clear_buffer():
+        cleared["value"] = True
+
+    cli._clear_secret_input_buffer = clear_buffer
+
+    with patch("hermes_cli.callbacks.queue.Queue.get", side_effect=queue.Empty), patch(
+        "hermes_cli.callbacks._time.monotonic",
+        side_effect=[0, 121],
+    ):
+        result = prompt_for_secret(cli, "TENOR_API_KEY", "Tenor API key")
+
+    assert result["success"] is True
+    assert result["skipped"] is True
+    assert result["reason"] == "timeout"
+    assert cleared["value"] is True
+
+
+def test_cli_chat_registers_secret_capture_callback():
+    clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {"compact": False, "tool_progress": "all"},
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+
+    with patch("cli.get_tool_definitions", return_value=[]), patch.dict(
+        "os.environ", {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}, clear=False
+    ), patch.dict(cli_module.__dict__, {"CLI_CONFIG": clean_config}):
+        cli_obj = HermesCLI()
+        with patch.object(cli_obj, "_ensure_runtime_credentials", return_value=False):
+            cli_obj.chat("hello")
+
+    try:
+        assert skills_tool_module._secret_capture_callback == cli_obj._secret_capture_callback
+    finally:
+        set_secret_capture_callback(None)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_session_store_shared_registry.py ===
+"""The CLI's session store must be the registry's shared handle for state.db.
+
+``_init_session_store`` used to construct a bare ``SessionDB()``. The goal/loop/heartbeat
+managers acquire the same path through ``hermes_state_registry`` from the REPL thread a
+moment later, so a bare handle meant a SECOND full open — including the /proc-wide
+deleted-WAL sidecar scan (~4k readlinks, each a GIL round-trip against the busy startup
+threads) — which showed up as the post-banner freeze before the first prompt.
+"""
+
+from types import SimpleNamespace
+
+import hermes_cli.goals as goals
+from cli import HermesCLI
+
+
+def test_cli_session_store_is_the_registry_handle_goals_reuse(monkeypatch):
+    import hermes_state_registry
+
+    monkeypatch.setattr(goals, "_DB_CACHE", {})
+    constructed = []
+    real_open = hermes_state_registry._open_session_db
+
+    def recording_open(path):
+        constructed.append(path)
+        return real_open(path)
+
+    monkeypatch.setattr(hermes_state_registry, "_open_session_db", recording_open)
+
+    cli = SimpleNamespace()
+    try:
+        HermesCLI._init_session_store(cli)
+        assert cli._session_db is not None and not cli._session_db_unavailable
+        # goals/loops/heartbeat go through the registry: same object, no second open.
+        assert goals._get_session_db() is cli._session_db
+        assert len(constructed) == 1
+    finally:
+        hermes_state_registry.close_all()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_shift_enter_newline.py ===
+"""Verify Shift+Enter byte sequences parse to the same key tuple Alt+Enter
+produces, so the existing Alt+Enter newline handler in `cli.py` fires for
+terminals that emit a distinct Shift+Enter under the Kitty keyboard protocol
+or xterm modifyOtherKeys mode.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.keys import Keys
+
+from hermes_cli.pt_input_extras import install_shift_enter_alias
+
+
+SHIFT_ENTER_SEQUENCES = (
+    "\x1b[13;2u",      # Kitty / CSI-u, modifier=2 (Shift)
+    "\x1b[27;2;13~",   # xterm modifyOtherKeys=2
+    "\x1b[27;2;13u",
+)
+
+
+@pytest.fixture(autouse=True)
+def _ensure_alias_installed():
+    """Make every test idempotent — install the alias once per test run."""
+    install_shift_enter_alias()
+
+
+def _parse(byte_seq: str):
+    out = []
+    parser = Vt100Parser(out.append)
+    for ch in byte_seq:
+        parser.feed(ch)
+    parser.flush()
+    return [kp.key for kp in out]
+
+
+def test_install_registers_all_three_sequences():
+    for seq in SHIFT_ENTER_SEQUENCES:
+        assert seq in ANSI_SEQUENCES, f"missing mapping for {seq!r}"
+        assert ANSI_SEQUENCES[seq] == (Keys.Escape, Keys.ControlM)
+
+
+
+
+def test_install_returns_zero_when_already_correct():
+    """Idempotency — running install twice should not report a second change."""
+    install_shift_enter_alias()
+    assert install_shift_enter_alias() == 0
+
+
+def test_csi_u_shift_enter_parses_as_alt_enter():
+    """Kitty keyboard protocol Shift+Enter must parse to the same key tuple
+    Alt+Enter produces, so the existing handler is reused."""
+    alt_enter = _parse("\x1b\r")
+    shift_enter = _parse("\x1b[13;2u")
+    assert shift_enter == alt_enter, (
+        f"Shift+Enter via CSI-u should parse identically to Alt+Enter; "
+        f"got {shift_enter!r} vs {alt_enter!r}"
+    )
+
+
+
+
+def test_plain_enter_remains_distinct_from_alt_enter():
+    """Plain Enter must keep emitting a single key (submit), not a two-key
+    Alt+Enter tuple — otherwise we would have broken submit."""
+    enter = _parse("\r")
+    alt_enter = _parse("\x1b\r")
+    assert enter != alt_enter
+    assert len(enter) == 1
+    assert len(alt_enter) == 2
+

@@ -1,0 +1,126 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\google-workspace\references\daily-brief.md ===
+# Daily Brief (Gmail + Calendar)
+
+Produce an action-oriented start-of-day or next-day brief from Gmail and Google Calendar. Load this reference when the user asks for a morning brief, "what's on my calendar and what email needs attention," meeting preparation, or tomorrow's deadlines and conflicts. The main SKILL.md owns the commands; this reference owns the brief-composition procedure.
+
+Credit: workflow contributed by Ben Barclay (benbarclay).
+
+## Procedure
+
+### 1. Resolve day and identity
+
+Confirm Google account, timezone, and target local day. Use an explicit half-open window `[day_start, next_day_start)` in the account's timezone rather than vague "today" filters — the account timezone and the machine timezone are frequently different. Done when the exact UTC and local window are stated.
+
+### 2. Fetch calendar events
+
+Retrieve all calendars in scope, including accepted and tentative meetings, all-day events, travel/holds, location/video links, organizers, and attendee status. Detect overlaps and unrealistic travel gaps between consecutive events. Done when pagination is complete and declined/cancelled events are excluded intentionally.
+
+### 3. Fetch relevant Gmail threads
+
+Search a bounded recent window plus messages connected to meeting participants, subjects, projects, and explicit deadlines (see `gmail-search-syntax.md` for operators). Read full relevant threads. Do not dump every unread newsletter into the brief. Done when each included email changes preparation, priority, or follow-up.
+
+### 4. Link mail to meetings
+
+Match by thread references, participant addresses, company/domain, event title, and project context. Treat fuzzy matches as suggestions, not facts — one shared keyword is not an association. Extract promised documents, unanswered questions, pre-read links, and decisions needed. Done when each meeting has either preparation items or an explicit "no preparation found."
+
+### 5. Build the brief
+
+Use this order:
+
+1. Schedule at a glance
+2. Conflicts and tight transitions
+3. Meetings requiring preparation
+4. Urgent mail and deadlines
+5. Follow-ups owed by the user
+6. Waiting on others
+7. Data coverage or connector failures
+
+Rank by consequence and time, not message count. Done when each included item has a clear preparation, deadline, conflict, or follow-up reason.
+
+### 6. Offer bounded actions
+
+Draft replies, create calendar holds, or add tasks only after presenting them — a brief request is not authorization to mutate. Apply approved actions with the main skill's commands, then read them back. Done when every approved mutation has a Google object ID/link and correct time/recipient.
+
+## Pitfalls
+
+- Mixing account timezone with the machine timezone.
+- Hiding all-day commitments below timed meetings.
+- Treating tentative meetings as confirmed.
+- Associating an email to a meeting from one shared keyword alone.
+- Creating calendar events while the user only requested a brief.
+
+## Verification
+
+- [ ] The day window and calendars covered are stated, or gaps are named.
+- [ ] Every prep item, deadline, and conflict traces to a specific event or thread.
+- [ ] No mutation happened without presentation and approval; approved writes were read back.
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\google-workspace\references\gmail-search-syntax.md ===
+# Gmail Search Syntax
+
+Standard Gmail search operators work in the `query` argument.
+
+## Common Operators
+
+| Operator | Example | Description |
+|----------|---------|-------------|
+| `is:unread` | `is:unread` | Unread messages |
+| `is:starred` | `is:starred` | Starred messages |
+| `is:important` | `is:important` | Important messages |
+| `in:inbox` | `in:inbox` | Inbox only |
+| `in:sent` | `in:sent` | Sent folder |
+| `in:drafts` | `in:drafts` | Drafts |
+| `in:trash` | `in:trash` | Trash |
+| `in:anywhere` | `in:anywhere` | All mail including spam/trash |
+| `from:` | `from:alice@example.com` | Sender |
+| `to:` | `to:bob@example.com` | Recipient |
+| `cc:` | `cc:team@example.com` | CC recipient |
+| `subject:` | `subject:invoice` | Subject contains |
+| `label:` | `label:work` | Has label |
+| `has:attachment` | `has:attachment` | Has attachments |
+| `filename:` | `filename:pdf` | Attachment filename/type |
+| `larger:` | `larger:5M` | Larger than size |
+| `smaller:` | `smaller:1M` | Smaller than size |
+
+## Date Operators
+
+| Operator | Example | Description |
+|----------|---------|-------------|
+| `newer_than:` | `newer_than:7d` | Within last N days (d), months (m), years (y) |
+| `older_than:` | `older_than:30d` | Older than N days/months/years |
+| `after:` | `after:2026/02/01` | After date (YYYY/MM/DD) |
+| `before:` | `before:2026/03/01` | Before date |
+
+## Combining
+
+| Syntax | Example | Description |
+|--------|---------|-------------|
+| space | `from:alice subject:meeting` | AND (implicit) |
+| `OR` | `from:alice OR from:bob` | OR |
+| `-` | `-from:noreply@` | NOT (exclude) |
+| `()` | `(from:alice OR from:bob) subject:meeting` | Grouping |
+| `""` | `"exact phrase"` | Exact phrase match |
+
+## Common Patterns
+
+```
+# Unread emails from the last day
+is:unread newer_than:1d
+
+# Emails with PDF attachments from a specific sender
+from:accounting@company.com has:attachment filename:pdf
+
+# Important unread emails (not promotions/social)
+is:unread -category:promotions -category:social
+
+# Emails in a thread about a topic
+subject:"Q4 budget" newer_than:30d
+
+# Large attachments to clean up
+has:attachment larger:10M older_than:90d
+```
+

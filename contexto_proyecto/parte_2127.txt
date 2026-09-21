@@ -1,0 +1,373 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_moa_reasoning_effort.py ===
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+
+def _response(content="ok"):
+    message = SimpleNamespace(content=content, tool_calls=[])
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None, model="fake")
+
+
+
+
+
+
+def test_slot_reasoning_config_parses_effort_and_none():
+    from agent.moa_loop import _slot_reasoning_config
+
+    assert _slot_reasoning_config({"reasoning_effort": "high"}) == {
+        "enabled": True,
+        "effort": "high",
+    }
+    assert _slot_reasoning_config({"reasoning_effort": "none"}) == {"enabled": False}
+    assert _slot_reasoning_config({}) is None
+
+
+
+def test_moa_reference_passes_per_slot_reasoning_config(monkeypatch):
+    from agent.moa_loop import _run_reference
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return _response("advice")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider") as mock_resolve:
+        mock_resolve.return_value = {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        _run_reference(
+            {"provider": "openai-codex", "model": "gpt-5.6-sol", "reasoning_effort": "low"},
+            [{"role": "user", "content": "judge this"}],
+        )
+
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "low"}
+
+
+
+
+
+class TestAggregatorGlobalFallback:
+    """#64187: the aggregator (MoA's acting model) resolves like any acting
+    model when its slot has no reasoning_effort: per-model override
+    (agent.reasoning_overrides for the slot's model) > global
+    agent.reasoning_effort. Reference advisors do NOT get this fallback
+    (side calls — cost containment)."""
+
+
+
+
+
+    def test_global_yaml_false_disables(self, monkeypatch):
+        from agent import moa_loop
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"reasoning_effort": False}},
+        )
+        cfg = moa_loop._aggregator_reasoning_config({})
+        assert cfg == {"enabled": False}
+
+
+    def test_reference_slots_do_not_inherit_global(self, monkeypatch):
+        """Advisors stay slot-or-default: global effort must NOT leak in."""
+        from agent import moa_loop
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"reasoning_effort": "xhigh"}},
+        )
+        assert moa_loop._slot_reasoning_config({"provider": "p", "model": "m"}) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_moa_reference_system_prompt.py ===
+"""
+Test that the MoA reference system prompt contains explicit warnings
+against claiming tool execution.
+
+Related issue: #61452
+"""
+
+from agent.moa_loop import _REFERENCE_SYSTEM_PROMPT
+
+
+def test_reference_system_prompt_prohibits_claiming_execution():
+    """
+    Verify that the reference system prompt contains explicit warnings
+    against claiming tool execution.
+
+    The prompt should:
+    1. State that reference models cannot execute anything
+    2. Warn against claiming/implying execution
+    3. Provide bad/good examples
+
+    This addresses #61452 where reference models were fabricating
+    tool execution in their text output.
+    """
+    prompt_lower = _REFERENCE_SYSTEM_PROMPT.lower()
+
+    # Critical constraints
+    assert "you cannot call tools" in prompt_lower or "you do not execute" in prompt_lower, \
+        "Prompt must explicitly state that reference models cannot execute"
+
+    assert "never claim" in prompt_lower or "never imply" in prompt_lower, \
+        "Prompt must warn against claiming/implying execution"
+
+    # Check for examples (helps models understand what NOT to do)
+    assert "bad:" in prompt_lower or "avoid:" in prompt_lower, \
+        "Prompt should provide negative examples"
+
+    # Specific action verbs that should NOT appear as claimed actions
+    # (these are common patterns of hallucinated execution)
+    forbidden_patterns = [
+        "i ran", "i executed", "i downloaded", "i accessed",
+        "i checked", "i called", "i browsed"
+    ]
+
+    # The prompt should mention these as bad examples
+    # (i.e., in the context of what to avoid, not as instruction)
+    has_any_forbidden = any(
+        f"bad: \"{pattern}" in _REFERENCE_SYSTEM_PROMPT.lower() or
+        f"avoid \"{pattern}" in _REFERENCE_SYSTEM_PROMPT.lower()
+        for pattern in forbidden_patterns
+    )
+
+    # At least one bad example pattern should exist
+    assert has_any_forbidden or "examples" in _REFERENCE_SYSTEM_PROMPT.lower(), \
+        "Prompt should contain examples of what to avoid"
+
+
+def test_reference_system_prompt_structure():
+    """
+    Verify the reference system prompt has a clear structure.
+
+    A well-structured prompt helps models follow instructions better.
+    """
+    # Prompt should not be empty
+    assert len(_REFERENCE_SYSTEM_PROMPT) > 100, \
+        "Reference system prompt should be substantive"
+
+    # Should have multiple paragraphs (structured guidance)
+    assert _REFERENCE_SYSTEM_PROMPT.count("\n\n") >= 2, \
+        "Prompt should be structured with multiple sections"
+
+    # Should contain the word "advisor" (defines role)
+    assert "advisor" in _REFERENCE_SYSTEM_PROMPT.lower(), \
+        "Prompt should clearly define the advisor role"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_moa_slot_api_mode.py ===
+"""Tests for MoA slot_runtime api_mode propagation (issue #54379).
+
+Verify that _slot_runtime passes the resolved api_mode through to call_llm,
+so reference slots using providers that require a specific API surface
+(e.g. Copilot GPT-5.x → codex_responses) get routed correctly.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+
+def _response(content="ok"):
+    message = SimpleNamespace(content=content, tool_calls=[])
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None, model="fake")
+
+
+class TestSlotRuntimeApiMode:
+    """_slot_runtime should include api_mode when resolve_runtime_provider returns it."""
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_slot_runtime_includes_api_mode(self, mock_resolve):
+        """api_mode from resolve_runtime_provider is forwarded in output dict."""
+        mock_resolve.return_value = {
+            "provider": "copilot",
+            "model": "gpt-5.5",
+            "base_url": "https://api.githubcopilot.com",
+            "api_key": "test-key",
+            "api_mode": "codex_responses",
+        }
+        from agent.moa_loop import _slot_runtime
+
+        result = _slot_runtime({"provider": "copilot", "model": "gpt-5.5"})
+        assert result["api_mode"] == "codex_responses"
+        assert result["base_url"] == "https://api.githubcopilot.com"
+        assert result["api_key"] == "test-key"
+
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_slot_runtime_omits_api_mode_when_empty(self, mock_resolve):
+        """Empty string api_mode is treated as absent."""
+        mock_resolve.return_value = {
+            "provider": "copilot",
+            "model": "gpt-5.5",
+            "base_url": "https://api.githubcopilot.com",
+            "api_key": "test-key",
+            "api_mode": "",
+        }
+        from agent.moa_loop import _slot_runtime
+
+        result = _slot_runtime({"provider": "copilot", "model": "gpt-5.5"})
+        assert "api_mode" not in result
+
+
+
+def test_run_reference_passes_slot_extra_body(monkeypatch):
+    """Reference advisors should receive custom provider extra_body."""
+    from agent import moa_loop
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return _response("advisor")
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "custom",
+            "model": "qwen3.7-max",
+            "base_url": "https://dashscope.example/v1",
+            "api_key": "test-key",
+            "extra_body": {"enable_thinking": False},
+        },
+    )
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(moa_loop, "_maybe_apply_moa_cache_control", lambda messages, runtime, **kwargs: messages)
+
+    label, text, _usage = moa_loop._run_reference(
+        {"provider": "dashscope", "model": "qwen3.7-max"},
+        [{"role": "user", "content": "hello"}],
+    )
+
+    assert label == "dashscope:qwen3.7-max"
+    assert text == "advisor"
+    assert captured["extra_body"] == {"enable_thinking": False}
+
+
+def test_moa_aggregator_merges_slot_extra_body_with_caller_override(tmp_path, monkeypatch):
+    """Aggregator calls should merge slot defaults without duplicate kwargs."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: closed
+  presets:
+    closed:
+      enabled: true
+      reference_models: []
+      aggregator:
+        provider: dashscope
+        model: qwen3.7-max
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from agent import moa_loop
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return _response("acted")
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "custom",
+            "model": "qwen3.7-max",
+            "base_url": "https://dashscope.example/v1",
+            "api_key": "test-key",
+            "extra_body": {
+                "enable_thinking": False,
+                "metadata": {"source": "slot"},
+            },
+        },
+    )
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+
+    facade = moa_loop.MoAChatCompletions("closed")
+    facade.create(
+        model="closed",
+        messages=[{"role": "user", "content": "hello"}],
+        extra_body={
+            "metadata": {"source": "caller"},
+            "reasoning": {"effort": "none"},
+        },
+    )
+
+    assert captured["extra_body"] == {
+        "enable_thinking": False,
+        "metadata": {"source": "caller"},
+        "reasoning": {"effort": "none"},
+    }
+
+
+def test_one_shot_aggregate_moa_context_passes_slot_extra_body(monkeypatch):
+    """The one-shot `/moa <prompt>` synthesis call (aggregate_moa_context) is
+    the third independent MoA call path — its aggregator call receives the
+    slot runtime via **agg_runtime, so custom-provider extra_body must flow
+    through it too."""
+    from agent import moa_loop
+
+    captured_calls = []
+
+    def fake_call_llm(**kwargs):
+        captured_calls.append(kwargs)
+        return _response("synthesis")
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "custom",
+            "model": "qwen3.7-max",
+            "base_url": "https://dashscope.example/v1",
+            "api_key": "test-key",
+            "extra_body": {"enable_thinking": False},
+        },
+    )
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        moa_loop, "_maybe_apply_moa_cache_control", lambda messages, runtime, **kwargs: messages
+    )
+
+    result = moa_loop.aggregate_moa_context(
+        user_prompt="hello",
+        api_messages=[{"role": "user", "content": "hello"}],
+        reference_models=[{"provider": "dashscope", "model": "qwen3.7-max"}],
+        aggregator={"provider": "dashscope", "model": "qwen3.7-max"},
+    )
+
+    assert "synthesis" in result
+    agg_calls = [c for c in captured_calls if c.get("task") == "moa_aggregator"]
+    assert len(agg_calls) == 1
+    assert agg_calls[0]["extra_body"] == {"enable_thinking": False}
+
+
+class TestCallLlmApiMode:
+    """call_llm should accept and forward api_mode parameter."""
+
+    def test_call_llm_accepts_api_mode_kwarg(self):
+        """call_llm signature includes api_mode parameter."""
+        import inspect
+        from agent.auxiliary_client import call_llm
+
+        sig = inspect.signature(call_llm)
+        assert "api_mode" in sig.parameters
+        assert sig.parameters["api_mode"].default is None
+

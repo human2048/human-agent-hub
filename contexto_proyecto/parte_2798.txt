@@ -1,0 +1,323 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_replay_entry_fields.py ===
+"""Tests for ``gateway.run._build_replay_entry``.
+
+The gateway rebuilds ``agent_history`` from the persisted transcript on every
+turn (unlike the CLI, which keeps the live in-memory message list).  When a
+pure-text assistant turn (no ``tool_calls``) is replayed, the simple-text
+branch in ``run_sync`` used to whitelist only three reasoning fields:
+``reasoning``, ``reasoning_details``, ``codex_reasoning_items``.
+
+That whitelist predated three fields the DB now persists:
+``reasoning_content``, ``codex_message_items``, and ``finish_reason``.  The
+unrecovered drop of ``codex_message_items`` in particular kills prefix-cache
+hits for OpenAI Codex Responses API users — OpenAI's docs require the
+``phase`` field be replayed on every assistant message.
+
+These tests pin the expanded whitelist so it doesn't regress.
+"""
+from __future__ import annotations
+
+
+from gateway.run import _ASSISTANT_REPLAY_FIELDS, _build_replay_entry
+
+
+class TestBuildReplayEntry:
+    def test_user_message_has_only_role_and_content(self):
+        entry = _build_replay_entry(
+            "user",
+            "hello",
+            {"role": "user", "content": "hello", "reasoning": "leak", "extra": "drop"},
+        )
+        assert entry == {"role": "user", "content": "hello"}
+
+    def test_tool_message_has_only_role_and_content(self):
+        # Tool messages aren't routed through this helper in production
+        # (they take the rich-passthrough branch), but the helper itself
+        # must not leak reasoning fields onto non-assistant roles even if
+        # someone calls it incorrectly.
+        entry = _build_replay_entry(
+            "tool",
+            "result",
+            {"role": "tool", "content": "result", "reasoning": "leak"},
+        )
+        assert entry == {"role": "tool", "content": "result"}
+
+
+    def test_assistant_drops_falsy_reasoning(self):
+        """Empty/None reasoning fields stay dropped (matching PR #2974
+        behaviour) — empty strings/lists for these fields carry no info."""
+        msg = {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "",
+            "reasoning_details": [],
+            "codex_reasoning_items": [],
+            "codex_message_items": [],
+            "finish_reason": "",
+        }
+        entry = _build_replay_entry("assistant", "answer", msg)
+        assert entry == {"role": "assistant", "content": "answer"}
+
+
+    def test_assistant_preserves_all_six_fields_together(self):
+        details = [{"type": "reasoning.summary", "summary": "s"}]
+        codex_items = [{"type": "reasoning", "encrypted_content": "b"}]
+        msg_items = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "x"}],
+            }
+        ]
+        msg = {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "thinking",
+            "reasoning_content": "structured",
+            "reasoning_details": details,
+            "codex_reasoning_items": codex_items,
+            "codex_message_items": msg_items,
+            "finish_reason": "stop",
+        }
+        entry = _build_replay_entry("assistant", "answer", msg)
+        assert entry["reasoning"] == "thinking"
+        assert entry["reasoning_content"] == "structured"
+        assert entry["reasoning_details"] == details
+        assert entry["codex_reasoning_items"] == codex_items
+        assert entry["codex_message_items"] == msg_items
+        assert entry["finish_reason"] == "stop"
+
+
+    def test_replay_fields_constant_is_stable(self):
+        """Pin the whitelist explicitly so accidental renames are caught."""
+        assert _ASSISTANT_REPLAY_FIELDS == (
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+            "finish_reason",
+        )
+
+    def test_unrelated_keys_are_ignored(self):
+        """Random keys on the message must not leak into the replay entry."""
+        msg = {
+            "role": "assistant",
+            "content": "answer",
+            "timestamp": 12345.6,
+            "internal_marker": "should not flow",
+            "tool_call_id": "should not be set on simple-text branch",
+        }
+        entry = _build_replay_entry("assistant", "answer", msg)
+        assert "timestamp" not in entry
+        assert "internal_marker" not in entry
+        assert "tool_call_id" not in entry
+
+
+class TestReplayEntryApiContentSidecar:
+    """The api_content sidecar (persist-what-you-send) must survive the
+    gateway's transcript→agent_history rebuild, or the whole prompt-cache
+    fix is inert on gateway platforms — but only when this pipeline did not
+    rewrite the content (a rewrite means different bytes must replay)."""
+
+    def test_user_forwards_api_content_when_content_unchanged(self):
+        msg = {"role": "user", "content": "hi", "api_content": "hi\n\nCTX"}
+        entry = _build_replay_entry("user", "hi", msg)
+        assert entry["api_content"] == "hi\n\nCTX"
+        assert entry["content"] == "hi"
+
+    def test_assistant_forwards_api_content_when_content_unchanged(self):
+        msg = {"role": "assistant", "content": "a", "api_content": "a <memory-context>"}
+        entry = _build_replay_entry("assistant", "a", msg)
+        assert entry["api_content"] == "a <memory-context>"
+
+
+class TestGatewayHistoryBuildForwardsSidecar:
+    def test_end_to_end_history_build_keeps_sidecar(self):
+        from gateway.run import _build_gateway_agent_history
+
+        history = [
+            {"role": "user", "content": "hi", "api_content": "hi\n\nCTX", "timestamp": 123.0},
+            {"role": "assistant", "content": "hello"},
+        ]
+        agent_history, _obs = _build_gateway_agent_history(history)
+        assert agent_history[0]["api_content"] == "hi\n\nCTX"
+
+
+
+def test_gateway_history_keeps_sidecar_only_assistant_row():
+    """A reasoning-only clean stop persists content="" with the promoted reply in ``api_content``
+    (agent/turn_final_response.py); the gateway rebuild must replay it, not drop it (user->user)."""
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": "", "reasoning": "The answer is 4.", "api_content": "The answer is 4."},
+        {"role": "user", "content": "thanks"},
+    ]
+    agent_history, _ = _build_gateway_agent_history(history)
+    assert [m["role"] for m in agent_history] == ["user", "assistant", "user"]
+    assert agent_history[1]["api_content"] == "The answer is 4."
+    assert agent_history[1]["reasoning"] == "The answer is 4."
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_reply_to_injection.py ===
+"""Tests for reply-to pointer injection in _prepare_inbound_message_text.
+
+The `[Replying to: "..."]` prefix is a *disambiguation pointer*, not
+deduplication. It must always be injected when the user explicitly replies
+to a prior message — even when the quoted text already exists somewhere
+in the conversation history. History can contain the same or similar text
+multiple times, and without an explicit pointer the agent has to guess
+which prior message the user is referencing.
+"""
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+
+
+def _make_runner() -> GatewayRunner:
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")},
+    )
+    runner.adapters = {}
+    runner._model = "openai/gpt-4.1-mini"
+    runner._base_url = None
+    return runner
+
+
+def _source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_name="DM",
+        chat_type="private",
+        user_name="Alice",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reply_prefix_injected_when_text_absent_from_history():
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="What's the best time to go?",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text="Japan is great for culture, food, and efficiency.",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[{"role": "user", "content": "unrelated"}],
+    )
+
+    assert result is not None
+    assert result.startswith(
+        '[Replying to: "Japan is great for culture, food, and efficiency."]'
+    )
+    assert result.endswith("What's the best time to go?")
+
+
+@pytest.mark.asyncio
+async def test_telegram_long_reply_reaches_prompt_without_losing_later_items():
+    """The native reply already has the full message; preparation must not trim it."""
+    from gateway.platforms.event import MessageType
+    from tests.gateway.test_telegram_reply_quote import _make_adapter, _make_message
+
+    quoted = "\n".join(
+        f"{index}. {company}: " + "Evidence from the supplied list. " * 12
+        for index, company in enumerate(
+            ["GoCar", "Urban Drive", "DubCar", "GRPS", "Halucar"], 1
+        )
+    )
+    event = _make_adapter()._build_message_event(
+        _make_message(text="Review all five companies.", reply_to_text=quoted),
+        MessageType.TEXT,
+    )
+    history = [{"role": "user", "content": "Previous request"}]
+    result = await _make_runner()._prepare_inbound_message_text(
+        event=event, source=event.source, history=history,
+    )
+    assert result is not None
+    assert quoted in result
+    assert result.endswith("Review all five companies.")
+    assert history == [{"role": "user", "content": "Previous request"}]
+
+
+@pytest.mark.asyncio
+async def test_quoted_reply_references_stay_literal_while_typed_ones_expand(tmp_path, monkeypatch):
+    """The replied-to author's ``@file:`` is quoted text, not the replier's request: no local read.
+    The same reference typed in the new message still expands (positive control)."""
+    import threading
+
+    payload = tmp_path / "notes.txt"
+    payload.write_text("LOCAL-FILE-MARKER", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    runner = _make_runner()
+    runner._session_model_overrides, runner._last_resolved_model = {}, {}
+    runner._agent_cache, runner._agent_cache_lock = {}, threading.Lock()
+    runner._resolve_session_agent_runtime = lambda **kw: ("openai/gpt-4.1-mini", {"base_url": None, "api_key": ""})
+    source = _source()
+
+    quoted = ("x " * 300) + f"\nsee @file:{payload.name} for details"
+    quoted_ref = MessageEvent(text="what does this say?", source=source, reply_to_message_id="7", reply_to_text=quoted)
+    result = await runner._prepare_inbound_message_text(event=quoted_ref, source=source, history=[])
+    assert quoted in result
+    assert "LOCAL-FILE-MARKER" not in result
+
+    typed_ref = MessageEvent(text=f"read @file:{payload.name}", source=source, reply_to_message_id="7", reply_to_text="short")
+    result = await runner._prepare_inbound_message_text(event=typed_ref, source=source, history=[])
+    assert result.startswith('[Replying to: "short"]')
+    assert "LOCAL-FILE-MARKER" in result
+
+
+@pytest.mark.asyncio
+async def test_reply_prefix_still_injected_when_text_in_history():
+    """Regression test: the pointer must survive even when the quoted text
+    already appears in history. Previously a `found_in_history` guard
+    silently dropped the prefix, leaving the agent to guess which prior
+    message the user was referencing."""
+    runner = _make_runner()
+    source = _source()
+    quoted = "Japan is great for culture, food, and efficiency."
+    event = MessageEvent(
+        text="What's the best time to go?",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=quoted,
+    )
+
+    history = [
+        {"role": "user", "content": "I'm thinking of going to Japan or Italy."},
+        {
+            "role": "assistant",
+            "content": (
+                f"{quoted} Italy is better if you prefer a relaxed pace."
+            ),
+        },
+        {"role": "user", "content": "How long should I stay?"},
+        {"role": "assistant", "content": "For Japan, 10-14 days is ideal."},
+    ]
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=history,
+    )
+
+    assert result is not None
+    assert result.startswith(f'[Replying to: "{quoted}"]')
+    assert result.endswith("What's the best time to go?")
+
+
+

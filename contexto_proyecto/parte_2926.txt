@@ -1,0 +1,308 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_bot_auth_bypass.py ===
+"""Regression guard for Telegram bot-origin authorization (#32188)."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from gateway.session import Platform, SessionSource
+
+
+@pytest.fixture(autouse=True)
+def _isolate_telegram_env(monkeypatch):
+    for var in (
+        "TELEGRAM_ALLOW_BOTS",
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _make_bare_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
+    return runner
+
+
+def _make_telegram_bot_source(bot_id: str = "999888777"):
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        user_id=bot_id,
+        user_name="OtherProfileBot",
+        is_bot=True,
+    )
+
+
+def _make_telegram_human_source(user_id: str = "100200300"):
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        user_id=user_id,
+        user_name="SomeHuman",
+        is_bot=False,
+    )
+
+
+def test_telegram_bot_authorized_when_allow_bots_mentions(monkeypatch):
+    runner = _make_bare_runner()
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100200300")
+
+    assert runner._is_user_authorized(_make_telegram_bot_source("999888777")) is True
+
+
+def test_telegram_human_still_checked_against_allowlist_when_bot_policy_set(monkeypatch):
+    runner = _make_bare_runner()
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "all")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100200300")
+
+    assert runner._is_user_authorized(_make_telegram_human_source("999999999")) is False
+    assert runner._is_user_authorized(_make_telegram_human_source("100200300")) is True
+
+
+def _build_telegram_message(*, is_bot: bool):
+    user = SimpleNamespace(
+        id=999888777 if is_bot else 100200300,
+        full_name="OtherProfileBot" if is_bot else "Alice",
+        is_bot=is_bot,
+    )
+    chat = SimpleNamespace(
+        id=123,
+        type="private",
+        title=None,
+        full_name="Alice",
+        is_forum=False,
+    )
+    message = MagicMock()
+    message.from_user = user
+    message.chat = chat
+    message.message_id = 4242
+    message.message_thread_id = None
+    message.is_topic_message = False
+    message.forum_topic_created = None
+    message.reply_to_message = None
+    message.quote = None
+    message.text = "hello"
+    message.caption = None
+    return message
+
+
+def _capture_build_source_is_bot(is_bot: bool):
+    from gateway.platforms.event import MessageType
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = SimpleNamespace(extra={})
+    message = _build_telegram_message(is_bot=is_bot)
+    captured: dict = {}
+
+    def fake_build_source(**kwargs):
+        captured.update(kwargs)
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=str(kwargs.get("chat_id") or ""),
+            chat_type=kwargs.get("chat_type") or "dm",
+            user_id=kwargs.get("user_id"),
+            is_bot=kwargs.get("is_bot", False),
+        )
+
+    with patch.object(adapter, "build_source", side_effect=fake_build_source):
+        try:
+            adapter._build_message_event(message, MessageType.TEXT, update_id=1)
+        except Exception:
+            # The method may continue into PTB-specific optional fields after
+            # source construction; this test only pins the source kwarg.
+            pass
+
+    return captured.get("is_bot")
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_callback_auth_fail_closed.py ===
+"""Tests for Telegram adapter fail-closed auth fallback (#24457).
+
+The _is_callback_user_authorized fallback must deny users by default
+when TELEGRAM_ALLOWED_USERS is empty, instead of allowing everyone.
+"""
+
+import sys
+import types
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.config import PlatformConfig, Platform
+
+
+# -- Fake telegram modules (minimal stubs) --------------------------------
+
+_fake_telegram_error = types.ModuleType("telegram.error")
+
+
+class _TelegramError(Exception):
+    pass
+
+
+_fake_telegram_error.TelegramError = _TelegramError
+_fake_telegram_error.BadRequest = type("BadRequest", (_TelegramError,), {})
+_fake_telegram_error.NetworkError = type("NetworkError", (_TelegramError,), {})
+
+_fake_telegram_constants = types.ModuleType("telegram.constants")
+_fake_telegram_constants.ParseMode = SimpleNamespace(HTML="HTML")
+
+_fake_telegram_request = types.ModuleType("telegram.request")
+_fake_telegram_request.HTTPXRequest = type("HTTPXRequest", (), {"__init__": lambda *a, **kw: None})
+
+_fake_telegram_ext = types.ModuleType("telegram.ext")
+_fake_telegram_ext.ApplicationBuilder = type("ApplicationBuilder", (), {
+    "token": lambda self, *a: self,
+    "build": lambda self: None,
+})
+
+_fake_telegram = types.ModuleType("telegram")
+_fake_telegram.error = _fake_telegram_error
+_fake_telegram.constants = _fake_telegram_constants
+_fake_telegram.ext = _fake_telegram_ext
+_fake_telegram.request = _fake_telegram_request
+
+
+@pytest.fixture(autouse=True)
+def _inject_fake_telegram(monkeypatch):
+    monkeypatch.setitem(sys.modules, "telegram", _fake_telegram)
+    monkeypatch.setitem(sys.modules, "telegram.error", _fake_telegram_error)
+    monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
+    monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
+    monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+
+
+def _make_adapter():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    config = PlatformConfig(enabled=True, token="fake-token")
+    adapter = object.__new__(TelegramAdapter)
+    adapter.config = config
+    adapter._config = config
+    adapter._platform = Platform.TELEGRAM
+    adapter._connected = True
+    return adapter
+
+
+class TestCallbackAuthFailClosed:
+    """_is_callback_user_authorized fallback must be fail-closed."""
+
+    def test_no_allowlist_no_allow_all_denies(self, monkeypatch):
+        """No TELEGRAM_ALLOWED_USERS and no GATEWAY_ALLOW_ALL_USERS → deny."""
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter()
+        # Force the fallback path (no runner auth)
+        adapter._message_handler = None
+        assert adapter._is_callback_user_authorized("12345") is False
+
+
+    def test_allowlist_with_matching_user_permits(self, monkeypatch):
+        """TELEGRAM_ALLOWED_USERS contains the user → allow."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "12345,67890")
+        adapter = _make_adapter()
+        adapter._message_handler = None
+        assert adapter._is_callback_user_authorized("12345") is True
+
+
+class TestCallbackAuthPrefersInjectedCheck:
+    """_is_callback_user_authorized must use the auth callback GatewayRunner
+    injects via set_authorization_check before the _message_handler.__self__
+    introspection.
+
+    A secondary multiplexed adapter's _message_handler is a profile closure
+    (no __self__), so the introspection path resolves to nothing and the old
+    code fell through to the env-only fallback — which knows nothing about
+    profile config allowlists or the pairing store. The injected callback is
+    registered for every gateway-connected adapter, including multiplexed
+    secondaries, and delegates to the full _is_user_authorized chain.
+    """
+
+    def test_injected_check_used_when_handler_is_a_closure(self, monkeypatch):
+        """Multiplexed shape: closure handler (no __self__) + injected check
+        registered → the injected check decides, not the env fallback."""
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter()
+        adapter._message_handler = lambda *a, **kw: None  # no __self__
+        seen = {}
+
+        def _check(user_id, chat_type=None, chat_id=None):
+            seen.update(user_id=user_id, chat_type=chat_type, chat_id=chat_id)
+            return user_id == "999"
+
+        adapter._authorization_check = _check
+
+        # Env fallback would deny (empty allowlist); the injected check allows.
+        assert adapter._is_callback_user_authorized(
+            "999", chat_id="777", chat_type="supergroup"
+        ) is True
+        assert seen == {"user_id": "999", "chat_type": "group", "chat_id": "777"}
+
+    def test_injected_check_deny_wins_over_env_allowlist(self, monkeypatch):
+        """The injected check is authoritative when registered — an env
+        allowlist entry must not override its deny."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "12345")
+        adapter = _make_adapter()
+        adapter._message_handler = lambda *a, **kw: None
+        adapter._authorization_check = lambda user_id, chat_type=None, chat_id=None: False
+
+        assert adapter._is_callback_user_authorized("12345") is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_caption_merge.py ===
+"""Tests for TelegramPlatform._merge_caption caption deduplication logic."""
+
+
+from plugins.platforms.telegram.adapter import TelegramAdapter
+
+merge = TelegramAdapter._merge_caption
+
+
+class TestMergeCaptionBasic:
+    def test_no_existing_text(self):
+        assert merge(None, "Hello") == "Hello"
+
+
+class TestMergeCaptionSubstringBug:
+    """These are the exact scenarios that the old substring check got wrong."""
+
+    def test_shorter_caption_not_dropped_when_substring(self):
+        # Bug: "Meeting" in "Meeting agenda" → True → caption was silently lost
+        result = merge("Meeting agenda", "Meeting")
+        assert result == "Meeting agenda\n\nMeeting"
+
+
+class TestMergeCaptionWhitespace:
+    def test_trailing_space_treated_as_duplicate(self):
+        assert merge("Revenue", "Revenue  ") == "Revenue"
+
+
+class TestMergeCaptionMultipleItems:
+    def test_three_unique_captions_all_present(self):
+        text = merge(None, "A")
+        text = merge(text, "B")
+        text = merge(text, "C")
+        assert text == "A\n\nB\n\nC"
+
+
+

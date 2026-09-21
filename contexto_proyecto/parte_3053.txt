@@ -1,0 +1,216 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\relay\__init__.py ===
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\anon_portal.py ===
+"""The fake NAS anonymous surface shared by the free-tier tests.
+
+One ``FakePortal`` and one ``install_portal`` behind every ``portal`` fixture: the wire contract is
+exercised through Hermes' real client code, never mocked away. Scenarios flip its behaviour
+(``gate_closed``, ``dead_tokens``, a canned ``create_response`` / ``token_response``, or a
+``raise_transport`` that makes the wire itself fail).
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import time
+
+import httpx
+
+WELCOME = "https://welcome-api.nousresearch.com/v1"
+PORTAL = "https://portal.example.test"
+
+
+def make_jwt(**claims) -> str:
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    payload = {"sub": "nas_user:1", "client_id": "nas-anonymous", "account_tier": "anonymous",
+               "scope": "inference:invoke tool:invoke", "exp": int(time.time()) + 900, **claims}
+    return f"{seg({'alg': 'RS256'})}.{seg(payload)}.sig"
+
+
+class FakePortal:
+    """Minimal NAS anonymous surface. Records every call; scenarios flip its behaviour."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+        self.dead_tokens: set[str] = set()
+        self.gate_closed = False
+        self.minted = 0
+        # What the token exchange names as the inference host; None = an older NAS that omits it.
+        self.inference_base_url: str | None = WELCOME
+        # One canned refusal in place of the happy path, and a wire failure in place of any answer.
+        self.create_response: httpx.Response | None = None
+        self.token_response: httpx.Response | None = None
+        self.raise_transport: Exception | None = None
+
+    def creates(self) -> int:
+        return [p for _, p in self.calls].count("/api/anonymous/create")
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.calls.append((request.method, path))
+        if self.raise_transport is not None:
+            raise self.raise_transport
+        if path.startswith("/api/anonymous/") and not request.headers.get("x-anonymous-api-secret"):
+            return httpx.Response(401, json={"error": "invalid_shared_secret"})
+        if self.gate_closed:
+            return httpx.Response(401, json={"error": "invalid_shared_secret"})
+        if path == "/api/anonymous/create":
+            if self.create_response is not None:
+                return self.create_response
+            self.minted += 1
+            return httpx.Response(201, json={"user_id": f"nas_user:{self.minted}", "org_id": "nas_org:1",
+                                             "token": f"anon_{self.minted:04d}", "idle_ttl_days": 14})
+        if path == "/api/anonymous/token":
+            if self.token_response is not None:
+                return self.token_response
+            token = json.loads(request.content)["token"]
+            if token in self.dead_tokens:
+                return httpx.Response(404, json={"error": "unknown_token"})
+            body = {"access_token": make_jwt(), "token_type": "Bearer", "expires_in": 900,
+                    "user_id": "nas_user:1", "org_id": "nas_org:1"}
+            if self.inference_base_url:
+                body["inference_base_url"] = self.inference_base_url
+            return httpx.Response(200, json=body)
+        return httpx.Response(500, json={"error": f"unexpected {path}"})
+
+
+def install_portal(monkeypatch, tmp_path, fake: FakePortal | None = None) -> FakePortal:
+    """Route every Nous HTTP client at *fake*, isolate the stores, and reset the per-process memos.
+
+    One transport seam: ``httpx.Client`` itself, which ``auth_nous._nous_http_client`` and
+    ``resolve_nous_access_token`` both construct."""
+    from hermes_cli import anon_auth, free_tier_bootstrap
+    from hermes_cli import auth as auth_mod
+
+    fake = fake or FakePortal()
+    monkeypatch.setenv("HERMES_PORTAL_BASE_URL", PORTAL)
+    monkeypatch.setenv("HERMES_ANON_API_SECRET", "test-secret")
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared-store"))
+    monkeypatch.setenv("HERMES_GUEST_ONBOARDING", "1")
+    for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NOUS_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    real_client = httpx.Client
+
+    class _RoutedClient(real_client):
+        def __init__(self, *a, **kw):
+            kw.pop("verify", None)
+            kw["transport"] = httpx.MockTransport(fake.handler)
+            super().__init__(*a, **kw)
+    monkeypatch.setattr(httpx, "Client", _RoutedClient)
+    monkeypatch.setattr("agent.bedrock_adapter.has_aws_credentials", lambda: False)
+    anon_auth.reset_mint_memo_for_tests()
+    free_tier_bootstrap.reset_for_tests()
+    # resolve_nous_access_token memoises the last token for 5 s per profile home (dict); a token minted
+    # by an earlier test must not be served to this one.
+    monkeypatch.setattr(auth_mod, "_RESOLVE_TOKEN_CACHE", {})
+    return fake
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\benchmark_session_timeline.py ===
+"""Reproducible HTTP payload benchmark using generated data, never a live store.
+
+Run with the development Python from the repository root. Prints a JSON receipt;
+fixture setup is excluded from timings. No provider, credential, or app access.
+"""
+
+import json
+import os
+from pathlib import Path
+import statistics
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def main():
+    with tempfile.TemporaryDirectory(prefix="hermes-timeline-bench-") as directory:
+        os.environ["HERMES_HOME"] = directory
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from hermes_state import SessionDB
+        from hermes_cli.web_routers.sessions import manage_router
+
+        sid = "generated-tool-heavy"
+        prompt_count = 600
+        rows_per_turn = 10
+        with SessionDB(db_path=Path(directory) / "state.db") as db:
+            db.create_session(session_id=sid, source="desktop")
+            for start in range(0, prompt_count, 100):
+                batch = []
+                for turn in range(start, start + 100):
+                    batch.append({"role": "user", "content": f"Investigate generated task {turn}", "timestamp": turn + 1})
+                    for tool in range(4):
+                        call_id = f"call-{turn}-{tool}"
+                        batch.append({"role": "assistant", "content": "", "tool_calls": [{
+                            "id": call_id, "type": "function", "function": {
+                                "name": "terminal", "arguments": json.dumps({"command": "x" * 4096})}}]})
+                        batch.append({"role": "tool", "tool_call_id": call_id,
+                                      "content": "generated tool output\n" * 800})
+                    batch.append({"role": "assistant", "content": f"Finished task {turn}"})
+                db.append_messages_batch(sid, batch)
+        app = FastAPI()
+        app.include_router(manage_router)
+        with TestClient(app) as client:
+            def full_messages():
+                total_bytes = count = requests = 0
+                for offset in range(0, prompt_count * rows_per_turn + 1, 500):
+                    response = client.get(f"/api/sessions/{sid}/messages", params={
+                        "limit": 500, "offset": offset, "order": "oldest", "include_compacted": True})
+                    response.raise_for_status()
+                    page = response.json()["messages"]
+                    total_bytes += len(response.content)
+                    count += len(page)
+                    requests += 1
+                    if len(page) < 500:
+                        break
+                assert count == prompt_count * rows_per_turn
+                return {"bytes": total_bytes, "rows": count, "requests": requests}
+
+            def timeline():
+                total_bytes = count = requests = 0
+                cursor = 0
+                seen = set()
+                while True:
+                    response = client.get(f"/api/sessions/{sid}/timeline", params={"limit": 500, "after_row_id": cursor})
+                    response.raise_for_status()
+                    page = response.json()
+                    total_bytes += len(response.content)
+                    count += len(page["entries"])
+                    requests += 1
+                    seen.update(entry["row_id"] for entry in page["entries"])
+                    if not page["pagination"]["has_more"]:
+                        break
+                    cursor = page["pagination"]["next_cursor"]
+                assert count == len(seen) == prompt_count
+                return {"bytes": total_bytes, "rows": count, "requests": requests}
+
+            samples = {"full_messages": [], "timeline": []}
+            for _ in range(3):
+                for name, procedure in (("full_messages", full_messages), ("timeline", timeline)):
+                    started = time.perf_counter()
+                    result = procedure()
+                    result["elapsed_ms"] = (time.perf_counter() - started) * 1000
+                    samples[name].append(result)
+            receipt = {
+                "fixture": {"prompts": prompt_count, "message_rows": prompt_count * rows_per_turn,
+                            "tool_results": prompt_count * 4},
+                **{name: {**runs[-1], "elapsed_ms": statistics.median(r["elapsed_ms"] for r in runs),
+                          "samples_ms": [r["elapsed_ms"] for r in runs]} for name, runs in samples.items()},
+            }
+            receipt["payload_reduction_percent"] = 100 * (1 - receipt["timeline"]["bytes"] / receipt["full_messages"]["bytes"])
+            receipt["speedup"] = receipt["full_messages"]["elapsed_ms"] / receipt["timeline"]["elapsed_ms"]
+            print(json.dumps(receipt, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+

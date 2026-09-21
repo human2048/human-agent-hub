@@ -1,0 +1,14 @@
+
+
+=== ARCHIVO: .\hermes-agent\acp_adapter\__init__.py ===
+"""ACP (Agent Communication Protocol) adapter for hermes-agent."""
+
+
+
+=== ARCHIVO: .\hermes-agent\acp_adapter\__main__.py ===
+"""Allow running the ACP adapter as ``python -m acp_adapter``."""
+
+from .entry import main
+
+main()
+

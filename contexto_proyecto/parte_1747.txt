@@ -1,0 +1,209 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\product-price-monitor\SKILL.md ===
+---
+name: product-price-monitor
+description: "Watch product, flight, or listing prices; alert on target."
+version: 0.1.0
+author: Ben Barclay (benbarclay), Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [Prices, Availability, Shopping, Travel, Alerts]
+    related_skills: [maps]
+---
+
+# Product Price Monitor
+
+Monitor a concrete purchasable item and alert on a normalized all-in price or availability condition. Handle variants, taxes, fees, currencies, stock, cancellation terms, and duplicate alerts explicitly. Setup runs once in the foreground; the recurring check runs as a `cronjob` tick (the `price-watch` automation blueprint scaffolds this).
+
+## When to Use
+
+- "Alert me when this laptop drops below $1,000."
+- "Watch these flights for a fare under $500."
+- "Tell me when this hotel has a refundable room."
+- "Track ticket/listing availability."
+- A cron tick fires for an existing price watch (steps 4-6).
+
+Don't use for: one-off "what does this cost right now" lookups (use `web_search`/`web_extract` directly).
+
+## Procedure — Setup (foreground, once)
+
+### 1. Define the exact item
+
+Record source URL/provider, product/listing ID where available, variant, quantity, location, dates, travelers/guests, membership/login assumptions, condition, seller, and acceptable substitutes. Done when two variants cannot be confused.
+
+### 2. Define the alert condition
+
+Specify currency, all-in vs pre-tax price, maximum price, availability/stock rule, shipping, refundability, cabin/room/ticket class, cooldown, and notification destination. Done when synthetic examples have deterministic alert decisions.
+
+### 3. Establish a live baseline, then schedule
+
+Fetch a bounded live result with `web_extract` or `browser_navigate` and record retrieval time, source price, fees/taxes, availability, and terms. Do not schedule until one foreground fetch works. Write the watch contract (item, condition, baseline observation) to a state file under `~/.hermes/price-watches/<watch-slug>.json`, then create the job:
+
+```
+cronjob(action="create",
+        schedule="every 6h",
+        prompt="Load the product-price-monitor skill and run the tick for the watch contract at ~/.hermes/price-watches/<watch-slug>.json.",
+        deliver=<user's destination>)
+```
+
+Pick a cadence that respects rate limits and site terms. Done when the baseline matches the exact item contract and the job exists.
+
+## Procedure — Tick (each scheduled run)
+
+### 4. Fetch and normalize
+
+Re-fetch the source. Convert currency only with a timestamped rate and retain the source currency. Separate base price, mandatory fees, shipping/taxes, total, and availability. Exclude volatile page metadata. A failed fetch means unknown state: report or skip, but never overwrite the last good observation with an error page. Done when the observation is comparable to the baseline or explicitly marked failed.
+
+### 5. Compare and suppress duplicates
+
+Alert on threshold entry, qualifying availability, material lower price, or recovery as requested. Store the last good observation and last alert fingerprint in the state file. Replaying the same offer must send no second alert; respect the cooldown. Done when the alert decision is deterministic against stored state.
+
+### 6. Deliver or stay silent
+
+When a condition is met, the alert includes: exact item/variant, observed all-in price and source currency, availability/terms, threshold, retrieval timestamp, source link, and important uncertainty. Never claim inventory is reserved. When nothing qualifies, stay silent — no "still watching" noise unless a periodic all-clear was requested. Done when the state file reflects this run.
+
+## Pitfalls
+
+- Comparing a base fare with an all-in threshold.
+- Alerting on the wrong size, seller, cabin, dates, or room terms.
+- Overwriting a last-known-good value with an error page.
+- Polling aggressively enough to trigger blocking or violate site terms.
+- Scheduling before a single foreground fetch has succeeded.
+
+## Verification
+
+- [ ] The watch contract pins the item so two variants cannot be confused.
+- [ ] One foreground fetch succeeded before any job was created.
+- [ ] Alert decisions replay deterministically from the state file; duplicates suppressed.
+- [ ] Failed fetches never replaced last-known-good state.
+- [ ] Alerts carry all-in price, source currency, timestamp, and source link.
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\teams-meeting-pipeline\SKILL.md ===
+---
+name: teams-meeting-pipeline
+description: Teams meeting summaries, job replay, Graph subscriptions.
+version: 1.1.0
+author: Hermes Agent + Teknium
+license: MIT
+platforms: [linux, macos, windows]
+prerequisites:
+  env_vars: [MSGRAPH_TENANT_ID, MSGRAPH_CLIENT_ID, MSGRAPH_CLIENT_SECRET]
+  commands: [hermes]
+metadata:
+  hermes:
+    tags: [Teams, Microsoft Graph, Meetings, Productivity, Operations]
+    # Channel-gated: this pipeline only makes sense on the Teams gateway
+    # channel (and in cron jobs, where its scheduled summary/replay work
+    # actually runs). Hidden from every other session's skills index.
+    session_platforms: [teams, cron]
+    related_docs:
+      - /docs/guides/microsoft-graph-app-registration
+      - /docs/user-guide/messaging/teams-meetings
+      - /docs/guides/operate-teams-meeting-pipeline
+---
+
+# Teams Meeting Pipeline
+
+Use this skill whenever the user asks about Microsoft Teams meeting summaries, transcripts, recordings, action items, Graph subscriptions, or any operational question about the Teams meeting pipeline. Works in any language — the triggers below are examples, not an exhaustive list.
+
+Everything operator-facing is a `hermes teams-pipeline` subcommand run via the terminal tool. There are no new model tools for this pipeline — the CLI is the surface.
+
+## When to use this skill
+
+The user is asking to:
+- summarize a Teams meeting / extract action items / pull meeting notes
+- check pipeline status, inspect a stored meeting job, or see recent meetings
+- replay / re-run a stored job that failed or needs a fresh summary
+- validate Microsoft Graph setup after changing env or config
+- troubleshoot "meeting summary never arrived" or "no new meetings are ingesting"
+- manage Graph webhook subscriptions (create, renew, delete, inspect)
+- set up automated subscription renewal (see pitfall below)
+
+Multilingual trigger examples (not exhaustive):
+- English: "summarize the Teams meeting", "pipeline status", "replay job X"
+- Turkish: "Teams meeting özetle", "action item çıkar", "toplantı notu", "pipeline durumu", "replay job"
+
+## Prerequisites
+
+Before using the pipeline, verify these are set in `${HERMES_HOME:-~/.hermes}/.env`:
+
+```bash
+MSGRAPH_TENANT_ID=...
+MSGRAPH_CLIENT_ID=...
+MSGRAPH_CLIENT_SECRET=...
+```
+
+If any are missing, direct the user to the Azure app registration guide at `/docs/guides/microsoft-graph-app-registration` — they need an Azure AD app registration with admin-consented Graph application permissions before the pipeline will work.
+
+## Command reference
+
+### Status and inspection (start here)
+
+```bash
+hermes teams-pipeline validate              # config snapshot — run first after any change
+hermes teams-pipeline token-health          # Graph token status
+hermes teams-pipeline token-health --force-refresh   # force a fresh token acquisition
+hermes teams-pipeline list                  # recent meeting jobs
+hermes teams-pipeline list --status failed  # only failed jobs
+hermes teams-pipeline show <job-id>         # full detail of one job
+hermes teams-pipeline subscriptions         # current Graph webhook subscriptions
+```
+
+### Re-running / debugging
+
+```bash
+hermes teams-pipeline run <job-id>          # replay a stored job (re-summarize, re-deliver)
+hermes teams-pipeline fetch --meeting-id <id>   # dry-run: resolve meeting + transcript without persisting
+hermes teams-pipeline fetch --join-web-url "<url>"   # dry-run by join URL
+hermes teams-pipeline fetch --join-web-url "<url>" --organizer-user-id <id>   # organizer-scoped lookup (required for /meet/ short URLs)
+```
+
+### Subscription management
+
+```bash
+hermes teams-pipeline subscribe \
+  --resource communications/onlineMeetings/getAllTranscripts \
+  --notification-url https://<your-public-host>/msgraph/webhook \
+  --client-state "$MSGRAPH_WEBHOOK_CLIENT_STATE"
+
+hermes teams-pipeline renew-subscription <sub-id> --expiration <iso-8601>
+hermes teams-pipeline delete-subscription <sub-id>
+hermes teams-pipeline maintain-subscriptions            # renew near-expiry ones
+hermes teams-pipeline maintain-subscriptions --dry-run  # show what would be renewed
+```
+
+## Decision tree for common asks
+
+- User asks "why didn't I get a summary for today's meeting?" → start with `list --status failed`, then `show <job-id>` on the relevant row. If the job doesn't exist at all, check `subscriptions` — the webhook may have expired (see pitfall below).
+- User asks "is setup working?" → `validate`, then `token-health`, then `subscriptions`. If all three pass, request a test meeting and check `list` for a fresh row.
+- User asks "re-run summary for meeting X" → `list` to find the job ID, `run <job-id>` to replay. If it fails again, `show <job-id>` to inspect the error and `fetch --meeting-id` to dry-run the artifact resolution.
+- User asks "add meeting X to the pipeline" → usually you don't — the pipeline is subscription-driven, not per-meeting. If they want a specific past meeting summarized, use `fetch` to pull transcript + `run` after a job is created.
+
+## Critical pitfall: Graph subscriptions expire in 72 hours
+
+Microsoft Graph caps webhook subscriptions at 72 hours and **will not auto-renew them**. If `maintain-subscriptions` is not scheduled, meeting notifications silently stop arriving 3 days after any manual subscription creation.
+
+When the user reports "the pipeline worked yesterday but nothing is arriving today":
+1. Run `hermes teams-pipeline subscriptions` — if it's empty or all entries show `expirationDateTime` in the past, that's the cause.
+2. Recreate with `subscribe` as shown above.
+3. **Set up automated renewal immediately** via `hermes cron add`, a systemd timer, or plain crontab. The operator runbook at `/docs/guides/operate-teams-meeting-pipeline#automating-subscription-renewal-required-for-production` has all three options. 12-hour interval is safe (6x headroom against the 72h limit).
+
+## Other pitfalls
+
+- **Transcript not available yet.** Teams takes some time after a meeting ends to generate the transcript artifact. `fetch --meeting-id` on a just-ended meeting may return empty. Wait 2-5 minutes and retry, or let the Graph webhook drive ingestion naturally.
+- **Delivery mode mismatch.** If summaries are produced (`list` shows success) but nothing lands in Teams, check `platforms.teams.extra.delivery_mode` and the matching target config (`incoming_webhook_url` OR `chat_id` OR `team_id`+`channel_id`). The writer reads these from config.yaml or `TEAMS_*` env vars.
+- **Graph app permissions.** A token acquires cleanly (`token-health` passes) but Graph API calls return 401/403 when permissions were added but admin consent wasn't re-granted. Have the user revisit the app registration in the Azure portal and click "Grant admin consent" again.
+
+## Related docs
+
+Point the user to these when they need more depth than this skill covers:
+- Azure app registration walkthrough: `/docs/guides/microsoft-graph-app-registration`
+- Full pipeline setup: `/docs/user-guide/messaging/teams-meetings`
+- Operator runbook (renewal automation, troubleshooting, go-live checklist): `/docs/guides/operate-teams-meeting-pipeline`
+- Webhook listener setup: `/docs/user-guide/messaging/msgraph-webhook`
+

@@ -1,0 +1,360 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_allowed_channels_widening.py ===
+"""Tests for the allowed_{channels,chats,rooms} whitelist extension
+added alongside PR #7401 (Slack).
+
+Covers: Telegram, Matrix, Mattermost, DingTalk.
+
+For each platform:
+- Empty = no restriction (fully backward compatible).
+- When set, messages from non-listed chats/rooms are silently ignored.
+- DMs are never filtered.
+- @mention does NOT bypass the whitelist.
+- config.yaml → env var bridging (via load_gateway_config) where applicable.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
+def _make_telegram_adapter(*, allowed_chats=None, require_mention=None, guest_mode=False):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    extra = {"guest_mode": guest_mode}
+    if allowed_chats is not None:
+        extra["allowed_chats"] = allowed_chats
+    if require_mention is not None:
+        extra["require_mention"] = require_mention
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(enabled=True, token="***", extra=extra)
+    adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
+    adapter._message_handler = AsyncMock()
+    adapter._mention_patterns = adapter._compile_mention_patterns()
+    # PR db50af910 added a TELEGRAM_ALLOWED_USERS allowlist gate to
+    # _should_process_message; stub it for tests that exercise the
+    # allowed-channels widening logic that runs after.
+    adapter._is_callback_user_authorized = lambda *_a, **_kw: True
+    return adapter
+
+
+def _tg_group_message(chat_id=-100, text="hello"):
+    return SimpleNamespace(
+        text=text,
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        chat=SimpleNamespace(id=chat_id, type="group"),
+        from_user=SimpleNamespace(id=111),
+        reply_to_message=None,
+    )
+
+
+def _tg_dm_message(text="hello"):
+    return SimpleNamespace(
+        text=text,
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        chat=SimpleNamespace(id=111, type="private"),
+        from_user=SimpleNamespace(id=111),
+        reply_to_message=None,
+    )
+
+
+class TestTelegramAllowedChats:
+    def test_empty_is_no_restriction(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
+        adapter = _make_telegram_adapter()
+        assert adapter._telegram_allowed_chats() == set()
+        assert adapter._should_process_message(_tg_group_message(-100)) is True
+
+    def test_list_form(self):
+        adapter = _make_telegram_adapter(allowed_chats=[-100, -200])
+        assert adapter._telegram_allowed_chats() == {"-100", "-200"}
+
+
+    def test_mention_cannot_bypass_whitelist(self):
+        """@mention in a non-allowed chat is still ignored."""
+        adapter = _make_telegram_adapter(allowed_chats=["-100"])
+        msg = _tg_group_message(-999, text="@hermes_bot hello")
+        msg.entities = [SimpleNamespace(
+            type="mention", offset=0, length=len("@hermes_bot"),
+        )]
+        assert adapter._should_process_message(msg) is False
+
+
+    def test_config_bridge(self, monkeypatch, tmp_path):
+        """slack-style config.yaml → env var bridge works."""
+        from gateway.config import load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "telegram:\n"
+            "  allowed_chats:\n"
+            "    - -100\n"
+            "    - -200\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", "__sentinel__")
+        monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS")
+
+        load_gateway_config()
+
+        import os as _os
+        assert _os.environ["TELEGRAM_ALLOWED_CHATS"] == "-100,-200"
+
+
+# ---------------------------------------------------------------------------
+# DingTalk
+# ---------------------------------------------------------------------------
+
+def _make_dingtalk_adapter(*, allowed_chats=None, require_mention=None):
+    # Import lazily — DingTalk SDK may not be installed.
+    pytest.importorskip("plugins.platforms.dingtalk.adapter", reason="DingTalk adapter not importable")
+    from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+    extra = {}
+    if allowed_chats is not None:
+        extra["allowed_chats"] = allowed_chats
+    if require_mention is not None:
+        extra["require_mention"] = require_mention
+
+    adapter = object.__new__(DingTalkAdapter)
+    adapter.platform = Platform.DINGTALK
+    adapter.config = PlatformConfig(enabled=True, extra=extra)
+    return adapter
+
+
+class TestDingTalkAllowedChats:
+    def test_empty_is_no_restriction(self, monkeypatch):
+        monkeypatch.delenv("DINGTALK_ALLOWED_CHATS", raising=False)
+        adapter = _make_dingtalk_adapter()
+        assert adapter._dingtalk_allowed_chats() == set()
+
+    def test_list_form(self):
+        adapter = _make_dingtalk_adapter(allowed_chats=["cidABC", "cidDEF"])
+        assert adapter._dingtalk_allowed_chats() == {"cidABC", "cidDEF"}
+
+
+# ---------------------------------------------------------------------------
+# Mattermost (env-var only — no config.yaml bridge)
+# ---------------------------------------------------------------------------
+
+class TestMattermostAllowedChannels:
+    """Mattermost whitelist logic — replicated since the adapter reads config
+    with env-var fallback inline inside _handle_post rather than through a
+    helper method."""
+
+    @staticmethod
+    def _would_process(channel_id, channel_type="O", allowed_cfg=None, allowed_env=""):
+        """Replicate the whitelist gate from gateway/platforms/mattermost.py."""
+        if channel_type == "D":
+            return True
+        # config-first, env-var fallback (matching the adapter)
+        allowed_raw = allowed_cfg
+        if allowed_raw is None:
+            allowed_raw = allowed_env
+        if isinstance(allowed_raw, list):
+            allowed = {str(c).strip() for c in allowed_raw if str(c).strip()}
+        else:
+            allowed = {c.strip() for c in str(allowed_raw).split(",") if c.strip()}
+        if allowed and channel_id not in allowed:
+            return False
+        return True
+
+    def test_empty_config_is_no_restriction(self):
+        assert self._would_process("chan123", allowed_cfg=None, allowed_env="") is True
+
+
+    def test_config_bridge(self, monkeypatch, tmp_path):
+        from gateway.config import load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "mattermost:\n"
+            "  allowed_channels:\n"
+            "    - chanABC\n"
+            "    - chanDEF\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        # Pre-register the key with monkeypatch so teardown cleans it up
+        # even though load_gateway_config mutates os.environ directly
+        # (monkeypatch only restores keys it's touched via setenv/delenv;
+        # delenv on an absent key is a no-op for teardown purposes).
+        monkeypatch.setenv("MATTERMOST_ALLOWED_CHANNELS", "__sentinel__")
+        monkeypatch.delenv("MATTERMOST_ALLOWED_CHANNELS")
+
+        load_gateway_config()
+
+        import os as _os
+        assert _os.environ["MATTERMOST_ALLOWED_CHANNELS"] == "chanABC,chanDEF"
+
+
+# ---------------------------------------------------------------------------
+# Matrix
+# ---------------------------------------------------------------------------
+
+class TestMatrixAllowedRooms:
+    """Matrix whitelist behavior — tested via the env-var-initialized
+    instance attribute _allowed_rooms."""
+
+    def test_empty_env_empty_set(self, monkeypatch):
+        monkeypatch.delenv("MATRIX_ALLOWED_ROOMS", raising=False)
+        # Replicate __init__ parsing without needing the real adapter.
+        raw = "" or ""
+        allowed = {r.strip() for r in raw.split(",") if r.strip()}
+        assert allowed == set()
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_allowlist_startup_check.py ===
+"""Tests for the startup allowlist warning check in gateway/run.py."""
+
+import os
+from unittest.mock import patch
+
+
+def _would_warn():
+    """Replicate the startup allowlist warning logic. Returns True if warning fires."""
+    _any_allowlist = any(
+        os.getenv(v)
+        for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
+                   "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
+                   "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
+                   "EMAIL_ALLOWED_USERS",
+                   "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
+                   "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS", "FEISHU_ALLOWED_USERS", "WECOM_ALLOWED_USERS",
+                   "GATEWAY_ALLOWED_USERS")
+    )
+    _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
+        os.getenv(v, "").lower() in {"true", "1", "yes"}
+        for v in ("TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
+                   "WHATSAPP_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS",
+                   "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
+                   "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
+                   "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS", "FEISHU_ALLOW_ALL_USERS", "WECOM_ALLOW_ALL_USERS")
+    )
+    return not _any_allowlist and not _allow_all
+
+
+class TestAllowlistStartupCheck:
+
+    def test_no_config_emits_warning(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert _would_warn() is True
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_delegation_delivery_contract.py ===
+"""A detached API result must have an addressable consumer and one durable row."""
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.platforms.api_server import APIServerAdapter
+from gateway.session_context import clear_session_vars
+from gateway.wake import persist_delegation_delivery
+from hermes_state import SessionDB
+from tools.delegate_tool_dispatch import _resolve_async_wake_sid
+
+
+@pytest.mark.asyncio
+async def test_detached_dispatch_requires_a_declared_consumer(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_HISTORY_DELIVERY", "1")
+    for capability in (None, "", "1"):
+        kw = dict(chat_id="api-parent", session_id="api-parent")
+        import inspect
+        if capability is not None and "session_history_delivery" in inspect.signature(APIServerAdapter._bind_api_server_session).parameters:
+            kw["session_history_delivery"] = capability
+        tokens = APIServerAdapter._bind_api_server_session(**kw)
+        try:
+            args = ["api-parent"]
+            if len(inspect.signature(_resolve_async_wake_sid).parameters) > 1:
+                from gateway.session_context import session_history_delivery_supported
+                args.append(session_history_delivery_supported())
+            target = _resolve_async_wake_sid(*args)
+            assert target == ("api-parent" if capability == "1" else None)
+        finally:
+            clear_session_vars(tokens)
+    from evals.api_delegation_http_probe import probe
+    result = await probe()
+    for request in result["requests"]:
+        assert request["status"] == 200
+        runtime = request["runtime"]
+        assert runtime["target"] == ("child" if request["explicit"] else None)
+        if request["explicit"]:
+            assert runtime["session_id"] == "child"
+            assert request["header"] == "parent"
+    assert result["unsolicited_calls"] == 0
+    assert result["durable_child_rows"] == 1
+    assert sum(m["content"] == "DELIVERY_RESULT" for m in result["resumed_history"]) == 1
+    runs = {r["name"]: r for r in result["runs"]}
+    assert all(r["status"] == 202 for r in runs.values())
+    for name in ("caller_history", "response_chain"):
+        assert runs[name]["runtime"]["target"] is None
+        assert runs[name]["runtime"]["history"] == [{"role": "user", "content": "caller snapshot"}]
+    assert runs["session"]["runtime"]["target"] == "child"
+    assert runs["session"]["runtime"]["history"] == result["resumed_history"]
+    assert runs["declared_key"]["runtime"]["target"] == "declared"
+    assert runs["declared_key"]["runtime"]["history"][0]["content"] == "DECLARED_HISTORY"
+
+
+@pytest.mark.asyncio
+async def test_delivery_replay_is_atomic_across_continuation_and_busy_turn(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    peer = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("parent", source="api_server")
+        db.create_session("other", source="api_server")
+        adapters = [SimpleNamespace(_ensure_session_db=lambda: db), SimpleNamespace(_ensure_session_db=lambda: peer)]
+        evt = {"type": "async_delegation", "delegation_id": "unique-unit"}
+        async def send(adapter, event=evt):
+            await persist_delegation_delivery(adapter, text="RESULT", session_id="parent", evt=event)
+        await asyncio.gather(*(send(a) for a in adapters))
+        assert len(db.get_messages("parent")) == 1
+        db.end_session("parent", "compression")
+        db.create_session("child", source="api_server", parent_session_id="parent")
+        await send(adapters[0])
+        assert db.get_messages("child") == []  # old event was already recorded in the lineage
+        from hermes_state_errors import SessionTurnLeaseLostError
+        assert db.acquire_session_turn_lease("child", "client-turn", wait_seconds=0)
+        later = {**evt, "delegation_id": "later-unit"}
+        try:
+            with pytest.raises(SessionTurnLeaseLostError):
+                await send(adapters[0], later)
+            assert db.get_messages("child") == []
+        finally:
+            db.release_session_turn_lease("child", "client-turn")
+        await send(adapters[0], later)
+        assert len(db.get_messages("child")) == 1
+        notice = {**later, "task_failure_notice": True, "results": [{"task_index": 0, "status": "failed"}]}
+        await send(adapters[0], notice)
+        await send(adapters[1], notice)
+        assert len(db.get_messages("child")) == 2  # interim notice cannot consume the final's identity
+        assert db.get_messages("other") == []
+    finally:
+        peer.close()
+        db.close()
+

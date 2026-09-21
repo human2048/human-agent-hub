@@ -1,0 +1,365 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_list_reader_disposable.py ===
+"""Read-only session-list opens must stay disposable.
+
+Two properties that a "keep the read-only handle for the process lifetime"
+optimisation silently destroys. Both are asserted against the real
+``_open_session_db_at_path`` read path the sidebar poll uses, because both
+failures are invisible in a unit test that mocks the store.
+
+1. **The store on disk is the truth.** Recovering a corrupt ``state.db``
+   is a file swap (``mv state.db state.db.corrupt-…; cp -a recovered.db
+   state.db``) performed while the backend is stopped, but a poll can also
+   race a restore. A reader pinned to the old inode keeps serving
+   pre-recovery rows forever, so the user "recovers" and still sees the
+   broken list.
+
+2. **Forensic backup must stay reachable.** ``offline_file_access`` refuses
+   raw byte access while ANY tracked connection is registered for the path,
+   because a raw ``close()`` would cancel this process's POSIX advisory locks
+   (howtocorrupt §2.2). ``_backup_db_file`` (the copy taken BEFORE a malformed
+   store is repaired) and ``_db_fingerprint`` (the repair-attempt ledger key)
+   both go through it. A never-closed list reader makes both fail for the rest
+   of the process, so a repair runs without its forensic backup and the
+   ledger degrades to a size-only key.
+"""
+
+from __future__ import annotations
+
+import shutil
+
+from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+from hermes_cli.web_server_sessions import _open_session_db_at_path
+from hermes_state import SessionDB
+from hermes_state_repair import _db_fingerprint
+
+
+def _ids(db) -> list:
+    return [row["id"] for row in db.list_sessions_rich(limit=10, compact_rows=True)]
+
+
+def test_poll_observes_a_replaced_state_db(tmp_path):
+    db_path = tmp_path / "state.db"
+    old = SessionDB(db_path=db_path)
+    old.create_session("before-recovery", source="cli")
+    old.close()
+
+    first = _open_session_db_at_path(db_path, read_only=True)
+    try:
+        assert _ids(first) == ["before-recovery"]
+    finally:
+        first.close()
+
+    # `hermes sessions recover` writes a clean database, which the operator
+    # then installs over the corrupt one.
+    recovered = tmp_path / "recovered-state.db"
+    rebuilt = SessionDB(db_path=recovered)
+    rebuilt.create_session("after-recovery", source="cli")
+    rebuilt.close()
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    db_path.unlink()
+    shutil.copy2(recovered, db_path)
+
+    second = _open_session_db_at_path(db_path, read_only=True)
+    try:
+        assert _ids(second) == ["after-recovery"]
+    finally:
+        second.close()
+
+
+def test_poll_leaves_forensic_backup_reachable(tmp_path):
+    db_path = tmp_path / "state.db"
+    writer = SessionDB(db_path=db_path)
+    writer.create_session("s1", source="cli")
+    writer.close()
+
+    baseline = _db_fingerprint(db_path)
+    assert baseline is not None
+
+    poll = _open_session_db_at_path(db_path, read_only=True)
+    try:
+        assert _ids(poll) == ["s1"]
+    finally:
+        poll.close()
+
+    # The raw-copy path a malformed-store repair takes before it touches
+    # anything must still be permitted after the poll.
+    try:
+        with offline_file_access(db_path, what="forensic-backup"):
+            pass
+    except LiveConnectionError as exc:  # pragma: no cover - failure detail
+        raise AssertionError(
+            f"a session-list poll left a tracked connection open: {exc}"
+        ) from exc
+
+    assert _db_fingerprint(db_path) == baseline
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_message_page_owner.py ===
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+@pytest.mark.parametrize("serving_profile", ["work", None])
+def test_message_pages_identify_the_serving_profile(tmp_path, monkeypatch, serving_profile):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    default_home = tmp_path / ".hermes"
+    work_home = default_home / "profiles" / "work" if serving_profile else default_home / "custom-home"
+    default_home.mkdir(parents=True)
+    work_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(work_home))
+    # conftest redirects this legacy override independently of HERMES_HOME.
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", work_home / "state.db")
+
+    for home, count in ((default_home, 1), (work_home, 199)):
+        db = SessionDB(db_path=home / "state.db")
+        try:
+            db.create_session(session_id="same-id", source="desktop")
+            db.append_messages_batch("same-id", [
+                {"role": "user", "content": f"message-{index}"}
+                for index in range(count)
+            ])
+        finally:
+            db.close()
+
+    from hermes_cli.web_routers.sessions import manage_router
+
+    app = FastAPI()
+    app.include_router(manage_router)
+    with TestClient(app) as client:
+        query = "limit=120&order=latest&include_compacted=true"
+        tail = client.get(f"/api/sessions/same-id/messages?{query}").json()
+        older = client.get(f"/api/sessions/same-id/messages?{query}&offset=120").json()
+        default = client.get(f"/api/sessions/same-id/messages?{query}&profile=default").json()
+
+    assert tail["profile"] == older["profile"] == (serving_profile or "default")
+    assert default["profile"] == "default"
+    assert len(tail["messages"]) == 120
+    assert len(older["messages"]) == 79
+    assert len(default["messages"]) == 1
+    assert [row["content"] for row in older["messages"] + tail["messages"]] == [
+        f"message-{index}" for index in range(199)
+    ]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_owner_backfill.py ===
+"""Legacy NULL-profile session owner backfill (#94724).
+
+Pre-#95407 session rows carry ``profile_name = NULL``. Once a Desktop has
+registry topology (≥2 registered connections) the fail-closed owner ladder
+can no longer route those rows, making every pre-campaign session
+unresumable. POST /api/sessions/owner-backfill stamps each store's own
+serving-profile identity onto its legacy rows — single-match by construction
+(a profile's state.db belongs to exactly one profile), idempotent, and never
+overwriting a non-NULL owner.
+"""
+
+import sqlite3
+
+import pytest
+
+
+@pytest.fixture
+def client(monkeypatch, _isolate_hermes_home):
+    try:
+        from starlette.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi/starlette not installed")
+
+    import hermes_state
+    from hermes_constants import get_hermes_home
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    return client
+
+
+def _seed(db_path, rows):
+    """Insert bare session rows the way a pre-ownership install left them."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=db_path)
+    try:
+        for session_id, profile_name in rows:
+            db.create_session(session_id, source="cli", profile_name=profile_name)
+            db.append_message(
+                session_id, role="user", content=f"hello from {session_id}"
+            )
+        # create_session backfills nothing here, but be explicit: force the
+        # legacy shape at the SQL level so the fixture cannot silently depend
+        # on create_session's own COALESCE behavior.
+        for session_id, profile_name in rows:
+            if profile_name is None:
+                db._conn.execute(
+                    "UPDATE sessions SET profile_name = NULL WHERE id = ?",
+                    (session_id,),
+                )
+        db._conn.commit()
+    finally:
+        db.close()
+
+
+def _profiles(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return dict(conn.execute("SELECT id, profile_name FROM sessions").fetchall())
+    finally:
+        conn.close()
+
+
+def test_backfill_stamps_only_null_rows_and_is_idempotent(client):
+    from hermes_constants import get_hermes_home
+
+    db_path = get_hermes_home() / "state.db"
+    _seed(
+        db_path,
+        [
+            ("legacy-null-1", None),
+            ("legacy-null-2", None),
+            ("owned-other", "researcher"),
+        ],
+    )
+
+    resp = client.post("/api/sessions/owner-backfill", json={})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    # Exactly the two legacy rows were stamped; the count is reported so the
+    # caller can log it.
+    assert body["stamped"] == 2
+    assert body["profile"] == "default"
+
+    stamped = _profiles(db_path)
+    assert stamped["legacy-null-1"] == "default"
+    assert stamped["legacy-null-2"] == "default"
+    # Fail-closed contract: a non-NULL owner is NEVER overwritten, even when
+    # it names a different profile than the serving store.
+    assert stamped["owned-other"] == "researcher"
+
+    # One-shot-per-row: a second run finds nothing left to stamp and the rows
+    # are byte-identical.
+    resp2 = client.post("/api/sessions/owner-backfill", json={})
+    assert resp2.status_code == 200
+    assert resp2.json()["stamped"] == 0
+    assert _profiles(db_path) == stamped
+
+
+def test_backfilled_rows_circulate_owned_on_the_list_endpoint(client):
+    """After the backfill, the durable stamp (not just the per-response
+    serving-profile decoration) owns the rows: the raw DB column is non-NULL,
+    which is what survives into any other consumer of state.db."""
+    from hermes_constants import get_hermes_home
+
+    db_path = get_hermes_home() / "state.db"
+    _seed(db_path, [("legacy-null-3", None)])
+
+    assert _profiles(db_path)["legacy-null-3"] is None
+
+    resp = client.post("/api/sessions/owner-backfill", json={})
+    assert resp.status_code == 200
+    assert resp.json()["stamped"] == 1
+
+    listed = client.get("/api/sessions?limit=50&offset=0").json()["sessions"]
+    row = next(s for s in listed if s["id"] == "legacy-null-3")
+    assert row["profile"] == "default"
+    assert _profiles(db_path)["legacy-null-3"] == "default"
+
+
+def test_backfill_treats_empty_string_profile_as_legacy(client):
+    """TRIM('') rows are the same stranded class as NULL — stamp them too."""
+    from hermes_constants import get_hermes_home
+
+    db_path = get_hermes_home() / "state.db"
+    _seed(db_path, [("legacy-empty", None)])
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE sessions SET profile_name = '  ' WHERE id = 'legacy-empty'")
+    conn.commit()
+    conn.close()
+
+    resp = client.post("/api/sessions/owner-backfill", json={})
+    assert resp.status_code == 200
+    assert resp.json()["stamped"] == 1
+    assert _profiles(get_hermes_home() / "state.db")["legacy-empty"] == "default"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_recap.py ===
+"""Unit tests for hermes_cli.session_recap."""
+from __future__ import annotations
+
+import json
+
+
+from hermes_cli.session_recap import build_recap
+
+
+def _user(text):
+    return {"role": "user", "content": text}
+
+
+def _assistant(text=None, tool_calls=None):
+    msg = {"role": "assistant", "content": text}
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    return msg
+
+
+def _tool_call(name, args):
+    return {
+        "id": f"call_{name}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args)},
+    }
+
+
+def _tool_result(content="ok"):
+    return {"role": "tool", "content": content}
+
+
+
+
+
+
+
+
+
+
+def test_tool_preview_length_truncates_long_user_prompt():
+    long = "x " * 500
+    out = build_recap([_user(long)])
+    ask_line = [l for l in out.splitlines() if "Last ask" in l][0]
+    assert len(ask_line) < 300  # truncated with ellipsis
+    assert "…" in ask_line
+
+
+
+
+def test_escape_sequences_sanitized_in_previews():
+    """Recap previews must not carry raw terminal escapes (codex#31494 class)."""
+    msgs = [
+        _user("please \x1b[2J\x1b]0;pwned\x07 do the thing"),
+        _assistant("done \x9b31m with it\x07"),
+    ]
+    out = build_recap(msgs)
+    assert "\x1b" not in out
+    assert "\x9b" not in out
+    assert "\x07" not in out
+    assert "do the thing" in out
+    assert "with it" in out
+

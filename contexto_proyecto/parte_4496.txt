@@ -1,0 +1,273 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_session_id_injection.py ===
+"""Contract test: tui_gateway._set_session_context must inject the live
+session id into HERMES_SESSION_ID so terminal/execute_code subprocesses can
+read the current session's id.
+
+Regression for the bug where _set_session_context called set_session_vars
+WITHOUT session_id, leaving the contextvar as "" (explicitly empty). Because
+the session-context bridge treats an explicit "" as authoritative and does NOT
+fall back to os.environ, every terminal command in a dashboard/TUI/web session
+saw an empty HERMES_SESSION_ID even though agent_init had set it via
+set_current_session_id().
+"""
+import pytest
+
+from gateway.session_context import (
+    get_session_env,
+    _VAR_MAP,
+    _UNSET,
+)
+import tui_gateway.server as server
+
+
+@pytest.fixture(autouse=True)
+def _reset_contextvars():
+    """Reset all session contextvars to _UNSET between tests.
+
+    In production each asyncio.Task/worker thread gets a fresh context copy
+    where the defaults are _UNSET. In tests functions share one thread
+    context, so a value set by test A would leak into test B without this.
+    """
+    yield
+    for var in _VAR_MAP.values():
+        var.set(_UNSET)
+
+
+class _FakeAgent:
+    def __init__(self, session_id):
+        self.session_id = session_id
+
+
+def _install_session(
+    monkeypatch,
+    *,
+    session_key,
+    agent_session_id,
+    source="cli",
+    profile_home=None,
+):
+    """Register a fake session in server._sessions for the duration of a test."""
+    sess = {
+        "session_key": session_key,
+        "source": source,
+        "agent": _FakeAgent(agent_session_id) if agent_session_id is not None else None,
+        "cwd": "/home/user",
+    }
+    if profile_home is not None:
+        sess["profile_home"] = str(profile_home)
+    monkeypatch.setattr(server, "_sessions", {session_key: sess}, raising=False)
+    return sess
+
+
+def test_set_session_context_injects_agent_session_id(monkeypatch):
+    """HERMES_SESSION_ID must equal the live agent.session_id after binding."""
+    _install_session(
+        monkeypatch, session_key="skey-abc", agent_session_id="20260722_deadbeef"
+    )
+
+    server._set_session_context("skey-abc", ui_session_id="ui-123")
+
+    assert get_session_env("HERMES_SESSION_ID") == "20260722_deadbeef"
+
+
+def test_set_session_context_falls_back_to_session_key(monkeypatch):
+    """When the agent has no session_id yet, fall back to the session_key
+    (never leave HERMES_SESSION_ID empty for an identified session)."""
+    _install_session(monkeypatch, session_key="skey-xyz", agent_session_id=None)
+
+    server._set_session_context("skey-xyz")
+
+    assert get_session_env("HERMES_SESSION_ID") == "skey-xyz"
+
+
+def test_set_session_context_injects_session_profile(tmp_path, monkeypatch):
+    """A non-launch Desktop session exports its own profile name to tools."""
+    profile_home = tmp_path / "profiles" / "work"
+    _install_session(
+        monkeypatch,
+        session_key="skey-work",
+        agent_session_id="session-work",
+        profile_home=profile_home,
+    )
+
+    server._set_session_context("skey-work")
+
+    assert get_session_env("HERMES_SESSION_PROFILE") == "work"
+
+
+def test_set_session_context_uses_launch_profile_without_override(monkeypatch):
+    """Launch-profile sessions also receive a non-empty profile identity."""
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    _install_session(
+        monkeypatch,
+        session_key="skey-default",
+        agent_session_id="session-default",
+    )
+
+    server._set_session_context("skey-default")
+
+    assert get_session_env("HERMES_SESSION_PROFILE") == "default"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_session_images_dir.py ===
+"""Write-side scoping for desktop/clipboard image uploads (#69575).
+
+Attach RPCs (``image.attach_bytes``, ``clipboard.paste``, ``pdf.attach``) run
+before ``prompt.submit`` installs the session's profile HERMES_HOME override, so
+the upload must be written under the session's *stored* ``profile_home`` — the
+same scope the Docker mount and the vision host-read allowlist resolve at run
+time. Otherwise, in a multi-profile / root-gateway deployment, the file is
+written to the launch home while the sandbox mounts (and vision reads) the
+profile home, and the agent can never see the upload it was handed.
+"""
+
+from pathlib import Path
+from unittest.mock import patch
+
+from tui_gateway.server import _session_images_dir
+
+
+def test_profile_home_session_writes_under_profile(tmp_path):
+    """A session pinned to a profile writes uploads under that profile's home."""
+    profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+    session = {"profile_home": str(profile_home)}
+
+    assert _session_images_dir(session) == profile_home / "images"
+
+
+def test_launch_home_fallback_when_no_profile(tmp_path):
+    """No ``profile_home`` on the session → the gateway launch home is used."""
+    launch_home = tmp_path / ".hermes"
+    session = {}
+
+    with patch("tui_gateway.server._hermes_home", launch_home):
+        assert _session_images_dir(session) == launch_home / "images"
+
+
+def test_empty_profile_home_falls_back_to_launch_home(tmp_path):
+    """An empty-string ``profile_home`` is treated as absent, not as ``/images``."""
+    launch_home = tmp_path / ".hermes"
+    session = {"profile_home": ""}
+
+    with patch("tui_gateway.server._hermes_home", launch_home):
+        assert _session_images_dir(session) == launch_home / "images"
+
+
+def test_two_profiles_are_isolated(tmp_path):
+    """Uploads from different profile sessions never share an images dir."""
+    home_a = tmp_path / ".hermes" / "profiles" / "a"
+    home_b = tmp_path / ".hermes" / "profiles" / "b"
+
+    dir_a = _session_images_dir({"profile_home": str(home_a)})
+    dir_b = _session_images_dir({"profile_home": str(home_b)})
+
+    assert dir_a == home_a / "images"
+    assert dir_b == home_b / "images"
+    assert dir_a != dir_b
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_session_platform_resolution.py ===
+"""Platform/source tagging for the desktop chat surface.
+
+The desktop app's chat panel uses ``hermes serve`` (the ``tui_gateway``
+backend), so every chat session historically got ``platform="tui"`` stamped
+on it — even though the user is in a graphical chat surface, not a
+terminal. That mis-tag is why the agent suggested TUI-only slash commands
+(like ``/reload-mcp``) to desktop chat users.
+
+These tests pin the env-var matrix that resolves the session platform at
+``tui_gateway`` session-creation time:
+
+  HERMES_DESKTOP=1, HERMES_DESKTOP_TERMINAL unset  -> platform="desktop"
+  HERMES_DESKTOP=1, HERMES_DESKTOP_TERMINAL=1     -> platform="tui"  (embedded pane)
+  neither set                                      -> platform="tui"  (standalone)
+
+The resolver helper is import-safe (no heavy module side effects) so it
+can be unit-tested without spinning up the full gateway.
+"""
+
+import pytest
+
+
+def _reload_resolver():
+    # Plain import — every resolver under test reads the env at CALL time, so
+    # no reload is needed. importlib.reload(tui_gateway.server) would
+    # re-register the module's atexit hooks (thread-pool shutdown +
+    # _shutdown_sessions) on every test; duplicated hooks race the stderr
+    # buffer at interpreter shutdown (Fatal Python error:
+    # _enter_buffered_busy) — same flake class as PR #34217. Name kept for
+    # the existing call sites.
+    import tui_gateway.server as _srv
+    return _srv
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
+    return monkeypatch
+
+
+class TestResolveSessionPlatform:
+    def test_standalone_tui_neither_env_set(self, clean_env):
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_platform() == "tui"
+
+    def test_desktop_chat_backend_gets_desktop_tag(self, clean_env):
+        clean_env.setenv("HERMES_DESKTOP", "1")
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_platform() == "desktop"
+
+
+    @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE", "Yes", "ON"])
+    def test_truthy_variants_recognized(self, clean_env, val):
+        clean_env.setenv("HERMES_DESKTOP", val)
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_platform() == "desktop"
+
+    @pytest.mark.parametrize("val", ["0", "false", "", "no", "off", "False"])
+    def test_falsy_variants_fall_back_to_tui(self, clean_env, val):
+        clean_env.setenv("HERMES_DESKTOP", val)
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_platform() == "tui"
+
+    def test_embedded_terminal_overrides_desktop_when_both_set(self, clean_env):
+        """The terminal-pane qualifier must short-circuit the desktop-backend
+        marker. An embedded TUI is a TUI, not a desktop chat surface."""
+        clean_env.setenv("HERMES_DESKTOP", "1")
+        clean_env.setenv("HERMES_DESKTOP_TERMINAL", "true")
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_platform() == "tui"
+
+
+class TestResolveSessionSource:
+    def test_explicit_source_param_wins(self, clean_env):
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_source("telegram") == "telegram"
+
+
+    def test_no_env_no_param_defaults_to_tui(self, clean_env):
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_source(None) == "tui"
+
+
+class TestResolveAgentPlatform:
+
+    def test_missing_source_falls_back_to_env_resolved_platform(self, clean_env):
+        clean_env.setenv("HERMES_DESKTOP", "1")
+        _srv = _reload_resolver()
+        assert _srv._resolve_agent_platform(None) == "desktop"
+
+
+class TestSessionSourceFallback:
+    def test_session_source_uses_existing_session_value(self, clean_env):
+        clean_env.setenv("HERMES_DESKTOP", "1")
+        _srv = _reload_resolver()
+        assert _srv._session_source({"source": "telegram"}) == "telegram"
+
+
+

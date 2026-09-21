@@ -1,0 +1,315 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\user-guide\skills\bundled\research\research-blocked-page-recovery.md ===
+---
+title: "Blocked Page Recovery — Recover blocked/paywalled/WAF'd pages via archive snapshots and reader fallbacks"
+sidebar_label: "Blocked Page Recovery"
+description: "Recover blocked/paywalled/WAF'd pages via archive snapshots and reader fallbacks"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Blocked Page Recovery
+
+Recover blocked/paywalled/WAF'd pages via archive snapshots and reader fallbacks. Use when web_extract or the browser hits 403/429/challenge pages, paywalls, or bot-detection interstitials.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Bundled (installed by default) |
+| Path | `skills/research/blocked-page-recovery` |
+| Version | `1.0.0` |
+| Author | Hermes Agent |
+| License | MIT |
+| Platforms | linux, macos, windows |
+| Tags | `Research`, `Archives`, `Wayback`, `Paywall`, `WAF`, `Fallback` |
+| Related skills | [`grounded-citations`](./research-grounded-citations.md) |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
+
+# Blocked-Page Recovery
+
+When a page won't fetch — 403/429, Cloudflare "Just a moment...", a paywall,
+or a bot-detection interstitial — don't give up and don't loop on the same
+URL. Third-party services often hold a **copy** of the page. Work down this
+ladder, cheapest first.
+
+## The ladder
+
+```
+1. Wayback Machine  — archive.org "available" API  (snapshot + timestamp)
+2. archive.today    — domain rotation: archive.ph → .md → .li → .is
+3. Jina Reader      — only if JINA_API_KEY is set  (live server-side render)
+4. API-first pivot  — look for /api/, /graphql, .json, or RSS on the same host
+5. Real browser     — browser tool as the last, most expensive resort
+```
+
+Run it in one shot with the bundled script:
+
+```bash
+python3 scripts/recover_page.py "https://example.com/blocked-article" --json
+```
+
+The script tries each route in order, validates every body (see "Fake
+successes" below), and prints the first genuine hit with its provenance.
+
+## Provenance discipline (non-negotiable)
+
+Every recovered copy carries a provenance you MUST preserve when citing:
+
+| Route | Provenance | How to cite |
+|-------|-----------|-------------|
+| Wayback / archive.today | `snapshot` | Cite WITH the snapshot date: "as archived 2026-08-06". Never present a snapshot as the live page — it may be stale. |
+| Jina Reader | `live` | Server-side re-render of the live page; cite normally. |
+| Live fetch / browser | `live` | Cite normally. |
+
+If the user needs *current* data (prices, availability, breaking news), a
+snapshot is context, not an answer — say so explicitly and note its age.
+
+## Manual routes
+
+### 1. Wayback Machine (best provenance, try first)
+
+```bash
+# Discovery: returns closest snapshot URL + timestamp as JSON
+curl -sL "https://archive.org/wayback/available?url={URL}"
+# Then fetch archived_snapshots.closest.url
+```
+
+For enumerating many snapshots (or recovering deleted pages), the CDX index:
+
+```bash
+curl -sL "https://web.archive.org/cdx/search/cdx?url={URL}&output=json&limit=10"
+```
+
+CDX intermittently returns 503 under load — if it does, fall back to the
+`available` API; don't retry-hammer it.
+
+Works for: any publicly crawled URL. Fails for: robots-blocked sites,
+never-crawled URLs, JS-only SPAs (snapshots don't render).
+
+### 2. archive.today (paywalls, deleted content)
+
+User-submitted archives — often has paywalled news articles Wayback lacks.
+Rate-limits aggressively (429) and rotates domains, so iterate:
+
+```bash
+for d in archive.ph archive.md archive.li archive.is; do
+  curl -sL --max-time 20 "https://$d/newest/{URL}" -o /tmp/page.html \
+    -w "%{http_code}" && break
+done
+```
+
+**Validate the body, not the status code** — a 429 still ships several KB of
+rate-limit HTML that looks like a success to a size check alone.
+
+### 3. Jina Reader (requires JINA_API_KEY)
+
+`r.jina.ai` re-renders the live page in a real browser server-side and
+returns markdown. Anonymous access is dead (401 → Turnstile); a key is
+required:
+
+```bash
+curl -s -H "Authorization: Bearer $JINA_API_KEY" "https://r.jina.ai/{URL}"
+```
+
+Handles JS SPAs that archives can't. Skip this route entirely when the env
+var is unset.
+
+### 4. API-first pivot
+
+WAFs protect the HTML surface far more aggressively than the data endpoints
+behind it. After 2-3 blocked attempts on a site, stop fighting the HTML and
+look for:
+
+- `/api/...`, `/graphql`, or `.json` variants of the page URL
+- An RSS/Atom feed (`/feed`, `/rss`, `<link rel="alternate">` in any copy
+  you did recover)
+- A sitemap (`/sitemap.xml`) revealing canonical URLs that may not be gated
+
+## Fake successes — routes that LIE
+
+These return HTTP 200 with a plausible body that is NOT the page. The script
+rejects them automatically; reject them manually too:
+
+- **Google Cache is dead** (since mid-2024). `webcache.googleusercontent.com`
+  returns 200 + tens of KB, but it's a Google Search interstitial with a JS
+  redirect, not a cache. Never use it.
+- **AMP caches** (`*.cdn.ampproject.org`) mostly return a ~300-byte
+  `<title>Redirecting</title>` meta-refresh stub pointing back at the
+  original (blocked) URL. Treating that as success creates a fetch loop.
+- **Rate-limit bodies**: archive.today 429 pages are multi-KB HTML. Check for
+  the target's actual content (title words, expected strings), not just size.
+
+Detection heuristics the script applies: body under a per-route byte floor;
+meta-refresh/JS-redirect stubs whose target is the original host; interstitial
+titles ("Just a moment", "Redirecting", "Google Search", "Attention Required").
+
+## Proxy relays: don't
+
+Generic "web proxy" relays are man-in-the-middle by construction. Never send
+cookies or Authorization headers through one, and don't use them for anything
+the user will rely on — provenance is unverifiable. Prefer archives, which at
+least timestamp their copies.
+
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\user-guide\skills\bundled\research\research-blogwatcher.md ===
+---
+title: "Blogwatcher — Monitor blogs and RSS/Atom feeds via blogwatcher-cli tool"
+sidebar_label: "Blogwatcher"
+description: "Monitor blogs and RSS/Atom feeds via blogwatcher-cli tool"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Blogwatcher
+
+Monitor blogs and RSS/Atom feeds via blogwatcher-cli tool.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Bundled (installed by default) |
+| Path | `skills/research/blogwatcher` |
+| Version | `2.0.0` |
+| Author | JulienTant (fork of Hyaxia/blogwatcher) |
+| License | MIT |
+| Platforms | linux, macos, windows |
+| Tags | `RSS`, `Blogs`, `Feed-Reader`, `Monitoring` |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
+
+# Blogwatcher
+
+Track blog and RSS/Atom feed updates with the `blogwatcher-cli` tool. Supports automatic feed discovery, HTML scraping fallback, OPML import, and read/unread article management.
+
+## Installation
+
+Pick one method:
+
+- **Go:** `go install github.com/JulienTant/blogwatcher-cli/cmd/blogwatcher-cli@latest`
+- **Docker:** `docker run --rm -v blogwatcher-cli:/data ghcr.io/julientant/blogwatcher-cli`
+- **Binary (Linux amd64):** `curl -sL https://github.com/JulienTant/blogwatcher-cli/releases/latest/download/blogwatcher-cli_linux_amd64.tar.gz | tar xz -C /usr/local/bin blogwatcher-cli`
+- **Binary (Linux arm64):** `curl -sL https://github.com/JulienTant/blogwatcher-cli/releases/latest/download/blogwatcher-cli_linux_arm64.tar.gz | tar xz -C /usr/local/bin blogwatcher-cli`
+- **Binary (macOS Apple Silicon):** `curl -sL https://github.com/JulienTant/blogwatcher-cli/releases/latest/download/blogwatcher-cli_darwin_arm64.tar.gz | tar xz -C /usr/local/bin blogwatcher-cli`
+- **Binary (macOS Intel):** `curl -sL https://github.com/JulienTant/blogwatcher-cli/releases/latest/download/blogwatcher-cli_darwin_amd64.tar.gz | tar xz -C /usr/local/bin blogwatcher-cli`
+
+All releases: https://github.com/JulienTant/blogwatcher-cli/releases
+
+### Docker with persistent storage
+
+By default the database lives at `~/.blogwatcher-cli/blogwatcher-cli.db`. In Docker this is lost on container restart. Use `BLOGWATCHER_DB` or a volume mount to persist it:
+
+```bash
+# Named volume (simplest)
+docker run --rm -v blogwatcher-cli:/data -e BLOGWATCHER_DB=/data/blogwatcher-cli.db ghcr.io/julientant/blogwatcher-cli scan
+
+# Host bind mount
+docker run --rm -v /path/on/host:/data -e BLOGWATCHER_DB=/data/blogwatcher-cli.db ghcr.io/julientant/blogwatcher-cli scan
+```
+
+### Migrating from the original blogwatcher
+
+If upgrading from `Hyaxia/blogwatcher`, move your database:
+
+```bash
+mv ~/.blogwatcher/blogwatcher.db ~/.blogwatcher-cli/blogwatcher-cli.db
+```
+
+The binary name changed from `blogwatcher` to `blogwatcher-cli`.
+
+## Common Commands
+
+### Managing blogs
+
+- Add a blog: `blogwatcher-cli add "My Blog" https://example.com`
+- Add with explicit feed: `blogwatcher-cli add "My Blog" https://example.com --feed-url https://example.com/feed.xml`
+- Add with HTML scraping: `blogwatcher-cli add "My Blog" https://example.com --scrape-selector "article h2 a"`
+- List tracked blogs: `blogwatcher-cli blogs`
+- Remove a blog: `blogwatcher-cli remove "My Blog" --yes`
+- Import from OPML: `blogwatcher-cli import subscriptions.opml`
+
+### Scanning and reading
+
+- Scan all blogs: `blogwatcher-cli scan`
+- Scan one blog: `blogwatcher-cli scan "My Blog"`
+- List unread articles: `blogwatcher-cli articles`
+- List all articles: `blogwatcher-cli articles --all`
+- Filter by blog: `blogwatcher-cli articles --blog "My Blog"`
+- Filter by category: `blogwatcher-cli articles --category "Engineering"`
+- Mark article read: `blogwatcher-cli read 1`
+- Mark article unread: `blogwatcher-cli unread 1`
+- Mark all read: `blogwatcher-cli read-all`
+- Mark all read for a blog: `blogwatcher-cli read-all --blog "My Blog" --yes`
+
+## Environment Variables
+
+All flags can be set via environment variables with the `BLOGWATCHER_` prefix:
+
+| Variable | Description |
+|---|---|
+| `BLOGWATCHER_DB` | Path to SQLite database file |
+| `BLOGWATCHER_WORKERS` | Number of concurrent scan workers (default: 8) |
+| `BLOGWATCHER_SILENT` | Only output "scan done" when scanning |
+| `BLOGWATCHER_YES` | Skip confirmation prompts |
+| `BLOGWATCHER_CATEGORY` | Default filter for articles by category |
+
+## Example Output
+
+```
+$ blogwatcher-cli blogs
+Tracked blogs (1):
+
+  xkcd
+    URL: https://xkcd.com
+    Feed: https://xkcd.com/atom.xml
+    Last scanned: 2026-04-03 10:30
+```
+
+```
+$ blogwatcher-cli scan
+Scanning 1 blog(s)...
+
+  xkcd
+    Source: RSS | Found: 4 | New: 4
+
+Found 4 new article(s) total!
+```
+
+```
+$ blogwatcher-cli articles
+Unread articles (2):
+
+  [1] [new] Barrel - Part 13
+       Blog: xkcd
+       URL: https://xkcd.com/3095/
+       Published: 2026-04-02
+       Categories: Comics, Science
+
+  [2] [new] Volcano Fact
+       Blog: xkcd
+       URL: https://xkcd.com/3094/
+       Published: 2026-04-01
+       Categories: Comics
+```
+
+## Notes
+
+- Auto-discovers RSS/Atom feeds from blog homepages when no `--feed-url` is provided.
+- Falls back to HTML scraping if RSS fails and `--scrape-selector` is configured.
+- Categories from RSS/Atom feeds are stored and can be used to filter articles.
+- Import blogs in bulk from OPML files exported by Feedly, Inoreader, NewsBlur, etc.
+- Database stored at `~/.blogwatcher-cli/blogwatcher-cli.db` by default (override with `--db` or `BLOGWATCHER_DB`).
+- Use `blogwatcher-cli <command> --help` to discover all flags and options.
+

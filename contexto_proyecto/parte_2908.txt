@@ -1,0 +1,269 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_streaming_tts_gateway_regression.py ===
+"""Gateway regression: the outer finalisation path must not NameError on
+the streaming-TTS consumer (#60671).
+
+The original commit created ``_streaming_tts_consumer`` as a local inside
+``run_sync`` (executor-thread) but the outer ``_run_agent_inner`` code
+referenced it during interrupt/finalisation — a cross-scope ``NameError``
+on ordinary gateway turns.  The hardening moves the consumer into a
+``streaming_tts_consumer_holder`` created on the event-loop thread.
+
+This test exercises the real ``_run_agent`` → ``_run_agent_inner`` path
+with a voice input message type so the streaming-TTS consumer setup
+branch is entered.  The fake agent returns synchronously, the executor
+finishes, and the outer finalisation code runs — proving no NameError.
+"""
+
+import asyncio
+import sys
+import threading
+import types
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+import gateway.run as gateway_run
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource
+
+
+class _NoopAgent:
+    """Minimal agent stub that returns immediately without tool calls."""
+
+    def __init__(self, *args, **kwargs):
+        self.tools = []
+        self.model = kwargs.get("model", "test-model")
+        self.provider = kwargs.get("provider", "test-provider")
+        self.session_id = kwargs.get("session_id", "session-1")
+        self.context_compressor = None
+        self.is_interrupted = False
+
+    def run_conversation(self, user_message, conversation_history=None,
+                         task_id=None, persist_user_message=None,
+                         persist_user_timestamp=None):
+        return {
+            "final_response": "Hello from the agent.",
+            "messages": [],
+            "api_calls": 1,
+            "completed": True,
+        }
+
+
+def _install_fake_agent(monkeypatch):
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _NoopAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+
+def _make_runner():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._service_tier = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._running_agents = {}
+    runner._pending_model_notes = {}
+    runner._session_db = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.config = SimpleNamespace(streaming=None, multiplex_profiles=False)
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
+        load_transcript=lambda session_id: [],
+    )
+    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
+    runner._gateway_loop = None
+    return runner
+
+
+def _make_voice_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+
+def _setup_monkeypatches(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    (tmp_path / "config.yaml").write_text("agent:\n  model: test-model\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"agent": {"model": "test-model"}},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "test-model")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+
+def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
+    """A voice-input turn must complete without a _streaming_tts_consumer NameError.
+
+    The streaming-TTS consumer setup is entered (voice input + auto-TTS),
+    but since no adapter is configured the consumer setup is skipped.  The
+    outer finalisation path still runs and must not raise NameError when
+    reading ``streaming_tts_consumer_holder``.
+    """
+    _setup_monkeypatches(monkeypatch, tmp_path)
+    runner = _make_runner()
+
+    # No adapter for this source → consumer setup skipped, but the outer
+    # finalisation path still runs with streaming_tts_consumer_holder[0]=None.
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_adapter_for_source",
+        lambda self, source: None,
+    )
+
+    async def _run():
+        result = await runner._run_agent(
+            message="Hello Jarvis",
+            context_prompt="",
+            history=[],
+            source=_make_voice_source(),
+            session_id="session-1",
+            session_key="agent:main:telegram:dm:12345",
+            message_type=MessageType.VOICE,
+        )
+        return result
+
+    result = asyncio.new_event_loop().run_until_complete(_run())
+    assert result["final_response"] == "Hello from the agent."
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_stream_abandon_on_turn_death.py ===
+"""Regression: a dying turn closes its native stream (PR 85796 review, B8).
+
+Stale-generation exits and cancellations returned from run() with the
+native stream still open: the Slack message kept its live streaming
+indicator forever, and the adapter's armed interception state survived
+into the next turn (which could inherit the key and seal a dead
+draft_id). The consumer now calls adapter.abandon_open_draft on both
+death paths — sealing in place with the last delivered frame, claiming
+nothing (no delivery flags).
+"""
+
+import asyncio
+
+import pytest
+
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from tests.gateway.relay.test_relay_live_cards import _connected_adapter
+
+
+class RecordingTransport:
+    def __init__(self):
+        self.ops = []
+
+    async def send_outbound(self, payload, platform=None):
+        self.ops.append(dict(payload))
+        return {"success": True, "message_id": "ts.1"}
+
+
+def _consumer(run_still_current=None):
+    adapter, _ = _connected_adapter()
+    t = RecordingTransport()
+    adapter._transport = t
+    cfg = StreamConsumerConfig(
+        transport="auto", chat_type="dm",
+        edit_interval=0.01, buffer_threshold=1, cursor="",
+    )
+    sc = GatewayStreamConsumer(
+        adapter, "C1", cfg,
+        metadata={"thread_ts": "1700.8", "message_id": "1700.801"},
+        run_still_current=run_still_current,
+    )
+    return sc, adapter, t
+
+
+class TestAbandonOnTurnDeath:
+    @pytest.mark.asyncio
+    async def test_stale_generation_seals_open_stream(self):
+        """/new mid-stream: run_still_current flips False → the open
+        stream is sealed with the on-screen text, and no delivery is
+        claimed."""
+        _alive = [True]
+        sc, adapter, t = _consumer(run_still_current=lambda: _alive[0])
+        task = asyncio.create_task(sc.run())
+        sc.on_delta("partial answer on screen")
+        await asyncio.sleep(0.08)
+        assert adapter._open_draft_by_chat, "stream should be armed"
+        _alive[0] = False
+        await task
+        assert not adapter._open_draft_by_chat, "stream left armed after stale exit"
+        seals = [o for o in t.ops if o["op"] == "draft" and o.get("final")]
+        assert len(seals) == 1
+        assert seals[0]["content"] == "partial answer on screen"
+        assert sc.final_response_sent is False
+
+    @pytest.mark.asyncio
+    async def test_cancellation_seals_open_stream(self):
+        sc, adapter, t = _consumer()
+        task = asyncio.create_task(sc.run())
+        sc.on_delta("partial before stop")
+        await asyncio.sleep(0.08)
+        assert adapter._open_draft_by_chat
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert not adapter._open_draft_by_chat, "stream left armed after cancel"
+        seals = [o for o in t.ops if o["op"] == "draft" and o.get("final")]
+        assert len(seals) == 1
+        assert sc.final_response_sent is False
+
+    @pytest.mark.asyncio
+    async def test_abandon_without_open_stream_is_noop(self):
+        sc, adapter, t = _consumer()
+        await sc._abandon_native_stream()
+        assert t.ops == []
+
+    @pytest.mark.asyncio
+    async def test_next_turn_not_intercepted_after_abandon(self):
+        """The B8 inheritance hazard: after an abandoned turn, a NEW turn
+        on the same key must arm and seal normally with its own content."""
+        _alive = [True]
+        sc, adapter, t = _consumer(run_still_current=lambda: _alive[0])
+        task = asyncio.create_task(sc.run())
+        sc.on_delta("old turn partial")
+        await asyncio.sleep(0.08)
+        _alive[0] = False
+        await task
+        # Next turn, same chat/keys, new draft_id:
+        md = {"thread_ts": "1700.8", "message_id": "1700.801"}
+        await adapter.send_draft("C1", 999, "new turn", metadata=md)
+        r = await adapter.send("C1", "new turn final", metadata=dict(md))
+        assert r.success
+        seals = [o for o in t.ops if o["op"] == "draft" and o.get("final")]
+        assert seals[-1]["draft_id"] == 999
+        assert seals[-1]["content"] == "new turn final"
+

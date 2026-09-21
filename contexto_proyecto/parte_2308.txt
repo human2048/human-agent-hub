@@ -1,0 +1,346 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_tts_registry.py ===
+"""Tests for agent/tts_registry.py and agent/tts_provider.py.
+
+Covers:
+- Registration happy path
+- Registration rejection: non-TTSProvider type
+- Registration rejection: empty/whitespace name
+- Built-in name shadowing: warning + silent ignore (no exception)
+- Re-registration: overwrites + logs at debug
+- Case + whitespace insensitivity on lookup
+- ABC contract: default implementations work
+- ABC contract: synthesize() must be implemented
+- ABC contract: stream() raises NotImplementedError by default
+- resolve_output_format helper coerces invalid input
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+import pytest
+
+from agent import tts_registry
+from agent.tts_provider import (
+    DEFAULT_OUTPUT_FORMAT,
+    VALID_OUTPUT_FORMATS,
+    TTSProvider,
+    resolve_output_format,
+)
+
+
+class _FakeProvider(TTSProvider):
+    def __init__(
+        self,
+        name: str = "fake",
+        display: Optional[str] = None,
+        voice_compat: bool = False,
+        synthesize_impl: Optional[Any] = None,
+    ):
+        self._name = name
+        self._display = display
+        self._voice_compat = voice_compat
+        self._synthesize_impl = synthesize_impl
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def display_name(self) -> str:
+        return self._display if self._display is not None else super().display_name
+
+    @property
+    def voice_compatible(self) -> bool:
+        return self._voice_compat
+
+    def synthesize(self, text: str, output_path: str, **kw):
+        if self._synthesize_impl is not None:
+            return self._synthesize_impl(text, output_path, **kw)
+        return output_path
+
+
+@pytest.fixture(autouse=True)
+def _reset_registry():
+    tts_registry._reset_for_tests()
+    yield
+    tts_registry._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+class TestRegistration:
+    def test_happy_path(self):
+        p = _FakeProvider(name="cartesia")
+        tts_registry.register_provider(p)
+        assert tts_registry.get_provider("cartesia") is p
+        assert [r.name for r in tts_registry.list_providers()] == ["cartesia"]
+
+
+
+
+    @pytest.mark.parametrize(
+        "builtin",
+        ["edge", "openai", "elevenlabs", "minimax", "gemini",
+         "mistral", "xai", "piper", "kittentts", "neutts"],
+    )
+    def test_rejects_builtin_shadow_with_warning(self, builtin, caplog):
+        """Built-in names always win — plugin registration is silently ignored
+        but a warning is logged so the operator can see what happened.
+        """
+        p = _FakeProvider(name=builtin)
+        with caplog.at_level(logging.WARNING, logger="agent.tts_registry"):
+            tts_registry.register_provider(p)
+        assert "shadows a built-in name" in caplog.text
+        assert builtin in caplog.text
+        assert tts_registry.get_provider(builtin) is None
+        assert tts_registry.list_providers() == []
+
+
+
+
+# ---------------------------------------------------------------------------
+# Lookup
+# ---------------------------------------------------------------------------
+
+
+class TestLookup:
+
+    def test_get_provider_non_string_returns_none(self):
+        assert tts_registry.get_provider(None) is None  # type: ignore[arg-type]
+        assert tts_registry.get_provider(123) is None  # type: ignore[arg-type]
+
+
+
+    def test_list_providers_sorted(self):
+        tts_registry.register_provider(_FakeProvider(name="zylo"))
+        tts_registry.register_provider(_FakeProvider(name="alpha"))
+        tts_registry.register_provider(_FakeProvider(name="middle"))
+        names = [p.name for p in tts_registry.list_providers()]
+        assert names == ["alpha", "middle", "zylo"]
+
+
+# ---------------------------------------------------------------------------
+# ABC contract
+# ---------------------------------------------------------------------------
+
+
+class TestABCContract:
+
+
+
+
+    def test_is_available_default_true(self):
+        p = _FakeProvider(name="cartesia")
+        assert p.is_available() is True
+
+
+
+
+
+    def test_default_model_first_listed(self):
+        class WithModels(_FakeProvider):
+            def list_models(self):
+                return [{"id": "sonic-2"}, {"id": "sonic-1"}]
+
+        p = WithModels(name="cartesia")
+        assert p.default_model() == "sonic-2"
+
+    def test_default_voice_first_listed(self):
+        class WithVoices(_FakeProvider):
+            def list_voices(self):
+                return [{"id": "voice-aria"}, {"id": "voice-jasper"}]
+
+        p = WithVoices(name="cartesia")
+        assert p.default_voice() == "voice-aria"
+
+    def test_get_setup_schema_default_minimal(self):
+        p = _FakeProvider(name="cartesia")
+        schema = p.get_setup_schema()
+        assert schema["name"] == "Cartesia"
+        assert schema["env_vars"] == []
+
+    def test_stream_raises_not_implemented_by_default(self):
+        p = _FakeProvider(name="cartesia")
+        with pytest.raises(NotImplementedError, match="does not implement streaming"):
+            next(p.stream("hello"))
+
+
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class TestResolveOutputFormat:
+    @pytest.mark.parametrize("valid", sorted(VALID_OUTPUT_FORMATS))
+    def test_valid_passes_through(self, valid):
+        assert resolve_output_format(valid) == valid
+
+
+
+
+
+    def test_non_string_returns_default(self):
+        assert resolve_output_format(123) == DEFAULT_OUTPUT_FORMAT  # type: ignore[arg-type]
+        assert resolve_output_format([]) == DEFAULT_OUTPUT_FORMAT  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Sync invariant: registry's built-in list vs dispatcher's built-in list
+# ---------------------------------------------------------------------------
+
+
+class TestBuiltinSync:
+    """``_BUILTIN_NAMES`` in agent/tts_registry.py is duplicated from
+    ``BUILTIN_TTS_PROVIDERS`` in tools/tts_tool.py (importing directly
+    would create a circular dependency). This test fails loudly if the
+    two lists drift — a new built-in added to tts_tool.py MUST also be
+    added to tts_registry.py's _BUILTIN_NAMES or the registry will
+    accept a name the dispatcher will silently route to the wrong
+    handler.
+    """
+
+    def test_registry_builtins_match_dispatcher_builtins(self):
+        from tools.tts_tool import BUILTIN_TTS_PROVIDERS
+
+        assert tts_registry._BUILTIN_NAMES == BUILTIN_TTS_PROVIDERS, (
+            "agent.tts_registry._BUILTIN_NAMES and "
+            "tools.tts_tool.BUILTIN_TTS_PROVIDERS have drifted!\n"
+            f"  Registry only: {sorted(tts_registry._BUILTIN_NAMES - BUILTIN_TTS_PROVIDERS)}\n"
+            f"  Dispatcher only: {sorted(BUILTIN_TTS_PROVIDERS - tts_registry._BUILTIN_NAMES)}\n"
+            "Add the missing names to whichever list is incomplete. "
+            "These two lists exist as a circular-import workaround and "
+            "MUST be kept in sync manually."
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_turn_api_call_interrupt.py ===
+"""Tests for ``agent/turn_api_call.py::handle_api_interrupt`` — the plain (non-redirect)
+interrupt that lands mid provider call and records the streamed partial as the interrupted
+assistant row."""
+from __future__ import annotations
+
+import threading
+import time
+
+from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED
+from agent.turn_api_call import handle_api_interrupt
+from agent.turn_retry_state import TurnRetryState
+from run_agent import AIAgent
+
+
+def _bare_agent(streamed: str) -> AIAgent:
+    agent = object.__new__(AIAgent)
+    agent._pending_redirect = None
+    agent._pending_redirect_lock = threading.Lock()
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._current_streamed_assistant_text = streamed
+    agent._strip_think_blocks = lambda content: content
+    agent.quiet_mode = True
+    agent.log_prefix = ""
+    agent.thinking_callback = None
+    agent._print_fn = lambda *args, **kwargs: None
+    agent._persist_session = lambda *args, **kwargs: None
+    return agent
+
+
+def _interrupt(streamed: str):
+    messages = [{"role": "user", "content": "start"}]
+    verdict = handle_api_interrupt(
+        _bare_agent(streamed), _retry=TurnRetryState(), thinking_spinner=None, messages=messages,
+        conversation_history=[], api_start_time=time.time(), interrupted=False, final_response=None,
+    )
+    return messages, verdict
+
+
+def test_repetition_dominated_partial_is_not_kept_as_the_interrupted_row():
+    """A looped partial replayed as the interrupted assistant row re-seeds the loop on the next
+    turn (#112764): the row keeps the neutral placeholder and the user is told what happened."""
+    looped = "I. " * 1941
+
+    messages, verdict = _interrupt(looped)
+
+    # Same hidden shape as the redirect placeholder: no visible bubble in transcript replays.
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == ""
+    assert messages[-1]["display_kind"] == "hidden"
+    assert messages[-1]["api_content"] == _INTERRUPTED_PLACEHOLDER
+    assert verdict.final_response == REPETITION_LOOP_INTERRUPTED
+    assert "I. I. I." not in verdict.final_response
+
+
+def test_distinct_batch_rows_are_not_mistaken_for_a_loop():
+    """Legitimately repetitive output (distinct INSERT rows sharing a long prefix) trips the
+    window scan but is not a runaway loop: the partial must stay the interrupted row and must
+    not be relabelled as a degenerate reply."""
+    rows = "\n".join(
+        f"INSERT INTO users (id, name, email, created_at) VALUES ({i}, 'user{i}', 'user{i}@example.com', NOW());"
+        for i in range(12)
+    )
+    messages, verdict = _interrupt(rows)
+
+    assert (messages[-1]["role"], messages[-1]["content"]) == ("assistant", rows)
+    assert verdict.final_response == rows
+
+
+def test_ordinary_partial_is_kept_as_the_interrupted_row():
+    messages, verdict = _interrupt("Visible draft.")
+
+    assert (messages[-1]["role"], messages[-1]["content"]) == ("assistant", "Visible draft.")
+    assert verdict.final_response == "Visible draft."
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_turn_author.py ===
+"""Tests for agent.turn_author: the per-turn author carried from a dispatcher to memory hooks."""
+
+
+import pytest
+
+from agent.turn_author import (
+    TURN_AUTHOR_ENV,
+    parse_turn_author,
+    take_turn_author_from_env,
+    turn_author_env,
+    turn_author_from_env,
+)
+
+FAMILY = "\U0001F468\u200D\U0001F469\u200D\U0001F467"
+
+
+class TestParseTurnAuthor:
+
+    @pytest.mark.parametrize("raw", [
+        None, 42, [], ["bot:alpha"], "not json", '"a string"', "[1, 2]", b"\xff",
+        {}, {"is_bot": True}, {"id": "", "name": "   "},
+    ])
+    def test_junk_and_authors_without_id_or_name_return_none(self, raw):
+        assert parse_turn_author(raw) is None
+
+
+class TestEnvCarrier:
+    def test_round_trip_through_env(self):
+        author = {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
+        env = turn_author_env(author)
+        assert set(env) == {TURN_AUTHOR_ENV}
+        assert turn_author_from_env(env) == author
+
+
+    def test_take_removes_the_variable(self):
+        author = {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
+        env = dict(turn_author_env(author), OTHER="kept")
+        assert take_turn_author_from_env(env) == author
+        assert env == {"OTHER": "kept"}
+        assert take_turn_author_from_env(env) is None
+

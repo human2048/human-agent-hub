@@ -1,0 +1,417 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_memory_async_sync.py ===
+"""Regression guard: end-of-turn memory sync must not block the turn.
+
+Before this fix, ``MemoryManager.sync_all`` / ``queue_prefetch_all`` looped
+``provider.sync_turn`` / ``provider.queue_prefetch`` INLINE on the
+turn-completion path. A provider making a blocking network/daemon call (a
+misconfigured Hindsight daemon was observed blocking ~298s before failing)
+held ``run_conversation`` open long after the user saw their response, so
+every interface (CLI, TUI, gateway) kept the agent marked "running" for
+minutes and any follow-up message triggered an aggressive interrupt that
+dropped the message.
+
+The fix dispatches provider work to a single-worker background executor.
+``sync_all`` / ``queue_prefetch_all`` return immediately; the work completes
+(or fails, logged) in the background. ``flush_pending`` provides a barrier
+for session boundaries and deterministic tests. ``shutdown_all`` drains the
+executor with a bounded timeout so a wedged provider can't hang teardown.
+"""
+import logging
+import threading
+import time
+
+import pytest
+
+from agent.memory_provider import MemoryProvider
+from agent.memory_manager import MemoryManager
+
+
+class _SlowProvider(MemoryProvider):
+    """Provider whose sync/prefetch block, simulating a slow backend."""
+
+    _name = "slow"
+
+    def __init__(self, delay: float = 1.0):
+        self._delay = delay
+        self.sync_done = False
+        self.prefetch_done = False
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def initialize(self, session_id: str = "", **kwargs) -> None:
+        pass
+
+    def is_available(self) -> bool:
+        return True
+
+    def system_prompt_block(self) -> str:
+        return ""
+
+    def prefetch(self, query, *, session_id: str = "") -> str:
+        return ""
+
+    def queue_prefetch(self, query, *, session_id: str = "") -> None:
+        time.sleep(self._delay)
+        self.prefetch_done = True
+
+    def sync_turn(self, user_content, assistant_content, *, session_id: str = "", messages=None) -> None:
+        time.sleep(self._delay)
+        self.sync_done = True
+
+    def get_tool_schemas(self):
+        return []
+
+    def handle_tool_call(self, tool_name, args, **kwargs) -> str:
+        return ""
+
+
+
+
+def test_background_work_still_completes():
+    """Dispatching off-thread must not silently drop the write."""
+    mgr = MemoryManager()
+    p = _SlowProvider(delay=0.1)
+    mgr.add_provider(p)
+
+    mgr.sync_all("hi", "hey", session_id="s1")
+    mgr.queue_prefetch_all("hi", session_id="s1")
+
+    assert mgr.flush_pending(timeout=10) is True
+    assert p.sync_done is True
+    assert p.prefetch_done is True
+
+
+
+
+
+
+
+
+
+
+def test_shutdown_drains_queued_writes_and_boundary_in_fifo_order():
+    """Shutdown must not cancel durable work merely because it is still queued."""
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class _BlockingProvider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            if user_content == "turn-0":
+                started.set()
+                assert release.wait(timeout=2)
+            calls.append(("sync", user_content))
+
+        def on_session_end(self, messages):
+            calls.append(("end", messages[0]["content"]))
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            calls.append(("switch", new_session_id))
+
+    mgr = MemoryManager()
+    mgr.add_provider(_BlockingProvider(delay=0))
+    mgr.sync_all("turn-0", "response")
+    assert started.wait(timeout=1)
+    mgr.sync_all("turn-1", "response")
+    mgr.commit_session_boundary_async(
+        [{"role": "user", "content": "old-session"}],
+        new_session_id="new-session",
+    )
+
+    threading.Timer(0.05, release.set).start()
+    mgr.shutdown_all()
+
+    assert calls == [
+        ("sync", "turn-0"),
+        ("sync", "turn-1"),
+        ("end", "old-session"),
+        ("switch", "new-session"),
+    ]
+    assert mgr.shutdown_drain_state["status"] == "drained"
+    assert mgr.shutdown_drain_state["abandoned_writes"] == 0
+
+
+def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, caplog):
+    """A wedged active write bounds shutdown and reports queued data loss."""
+    import agent.memory_manager as memory_manager_module
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class _WedgedProvider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            if user_content == "active":
+                started.set()
+                release.wait(timeout=2)
+            calls.append(user_content)
+
+    monkeypatch.setattr(memory_manager_module, "_SYNC_DRAIN_TIMEOUT_S", 0.1)
+    mgr = MemoryManager()
+    mgr.add_provider(_WedgedProvider(delay=0))
+    mgr.sync_all("active", "response")
+    assert started.wait(timeout=1)
+    mgr.sync_all("queued", "response")
+
+    with caplog.at_level(logging.WARNING, logger="agent.memory_manager"):
+        t0 = time.monotonic()
+        mgr.shutdown_all()
+        elapsed = time.monotonic() - t0
+
+    state = mgr.shutdown_drain_state
+    assert elapsed < 0.5
+    assert state["status"] == "timed_out"
+    assert state["abandoned_writes"] == 1
+    assert "queued" not in calls
+    assert "abandoning 1 queued memory write" in caplog.text
+    release.set()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_memory_boundary_commit.py ===
+"""Tests for MemoryManager.commit_session_boundary_async.
+
+The /new session boundary must deliver on_session_end (old-session
+extraction) strictly BEFORE on_session_switch (provider rebinding to the
+new session), without blocking the caller. Both hooks run as one task on
+the manager's single serialized background worker.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any, Dict, List
+
+from agent.memory_manager import MemoryManager
+from agent.memory_provider import MemoryProvider
+
+
+class _RecordingProvider(MemoryProvider):
+    """Provider that records hook invocations with thread identity."""
+
+    def __init__(self, end_delay: float = 0.0):
+        self.calls: List[tuple] = []
+        self._end_delay = end_delay
+        self._caller_thread_ids: List[int] = []
+
+    # Required ABC surface (minimal no-ops)
+    @property
+    def name(self) -> str:
+        return "recorder"
+
+    def is_available(self) -> bool:
+        return True
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        return []
+
+    def initialize(self, agent: Any = None, **kwargs) -> bool:  # type: ignore[override]
+        return True
+
+    def build_system_prompt(self) -> str:  # type: ignore[override]
+        return ""
+
+    def sync_turn(self, user_content: str, assistant_content: str, **kwargs) -> None:  # type: ignore[override]
+        self.calls.append(("sync_turn", kwargs.get("session_id", "")))
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        if self._end_delay:
+            time.sleep(self._end_delay)
+        self._caller_thread_ids.append(threading.get_ident())
+        self.calls.append(("end", list(messages)))
+
+    def on_session_switch(self, new_session_id: str, **kwargs) -> None:
+        self.calls.append(("switch", new_session_id, kwargs.get("reset")))
+
+
+def _make_manager(provider: _RecordingProvider) -> MemoryManager:
+    mm = MemoryManager()
+    mm._providers.append(provider)  # bypass add_provider validation for the stub
+    return mm
+
+
+def test_boundary_commit_delivers_end_strictly_before_switch():
+    """Even with a slow (LLM-like) extraction, switch waits for end."""
+    provider = _RecordingProvider(end_delay=0.15)
+    mm = _make_manager(provider)
+
+    msgs = [{"role": "user", "content": "old turn"}]
+    mm.commit_session_boundary_async(
+        msgs, new_session_id="new-sid", parent_session_id="old-sid"
+    )
+    # DETERMINISTIC non-blocking witness — replaces `assert elapsed < 0.1`.
+    #
+    # The old form timed `commit_session_boundary_async` and required it under
+    # 100ms, which makes the scheduler part of the assertion: thread startup
+    # alone can exceed that on a loaded box, flipping the inequality with
+    # nothing wrong in the code under test.
+    #
+    # The real contract is that the caller returns WITHOUT waiting for the slow
+    # extraction. Assert it directly: the background `on_session_end` sleeps
+    # 0.15s before recording anything, so if the caller had blocked on it, the
+    # provider would already have recorded the "end" call by the time we get
+    # here. An empty call list is a positive witness that /new was not gated.
+    assert provider.calls == [], (
+        "commit_session_boundary_async blocked on the slow extraction: "
+        f"provider already recorded {provider.calls} before the caller returned"
+    )
+
+    assert mm.flush_pending(timeout=30)
+
+    kinds = [c[0] for c in provider.calls]
+    assert kinds == ["end", "switch"], f"ordering violated: {provider.calls}"
+    assert provider.calls[0] == ("end", msgs)
+    assert provider.calls[1] == ("switch", "new-sid", True)
+    # And it genuinely ran off the caller's thread.
+    assert provider._caller_thread_ids[0] != threading.get_ident()
+
+
+
+
+def test_boundary_commit_switch_still_fires_when_end_raises():
+    """A failing provider extraction must not strand providers on the old sid."""
+
+    class _ExplodingEndProvider(_RecordingProvider):
+        def on_session_end(self, messages):  # type: ignore[override]
+            raise RuntimeError("provider extraction blew up")
+
+    provider = _ExplodingEndProvider()
+    mm = _make_manager(provider)
+
+    mm.commit_session_boundary_async([{"role": "user", "content": "x"}], new_session_id="new-sid")
+    assert mm.flush_pending(timeout=5)
+
+    assert ("switch", "new-sid", True) in provider.calls
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_memory_nudge_counter_hydration.py ===
+"""Regression test for issue #22357 — gateway memory-nudge counter hydration.
+
+The gateway creates a fresh AIAgent for each inbound message in several
+common scenarios (cache miss, 1h idle eviction at gateway/run.py
+_AGENT_CACHE_IDLE_TTL_SECS, config-signature mismatch, process restart).
+A freshly built AIAgent has _turns_since_memory=0 and _user_turn_count=0.
+
+Without hydration from conversation_history, the memory.nudge_interval
+trigger (`_turns_since_memory >= _memory_nudge_interval`) can never be
+reached: every turn looks like turn 1 to the counter, so a user can chat
+for hours without ever seeing a "💾 Self-improvement review:" message.
+
+This test pins the hydration behavior added at the top of run_conversation().
+"""
+
+from __future__ import annotations
+
+
+def _make_minimal_agent():
+    """Build the smallest object that can run the hydration block.
+
+    The hydration code only touches attributes — no I/O, no API calls.
+    We can just set up a SimpleNamespace-like object with the right fields
+    and call run_conversation's prelude logic via a thin wrapper.
+
+    The hydration block itself is straightforward enough that we test it
+    by replicating it inline against the same inputs — that's the only
+    way to test ~10 lines deep inside a 500+ line method without rewriting
+    the whole agent loop.
+    """
+
+
+def _run_hydration(conversation_history, memory_nudge_interval=10,
+                   prior_turn_count=0, prior_turns_since_memory=0):
+    """Replicate the hydration block from run_agent.py:11128-11150.
+    Keeping this in sync with the production code is a one-line job; the
+    block has no dependencies on anything except primitives + history.
+    """
+    user_turn_count = prior_turn_count
+    turns_since_memory = prior_turns_since_memory
+
+    if conversation_history and user_turn_count == 0:
+        prior_user_turns = sum(
+            1 for m in conversation_history if m.get("role") == "user"
+        )
+        if prior_user_turns > 0:
+            user_turn_count = prior_user_turns
+            if memory_nudge_interval > 0 and turns_since_memory == 0:
+                turns_since_memory = prior_user_turns % memory_nudge_interval
+
+    return user_turn_count, turns_since_memory
+
+
+def test_no_history_leaves_counters_at_zero():
+    user_turn, since_mem = _run_hydration([], memory_nudge_interval=10)
+    assert user_turn == 0
+    assert since_mem == 0
+
+
+def test_seven_user_turns_history_hydrates_to_seven():
+    """Mid-cycle history: 7 prior user turns, interval 10 → counter at 7."""
+    history = []
+    for i in range(7):
+        history.append({"role": "user", "content": f"q{i}"})
+        history.append({"role": "assistant", "content": f"a{i}"})
+
+    user_turn, since_mem = _run_hydration(history, memory_nudge_interval=10)
+
+    assert user_turn == 7
+    assert since_mem == 7  # 7 % 10 = 7, next 3 turns will trigger review
+
+
+
+
+def test_idempotent_when_counters_already_set():
+    """A cached agent with existing counters must NOT have them clobbered.
+
+    Without the `_user_turn_count == 0` guard, cached agents would lose
+    their accumulated state every time they re-entered the function.
+    """
+    history = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    user_turn, since_mem = _run_hydration(
+        history, memory_nudge_interval=10,
+        prior_turn_count=15, prior_turns_since_memory=5,
+    )
+    # Existing counters preserved (cache hit case)
+    assert user_turn == 15
+    assert since_mem == 5
+
+
+
+
+
+
+def test_production_code_contains_hydration_block():
+    """Smoke test: confirm the hydration code is actually wired into the
+    turn path. If someone deletes it, tests above still pass against the
+    inline replica — this fails them awake.
+
+    The agent-loop prologue now lives in ``agent/turn_context.py``
+    (``build_turn_context``), with the loop body in
+    ``agent/conversation_loop.py``.  Assert the block is present in the
+    turn subsystem — if it disappears entirely, this guard fails loudly.
+    Either module counts so the guard tolerates legitimate relocation
+    within the turn subsystem.
+    """
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[2]
+    turn_src = "".join(
+        (repo / "agent" / name).read_text(encoding="utf-8")
+        for name in ("conversation_loop.py", "turn_context.py")
+    )
+    # Anchor on the unique comment + the modulo line.
+    assert "Hydrate per-session nudge counters from persisted history" in turn_src, (
+        "Hydration comment missing from the turn subsystem "
+        "(conversation_loop.py / turn_context.py)"
+    )
+    assert (
+        "agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval"
+        in turn_src
+    ), "Hydration modulo assignment missing from the turn subsystem"
+

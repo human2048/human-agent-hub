@@ -1,0 +1,297 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_banner_skills.py ===
+"""Tests for banner get_available_skills() — disabled and platform filtering."""
+
+import pytest
+from unittest.mock import patch
+
+
+_MOCK_SKILLS = [
+    {"name": "skill-a", "description": "A skill", "category": "tools"},
+    {"name": "skill-b", "description": "B skill", "category": "tools"},
+    {"name": "skill-c", "description": "C skill", "category": "creative"},
+]
+
+
+@pytest.fixture(autouse=True)
+def _reset_skills_cache():
+    """get_available_skills is memoized per-process (startup perf) — reset
+    the cache around each test so patched _find_all_skills results are
+    actually observed."""
+    import hermes_cli.banner as banner
+    banner._available_skills_cache = None
+    yield
+    banner._available_skills_cache = None
+
+
+def test_get_available_skills_delegates_to_find_all_skills():
+    """get_available_skills should call _find_all_skills (which handles filtering)."""
+    with patch("tools.skills_tool._find_all_skills", return_value=list(_MOCK_SKILLS)):
+        from hermes_cli.banner import get_available_skills
+        result = get_available_skills()
+
+    assert "tools" in result
+    assert "creative" in result
+    assert sorted(result["tools"]) == ["skill-a", "skill-b"]
+    assert result["creative"] == ["skill-c"]
+
+
+def test_get_available_skills_null_category_becomes_general():
+    """Skills with None category should be grouped under 'general'."""
+    skills = [{"name": "orphan-skill", "description": "No cat", "category": None}]
+    with patch("tools.skills_tool._find_all_skills", return_value=skills):
+        from hermes_cli.banner import get_available_skills
+        result = get_available_skills()
+
+    assert "general" in result
+    assert result["general"] == ["orphan-skill"]
+
+
+def test_get_available_skills_is_memoized():
+    """Second call must not re-walk the skills tree (startup perf contract)."""
+    import hermes_cli.banner as banner
+    calls = []
+
+    def fake_find(**kwargs):
+        calls.append(1)
+        return list(_MOCK_SKILLS)
+
+    with patch("tools.skills_tool._find_all_skills", side_effect=fake_find):
+        first = banner.get_available_skills()
+        second = banner.get_available_skills()
+
+    assert first == second
+    assert len(calls) == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_banner_skills_width.py ===
+"""Tests for banner skills display — terminal-width-aware truncation."""
+
+import os
+from unittest.mock import patch
+
+from rich.console import Console
+
+import hermes_cli.banner as banner
+import model_tools
+import tools.mcp_tool_discovery
+
+
+def _build_banner_with_skills(skills_by_category, term_width=160):
+    """Helper: build banner with given skills and return captured output."""
+    with (
+        patch.object(
+            model_tools,
+            "check_tool_availability",
+            return_value=([], []),
+        ),
+        patch.object(banner, "get_available_skills", return_value=skills_by_category),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(tools.mcp_tool_discovery, "get_mcp_status", return_value=[]),
+        patch("shutil.get_terminal_size", return_value=os.terminal_size((term_width, 50))),
+    ):
+        console = Console(
+            record=True, force_terminal=False, color_system=None, width=term_width
+        )
+        banner.build_welcome_banner(
+            console=console,
+            model="anthropic/test-model",
+            cwd="/tmp/project",
+            tools=[],
+        )
+        return console.export_text()
+
+
+def test_wide_terminal_shows_more_than_8_skills():
+    """A wide terminal should display more than 8 skills per category."""
+    # 15 skills in one category
+    skills = {"research": [f"skill-{i:02d}" for i in range(15)]}
+    text = _build_banner_with_skills(skills, term_width=200)
+
+    # With a 200-char terminal, more than 8 should be visible.
+    # The old code always truncated at 8; we should see at least 9 now.
+    assert "skill-08" in text, f"Expected skill-08 in output for wide terminal: {text}"
+
+
+def test_small_category_shows_all_skills():
+    """Categories with few skills should show all of them regardless of width."""
+    skills = {"security": ["auth", "vault"]}
+    text = _build_banner_with_skills(skills, term_width=80)
+
+    assert "auth" in text
+    assert "vault" in text
+    # No "+N more" indicator for small categories
+    assert "+2 more" not in text
+
+
+def test_skills_respect_category_label_width():
+    """Skills display should account for the category label prefix width."""
+    # A category with a long name should have less room for skills
+    skills = {"very-long-category-name": [f"skill-{i:02d}" for i in range(10)]}
+    text = _build_banner_with_skills(skills, term_width=120)
+
+    # Should still show at least some skills
+    assert "skill-00" in text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_base_url_host_identity.py ===
+"""Regression tests: provider-identity checks must compare URL *hostnames*,
+not raw substrings.
+
+Port of earendil-works/pi#7933's bug class (DeepSeek base-URL detection used a
+substring check, missing case variants and matching lookalike URLs). Hermes
+had the same class at several sites: keyless-endpoint detection, /model
+catalog routing, local-endpoint detection, and Nous Portal cache-layout
+detection all used ``"host" in base_url``. A proxy URL that merely *contains*
+a provider host in its path (``https://proxy.internal/openrouter.ai/v1``) or
+a lookalike domain (``https://openrouter.ai.evil.com``) must not be treated
+as that provider, and casing must not matter.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+
+class _Host(CLIAgentSetupMixin):
+    def __init__(self):
+        self.requested_provider = "auto"
+        self._explicit_api_key = None
+        self._explicit_base_url = None
+
+
+def _ready_with(runtime: dict) -> bool:
+    host = _Host()
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=runtime,
+    ):
+        return host._runtime_credentials_ready()
+
+
+def test_keyless_real_openrouter_not_ready():
+    # OpenRouter itself requires a key: keyless => not ready.
+    assert _ready_with({"api_key": None, "base_url": "https://openrouter.ai/api/v1"}) is False
+
+
+def test_keyless_uppercase_openrouter_not_ready():
+    # Case variants of the real host are still the real host (pi#7933 class).
+    assert _ready_with({"api_key": None, "base_url": "https://OpenRouter.AI/api/v1"}) is False
+
+
+def test_keyless_proxy_with_openrouter_in_path_is_ready():
+    # A custom proxy whose *path* contains the substring is NOT OpenRouter —
+    # it's a keyless custom endpoint and must count as ready.
+    assert _ready_with({"api_key": None, "base_url": "https://proxy.internal/openrouter.ai/v1"}) is True
+
+
+def test_keyless_lookalike_domain_is_ready():
+    assert _ready_with({"api_key": None, "base_url": "https://openrouter.ai.evil.com/v1"}) is True
+
+
+def test_keyless_local_endpoint_is_ready():
+    assert _ready_with({"api_key": None, "base_url": "http://localhost:11434/v1"}) is True
+
+
+def test_validate_requested_model_proxy_url_routes_to_custom():
+    """/model validation: an 'openrouter' provider pointed at a non-OpenRouter
+    host is a custom endpoint, even when the URL contains the substring."""
+    from utils import base_url_host_matches
+
+    assert base_url_host_matches("https://openrouter.ai/api/v1", "openrouter.ai")
+    assert base_url_host_matches("https://OPENROUTER.AI/api/v1", "openrouter.ai")
+    assert not base_url_host_matches("https://proxy.internal/openrouter.ai/v1", "openrouter.ai")
+    assert not base_url_host_matches("https://openrouter.ai.evil.com/v1", "openrouter.ai")
+
+
+def test_local_endpoint_hostname_detection():
+    from utils import base_url_hostname
+
+    assert base_url_hostname("http://localhost:11434/v1") == "localhost"
+    assert base_url_hostname("http://127.0.0.1:1234") == "127.0.0.1"
+    # A remote host with "localhost" embedded in its name is not local.
+    assert base_url_hostname("https://my-localhost-mirror.com/v1") not in (
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+    )
+
+
+def test_nous_portal_host_detection():
+    from utils import base_url_host_matches
+
+    assert base_url_host_matches("https://inference-api.nousresearch.com/v1", "nousresearch.com")
+    assert base_url_host_matches("https://portal.nousresearch.com", "nousresearch.com")
+    assert not base_url_host_matches("https://nousresearch.com.evil.io/v1", "nousresearch.com")
+    assert not base_url_host_matches("https://proxy.example/nousresearch.com/v1", "nousresearch.com")
+
+
+# ── Widened class coverage (follow-up to #85737) ─────────────────────────────
+
+
+def test_azure_endpoint_detection_host_anchored():
+    """Azure detection (runtime_provider + run_agent) must be host-anchored:
+    a path or lookalike containing 'azure.com'/'openai.azure.com' is not Azure."""
+    from utils import base_url_host_matches
+
+    assert base_url_host_matches("https://myres.openai.azure.com/openai/v1", "azure.com")
+    assert base_url_host_matches("https://myres.openai.azure.com/openai/v1", "openai.azure.com")
+    assert not base_url_host_matches("https://proxy.corp/openai.azure.com/v1", "azure.com")
+    assert not base_url_host_matches("https://azure.com.evil.net/v1", "azure.com")
+    assert not base_url_host_matches("https://notazure.com/v1", "azure.com")
+
+
+def test_run_agent_azure_url_predicate():
+    from run_agent import AIAgent
+
+    probe = object.__new__(AIAgent)
+    assert probe._is_azure_openai_url("https://myres.openai.azure.com/openai/v1") is True
+    assert probe._is_azure_openai_url("https://proxy.internal/openai.azure.com/v1") is False
+    assert probe._is_azure_openai_url("https://openai.azure.com.evil.io/v1") is False
+
+
+def test_run_agent_copilot_url_predicate():
+    from run_agent import AIAgent
+
+    probe = object.__new__(AIAgent)
+    probe._base_url_lower = "https://api.githubcopilot.com/v1"
+    assert probe._is_copilot_url() is True
+    probe._base_url_lower = "https://proxy.test/api.githubcopilot.com/v1"
+    assert probe._is_copilot_url() is False
+    probe._base_url_lower = "https://models.github.ai/inference"
+    assert probe._is_copilot_url() is True
+    probe._base_url_lower = "https://models.github.ai.evil.com/v1"
+    assert probe._is_copilot_url() is False
+
+
+def test_dotted_model_name_provider_allowlist_host_anchored():
+    from run_agent import AIAgent
+
+    probe = object.__new__(AIAgent)
+    probe.provider = ""
+    probe.base_url = "https://open.bigmodel.cn/api/paas/v4"
+    assert probe._anthropic_preserve_dots() is True
+    probe.base_url = "https://gateway.example.com/bigmodel.cn/v4"
+    assert probe._anthropic_preserve_dots() is False
+    probe.base_url = "https://aiplatform.googleapis.com/v1"
+    assert probe._anthropic_preserve_dots() is True
+    probe.base_url = "https://evil.io/aiplatform.googleapis.com/v1"
+    assert probe._anthropic_preserve_dots() is False
+
+
+def test_figma_remote_mcp_host_anchored():
+    from tools.mcp_oauth import _is_figma_remote_mcp
+
+    assert _is_figma_remote_mcp(server_url="https://mcp.figma.com/mcp") is True
+    assert _is_figma_remote_mcp(server_url="https://www.figma.com/mcp") is True
+    assert _is_figma_remote_mcp(server_url="https://evil.example/mcp.figma.com/mcp") is False
+    assert _is_figma_remote_mcp(server_url="https://figma.com.evil.io/mcp") is False
+    # Name fallback still host-checks the URL when one is present.
+    assert _is_figma_remote_mcp(server_name="figma", server_url="https://phish.example/figma") is False
+    assert _is_figma_remote_mcp(server_name="figma") is True
+

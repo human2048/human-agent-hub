@@ -1,0 +1,454 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\finance\merger-model\SKILL.md ===
+---
+name: merger-model
+description: Build M&A accretion/dilution workbooks in Excel.
+version: 1.0.0
+author: Anthropic (adapted by Nous Research)
+license: Apache-2.0
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [finance, m-and-a, merger, accretion-dilution, excel, openpyxl, modeling, investment-banking]
+    related_skills: [excel-author, pptx-author, dcf-model, 3-statement-model]
+---
+
+## Environment
+
+This skill assumes **headless openpyxl** — you are producing an .xlsx file on disk.
+Follow the `excel-author` skill's conventions for cell coloring, formulas, named ranges, and sensitivity tables.
+Recalculate before delivery: `python /path/to/excel-author/scripts/recalc.py ./out/model.xlsx`.
+
+# Merger Model
+
+Build accretion/dilution analysis for M&A transactions. Models pro forma EPS impact, synergy sensitivities, and purchase price allocation. Use when evaluating a potential acquisition, preparing merger consequences analysis for a pitch, or advising on deal terms.
+
+## Workflow
+
+### Step 1: Gather Inputs
+
+**Acquirer:**
+- Company name, current share price, shares outstanding
+- LTM and NTM EPS (GAAP and adjusted)
+- P/E multiple
+- Pre-tax cost of debt, tax rate
+- Cash on balance sheet, existing debt
+
+**Target:**
+- Company name, current share price, shares outstanding (if public)
+- LTM and NTM EPS or net income
+- Enterprise value or equity value
+
+**Deal Terms:**
+- Offer price per share (or premium to current)
+- Consideration mix: % cash vs. % stock
+- New debt raised to fund cash portion
+- Expected synergies (revenue and cost) and phase-in timeline
+- Transaction fees and financing costs
+- Expected close date
+
+### Step 2: Purchase Price Analysis
+
+| Item | Value |
+|------|-------|
+| Offer price per share | |
+| Premium to current | |
+| Equity value | |
+| Plus: net debt assumed | |
+| Enterprise value | |
+| EV / EBITDA implied | |
+| P/E implied | |
+
+### Step 3: Sources & Uses
+
+| Sources | $ | Uses | $ |
+|---------|---|------|---|
+| New debt | | Equity purchase price | |
+| Cash on hand | | Refinance target debt | |
+| New equity issued | | Transaction fees | |
+| | | Financing fees | |
+| **Total** | | **Total** | |
+
+### Step 4: Pro Forma EPS (Accretion / Dilution)
+
+Calculate year-by-year (Year 1-3):
+
+| | Standalone | Pro Forma | Accretion/(Dilution) |
+|---|-----------|-----------|---------------------|
+| Acquirer net income | | | |
+| Target net income | | | |
+| Synergies (after tax) | | | |
+| Foregone interest on cash (after tax) | | | |
+| New debt interest (after tax) | | | |
+| Intangible amortization (after tax) | | | |
+| Pro forma net income | | | |
+| Pro forma shares | | | |
+| **Pro forma EPS** | | | |
+| **Accretion / (Dilution) %** | | | |
+
+### Step 5: Sensitivity Analysis
+
+**Accretion/Dilution vs. Synergies and Offer Premium:**
+
+| | $0M syn | $25M syn | $50M syn | $75M syn | $100M syn |
+|---|---------|----------|----------|----------|-----------|
+| 15% premium | | | | | |
+| 20% premium | | | | | |
+| 25% premium | | | | | |
+| 30% premium | | | | | |
+
+**Accretion/Dilution vs. Cash/Stock Mix:**
+
+| | 100% cash | 75/25 | 50/50 | 25/75 | 100% stock |
+|---|-----------|-------|-------|-------|------------|
+| Year 1 | | | | | |
+| Year 2 | | | | | |
+
+### Step 6: Breakeven Synergies
+
+Calculate the minimum synergies needed for the deal to be EPS-neutral in Year 1.
+
+### Step 7: Output
+
+- Excel workbook with:
+  - Assumptions tab
+  - Sources & uses
+  - Pro forma income statement
+  - Accretion/dilution summary
+  - Sensitivity tables
+  - Breakeven analysis
+- One-page merger consequences summary for pitch book
+
+## Important Notes
+
+- Always show both GAAP and adjusted (cash) EPS where relevant
+- Stock deals: use acquirer's current price for exchange ratio, note dilution from new shares
+- Include purchase price allocation — goodwill and intangible amortization matter for GAAP EPS
+- Synergy phase-in is critical — Year 1 is often only 25-50% of run-rate synergies
+- Don't forget foregone interest income on cash used and new interest expense on debt raised
+- Tax rate on synergies and interest adjustments should match the acquirer's marginal rate
+
+
+## Data sources — MCP first, web fallback
+
+Many passages below say "use the S&P Kensho MCP / Daloopa MCP / FactSet MCP". Those are commercial financial-data MCPs from the original Cowork plugin context. In Hermes:
+
+- **If you have any structured financial-data MCP configured** (Hermes supports MCP — see `native-mcp` skill), prefer it for point-in-time comps, precedent transactions, and filings.
+- **Otherwise**, fall back to:
+  - `web_search` / `web_extract` against SEC EDGAR (`https://www.sec.gov/cgi-bin/browse-edgar`) for US filings
+  - Company IR pages for press releases, earnings decks
+  - `browser_navigate` for interactive data portals
+  - User-provided data (explicitly ask when the context doesn't have it)
+- **Never fabricate**. If a multiple, precedent, or filing number can't be sourced, flag the cell as `[UNSOURCED]` and surface it to the user.
+
+## Attribution
+
+This skill is adapted from Anthropic's Claude for Financial Services plugin suite (Apache-2.0). The Office-JS / Cowork live-Excel paths have been removed; this version targets headless openpyxl via the `excel-author` skill's conventions. Original: https://github.com/anthropics/financial-services
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\finance\polymarket\SKILL.md ===
+---
+name: polymarket
+description: "Query Polymarket: markets, prices, orderbooks, history."
+version: 1.0.0
+author: Hermes Agent + Teknium
+license: MIT
+tags: [polymarket, prediction-markets, market-data, trading]
+platforms: [linux, macos, windows]
+---
+
+# Polymarket — Prediction Market Data
+
+Query prediction market data from Polymarket using their public REST APIs.
+All endpoints are read-only and require zero authentication.
+
+See `references/api-endpoints.md` for the full endpoint reference with curl examples.
+
+## When to Use
+
+- User asks about prediction markets, betting odds, or event probabilities
+- User wants to know "what are the odds of X happening?"
+- User asks about Polymarket specifically
+- User wants market prices, orderbook data, or price history
+- User asks to monitor or track prediction market movements
+
+## Key Concepts
+
+- **Events** contain one or more **Markets** (1:many relationship)
+- **Markets** are binary outcomes with Yes/No prices between 0.00 and 1.00
+- Prices ARE probabilities: price 0.65 means the market thinks 65% likely
+- `outcomePrices` field: JSON-encoded array like `["0.80", "0.20"]`
+- `clobTokenIds` field: JSON-encoded array of two token IDs [Yes, No] for price/book queries
+- `conditionId` field: hex string used for price history queries
+- Volume is in USDC (US dollars)
+
+## Three Public APIs
+
+1. **Gamma API** at `gamma-api.polymarket.com` — Discovery, search, browsing
+2. **CLOB API** at `clob.polymarket.com` — Real-time prices, orderbooks, history
+3. **Data API** at `data-api.polymarket.com` — Trades, open interest
+
+## Typical Workflow
+
+When a user asks about prediction market odds:
+
+1. **Search** using the Gamma API public-search endpoint with their query
+2. **Parse** the response — extract events and their nested markets
+3. **Present** market question, current prices as percentages, and volume
+4. **Deep dive** if asked — use clobTokenIds for orderbook, conditionId for history
+
+## Presenting Results
+
+Format prices as percentages for readability:
+- outcomePrices `["0.652", "0.348"]` becomes "Yes: 65.2%, No: 34.8%"
+- Always show the market question and probability
+- Include volume when available
+
+Example: `"Will X happen?" — 65.2% Yes ($1.2M volume)`
+
+## Parsing Double-Encoded Fields
+
+The Gamma API returns `outcomePrices`, `outcomes`, and `clobTokenIds` as JSON strings
+inside JSON responses (double-encoded). When processing with Python, parse them with
+`json.loads(market['outcomePrices'])` to get the actual array.
+
+## Rate Limits
+
+Generous — unlikely to hit for normal usage:
+- Gamma: 4,000 requests per 10 seconds (general)
+- CLOB: 9,000 requests per 10 seconds (general)
+- Data: 1,000 requests per 10 seconds (general)
+
+## Limitations
+
+- This skill is read-only — it does not support placing trades
+- Trading requires wallet-based crypto authentication (EIP-712 signatures)
+- Some new markets may have empty price history
+- Geographic restrictions apply to trading but read-only data is globally accessible
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\finance\polymarket\references\api-endpoints.md ===
+# Polymarket API Endpoints Reference
+
+All endpoints are public REST (GET), return JSON, and need no authentication.
+
+## Gamma API — gamma-api.polymarket.com
+
+### Search Markets
+
+```
+GET /public-search?q=QUERY
+```
+
+Response structure:
+```json
+{
+  "events": [
+    {
+      "id": "12345",
+      "title": "Event title",
+      "slug": "event-slug",
+      "volume": 1234567.89,
+      "markets": [
+        {
+          "question": "Will X happen?",
+          "outcomePrices": "[\"0.65\", \"0.35\"]",
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"TOKEN_YES\", \"TOKEN_NO\"]",
+          "conditionId": "0xabc...",
+          "volume": 500000
+        }
+      ]
+    }
+  ],
+  "pagination": {"hasMore": true, "totalResults": 100}
+}
+```
+
+### List Events
+
+```
+GET /events?limit=N&active=true&closed=false&order=volume&ascending=false
+```
+
+Parameters:
+- `limit` — max results (default varies)
+- `offset` — pagination offset
+- `active` — true/false
+- `closed` — true/false
+- `order` — sort field: `volume`, `createdAt`, `updatedAt`
+- `ascending` — true/false
+- `tag` — filter by tag slug
+- `slug` — get specific event by slug
+
+Response: array of event objects. Each event includes a `markets` array.
+
+Event fields: `id`, `title`, `slug`, `description`, `volume`, `liquidity`,
+`openInterest`, `active`, `closed`, `category`, `startDate`, `endDate`,
+`markets` (array of market objects).
+
+### List Markets
+
+```
+GET /markets?limit=N&active=true&closed=false&order=volume&ascending=false
+```
+
+Same filter parameters as events, plus:
+- `slug` — get specific market by slug
+
+Market fields: `id`, `question`, `conditionId`, `slug`, `description`,
+`outcomes`, `outcomePrices`, `volume`, `liquidity`, `active`, `closed`,
+`marketType`, `clobTokenIds`, `endDate`, `category`, `createdAt`.
+
+Important: `outcomePrices`, `outcomes`, and `clobTokenIds` are JSON strings
+(double-encoded). Parse with json.loads() in Python.
+
+### List Tags
+
+```
+GET /tags
+```
+
+Returns array of tag objects: `id`, `label`, `slug`.
+Use the `slug` value when filtering events/markets by tag.
+
+---
+
+## CLOB API — clob.polymarket.com
+
+All CLOB price endpoints use `token_id` from the market's `clobTokenIds` field.
+Index 0 = Yes outcome, Index 1 = No outcome.
+
+### Current Price
+
+```
+GET /price?token_id=TOKEN_ID&side=buy
+```
+
+Response: `{"price": "0.650"}`
+
+The `side` parameter: `buy` or `sell`.
+
+### Midpoint Price
+
+```
+GET /midpoint?token_id=TOKEN_ID
+```
+
+Response: `{"mid": "0.645"}`
+
+### Spread
+
+```
+GET /spread?token_id=TOKEN_ID
+```
+
+Response: `{"spread": "0.02"}`
+
+### Orderbook
+
+```
+GET /book?token_id=TOKEN_ID
+```
+
+Response:
+```json
+{
+  "market": "condition_id",
+  "asset_id": "token_id",
+  "bids": [{"price": "0.64", "size": "500"}, ...],
+  "asks": [{"price": "0.66", "size": "300"}, ...],
+  "min_order_size": "5",
+  "tick_size": "0.01",
+  "last_trade_price": "0.65"
+}
+```
+
+Bids and asks are sorted by price. Size is in shares (USDC-denominated).
+
+### Price History
+
+```
+GET /prices-history?market=CONDITION_ID&interval=INTERVAL&fidelity=N
+```
+
+Parameters:
+- `market` — the conditionId (hex string with 0x prefix)
+- `interval` — time range: `all`, `1d`, `1w`, `1m`, `3m`, `6m`, `1y`
+- `fidelity` — number of data points to return
+
+Response:
+```json
+{
+  "history": [
+    {"t": 1709000000, "p": "0.55"},
+    {"t": 1709100000, "p": "0.58"}
+  ]
+}
+```
+
+`t` is Unix timestamp, `p` is price (probability).
+
+Note: Very new markets may return empty history.
+
+### CLOB Markets List
+
+```
+GET /markets?limit=N
+```
+
+Response:
+```json
+{
+  "data": [
+    {
+      "condition_id": "0xabc...",
+      "question": "Will X?",
+      "tokens": [
+        {"token_id": "123...", "outcome": "Yes", "price": 0.65},
+        {"token_id": "456...", "outcome": "No", "price": 0.35}
+      ],
+      "active": true,
+      "closed": false
+    }
+  ],
+  "next_cursor": "cursor_string",
+  "limit": 100,
+  "count": 1000
+}
+```
+
+---
+
+## Data API — data-api.polymarket.com
+
+### Recent Trades
+
+```
+GET /trades?limit=N
+GET /trades?market=CONDITION_ID&limit=N
+```
+
+Trade fields: `side` (BUY/SELL), `size`, `price`, `timestamp`,
+`title`, `slug`, `outcome`, `transactionHash`, `conditionId`.
+
+### Open Interest
+
+```
+GET /oi?market=CONDITION_ID
+```
+
+---
+
+## Field Cross-Reference
+
+To go from a Gamma market to CLOB data:
+
+1. Get market from Gamma: has `clobTokenIds` and `conditionId`
+2. Parse `clobTokenIds` (JSON string): `["YES_TOKEN", "NO_TOKEN"]`
+3. Use YES_TOKEN with `/price`, `/book`, `/midpoint`, `/spread`
+4. Use `conditionId` with `/prices-history` and Data API endpoints
+

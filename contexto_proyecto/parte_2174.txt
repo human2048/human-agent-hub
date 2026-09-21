@@ -1,0 +1,378 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_pool_revert_after_cooldown.py ===
+# Copyright 2025 Nous Research (Licensed under the Apache License, Version 2.0)
+"""A live session rotated off a quota-benched credential moves back once the bench lifts.
+
+New sessions already do this (``load_pool().select()`` prefers the priority-0 entry again once
+its 429/402 cooldown has elapsed); the per-turn ``restore_primary_runtime`` hook must do the same
+for the session that took the rotation, or a long-lived gateway agent bills the fallback for
+its whole life. Credential-only: it must not touch the model/base_url/compressor restore path.
+"""
+
+import time
+
+import agent.credential_pool as cp
+from agent.agent_runtime_helpers import recover_with_credential_pool, restore_primary_runtime
+from agent.credential_pool import EXHAUSTED_TTL_429_SECONDS, CredentialPool, PooledCredential
+
+_BASE = "https://api.anthropic.com"
+
+
+def _entry(entry_id, label, *, priority, auth_type, token):
+    raw = {
+        "id": entry_id, "label": label, "auth_type": auth_type, "priority": priority,
+        "access_token": token, "base_url": _BASE, "source": "manual",
+    }
+    if auth_type == "oauth":
+        raw["refresh_token"] = f"rt-{entry_id}"
+        raw["expires_at_ms"] = int((time.time() + 30 * 86400) * 1000)
+    return PooledCredential.from_dict("anthropic", raw)
+
+
+class _LiveAgent:
+    """Long-lived session stand-in: real pool + real recovery/restore helpers, no client build."""
+
+    _fallback_activated = False
+    _fallback_index = 0
+    _primary_runtime = {"provider": "anthropic", "model": "claude-opus-5", "base_url": _BASE}
+    provider = "anthropic"
+    model = "claude-opus-5"
+    base_url = _BASE
+
+    def __init__(self, pool):
+        self._credential_pool = pool
+        first = pool.select()
+        self._credential_pool_entry_id = first.id
+        self.api_key = first.runtime_api_key
+
+    def _swap_credential(self, entry):
+        self.api_key = entry.runtime_api_key
+        self._credential_pool_entry_id = entry.id
+        return True
+
+    def _is_entitlement_failure(self, error_context, status_code):
+        return False
+
+
+def _expire_cooldowns(monkeypatch, real=None, windows=1):
+    real = real or time.time
+    monkeypatch.setattr(cp.time, "time", lambda: real() + windows * (EXHAUSTED_TTL_429_SECONDS + 120))
+
+
+def test_live_session_reverts_to_quota_benched_credential_once_cooldown_lifts(monkeypatch):
+    real_time = time.time
+    pool = CredentialPool(provider="anthropic", entries=[
+        _entry("pref0000", "subscription-oauth", priority=0, auth_type="oauth", token="sk-ant-oat01-PREF"),
+        _entry("fall0000", "paid-api-key", priority=1, auth_type="api_key", token="sk-ant-api03-FALL"),
+    ])
+    agent = _LiveAgent(pool)
+    assert agent.api_key == "sk-ant-oat01-PREF"
+
+    # 429 twice = retry once, then rotate (the real rate-limit ladder).
+    recover_with_credential_pool(agent, status_code=429, has_retried_429=False, error_context={"message": "Error"})
+    recovered, _ = recover_with_credential_pool(agent, status_code=429, has_retried_429=True, error_context={"message": "Error"})
+    assert recovered and agent.api_key == "sk-ant-api03-FALL"
+
+    # Control: while the bench is still active the session stays on the fallback.
+    assert restore_primary_runtime(agent) is False
+    assert agent.api_key == "sk-ant-api03-FALL"
+
+    _expire_cooldowns(monkeypatch)
+    assert restore_primary_runtime(agent) is False  # credential-only: no primary-runtime restore ran
+    assert agent.api_key == "sk-ant-oat01-PREF"
+    assert agent._credential_pool_entry_id == "pref0000"
+    assert agent._fallback_activated is False and agent.model == "claude-opus-5"
+    assert agent._credential_pool_revert_id is None
+    # The pool agrees the preferred entry is healthy again (cooldown cleared, not merely elapsed).
+    assert next(e for e in pool.entries() if e.id == "pref0000").last_status != cp.STATUS_EXHAUSTED
+
+    # Control (two-session interleaving): a session that started on the FALLBACK because another
+    # session benched the preferred entry, then rotates UP to the preferred entry once its window
+    # reopened, must not be pulled back DOWN when the fallback's own cooldown lifts.
+    pool2 = CredentialPool(provider="anthropic", entries=[
+        _entry("pref0000", "subscription-oauth", priority=0, auth_type="oauth", token="sk-ant-oat01-PREF"),
+        _entry("fall0000", "paid-api-key", priority=1, auth_type="api_key", token="sk-ant-api03-FALL"),
+    ])
+    monkeypatch.setattr(cp.time, "time", real_time)
+    pool2.mark_exhausted_and_rotate(  # the OTHER session benches the preferred entry
+        status_code=429, credential_id="pref0000", failure_reason="rate_limit", error_context={"message": "Error"},
+    )
+    late = _LiveAgent(pool2)
+    assert late.api_key == "sk-ant-api03-FALL"
+    _expire_cooldowns(monkeypatch, real_time, 1)  # pref's window reopened; fall benched from now
+    recover_with_credential_pool(late, status_code=429, has_retried_429=False, error_context={"message": "Error"})
+    recovered, _ = recover_with_credential_pool(late, status_code=429, has_retried_429=True, error_context={"message": "Error"})
+    assert recovered and late.api_key == "sk-ant-oat01-PREF"
+    assert getattr(late, "_credential_pool_revert_id", None) is None  # rotated UP: nothing to revert to
+    _expire_cooldowns(monkeypatch, real_time, 2)  # fall's cooldown lifts too
+    assert restore_primary_runtime(late) is False
+    assert late.api_key == "sk-ant-oat01-PREF" and pool2.select().id == "pref0000"
+
+
+def test_auth_bench_does_not_arm_a_revert(monkeypatch):
+    """A 401 bench is not a quota window: the session keeps the credential it rotated to."""
+    pool = CredentialPool(provider="anthropic", entries=[
+        _entry("pref0000", "primary-key", priority=0, auth_type="api_key", token="sk-ant-api03-PREF"),
+        _entry("fall0000", "backup-key", priority=1, auth_type="api_key", token="sk-ant-api03-FALL"),
+    ])
+    agent = _LiveAgent(pool)
+    recovered, _ = recover_with_credential_pool(agent, status_code=401, has_retried_429=False, error_context={"message": "invalid"})
+    assert recovered and agent.api_key == "sk-ant-api03-FALL"
+
+    _expire_cooldowns(monkeypatch)
+    assert restore_primary_runtime(agent) is False
+    assert agent.api_key == "sk-ant-api03-FALL"
+    assert getattr(agent, "_credential_pool_revert_id", None) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_portal_tags.py ===
+"""Tests for agent.portal_tags — Nous Portal request tag contract."""
+
+from __future__ import annotations
+
+
+
+
+
+
+def test_nous_portal_tags_contains_product_and_client():
+    """Every Nous Portal request gets BOTH the product tag and the version tag."""
+    from agent.portal_tags import hermes_client_tag, nous_portal_tags
+
+    tags = nous_portal_tags()
+    assert "product=hermes-agent" in tags
+    assert hermes_client_tag() in tags
+    assert len(tags) == 2
+
+
+
+
+
+
+
+
+
+
+# ── Ambient conversation context (ContextVar) ────────────────────────────────
+
+
+
+
+
+
+def test_ambient_context_set_none_clears():
+    """set_conversation_context(None) publishes no tag (and coerces '')."""
+    from agent.portal_tags import (
+        get_conversation_context,
+        nous_portal_tags,
+        reset_conversation_context,
+        set_conversation_context,
+    )
+
+    for empty in (None, ""):
+        token = set_conversation_context(empty)
+        try:
+            assert get_conversation_context() is None
+            assert len(nous_portal_tags()) == 2
+        finally:
+            reset_conversation_context(token)
+
+
+def test_ambient_context_isolated_between_contexts():
+    """Two copied Contexts (≈ two concurrent agents) don't leak into each other."""
+    import contextvars
+
+    from agent.portal_tags import (
+        conversation_tag,
+        nous_portal_tags,
+        set_conversation_context,
+    )
+
+    def _in_conversation(cid):
+        set_conversation_context(cid)
+        return nous_portal_tags()
+
+    tags_a = contextvars.copy_context().run(_in_conversation, "agent-a")
+    tags_b = contextvars.copy_context().run(_in_conversation, "agent-b")
+    assert conversation_tag("agent-a") in tags_a
+    assert conversation_tag("agent-b") in tags_b
+    assert conversation_tag("agent-b") not in tags_a
+    # The outer (test) context stays clean.
+    assert not any(t.startswith("conversation=") for t in nous_portal_tags())
+
+
+def test_ambient_context_propagates_via_thread_context_helper():
+    """propagate_context_to_thread carries the tag onto executor workers (MoA path)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from agent.portal_tags import (
+        conversation_tag,
+        nous_portal_tags,
+        reset_conversation_context,
+        set_conversation_context,
+    )
+    from tools.thread_context import propagate_context_to_thread
+
+    token = set_conversation_context("moa-root")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            plain = ex.submit(nous_portal_tags).result()
+            propagated = ex.submit(
+                propagate_context_to_thread(nous_portal_tags)
+            ).result()
+    finally:
+        reset_conversation_context(token)
+
+    # Bare submit loses the ContextVar; the propagation wrapper keeps it.
+    assert not any(t.startswith("conversation=") for t in plain)
+    assert conversation_tag("moa-root") in propagated
+
+
+
+
+
+
+
+
+def test_nous_sticky_key_matches_conversation_tag():
+    """Sticky routing key must resolve like the ``conversation=`` tag does.
+
+    The load-bearing case is the auxiliary call sites (compression, titles,
+    vision, MoA slots): they pass no ``session_id`` at all, so before this
+    resolution they carried the conversation tag but NO Portal sticky key and
+    routed independently of their conversation.
+
+    The explicit-argument case matters for installs that opt out of the
+    default ``compression.in_place: true`` (#38763) and therefore still rotate
+    ``agent.session_id`` at compaction, and for delegate-subagent trees that
+    should tag as the parent conversation.
+    """
+    from agent.portal_tags import (
+        conversation_tag,
+        reset_conversation_context,
+        set_conversation_context,
+    )
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("nous")
+    token = set_conversation_context("root-conversation")
+    try:
+        # Rotated segment id passed explicitly — root still wins, both places.
+        body = profile.build_extra_body(session_id="segment-after-compaction")
+        assert body["session_id"] == "root-conversation"
+        assert conversation_tag("root-conversation") in body["tags"]
+
+        # Auxiliary call sites pass no session_id but inherit the context.
+        aux = profile.build_extra_body()
+        assert aux["session_id"] == "root-conversation"
+    finally:
+        reset_conversation_context(token)
+
+
+
+
+
+
+def test_compress_context_preserves_ambient_context(monkeypatch):
+    """In-turn compaction inherits the turn's root and restores it untouched."""
+    import agent.conversation_compression as cc
+    from agent.portal_tags import (
+        get_conversation_context,
+        reset_conversation_context,
+        set_conversation_context,
+    )
+    from run_agent import AIAgent
+
+    seen = {}
+
+    def _fake_compress(agent, messages, system_message, **kwargs):
+        seen["conversation"] = get_conversation_context()
+        return ([], "")
+
+    monkeypatch.setattr(cc, "compress_context", _fake_compress)
+
+    class _Agent:
+        def _conversation_root_id(self):
+            # A rotated segment id must never win over the ambient root.
+            return "segment-after-compaction"
+
+    token = set_conversation_context("outer-root")
+    try:
+        AIAgent._compress_context(_Agent(), [], "sys")
+        assert seen["conversation"] == "outer-root"
+        assert get_conversation_context() == "outer-root"
+    finally:
+        reset_conversation_context(token)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_post_compression_trim.py ===
+"""A successful compaction hands allocator pages back to the OS.
+
+The compressed-away message dicts are the largest allocation a long session
+ever frees, but Python's arena allocator keeps those pages in the process heap
+— RSS retains the pre-compaction high-water mark until exit. #76905's
+trim_memory lifecycle covers the gateway/TUI housekeeping loops but not the
+CLI compression path, so compress() now calls
+``trim_memory(reason="post-compression")`` after a successful pass.
+
+trim_memory itself is glibc/Linux-gated (a fast no-op on macOS), so these
+tests monkeypatch the seam rather than asserting on RSS. Salvaged in spirit
+from #70782 (which reached for a bare gc.collect(); trim_memory is the
+house mechanism and already wraps a collect).
+"""
+import hermes_cli.mem_trim as mem_trim
+from agent.context_compressor import ContextCompressor
+
+
+def _compressor(threshold_tokens: int = 24_576) -> ContextCompressor:
+    cc = ContextCompressor(
+        model="test-model",
+        threshold_percent=0.75,
+        protect_first_n=5,
+        protect_last_n=20,
+        quiet_mode=True,
+        config_context_length=40960,
+        provider="test",
+    )
+    cc.threshold_tokens = threshold_tokens  # pin; don't couple to window math
+    cc._generate_summary = lambda *a, **k: "Summary of earlier turns."
+    return cc
+
+
+def _messages(n: int, size: int = 1500) -> list:
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(n):
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs.append({"role": role, "content": f"m{i} " + "z" * size})
+    return msgs
+
+
+def test_successful_compression_trims_memory_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        mem_trim, "trim_memory", lambda *a, **kw: calls.append(kw) or False
+    )
+
+    cc = _compressor()
+    out = cc.compress(_messages(14), current_tokens=100_000)
+
+    assert len(out) < 15, "sanity: compaction should have made progress"
+    assert len(calls) == 1, "trim_memory must run exactly once per compaction"
+    assert calls[0].get("reason") == "post-compression"
+
+
+def test_trim_failure_does_not_break_compression(monkeypatch):
+    def boom(*a, **kw):
+        raise RuntimeError("allocator says no")
+
+    monkeypatch.setattr(mem_trim, "trim_memory", boom)
+
+    cc = _compressor()
+    out = cc.compress(_messages(14), current_tokens=100_000)
+
+    assert cc._last_compression_made_progress is True
+    assert isinstance(out, list) and out, "compress() must still return messages"
+

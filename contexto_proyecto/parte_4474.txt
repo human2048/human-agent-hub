@@ -1,0 +1,241 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_multi_profile_hosting_transitions.py ===
+"""Serve / dashboard profile scopes stay authoritative across the first-secondary transition.
+
+Three edges of the fail-closed multi-profile host (review of #111620):
+
+* ``send`` under a routed profile's scope must keep the composed scope (user ``.env`` then external
+  secret sources) authoritative — replaying raw ``.env`` reversed that precedence for the request;
+* a launch-profile body that enters while the process is still single-profile must keep resolving
+  its own credential after a concurrent first secondary flips ``get_secret`` to fail closed
+  (``_MULTIPLEX_ACTIVE`` is consulted on every read; the scope decision is made once at entry);
+* releasing a runtime scope is per-reset best-effort: a failing terminal reset must not leave the
+  previous profile's secrets / HERMES_HOME installed for the next body in that context.
+"""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+
+import pytest
+
+import tui_gateway.server as server
+from tui_gateway import launch_profile_policy as lpp
+
+A_VAL = "a-only-secret-0001"
+B_VAL = "b-only-secret-0002"
+ENV_VAL = "systemd-injected-0003"
+
+
+@pytest.fixture
+def two_homes(tmp_path, monkeypatch):
+    root = tmp_path / "hermes_home"
+    b = root / "profiles" / "b"
+    b.mkdir(parents=True)
+    (root / ".env").write_text(f"A_ONLY_TOKEN={A_VAL}\n", encoding="utf-8")
+    (b / ".env").write_text(f"B_ONLY_TOKEN={B_VAL}\nSHARED_TOKEN=b-dotenv-stale\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("A_ONLY_TOKEN", A_VAL)
+    monkeypatch.setenv("INJECTED_TOKEN", ENV_VAL)  # systemd / op run credential injection, no file
+    monkeypatch.setattr(server, "_hermes_home", root)
+    monkeypatch.setattr(server, "_served_profile_homes", set())
+    monkeypatch.setattr(lpp, "_snapshot", None)
+    monkeypatch.setattr("agent.secret_scope._MULTIPLEX_ACTIVE", False)
+    return root, b
+
+
+def test_send_keeps_external_source_value_over_raw_dotenv(two_homes, monkeypatch):
+    """B's ``.env`` and B's secret manager both define SHARED_TOKEN; the installed scope (manager
+    wins) survives ``_load_hermes_env`` for the routed ``send``."""
+    from hermes_cli import env_loader
+    from hermes_cli.send_cmd import _load_hermes_env
+
+    root, b = two_homes
+    # B's secret manager already hydrated for this process (a hydrated home is not re-pulled).
+    monkeypatch.setattr(env_loader, "_SECRET_SOURCE_VALUES_BY_HOME",
+                        {str(b.resolve()): {"SHARED_TOKEN": "b-manager-fresh"}})
+    monkeypatch.setattr(env_loader, "_APPLIED_HOMES", {str(b.resolve())})
+    with server._session_profile_runtime_scope({"profile_home": str(b)}):
+        from agent.secret_scope import current_secret_scope, get_secret
+        assert get_secret("SHARED_TOKEN") == "b-manager-fresh"
+        _load_hermes_env()
+        assert get_secret("SHARED_TOKEN") == "b-manager-fresh"
+        assert current_secret_scope()["B_ONLY_TOKEN"] == B_VAL
+
+
+def test_launch_body_survives_first_secondary_activation(two_homes):
+    """Barrier: the launch RPC enters single-profile, B activates on another thread, the launch RPC
+    resumes and still resolves its env-injected credential instead of raising."""
+    from agent.secret_scope import get_secret, is_multiplex_active
+
+    root, b = two_homes
+    entered, activated = threading.Event(), threading.Event()
+    seen: dict = {}
+
+    def launch_body():
+        with server._session_profile_runtime_scope({"profile_home": None}):
+            seen["before"] = get_secret("INJECTED_TOKEN")
+            entered.set()
+            assert activated.wait(10)
+            seen["multiplex_now"] = is_multiplex_active()
+            seen["after"] = get_secret("INJECTED_TOKEN")
+            seen["b_leak"] = get_secret("B_ONLY_TOKEN")
+
+    t = threading.Thread(target=launch_body)
+    t.start()
+    assert entered.wait(10)
+    assert server._profile_home("b") == b  # first secondary: freezes the launch env, flips fail-closed
+    activated.set()
+    t.join(10)
+    assert seen == {"before": ENV_VAL, "multiplex_now": True, "after": ENV_VAL, "b_leak": None}
+
+
+def test_launch_body_survives_first_secondary_activation_on_the_dashboard(two_homes, monkeypatch):
+    pytest.importorskip("fastapi")
+    from agent.secret_scope import get_secret
+    from hermes_cli import web_server_profiles as wsp
+
+    root, b = two_homes
+    monkeypatch.setattr(wsp, "_resolve_profile_dir", lambda name: b)
+    entered, activated = threading.Event(), threading.Event()
+    seen: dict = {}
+
+    def launch_request():
+        with wsp._config_profile_scope(None):
+            seen["before"] = get_secret("INJECTED_TOKEN")
+            entered.set()
+            assert activated.wait(10)
+            seen["after"] = get_secret("INJECTED_TOKEN")
+
+    t = threading.Thread(target=launch_request)
+    t.start()
+    assert entered.wait(10)
+    with wsp._config_profile_scope("b") as scoped:
+        assert scoped == b and get_secret("B_ONLY_TOKEN") == B_VAL
+    activated.set()
+    t.join(10)
+    assert seen == {"before": ENV_VAL, "after": ENV_VAL}
+
+
+def test_release_resets_every_scope_when_one_reset_fails(two_homes, monkeypatch):
+    from agent.secret_scope import current_secret_scope
+    from hermes_constants import get_hermes_home_override
+    from tools import terminal_scope
+
+    root, b = two_homes
+    scopes = server._profile_runtime_scope_tokens(str(b))
+    assert current_secret_scope() is not None and get_hermes_home_override() == str(b)
+
+    def exploding(_token):
+        raise RuntimeError("terminal reset blew up")
+
+    monkeypatch.setattr(terminal_scope, "reset_terminal_scope", exploding)
+    server._release_build_profile_scopes(scopes)  # suppresses the re-raised failure
+    assert current_secret_scope() is None
+    assert get_hermes_home_override() is None
+    assert Path(server._hermes_home) == root
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_none_agent_turn_guard.py ===
+"""A turn must never run against a session record whose agent is ``None``.
+
+The deferred agent build can finish WITHOUT attaching an agent: when the record is replaced or
+closed while the build runs, ``_build`` leaves early while its ``finally`` still sets
+``agent_ready``.  Such a prompt used to reach the turn body, which dereferenced
+``session["agent"]`` twice (``_invoke_agent`` and the turn's ``finally``) — the turn thread died
+with ``running`` still True, the prompt vanished and the session stayed "busy" (#111531).
+"""
+
+from __future__ import annotations
+
+import threading
+import types
+
+from tui_gateway import server
+from tui_gateway.user_messages import AGENT_BUILD_ABANDONED
+
+
+class _InlineThread:
+    """Run the turn synchronously so tests observe its final state."""
+
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+def _session(agent, **extra):
+    return {
+        "agent": agent, "agent_error": None, "session_key": "gw-session-key", "history": [],
+        "history_lock": threading.RLock(), "history_version": 0, "running": True, "attached_images": [],
+        "image_counter": 0, "cols": 80, "slash_worker": None, "show_reasoning": False,
+        "tool_progress_mode": "all", "inflight_turn": None, **extra}
+
+
+def _turn_env(monkeypatch, tmp_path) -> list:
+    emitted: list[tuple] = []
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_emit", lambda event_type, sid, payload=None: emitted.append((event_type, sid, payload)))
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    return emitted
+
+
+def test_turn_without_agent_is_refused_with_retryable_frame(monkeypatch, tmp_path):
+    """The recorded build reason reaches the client as a retryable runtime frame; ``running`` is released."""
+    emitted = _turn_env(monkeypatch, tmp_path)
+    session = _session(None, agent_error=AGENT_BUILD_ABANDONED)
+
+    assert server._run_prompt_submit("rid", "ui-sid", session, "继续") is False
+
+    frames = [p for (t, _sid, p) in emitted if t == "message.complete"]
+    assert len(frames) == 1
+    assert frames[0]["status"] == "error" and frames[0]["recoverable"] is True
+    assert frames[0]["error"] == AGENT_BUILD_ABANDONED
+    assert frames[0]["error_surface"] == {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
+    assert session["running"] is False
+    assert session["inflight_turn"]["status"] == "error"  # retained for session.resume
+
+    # Control: a built agent still runs the turn to completion and clears the interim closure.
+    agent = types.SimpleNamespace(
+        session_id="agent-sid-1", run_conversation=lambda *a, **k: {"final_response": "done"},
+        clear_interrupt=lambda: None)
+    emitted.clear()
+    server._run_prompt_submit("rid", "ui-sid", _session(agent), "go")
+    assert [p["status"] for (t, _sid, p) in emitted if t == "message.complete"] == ["complete"]
+    assert agent.interim_assistant_callback is None
+
+
+def test_replaced_record_build_records_reason_and_leaves_agent_unset(monkeypatch, tmp_path):
+    """A build whose record was swapped mid-flight sets ``agent_ready`` AND records why nothing attached."""
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_await_resume_history", lambda sid, current: False)
+
+    sid = "replaced-record"
+    session = _session(None, agent_ready=threading.Event(), cwd=str(tmp_path), profile_home=None)
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert session["agent"] is None
+    assert session["agent_ready"].is_set()
+    assert session["agent_error"] == AGENT_BUILD_ABANDONED
+

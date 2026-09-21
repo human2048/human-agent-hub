@@ -1,0 +1,319 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_missing_provider_credentials_hint.py ===
+"""The "no credentials" error for an explicit provider names a remedy that can actually work.
+
+Deriving the env var from the provider id (``f"{id.upper()}_API_KEY"``) invents names nothing reads:
+``MINIMAX-OAUTH_API_KEY`` for OAuth ids (#114405, #78996) and ``ALIBABA_API_KEY`` where the registry
+reads ``DASHSCOPE_API_KEY``. Both the auxiliary ladder and main-agent init share one helper.
+"""
+import pytest
+import yaml
+
+from agent.auxiliary_unavailable import missing_provider_credentials_message
+from hermes_cli.auth import PROVIDER_REGISTRY
+
+
+@pytest.mark.parametrize("provider, expected, forbidden", [
+    ("minimax-oauth", "hermes auth add minimax-oauth", "MINIMAX-OAUTH_API_KEY"),
+    ("alibaba", "Set the DASHSCOPE_API_KEY environment variable", "ALIBABA_API_KEY"),
+])
+def test_aux_ladder_names_registry_remedy_for_explicit_provider(tmp_path, monkeypatch, provider, expected, forbidden):
+    """Real call_llm → ladder with the compression provider pinned and no credentials anywhere."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for var in ("MINIMAX_API_KEY", "DASHSCOPE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"provider": provider, "default": "test-model"},
+        "auxiliary": {"compression": {"provider": provider, "model": "test-model"}},
+    }), encoding="utf-8")
+    from agent.auxiliary_client import call_llm
+    from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
+
+    with pytest.raises(AuxiliaryClientUnavailable) as excinfo:
+        call_llm(task="compression", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
+    assert expected in str(excinfo.value)
+    assert forbidden not in str(excinfo.value)
+
+
+def test_main_init_shares_helper_and_no_registry_provider_gets_an_invented_env_var(tmp_path, monkeypatch):
+    """agent_init raises the same text as the helper; no registry id yields a made-up ``<ID>_API_KEY``."""
+    from types import SimpleNamespace
+
+    from agent.agent_init import _routed_client_kwargs
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    agent = SimpleNamespace(provider="minimax-oauth", model="m", base_url=None, api_key=None,
+                            _fallback_activated=False, _explicit_provider="minimax-oauth")
+    with pytest.raises(RuntimeError, match=r"hermes auth add minimax-oauth"):
+        _routed_client_kwargs(agent, None, 60)
+
+    for pid, pconfig in PROVIDER_REGISTRY.items():
+        invented = f"{pid.upper()}_API_KEY"
+        message = missing_provider_credentials_message(pid)
+        if invented in message:
+            assert invented in pconfig.api_key_env_vars, (pid, message)
+        if not pconfig.api_key_env_vars:
+            assert "_API_KEY environment variable" not in message, (pid, message)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_moa_aggregator_cache_control.py ===
+"""Regression test: the MoA aggregator's one-shot synthesis call
+(``aggregate_moa_context``, used by the ``/moa <prompt>`` command) must get
+the same Anthropic-style prompt-caching decoration as the acting-aggregator
+turn (``MoAChatCompletions.create``) and the advisor fan-out
+(``_run_reference``).
+
+22c5048d9 ("fix(moa): restore prompt caching for the aggregator and
+advisors") fixed the other two MoA call paths but never touched
+``aggregate_moa_context`` — a third, independent call path with its own
+``call_llm(task="moa_aggregator", ...)`` invocation. Without this fix, every
+``/moa <prompt>`` one-shot call re-bills its full input (system-less prompt
+containing all joined reference outputs) with zero cache_control breakpoints,
+even when the resolved aggregator slot is a cache-honoring route.
+"""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+
+
+def _response(content="synthesized guidance"):
+    message = SimpleNamespace(content=content, tool_calls=[])
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None, model="fake")
+
+
+@pytest.fixture
+def captured_calls(monkeypatch):
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return _response()
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "agent.moa_loop._run_references_parallel",
+        lambda *a, **k: [("advisor-a", "advice from a", None)],
+    )
+    return calls
+
+
+def _aggregator_kwargs(calls):
+    return next(c for c in calls if c.get("task") == "moa_aggregator")
+
+
+def test_aggregator_synthesis_gets_cache_control_on_native_anthropic_route(
+    captured_calls, monkeypatch
+):
+    """A cache-honoring aggregator slot (native Anthropic) must get
+    cache_control breakpoints on its synthesis call."""
+    from agent import moa_loop
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "anthropic",
+            "model": "claude-opus-4.8",
+            "base_url": "",
+            "api_mode": "anthropic_messages",
+        },
+    )
+
+    moa_loop.aggregate_moa_context(
+        user_prompt="what should I do next?",
+        api_messages=[{"role": "user", "content": "help me plan"}],
+        reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
+        aggregator={"provider": "anthropic", "model": "claude-opus-4.8"},
+    )
+
+    agg_kwargs = _aggregator_kwargs(captured_calls)
+    synth_message = agg_kwargs["messages"][0]
+    assert synth_message["role"] == "user"
+    content = synth_message["content"]
+    # Native Anthropic layout places cache_control on inner content blocks,
+    # so a cached message's content is a list of blocks rather than a bare
+    # string once decorated.
+    assert isinstance(content, list), "expected native cache_control block layout"
+    assert any(
+        isinstance(block, dict) and "cache_control" in block for block in content
+    ), "aggregator synthesis message must carry a cache_control breakpoint"
+
+
+def test_aggregator_synthesis_untouched_on_non_caching_route(
+    captured_calls, monkeypatch
+):
+    """A non-cache-honoring aggregator slot (plain OpenAI) must not be
+    decorated — proves the guard doesn't over-fire."""
+    from agent import moa_loop
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "base_url": "",
+            "api_mode": "chat_completions",
+        },
+    )
+
+    moa_loop.aggregate_moa_context(
+        user_prompt="what should I do next?",
+        api_messages=[{"role": "user", "content": "help me plan"}],
+        reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
+        aggregator={"provider": "openai", "model": "gpt-5.5"},
+    )
+
+    agg_kwargs = _aggregator_kwargs(captured_calls)
+    synth_message = agg_kwargs["messages"][0]
+    assert isinstance(synth_message["content"], str), "must stay undecorated (plain string content)"
+
+
+def test_prepared_aggregator_plans_tools_without_decorating_prepared_state(monkeypatch):
+    from agent import moa_loop
+
+    calls = []
+    monkeypatch.setattr(moa_loop, "call_llm", lambda **kwargs: calls.append(kwargs) or _response())
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+        },
+    )
+    completions = moa_loop.MoAChatCompletions.__new__(moa_loop.MoAChatCompletions)
+    completions._pending_trace = None
+    prepared = {
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "lookup"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "lookup", "function": {"name": "lookup", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "lookup", "content": "result"},
+        ],
+        "guidance": None,
+        "aggregator": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+        "aggregator_temperature": None,
+    }
+    canonical_prepared = copy.deepcopy(prepared)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}]
+
+    completions._call_prepared_aggregator(prepared, {"tools": tools})
+
+    assert "cache_control" in calls[0]["tools"][-1]
+    assert "cache_control" not in tools[-1]
+    assert prepared == canonical_prepared
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_moa_aggregator_cost_slot.py ===
+"""Tests for MoA aggregator-slot exposure used by session cost accounting.
+
+Regression guard for the ~50% MoA cost undercount: on the MoA path the
+agent's model/provider are the virtual preset name (e.g. "closed") and "moa",
+which have no pricing entry. Session cost accounting must price the
+aggregator's acting turn at its REAL model/provider, read from the MoA
+client's ``last_aggregator_slot``. Before the fix that slot did not exist and
+the aggregator's spend (often >50% of the turn) was silently dropped, leaving
+the session cost as advisor-fan-out only.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+
+def _response(content="ok"):
+    message = SimpleNamespace(content=content, tool_calls=[])
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None, model="fake")
+
+
+@pytest.fixture
+def moa_config(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: closed
+  presets:
+    closed:
+      enabled: true
+      reference_models:
+        - provider: openrouter
+          model: anthropic/claude-opus-4.8
+        - provider: openrouter
+          model: openai/gpt-5.5
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def test_create_populates_last_aggregator_slot(moa_config, monkeypatch):
+    """After a create() turn, last_aggregator_slot carries the REAL aggregator
+    model/provider — not the virtual preset name."""
+    from agent.moa_loop import MoAChatCompletions
+
+    def fake_call_llm(**kwargs):
+        return _response("acted" if kwargs.get("task") != "moa_reference" else "advice")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+
+    facade = MoAChatCompletions("closed")
+    # Slot is unset before any turn runs.
+    assert facade.last_aggregator_slot is None
+
+    facade.create(
+        model="closed",
+        messages=[{"role": "user", "content": "clean the db"}],
+    )
+
+    slot = facade.last_aggregator_slot
+    assert slot is not None
+    # The virtual preset name / "moa" must NOT leak into the priced slot.
+    assert slot["model"] == "anthropic/claude-opus-4.8"
+    assert slot["provider"] == "openrouter"
+    assert slot["model"] != "closed"
+
+
+def test_client_exposes_last_aggregator_slot(moa_config, monkeypatch):
+    """MoAClient delegates last_aggregator_slot to its completions facade so
+    session accounting can read it without touching internals."""
+    from agent.moa_loop import MoAClient
+
+    def fake_call_llm(**kwargs):
+        return _response("acted" if kwargs.get("task") != "moa_reference" else "advice")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+
+    client = MoAClient("closed")
+    assert client.last_aggregator_slot is None
+
+    client.chat.completions.create(
+        model="closed",
+        messages=[{"role": "user", "content": "clean the db"}],
+    )
+
+    slot = client.last_aggregator_slot
+    assert slot is not None
+    assert slot["model"] == "anthropic/claude-opus-4.8"
+    assert slot["provider"] == "openrouter"
+

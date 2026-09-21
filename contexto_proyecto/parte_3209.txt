@@ -1,0 +1,281 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dashboard_auth_provider_base.py ===
+"""Contract test for DashboardAuthProvider implementations.
+
+Every provider plugin should call ``assert_protocol_compliance`` on its
+provider class in its own unit test. This module tests the abstract base
+itself: dataclass fields, ABC rejection of partial impls, and the
+protocol-compliance helper.
+"""
+from __future__ import annotations
+
+import pytest
+
+from hermes_cli.dashboard_auth.base import (
+    DashboardAuthProvider,
+    Session,
+    LoginStart,
+    assert_protocol_compliance,
+)
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
+def test_session_has_required_fields():
+    s = Session(
+        user_id="u1",
+        email="a@b.com",
+        display_name="A",
+        org_id="org_1",
+        provider="test",
+        expires_at=1234567890,
+        access_token="at",
+        refresh_token="rt",
+    )
+    assert s.user_id == "u1"
+    assert s.provider == "test"
+    assert s.expires_at == 1234567890
+
+
+
+
+# ---------------------------------------------------------------------------
+# ABC enforcement
+# ---------------------------------------------------------------------------
+
+
+
+
+class _BrokenProvider(DashboardAuthProvider):
+    name = "broken"
+    display_name = "Broken"
+    # Deliberately missing all the methods.
+
+
+class _CompliantProvider(DashboardAuthProvider):
+    name = "ok"
+    display_name = "OK"
+
+    def start_login(self, *, redirect_uri: str) -> LoginStart:
+        return LoginStart(redirect_url="x", cookie_payload={})
+
+    def complete_login(self, *, code, state, code_verifier, redirect_uri) -> Session:
+        return Session(
+            user_id="u", email="x", display_name="x", org_id="o",
+            provider=self.name, expires_at=0,
+            access_token="a", refresh_token="r",
+        )
+
+    def verify_session(self, *, access_token: str):
+        return None
+
+    def refresh_session(self, *, refresh_token: str) -> Session:
+        return Session(
+            user_id="u", email="x", display_name="x", org_id="o",
+            provider=self.name, expires_at=0,
+            access_token="a", refresh_token="r",
+        )
+
+    def revoke_session(self, *, refresh_token: str) -> None:
+        return None
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Registry (Task 1.2)
+# ---------------------------------------------------------------------------
+
+
+from hermes_cli.dashboard_auth import (  # noqa: E402  (after-imports for clarity)
+    register_provider,
+    get_provider,
+    list_providers,
+    clear_providers,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_registry():
+    """Every test starts with an empty registry and leaves it empty."""
+    clear_providers()
+    yield
+    clear_providers()
+
+
+
+
+
+
+def test_registry_lists_in_registration_order():
+    class A(_CompliantProvider):
+        name = "a"
+        display_name = "A"
+
+    class B(_CompliantProvider):
+        name = "b"
+        display_name = "B"
+
+    register_provider(A())
+    register_provider(B())
+    names = [p.name for p in list_providers()]
+    assert names == ["a", "b"]
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dashboard_auth_status_endpoint.py ===
+"""Phase 7 — /api/status exposes auth-gate state + AuthWidget integration.
+
+The dashboard's status endpoint now reports ``auth_required`` and
+``auth_providers`` so the AuthWidget + StatusPage can render the
+correct "gated / loopback" badge without a separate round trip. This
+test asserts both shapes (gated and loopback).
+
+The AuthWidget itself is .tsx — no Python test here. The widget's
+behaviour (renders nothing on 401, shows truncated user_id, etc.) is
+documented in AuthWidget.tsx; covered manually via the Phase 4.2
+smoke test against staging Portal.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from hermes_cli import web_server
+from hermes_cli.dashboard_auth import clear_providers, register_provider
+from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+
+@pytest.fixture
+def gated_client():
+    clear_providers()
+    register_provider(StubAuthProvider())
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.bound_host = "fly-app.fly.dev"
+    web_server.app.state.bound_port = 443
+    web_server.app.state.auth_required = True
+    client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    yield client
+    clear_providers()
+    web_server.app.state.bound_host = prev_host
+    web_server.app.state.bound_port = prev_port
+    web_server.app.state.auth_required = prev_required
+
+
+@pytest.fixture
+def loopback_client():
+    clear_providers()
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.bound_host = "127.0.0.1"
+    web_server.app.state.bound_port = 8080
+    web_server.app.state.auth_required = False
+    client = TestClient(web_server.app, base_url="http://127.0.0.1:8080")
+    yield client
+    web_server.app.state.bound_host = prev_host
+    web_server.app.state.bound_port = prev_port
+    web_server.app.state.auth_required = prev_required
+
+
+def test_status_reports_auth_required_in_gated_mode(gated_client):
+    # No ``_login()`` call — ``/api/status`` is in the shared
+    # ``PUBLIC_API_PATHS`` allowlist precisely so external probes (and
+    # the SPA's pre-login bootstrap) can read the gate's shape without
+    # a cookie. Hit it cold.
+    r = gated_client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["auth_required"] is True
+    assert body["auth_providers"] == ["stub"]
+
+
+
+
+# Host-local detail (absolute paths, PID, internal gateway URL) is deployment
+# recon a liveness probe never needs. ``/api/status`` bypasses dashboard auth
+# (it is in ``PUBLIC_API_PATHS``), so on a network-exposed bind it must not
+# leak that detail to anonymous callers.
+_HOST_DETAIL_FIELDS = frozenset({
+    "hermes_home", "config_path", "env_path", "gateway_pid",
+    "gateway_health_url",
+})
+
+
+def test_status_withholds_host_detail_in_gated_mode(gated_client):
+    """On a gated (non-loopback) bind, the public ``/api/status`` probe must
+    expose only the liveness + auth-gate shape — never absolute host paths,
+    the gateway PID, or the internal gateway health URL. The endpoint
+    bypasses dashboard auth, so anyone who can reach the host hits it cold."""
+    r = gated_client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+    # Liveness / auth-gate shape stays public.
+    for key in ("version", "gateway_state", "auth_required", "auth_providers"):
+        assert key in body, f"liveness field {key!r} must stay public"
+    # Deployment recon must be withheld from the anonymous public probe.
+    leaked = _HOST_DETAIL_FIELDS & set(body.keys())
+    assert not leaked, f"/api/status leaked host detail under the gate: {leaked}"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dashboard_auth_stub_provider.py ===
+"""Contract test for the StubAuthProvider used in dashboard-auth E2E tests.
+
+Phase 2 of the dashboard-OAuth plan. Validates the stub against the
+provider protocol so subsequent phases that depend on its behavior
+have a guarantee.
+"""
+from __future__ import annotations
+
+import pytest
+
+from hermes_cli.dashboard_auth.base import (
+    InvalidCodeError, RefreshExpiredError, assert_protocol_compliance,
+)
+from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+
+def _pkce_payload(ls) -> dict:
+    """Parse ``state=...;verifier=...`` out of the LoginStart cookie payload."""
+    return dict(
+        item.split("=", 1)
+        for item in ls.cookie_payload["hermes_session_pkce"].split(";")
+    )
+
+
+def test_stub_complies_with_protocol():
+    assert assert_protocol_compliance(StubAuthProvider) is None
+
+
+def test_stub_complete_login_rejects_mismatched_state():
+    p = StubAuthProvider()
+    p.start_login(redirect_uri="https://x.fly.dev/auth/callback")
+    with pytest.raises(InvalidCodeError):
+        p.complete_login(
+            code="stub_code",
+            state="WRONG",
+            code_verifier="anything",
+            redirect_uri="https://x.fly.dev/auth/callback",
+        )
+
+
+def test_stub_verify_tampered_token_returns_none():
+    p = StubAuthProvider()
+    assert p.verify_session(access_token="garbage-not-a-real-token") is None
+
+
+

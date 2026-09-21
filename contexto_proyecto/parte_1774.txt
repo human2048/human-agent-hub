@@ -1,0 +1,297 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\software-development\github\references\review-output-template.md ===
+# Review Output Template
+
+Use this as the structure for PR review summary comments. Copy and fill in the sections.
+
+## For PR Summary Comment
+
+```markdown
+## Code Review Summary
+
+**Verdict: [Approved ✅ | Changes Requested 🔴 | Reviewed 💬]** ([N] issues, [N] suggestions)
+
+**PR:** #[number] — [title]
+**Author:** @[username]
+**Files changed:** [N] (+[additions] -[deletions])
+
+### 🔴 Critical
+<!-- Issues that MUST be fixed before merge -->
+- **file.py:line** — [description]. Suggestion: [fix].
+
+### ⚠️ Warnings
+<!-- Issues that SHOULD be fixed, but not strictly blocking -->
+- **file.py:line** — [description].
+
+### 💡 Suggestions
+<!-- Non-blocking improvements, style preferences, future considerations -->
+- **file.py:line** — [description].
+
+### ✅ Looks Good
+<!-- Call out things done well — positive reinforcement -->
+- [aspect that was done well]
+
+---
+*Reviewed by Hermes Agent*
+```
+
+## Severity Guide
+
+| Level | Icon | When to use | Blocks merge? |
+|-------|------|-------------|---------------|
+| Critical | 🔴 | Security vulnerabilities, data loss risk, crashes, broken core functionality | Yes |
+| Warning | ⚠️ | Bugs in non-critical paths, missing error handling, missing tests for new code | Usually yes |
+| Suggestion | 💡 | Style improvements, refactoring ideas, performance hints, documentation gaps | No |
+| Looks Good | ✅ | Clean patterns, good test coverage, clear naming, smart design decisions | N/A |
+
+## Verdict Decision
+
+- **Approved ✅** — Zero critical/warning items. Only suggestions or all clear.
+- **Changes Requested 🔴** — Any critical or warning item exists.
+- **Reviewed 💬** — Observations only (draft PRs, uncertain findings, informational).
+
+## For Inline Comments
+
+Prefix inline comments with the severity icon so they're scannable:
+
+```
+🔴 **Critical:** User input passed directly to SQL query — use parameterized queries to prevent injection.
+```
+
+```
+⚠️ **Warning:** This error is silently swallowed. At minimum, log it.
+```
+
+```
+💡 **Suggestion:** This could be simplified with a dict comprehension:
+`{k: v for k, v in items if v is not None}`
+```
+
+```
+✅ **Nice:** Good use of context manager here — ensures cleanup on exceptions.
+```
+
+## For Local (Pre-Push) Review
+
+When reviewing locally before push, use the same structure but present it as a message to the user instead of a PR comment. Skip the PR metadata header and just start with the severity sections.
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\software-development\github\scripts\git-credential-token.py ===
+#!/usr/bin/env python3
+"""Print the first unambiguous GitHub token in a git credential-store file."""
+
+from pathlib import Path
+import re
+import sys
+from urllib.parse import unquote, urlsplit
+
+
+_TOKEN_PREFIXES = ("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_")
+_INVALID_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+def _decode(value: str | None) -> str:
+    if value is None or _INVALID_ESCAPE.search(value):
+        return ""
+    decoded = unquote(value)
+    if not decoded or any(ord(char) <= 0x1F or 0x7F <= ord(char) <= 0x9F for char in decoded):
+        return ""
+    return decoded
+
+
+def _token_from_url(line: str) -> str:
+    if "\r" in line or "\n" in line:
+        return ""
+    try:
+        credential = urlsplit(line)
+        port = credential.port
+    except ValueError:
+        return ""
+    if credential.scheme != "https" or credential.hostname != "github.com" or port not in (None, 443):
+        return ""
+
+    username = _decode(credential.username)
+    password = _decode(credential.password)
+    if not username:
+        return ""
+    if password and password != "x-oauth-basic":
+        return password
+    if password == "x-oauth-basic":
+        return username
+    return username if username.startswith(_TOKEN_PREFIXES) else ""
+
+
+def main() -> int:
+    path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path.home() / ".git-credentials"
+    try:
+        lines = path.read_bytes().split(b"\n")
+    except OSError:
+        return 1
+
+    for raw_line in lines:
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        token = _token_from_url(line)
+        if token:
+            print(token)
+            return 0
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\software-development\github\templates\bug-report.md ===
+## Bug Description
+
+<!-- Clear, concise description of the bug -->
+
+## Steps to Reproduce
+
+1.
+2.
+3.
+
+## Expected Behavior
+
+<!-- What should happen -->
+
+## Actual Behavior
+
+<!-- What actually happens -->
+
+## Environment
+
+- OS:
+- Version/Commit:
+- Python version:
+- Browser (if applicable):
+
+## Error Output
+
+<!-- Paste relevant error messages, stack traces, or logs -->
+
+```
+```
+
+## Additional Context
+
+<!-- Screenshots, related issues, workarounds discovered, etc. -->
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\software-development\github\templates\feature-request.md ===
+## Feature Description
+
+<!-- What do you want? -->
+
+## Motivation
+
+<!-- Why would this be useful? What problem does it solve? -->
+
+## Proposed Solution
+
+<!-- How could it work? Include API sketches, CLI examples, or mockups if helpful -->
+
+```
+# Example usage
+```
+
+## Alternatives Considered
+
+<!-- Other approaches and why they're less ideal -->
+
+-
+
+## Scope / Effort Estimate
+
+<!-- How big is this? What areas of the codebase would it touch? -->
+
+Small / Medium / Large — <!-- explanation -->
+
+## Additional Context
+
+<!-- Links to similar features in other tools, relevant discussions, etc. -->
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\software-development\github\templates\pr-body-bugfix.md ===
+## Bug Description
+
+<!-- What was happening? -->
+
+Fixes #
+
+## Root Cause
+
+<!-- What was causing the bug? -->
+
+## Fix
+
+<!-- What does this PR change to fix it? -->
+
+-
+
+## How to Verify
+
+<!-- Steps a reviewer can follow to confirm the fix -->
+
+1.
+2.
+3.
+
+## Test Plan
+
+- [ ] Added regression test for this bug
+- [ ] Existing tests still pass
+- [ ] Manual verification of the fix
+
+## Risk Assessment
+
+<!-- Could this fix break anything else? What's the blast radius? -->
+
+Low / Medium / High — <!-- explanation -->
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\software-development\github\templates\pr-body-feature.md ===
+## Summary
+
+<!-- 1-3 bullet points describing what this PR does -->
+
+-
+
+## Motivation
+
+<!-- Why is this change needed? Link to issue if applicable -->
+
+Closes #
+
+## Changes
+
+<!-- Detailed list of changes made -->
+
+-
+
+## Test Plan
+
+<!-- How was this tested? Checklist of verification steps -->
+
+- [ ] Unit tests pass (`pytest`)
+- [ ] Manual testing of new functionality
+- [ ] No regressions in existing behavior
+
+## Screenshots / Examples
+
+<!-- If UI changes or new output, show before/after -->
+
+## Notes for Reviewers
+
+<!-- Anything reviewers should pay special attention to -->
+

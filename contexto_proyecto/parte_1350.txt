@@ -1,0 +1,658 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\software-development\ast-grep\references\recipes.md ===
+# Recipes — copy-paste patterns by language
+
+Every pattern in this file has been verified against the canonical syntax. They are starting points; tweak metavariable names and constraints to fit your case.
+
+Use them with the helper:
+
+```bash
+ast-grep-helper search '<PATTERN>' --lang <LANG> [path]
+ast-grep-helper replace '<PATTERN>' '<REWRITE>' --lang <LANG> [path]   # dry-run
+ast-grep-helper replace '<PATTERN>' '<REWRITE>' --lang <LANG> [path] --apply
+```
+
+Or directly:
+
+```bash
+sg run -p '<PATTERN>' --lang <LANG> [path]
+sg run -p '<PATTERN>' -r '<REWRITE>' --update-all --lang <LANG> [path]
+```
+
+---
+
+## TypeScript / TSX / JavaScript
+
+### Find structural patterns
+
+```typescript
+// Every function declaration
+function $NAME($$$PARAMS) { $$$BODY }
+
+// Every async function
+async function $NAME($$$PARAMS) { $$$BODY }
+
+// Every arrow function (any param shape)
+($$$PARAMS) => $$$BODY
+
+// Every method on a class
+class $C { $$$ $METHOD($$$P) { $$$B } $$$ }
+
+// Every import statement
+import { $$$NAMES } from '$MOD'
+import $DEFAULT from '$MOD'
+import * as $NS from '$MOD'
+
+// Every console.* call
+console.$METHOD($$$ARGS)
+
+// Every JSX element of a given name
+<MyComponent $$$PROPS>$$$CHILDREN</MyComponent>
+
+// Every try/catch
+try { $$$BODY } catch ($E) { $$$HANDLER }
+
+// Every throw
+throw $EXPR
+
+// Every new expression
+new $CLASS($$$ARGS)
+
+// Every type assertion to any (anti-pattern!)
+$EXPR as any
+$EXPR as unknown as $T
+```
+
+### Common rewrites
+
+```bash
+# console.log -> logger.info
+sg run -p 'console.log($$$A)' -r 'logger.info($$$A)' --lang ts --update-all .
+
+# require -> import (one-arg case)
+sg run -p 'const $V = require($M)' -r 'import $V from $M' --lang ts --update-all .
+
+# .then(callback) -> await on the same line (use with caution; needs async function context)
+sg run -p '$P.then($CB)' -r 'const $TMP = await $P; $CB($TMP)' --lang ts --update-all .
+
+# Strip `as any`
+sg run -p '$E as any' -r '$E' --lang ts --update-all .
+
+# Rename a function call site
+sg run -p 'oldName($$$A)' -r 'newName($$$A)' --lang ts --update-all .
+```
+
+---
+
+## Python
+
+> **Reminder**: never end a Python pattern with `:`. Patterns parse as a complete statement, so `def foo($$$):` is invalid.
+
+```python
+# Every function definition
+def $FN($$$PARAMS)
+
+# Every class definition
+class $C($$$BASES)
+
+# Every decorator usage
+@$DEC
+def $FN($$$P)
+
+# Every print call (Python 3)
+print($$$ARGS)
+
+# Every f-string
+f"$STR"
+
+# Every with-statement
+with $CTX as $VAR: $$$BODY
+
+# Every try/except
+try: $$$BODY
+except $EXC: $$$HANDLER
+
+# Every list comprehension
+[$EXPR for $VAR in $ITER]
+
+# Every async def
+async def $FN($$$PARAMS)
+
+# Type hints — Optional[X]
+Optional[$T]
+
+# Type hints — X | None (PEP 604)
+$T | None
+```
+
+### Common rewrites
+
+```bash
+# print(...) -> logger.info(...)
+sg run -p 'print($$$A)' -r 'logger.info($$$A)' --lang py --update-all .
+
+# Optional[X] -> X | None
+sg run -p 'Optional[$T]' -r '$T | None' --lang py --update-all .
+
+# from typing import List -> remove (built-in list works in 3.9+)
+sg run -p 'from typing import List' -r 'from typing import List  # TODO: remove, use list' --lang py --update-all .
+```
+
+---
+
+## Go
+
+```go
+// Every function
+func $NAME($$$PARAMS) $$$RET { $$$BODY }
+
+// Every method
+func ($RECV $TYPE) $NAME($$$PARAMS) $$$RET { $$$BODY }
+
+// The classic err nil-check
+if err != nil { $$$BODY }
+
+// Every fmt.Println / fmt.Printf / fmt.Sprintf
+fmt.$METHOD($$$ARGS)
+
+// Every defer
+defer $EXPR
+
+// Every goroutine
+go $EXPR
+
+// Every channel send/recv
+$CH <- $VAL
+$VAL := <-$CH
+
+// Every type assertion
+$EXPR.($TYPE)
+```
+
+### Common rewrites
+
+```bash
+# fmt.Println -> log.Println
+sg run -p 'fmt.Println($$$A)' -r 'log.Println($$$A)' --lang go --update-all .
+
+# Add error wrapping
+sg run -p 'return $ERR' -r 'return fmt.Errorf("operation failed: %w", $ERR)' --lang go --update-all .
+```
+
+---
+
+## Rust
+
+```rust
+// Every fn
+fn $NAME($$$PARAMS) -> $RET { $$$BODY }
+fn $NAME($$$PARAMS) { $$$BODY }       // no return type
+
+// Every async fn
+async fn $NAME($$$PARAMS) -> $RET { $$$BODY }
+
+// Every method on impl
+impl $TYPE { fn $METHOD($$$P) -> $R { $$$B } }
+
+// Every trait impl
+impl $TRAIT for $TYPE { $$$ITEMS }
+
+// Every match expression
+match $EXPR { $$$ARMS }
+
+// Every Result-returning fn that uses ?
+fn $N($$$P) -> Result<$T, $E> { $$$ }
+
+// .unwrap() / .expect() (anti-patterns)
+$EXPR.unwrap()
+$EXPR.expect($MSG)
+
+// Every println!/eprintln!/format!
+println!($$$ARGS)
+format!($$$ARGS)
+```
+
+### Common rewrites
+
+```bash
+# unwrap() -> ? in Result-returning fns (caution: needs context)
+sg run -p '$E.unwrap()' -r '$E?' --lang rust --update-all .
+
+# eprintln! -> log::error!
+sg run -p 'eprintln!($$$A)' -r 'log::error!($$$A)' --lang rust --update-all .
+```
+
+---
+
+## Java
+
+```java
+// Every public class
+public class $NAME { $$$BODY }
+
+// Every method (any modifier)
+$$$MOD $RET $NAME($$$P) { $$$BODY }
+
+// Every System.out.println / System.err.println
+System.$STREAM.println($$$ARGS)
+
+// Every try-with-resources
+try ($$$RES) { $$$BODY } catch ($EXC $E) { $$$HANDLER }
+
+// Every annotation usage
+@$ANNOTATION
+$DECL
+```
+
+---
+
+## C / C++
+
+```cpp
+// Every printf-family call
+printf($$$ARGS)
+sprintf($$$ARGS)
+fprintf($$$ARGS)
+
+// Every malloc / free pair (find-only — pairing requires data flow)
+malloc($SIZE)
+free($PTR)
+
+// Every for-loop
+for ($INIT; $COND; $POST) { $$$BODY }
+
+// C++ smart pointer make
+std::make_shared<$T>($$$ARGS)
+std::make_unique<$T>($$$ARGS)
+```
+
+### Rewrites
+
+```bash
+# malloc(N * sizeof(T)) -> calloc(N, sizeof(T)) - safer
+sg run -p 'malloc($N * sizeof($T))' -r 'calloc($N, sizeof($T))' --lang c --update-all .
+```
+
+---
+
+## CSS
+
+```css
+/* Every rule with a specific property */
+{ $$$ color: $VAL; $$$ }
+
+/* Every @media query */
+@media $QUERY { $$$BODY }
+
+/* Every var() reference */
+var($NAME)
+```
+
+---
+
+## HTML
+
+```html
+<!-- Every img without alt -->
+<img $$$ />
+
+<!-- Every script tag -->
+<script $$$>$$$BODY</script>
+
+<!-- Every link to stylesheet -->
+<link rel="stylesheet" href=$URL />
+```
+
+---
+
+## Bash / Shell
+
+```bash
+# Every for-loop
+for $VAR in $$$LIST; do $$$BODY; done
+
+# Every if-statement
+if $$$COND; then $$$BODY; fi
+
+# Every function definition
+$NAME() { $$$BODY }
+
+# Every subshell call
+$( $$$CMD )
+```
+
+---
+
+## YAML rule recipes (for `sg scan`)
+
+These are full YAML rules you can drop in `rules/*.yml` and run via `sg scan`. See `references/yaml-rules.md` for the full schema.
+
+### no-console (TypeScript)
+
+```yaml
+id: no-console
+language: TypeScript
+severity: warning
+message: "Avoid console.* in production"
+rule:
+  pattern: console.$METHOD($$$ARGS)
+fix: logger.$METHOD($$$ARGS)
+```
+
+### no-as-any (TypeScript)
+
+```yaml
+id: no-as-any
+language: TypeScript
+severity: error
+message: "`as any` defeats type safety. Use a proper type."
+rule:
+  pattern: $EXPR as any
+fix: $EXPR
+```
+
+### empty-catch (JavaScript)
+
+```yaml
+id: empty-catch
+language: JavaScript
+severity: error
+message: "Empty catch swallows errors silently."
+rule:
+  all:
+    - pattern: try { $$$T } catch ($E) { $$$H }
+    - has:
+        kind: catch_clause
+        has:
+          kind: statement_block
+          not:
+            has:
+              kind: statement
+              stopBy: end
+```
+
+### print-to-logger (Python)
+
+```yaml
+id: print-to-logger
+language: Python
+severity: hint
+message: "Use logger.info instead of print"
+rule:
+  pattern: print($$$ARGS)
+fix: logger.info($$$ARGS)
+```
+
+### no-unwrap (Rust)
+
+```yaml
+id: no-unwrap
+language: Rust
+severity: warning
+message: "Avoid .unwrap() in production code; propagate or handle the error."
+rule:
+  pattern: $EXPR.unwrap()
+```
+
+---
+
+## See also
+
+- `references/patterns.md` — meta-variable rules.
+- `references/yaml-rules.md` — full YAML rule schema (atomic / relational / composite / transform / fix).
+- `references/cli.md` — `sg run`, `sg scan`, `sg test`, `sg new`.
+- Official catalog: <https://ast-grep.github.io/catalog/> (community-maintained, browse by language).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\software-development\ast-grep\references\sgconfig.md ===
+# sgconfig.yml — project configuration
+
+`sgconfig.yml` lives at your project root (the same place as `package.json`, `Cargo.toml`, `pyproject.toml`, etc.) and tells `sg scan`/`sg test` where to find rules and tests.
+
+`sg` walks **upward** from the current directory until it finds an `sgconfig.yml`. You can also pass `--config <path>` explicitly.
+
+---
+
+## Minimal project layout
+
+```
+my-project/
+├── sgconfig.yml
+├── rules/
+│   ├── no-console.yml
+│   └── no-as-any.yml
+├── utils/
+│   └── is-literal.yml
+├── tests/
+│   ├── no-console.yml
+│   └── __snapshots__/
+│       └── no-console-snapshot.yml
+└── src/
+    └── ...
+```
+
+```yaml
+# sgconfig.yml
+ruleDirs:
+  - rules
+
+testConfigs:
+  - testDir: tests
+    snapshotDir: __snapshots__
+
+utilDirs:
+  - utils
+```
+
+That's it. `sg scan src/` will load every `.yml` in `rules/`, find every `.ts`/`.py`/whatever matching the rule's `language`, and report violations.
+
+---
+
+## Full schema
+
+```yaml
+# Rule directories — required
+ruleDirs:
+  - rules
+  - team-rules
+  - vendor/sg-rules
+
+# Test directories — optional
+testConfigs:
+  - testDir: tests
+    snapshotDir: __snapshots__
+  - testDir: integration-tests
+
+# Utility rule directories — optional
+# Files here become global utilities accessible via `matches: <id>` from any rule.
+utilDirs:
+  - utils
+  - team-utils
+
+# Override file-extension -> language mapping — optional
+# Useful when your code uses non-standard extensions.
+languageGlobs:
+  html:
+    - '*.vue'
+    - '*.svelte'
+    - '*.astro'
+  json:
+    - '.eslintrc'
+    - '.prettierrc'
+  cpp:
+    - '*.c'                  # treat C as C++
+  tsx:
+    - '*.ts'                 # treat all .ts as TSX (so TSX rules work everywhere)
+
+# Custom tree-sitter languages (experimental) — optional
+customLanguages:
+  mojo:
+    libraryPath: tree-sitter-mojo.so
+    extensions: [mojo, '🔥']
+    expandoChar: _           # Replace $ in patterns when language uses $ syntactically
+    languageSymbol: tree_sitter_mojo
+
+# Language injection — embedded code in another language (experimental) — optional
+# Example: CSS inside styled-components template literals.
+languageInjections:
+  - hostLanguage: js
+    rule:
+      pattern: 'styled.$TAG`$CONTENT`'
+    injected: css
+```
+
+---
+
+## Field-by-field
+
+### `ruleDirs` (required)
+
+`Array<string>` — directories containing rule YAML files. Resolved relative to `sgconfig.yml`.
+
+Each `.yml`/`.yaml` file in these directories is loaded as a rule. One file can contain multiple rules separated by `---`.
+
+### `testConfigs`
+
+`Array<TestConfig>` where each entry has:
+
+- `testDir` (required): directory of test YAML files.
+- `snapshotDir` (optional, default `__snapshots__`): directory for snapshots.
+
+Each test file looks like:
+
+```yaml
+id: no-console
+valid:
+  - 'logger.info("hi")'
+invalid:
+  - 'console.log("hi")'
+```
+
+`sg test` runs every test, compares matches against the snapshot, and fails on diff. Snapshots are created on first run with `-U`.
+
+### `utilDirs`
+
+`Array<string>` — directories with global utility rules. Each util file must have `id` and `language`. Utils become referenceable via `matches: <id>` from any rule in the project.
+
+### `languageGlobs`
+
+`HashMap<string, Array<string>>` — override which extensions map to which language. Takes precedence over the built-in defaults.
+
+Useful for:
+
+- Custom file extensions (`.eslintrc` is JSON).
+- Force-treating `.ts` files as TSX (so JSX-shaped patterns work).
+- Vue/Svelte/Astro files (HTML host language).
+
+### `customLanguages` (experimental)
+
+Register a tree-sitter parser that ast-grep doesn't ship with. Requires:
+
+- `libraryPath`: path to a built `.so` / `.dylib` / `.dll` containing the grammar.
+- `extensions`: file extensions to recognize.
+- `languageSymbol`: the C symbol exported by the grammar (typically `tree_sitter_<name>`).
+- `expandoChar` (optional): character to substitute for `$` in patterns when the host language uses `$` syntactically (PHP, jQuery, etc.).
+
+This is **rarely needed** — ast-grep already supports 25 languages out of the box.
+
+### `languageInjections` (experimental)
+
+Match patterns inside embedded languages. Example: CSS inside JS template literals (styled-components, emotion).
+
+```yaml
+languageInjections:
+  - hostLanguage: js
+    rule:
+      pattern: 'styled.$TAG`$CONTENT`'
+    injected: css
+```
+
+After this, a `css` rule with pattern `color: $C` will match `$CONTENT` strings.
+
+---
+
+## Common configurations
+
+### Monorepo with shared rules
+
+```
+monorepo/
+├── sgconfig.yml          # root config — applies to entire monorepo
+├── shared-rules/
+│   ├── no-todo.yml
+│   └── no-as-any.yml
+└── packages/
+    ├── frontend/
+    │   ├── sgconfig.yml  # extends root with frontend-specific rules
+    │   └── rules/
+    └── backend/
+        ├── sgconfig.yml  # extends root with backend-specific rules
+        └── rules/
+```
+
+Each package's `sgconfig.yml` references both the package-local rules and the shared ones:
+
+```yaml
+# packages/frontend/sgconfig.yml
+ruleDirs:
+  - rules
+  - ../../shared-rules
+```
+
+### Single rule file (no project)
+
+For one-offs, skip `sgconfig.yml` entirely:
+
+```bash
+sg scan -r path/to/single-rule.yml src/
+```
+
+### Inline rule (no file)
+
+```bash
+sg scan --inline-rules '
+id: no-todo
+language: TypeScript
+severity: warning
+rule: { pattern: TODO }' src/
+```
+
+Multiple rules separated by `---`:
+
+```bash
+sg scan --inline-rules '
+id: no-todo
+language: TypeScript
+rule: { pattern: TODO }
+---
+id: no-fixme
+language: TypeScript
+rule: { pattern: FIXME }' src/
+```
+
+---
+
+## Editor integration
+
+VS Code / Neovim / Helix detect `sgconfig.yml` automatically and surface diagnostics from every rule. Without `sgconfig.yml`, the LSP runs without any rules loaded.
+
+To enable schema validation in your editor, add a header to each rule file:
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+id: no-console
+language: TypeScript
+rule:
+  pattern: console.log($_)
+```
+
+---
+
+## See also
+
+- `references/yaml-rules.md` — rule schema (atomic / relational / composite / transform / fix).
+- `references/cli.md` — `sg scan`, `sg test`, `sg new project`.
+- Official: <https://ast-grep.github.io/reference/sgconfig.html>, <https://ast-grep.github.io/guide/project/project-config.html>
+

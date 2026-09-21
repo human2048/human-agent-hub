@@ -1,0 +1,229 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_file_safety.py ===
+"""Tests for agent/file_safety.py read guards — env file blocking.
+
+Run with:  python -m pytest tests/agent/test_file_safety.py -v
+"""
+
+import os
+from unittest.mock import patch
+
+import pytest
+
+from agent.file_safety import (
+    _BLOCKED_PROJECT_ENV_BASENAMES,
+    get_read_block_error,
+)
+
+
+# ---------------------------------------------------------------------------
+# Project-local .env file blocking (issue #20734)
+# ---------------------------------------------------------------------------
+
+
+class TestEnvFileReadBlocking:
+    """Secret-bearing .env files must be blocked by get_read_block_error."""
+
+    @pytest.mark.parametrize("basename", [
+        ".env",
+        ".env.local",
+        ".env.development",
+        ".env.production",
+        ".env.test",
+        ".env.staging",
+        ".envrc",
+    ])
+    def test_blocked_env_basenames(self, basename):
+        """All secret-bearing .env basenames are blocked regardless of directory."""
+        path = f"/tmp/project/{basename}"
+        error = get_read_block_error(path)
+        assert error is not None, f"{basename} should be blocked"
+        assert "Access denied" in error
+        assert "secret-bearing" in error.lower() or "environment file" in error.lower()
+
+
+    @pytest.mark.parametrize("basename", [
+        ".ENV",
+        ".Env.Local",
+        ".ENV.PRODUCTION",
+        ".ENVRC",
+    ])
+    def test_blocked_env_basenames_case_insensitive(self, basename):
+        """Secret-bearing .env basenames are blocked regardless of case."""
+        error = get_read_block_error(f"/tmp/project/{basename}")
+        assert error is not None, f"{basename} should be blocked"
+        assert "Access denied" in error
+        assert "environment file" in error.lower()
+
+
+    def test_allowed_env_example(self):
+        """"The .env.example file is explicitly allowed — it's documentation, not a secret."""
+        error = get_read_block_error("/tmp/project/.env.example")
+        assert error is None
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Existing cache-file blocking (regression — must still work)
+# ---------------------------------------------------------------------------
+
+
+class TestCacheFileReadBlocking:
+    """Internal Hermes cache files must remain blocked."""
+
+    def test_hub_index_cache_blocked(self, tmp_path):
+        """Hub index-cache reads are blocked."""
+        hermes_home = tmp_path / ".hermes"
+        cache = hermes_home / "skills" / ".hub" / "index-cache" / "data.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text("{}")
+
+        with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
+            error = get_read_block_error(str(cache))
+            assert error is not None
+            assert "internal Hermes cache" in error
+
+    def test_hub_directory_blocked(self, tmp_path):
+        """Hub directory reads are blocked."""
+        hermes_home = tmp_path / ".hermes"
+        hub = hermes_home / "skills" / ".hub" / "metadata.json"
+        hub.parent.mkdir(parents=True)
+        hub.write_text("{}")
+
+        with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
+            error = get_read_block_error(str(hub))
+            assert error is not None
+
+
+# ---------------------------------------------------------------------------
+# Combined: env guard + cache guard don't interfere
+# ---------------------------------------------------------------------------
+
+
+class TestCombinedGuards:
+    """Both guards should work independently without interference."""
+
+    def test_env_guard_works_regardless_of_hermes_home(self, tmp_path):
+        """The env basename guard does not depend on HERMES_HOME resolution."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+
+        with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
+            # Regular project .env should still be blocked
+            error = get_read_block_error("/workspace/.env")
+            assert error is not None
+
+            # .env.example should still be allowed
+            error = get_read_block_error("/workspace/.env.example")
+            assert error is None
+
+    def test_cache_guard_still_works_with_env_guard(self, tmp_path):
+        """Cache file blocking still works when env guard is active."""
+        hermes_home = tmp_path / ".hermes"
+        cache = hermes_home / "skills" / ".hub" / "index-cache" / "x"
+        cache.parent.mkdir(parents=True)
+        cache.write_text("")
+
+        with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
+            error = get_read_block_error(str(cache))
+            assert error is not None
+            assert "internal Hermes cache" in error
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_file_safety_container_mirror.py ===
+"""Tests for the container-context sandbox-mirror guard (#32049 follow-up).
+
+Brian's shape-based guard (#32213) catches paths that carry the full
+``…/sandboxes/<backend>/<task>/home/.hermes/…`` prefix. This covers the
+complementary inner-container case: when file tools execute inside Docker,
+the bind-mount strips that prefix and the guard sees plain ``/root/.hermes/…``.
+The root:root ownership on the divergent SOUL.md in #32049 confirms this
+is the primary failure mode.
+"""
+from __future__ import annotations
+
+import pytest
+
+
+class TestClassifyContainerMirrorTarget:
+
+    def test_catches_soul_md_with_context(self):
+        """Primary failure mode from #32049: agent writes SOUL.md via container path."""
+        from agent.file_safety import classify_container_mirror_target
+
+        result = classify_container_mirror_target(
+            "/root/.hermes/profiles/group1/SOUL.md",
+            mirror_prefix="/root/.hermes",
+        )
+        assert result is not None
+        assert result["mirror_root"].replace("\\", "/").endswith("root/.hermes")
+        assert result["inner_path"] == "profiles/group1/SOUL.md"
+
+    @pytest.mark.parametrize("inner", [
+        "SOUL.md",
+        "memories/MEMORY.md",
+    ])
+    def test_catches_authoritative_profile_files(self, inner):
+        from agent.file_safety import classify_container_mirror_target
+
+        result = classify_container_mirror_target(
+            f"/root/.hermes/{inner}",
+            mirror_prefix="/root/.hermes",
+        )
+        assert result is not None
+        assert result["inner_path"] == inner
+
+
+
+class TestGetContainerMirrorWarning:
+    def test_warning_names_inner_path_and_bypass(self):
+        from agent.file_safety import get_container_mirror_warning
+
+        warn = get_container_mirror_warning(
+            "/root/.hermes/profiles/group1/SOUL.md",
+            mirror_prefix="/root/.hermes",
+        )
+        assert warn is not None
+        assert "profiles/group1/SOUL.md" in warn
+        assert "cross_profile=True" in warn
+
+
+class TestOrthogonality:
+    """Container-context guard catches what the shape-based guard (#32213) misses."""
+
+    def test_inner_container_path_caught_by_context_guard(self):
+        """No sandboxes/ segment — shape guard passes, context guard blocks."""
+        from agent.file_safety import classify_container_mirror_target
+
+        path = "/root/.hermes/profiles/group1/SOUL.md"
+
+        assert classify_container_mirror_target(path) is None  # no context
+        assert classify_container_mirror_target(path, mirror_prefix="/root/.hermes") is not None
+
+
+class TestFileToolIntegration:
+    """file_tools must catch the mirror path before creating DockerEnvironment."""
+
+    def test_guard_uses_current_docker_config_before_env_exists(self, monkeypatch):
+        import tools.file_tools_write_guards as file_tools
+
+        monkeypatch.setattr(
+            file_tools,
+            "_get_container_mirror_prefix_for_task",
+            lambda task_id: "/root/.hermes",
+        )
+
+        warning = file_tools._check_cross_profile_path(
+            "/root/.hermes/profiles/group1/SOUL.md",
+            task_id="new-task",
+        )
+
+        assert warning is not None
+        assert "Sandbox-mirror write blocked" in warning
+        assert "profiles/group1/SOUL.md" in warning
+

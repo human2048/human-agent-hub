@@ -1,0 +1,337 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_canonical_custom_identity.py ===
+"""``canonical_custom_identity`` must return the durable config-key identity.
+
+A keyed ``providers:`` entry's identity is its config key, not its display
+name — ``custom_provider_slug`` encodes that, and the endpoint- and
+model-based recovery sources both honour it. The configured-provider fallback
+built its slug from whatever string the caller had, so a display name that
+differs from its key healed to ``custom:<display-name>``: a second identity
+for the same endpoint that no longer matches what persistence and routing
+store.
+
+Both spellings match the entry (``_get_named_custom_provider`` accepts
+either), so the test asserts they converge on one identity rather than
+asserting any particular spelling is rejected.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_cli import runtime_provider as rp
+
+PROVIDER_KEY = "my-endpoint"
+DISPLAY_NAME = "My Endpoint Display"
+BASE_URL = "https://example.invalid/v1"
+MODEL = "cool-model-1"
+
+CANONICAL = f"custom:{PROVIDER_KEY}"
+
+
+@pytest.fixture
+def keyed_provider_config(monkeypatch):
+    """A ``providers:`` entry whose display name differs from its config key."""
+    config = {
+        "providers": {
+            PROVIDER_KEY: {
+                "name": DISPLAY_NAME,
+                "api": BASE_URL,
+                "api_key": "sk-test",
+                "default_model": MODEL,
+                "models": [MODEL],
+            }
+        }
+    }
+    monkeypatch.setattr(rp, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: config)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    return config
+
+
+def test_display_name_heals_to_the_config_key_identity(keyed_provider_config):
+    """The regression: the display-name spelling must not mint a second identity."""
+    assert rp.canonical_custom_identity(config_provider=DISPLAY_NAME) == CANONICAL
+
+
+def test_config_model_provider_display_name_heals_too(keyed_provider_config, monkeypatch):
+    """Same path reached through ``config.model.provider`` rather than an argument."""
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": DISPLAY_NAME})
+    assert rp.canonical_custom_identity() == CANONICAL
+
+
+def test_config_key_spelling_still_resolves(keyed_provider_config):
+    """The spelling that already worked keeps working."""
+    assert rp.canonical_custom_identity(config_provider=PROVIDER_KEY) == CANONICAL
+
+
+def test_all_recovery_sources_agree_on_one_identity(keyed_provider_config):
+    """Endpoint, model and configured-provider recovery must not disagree.
+
+    Three sources feeding the same session-identity slot is only safe while
+    they agree; a divergent one silently splits an endpoint in two.
+    """
+    by_url = rp.canonical_custom_identity(base_url=BASE_URL)
+    by_model = rp.canonical_custom_identity(model=MODEL)
+    by_config = rp.canonical_custom_identity(config_provider=DISPLAY_NAME)
+
+    assert {by_url, by_model, by_config} == {CANONICAL}
+
+
+def test_unconfigured_candidate_still_returns_none(keyed_provider_config):
+    """Fail-closed contract: never invent an identity resolution can't honour."""
+    assert rp.canonical_custom_identity(config_provider="not-a-configured-entry") is None
+
+
+def test_legacy_unkeyed_entry_keeps_its_name_identity(monkeypatch):
+    """``custom_providers:`` entries have no key, so the name stays the identity."""
+    config = {
+        "custom_providers": [
+            {
+                "name": "Legacy Endpoint",
+                "base_url": "https://legacy.invalid/v1",
+                "api_key": "sk-legacy",
+                "models": ["legacy-model"],
+            }
+        ]
+    }
+    monkeypatch.setattr(rp, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: config)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+
+    assert rp.canonical_custom_identity(config_provider="Legacy Endpoint") == "custom:legacy-endpoint"
+
+
+class TestIsRoutableProvider:
+    """``is_routable_provider`` gates session-resume fallback: a persisted
+    provider name that no longer resolves (renamed/removed) must be detected
+    so recovery falls back instead of failing agent init with
+    "Unknown provider '<name>'".
+    """
+
+    def test_empty_auto_and_builtin_are_routable(self, keyed_provider_config):
+        assert rp.is_routable_provider(None) is True
+        assert rp.is_routable_provider("") is True
+        assert rp.is_routable_provider("auto") is True
+        assert rp.is_routable_provider("openrouter") is True
+
+    def test_bare_custom_is_not_routable(self, keyed_provider_config):
+        # The resolved billing class, not a routable identity — restore
+        # paths must heal it (canonical_custom_identity) or fall back.
+        assert rp.is_routable_provider("custom") is False
+
+    def test_registered_names_are_routable(self, keyed_provider_config):
+        assert rp.is_routable_provider(PROVIDER_KEY) is True
+        assert rp.is_routable_provider(CANONICAL) is True
+
+    def test_stale_name_is_not_routable(self, keyed_provider_config):
+        # Same endpoint family, but the OLD slug no longer matches any
+        # configured entry — the regression this gate exists for.
+        assert rp.is_routable_provider("stale-endpoint") is False
+        assert rp.is_routable_provider("custom:stale-endpoint") is False
+
+    def test_legacy_unkeyed_name_is_routable(self, monkeypatch):
+        config = {
+            "custom_providers": [
+                {
+                    "name": "Legacy Endpoint",
+                    "base_url": "https://legacy.invalid/v1",
+                    "api_key": "sk-legacy",
+                    "models": ["legacy-model"],
+                }
+            ]
+        }
+        monkeypatch.setattr(rp, "load_config", lambda *a, **k: config)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: config)
+        monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+
+        assert rp.is_routable_provider("legacy-endpoint") is True
+        assert rp.is_routable_provider("custom:legacy-endpoint") is True
+        assert rp.is_routable_provider("Legacy Endpoint") is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_catalog_json.py ===
+"""The pulled catalog: packaged JSON is the offline truth, a GitHub fetch
+swaps entries in memory only, and min_engine gates day-0 models.
+
+Nothing here touches disk beyond the packaged file — the design constraint
+is that a git checkout must never see a dirty tracked catalog.json."""
+
+from __future__ import annotations
+
+import dataclasses
+import io
+import json
+import urllib.request
+
+import pytest
+
+import hermes_cli.local_runtime.catalog as cat
+
+
+@pytest.fixture(autouse=True)
+def _reset_refresh_state(monkeypatch):
+    """Each test starts outside the TTL window with the packaged catalog."""
+    monkeypatch.setattr(cat, "_last_refresh_attempt", 0.0)
+    packaged = cat._packaged_catalog()
+    monkeypatch.setattr(cat, "CATALOG", packaged)
+    yield
+
+
+def _doc_from(entries):
+    """A fetchable catalog document built by mutating the packaged JSON."""
+    from importlib.resources import files
+
+    doc = json.loads(files("hermes_cli.local_runtime")
+                     .joinpath("catalog.json").read_text(encoding="utf-8"))
+    doc["models"] = entries(doc["models"])
+    return doc
+
+
+def _fetch_returns(monkeypatch, doc):
+    body = json.dumps(doc).encode()
+
+    class R(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: R(body))
+
+
+def test_packaged_json_round_trips_the_catalog():
+    """The packaged JSON must produce a complete, selection-ready catalog:
+    every entry carries estimator inputs and at least one variant, and the
+    known invariants (best-first ordering, Q4 floor) hold — the same
+    contract the literals obeyed."""
+    assert len(cat.CATALOG) >= 4
+    for e in cat.CATALOG:
+        assert e.variants and e.n_ctx_train > 0 and e.per_layer_f16 >= 0
+        sizes = [v.size_bytes for v in e.variants]
+        assert sizes == sorted(sizes, reverse=True), f"{e.id} not best-first"
+
+
+def test_refresh_swaps_in_memory_only(monkeypatch, tmp_path):
+    """A fetched catalog replaces CATALOG in memory; the packaged file on
+    disk is untouched (checkout stays clean)."""
+    from importlib.resources import files
+
+    packaged_path = files("hermes_cli.local_runtime").joinpath("catalog.json")
+    before = packaged_path.read_text(encoding="utf-8")
+
+    def add_day0(models):
+        day0 = dict(models[0])
+        day0.update(id="day0-model", display_name="Day 0",
+                    description="new", min_engine="b99999")
+        return models + [day0]
+
+    _fetch_returns(monkeypatch, _doc_from(add_day0))
+    assert cat.refresh_catalog(force=True) is True
+    assert "day0-model" in {e.id for e in cat.CATALOG}
+    assert cat.catalog_by_id()["day0-model"].min_engine == "b99999"
+    assert packaged_path.read_text(encoding="utf-8") == before
+
+
+def test_refresh_failure_keeps_current_catalog(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("offline")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    ids_before = [e.id for e in cat.CATALOG]
+    assert cat.refresh_catalog(force=True) is False
+    assert [e.id for e in cat.CATALOG] == ids_before
+
+
+def test_refresh_rejects_wrong_schema(monkeypatch):
+    doc = _doc_from(lambda m: m)
+    doc["schema_version"] = 2
+    _fetch_returns(monkeypatch, doc)
+    ids_before = [e.id for e in cat.CATALOG]
+    assert cat.refresh_catalog(force=True) is False
+    assert [e.id for e in cat.CATALOG] == ids_before
+
+
+def test_loader_ignores_unknown_fields():
+    doc = _doc_from(lambda m: m)
+    doc["models"][0]["future_field"] = {"anything": True}
+    entries = cat._load_catalog(doc)
+    assert entries[0].id == doc["models"][0]["id"]
+
+
+def test_min_engine_gate(monkeypatch):
+    from hermes_cli.web_routers.local_models import _engine_too_old
+
+    monkeypatch.setattr("hermes_cli.local_runtime.binaries.installed_tags",
+                        lambda: ["b10362"])
+    assert _engine_too_old("") is False, "no requirement, no gate"
+    assert _engine_too_old("b10000") is False, "installed engine suffices"
+    assert _engine_too_old("b10363") is True, "newer requirement gates"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_catalog_reachability.py ===
+"""Catalog reachability: every entry's repo and files must exist upstream.
+
+Existence is the contract; SIZES are advisory (they feed the estimator and
+progress bars, and downloads deliberately tolerate a stale size when
+upstream re-uploads — completeness is judged against the server's own
+declared length, never the catalog). Size drift prints as a warning so a
+catalog refresh can be batched deliberately; only a MISSING file or repo
+fails.
+
+Network-marked (skipped in hermetic CI unless explicitly enabled) — this is
+the test that catches wrong repo names (the Nemotron 401) and moved files.
+Run before any catalog commit:
+
+    HERMES_TEST_NETWORK=1 scripts/run_tests.sh tests/hermes_cli/test_catalog_reachability.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import urllib.request
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("HERMES_TEST_NETWORK"),
+    reason="network test; set HERMES_TEST_NETWORK=1 to run",
+)
+
+
+def test_every_catalog_file_resolves():
+    from hermes_cli.local_runtime.catalog import CATALOG
+
+    problems = []
+    drift = []
+    for entry in CATALOG:
+        url = f"https://huggingface.co/api/models/{entry.repo}/tree/main?recursive=true"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                files = {f["path"]: f.get("size") for f in json.load(r)}
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{entry.id}: repo {entry.repo} unreachable ({exc})")
+            continue
+        for variant in entry.variants:
+            for asset in entry.download_files(variant):
+                if asset.path not in files:
+                    problems.append(
+                        f"{entry.id}/{variant.quant}: {asset.path} not in {entry.repo}")
+                    continue
+                live_size = files[asset.path]
+                if live_size and live_size != asset.size_bytes:
+                    drift.append(
+                        f"{entry.id}/{variant.quant}: size drift on {asset.path} — "
+                        f"catalog {asset.size_bytes} vs live {live_size}")
+    if drift:
+        print("\nADVISORY size drift (downloads tolerate this; refresh when convenient):")
+        print("\n".join(drift))
+    assert not problems, "\n".join(problems)
+
+

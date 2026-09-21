@@ -1,0 +1,321 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subcommands_batch.py ===
+"""Smoke tests for the batch-extracted subcommand parser builders.
+
+Each ``build_<group>_parser`` should attach its subcommand to a subparsers
+group and wire ``func`` to the injected handler. These are intentionally
+light — the byte-identical ``--help`` verification done at extraction time is
+the real behavioral guarantee; this just guards against a module failing to
+import or a builder raising.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import pytest
+
+from hermes_cli.subcommands.auth import build_auth_parser
+from hermes_cli.subcommands.backup import build_backup_parser
+from hermes_cli.subcommands.config import build_config_parser
+from hermes_cli.subcommands.dashboard import build_dashboard_parser
+from hermes_cli.subcommands.debug import build_debug_parser
+from hermes_cli.subcommands.doctor import build_doctor_parser
+from hermes_cli.subcommands.dump import build_dump_parser
+from hermes_cli.subcommands.gui import build_gui_parser
+from hermes_cli.subcommands.hooks import build_hooks_parser
+from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
+from hermes_cli.subcommands.login import build_login_parser
+from hermes_cli.subcommands.logout import build_logout_parser
+from hermes_cli.subcommands.logs import build_logs_parser
+from hermes_cli.subcommands.model import build_model_parser
+
+from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
+from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.setup import build_setup_parser
+from hermes_cli.subcommands.slack import build_slack_parser
+from hermes_cli.subcommands.status import build_status_parser
+from hermes_cli.subcommands.uninstall import build_uninstall_parser
+from hermes_cli.subcommands.update import build_update_parser
+from hermes_cli.subcommands.webhook import build_webhook_parser
+from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
+
+
+def _h(name):
+    def handler(args):  # pragma: no cover - identity only
+        return name
+    handler.__name__ = f"cmd_{name}"
+    return handler
+
+
+# (subcommand_name, builder, handler_kwargs, sample_argv)
+SINGLE_HANDLER_CASES = [
+    ("model", build_model_parser, "cmd_model", ["model"]),
+    ("setup", build_setup_parser, "cmd_setup", ["setup"]),
+
+    ("whatsapp", build_whatsapp_parser, "cmd_whatsapp", ["whatsapp"]),
+    ("slack", build_slack_parser, "cmd_slack", ["slack"]),
+    ("login", build_login_parser, "cmd_login", ["login"]),
+    ("logout", build_logout_parser, "cmd_logout", ["logout"]),
+    ("auth", build_auth_parser, "cmd_auth", ["auth"]),
+    ("status", build_status_parser, "cmd_status", ["status"]),
+    ("webhook", build_webhook_parser, "cmd_webhook", ["webhook"]),
+    ("hooks", build_hooks_parser, "cmd_hooks", ["hooks"]),
+    ("doctor", build_doctor_parser, "cmd_doctor", ["doctor"]),
+    ("security", build_security_parser, "cmd_security", ["security"]),
+    ("dump", build_dump_parser, "cmd_dump", ["dump"]),
+    ("debug", build_debug_parser, "cmd_debug", ["debug"]),
+    ("backup", build_backup_parser, "cmd_backup", ["backup"]),
+    ("import", build_import_cmd_parser, "cmd_import", ["import", "/tmp/x.zip"]),
+    ("config", build_config_parser, "cmd_config", ["config"]),
+    ("update", build_update_parser, "cmd_update", ["update"]),
+    ("uninstall", build_uninstall_parser, "cmd_uninstall", ["uninstall"]),
+    ("gui", build_gui_parser, "cmd_gui", ["gui"]),
+    ("logs", build_logs_parser, "cmd_logs", ["logs"]),
+    ("prompt-size", build_prompt_size_parser, "cmd_prompt_size", ["prompt-size"]),
+]
+
+
+
+
+def test_config_get_unset_subcommands_parse():
+    """`hermes config get/unset` parse key args (and --json for get)."""
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    handler = _h("config")
+    build_config_parser(sub, cmd_config=handler)
+
+    ns = parser.parse_args(["config", "get", "terminal.backend", "--json"])
+    assert ns.func is handler
+    assert ns.config_command == "get"
+    assert ns.key == "terminal.backend"
+    assert ns.json is True
+
+    ns = parser.parse_args(["config", "unset", "terminal.backend"])
+    assert ns.func is handler
+    assert ns.config_command == "unset"
+    assert ns.key == "terminal.backend"
+
+
+
+
+# ── deprecated `hermes login` fails gracefully, not with argparse error ────
+#
+# `hermes login` is a removed command; its handler (`login_command` in
+# `hermes_cli/auth.py`) prints a deprecation notice pointing at `hermes auth` /
+# `hermes model` and exits 0.  Two behavior contracts guard the UX:
+#   1. ANY `--provider <value>` (including ones the user actually wants, like
+#      `anthropic`) must parse and reach the handler — never crash in argparse
+#      with `invalid choice` before the friendly redirect is printed (#24756).
+#   2. The subcommand must not advertise itself in the parser help row.
+
+
+def _login_parser():
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_login_parser(sub, cmd_login=_h("login"))
+    return parser
+
+
+
+
+def test_login_subparser_help_is_suppressed():
+    """The deprecated `login` row must not appear in `hermes --help`.
+
+    Must hold without leaking argparse's literal `==SUPPRESS==` placeholder,
+    which `help=argparse.SUPPRESS` emits for a top-level subparser on 3.12+.
+    The fix omits the `help=` kwarg entirely instead.
+    """
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_login_parser(sub, cmd_login=_h("login"))
+    help_text = parser.format_help()
+    # The misleading old help string must be gone from the top-level usage.
+    assert "Authenticate with an inference provider" not in help_text
+    # And no leaked SUPPRESS placeholder row.
+    assert "==SUPPRESS==" not in help_text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subcommands_final_batch.py ===
+"""Smoke tests for the final batch of subcommand builders extracted from main().
+
+These groups either imported their handler from a sibling module inside the
+parser block (moa, fallback, migrate, bundles, checkpoints, curator, pets,
+journey, secrets, egress) or carried a closure handler that only closed over
+its own parser (worktree, browser, computer-use, sessions, completion). The
+closures moved verbatim into the builder; sessions/completion take the handler
+by injection.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import pytest
+
+from hermes_cli.subcommands.browser import build_browser_parser
+from hermes_cli.subcommands.bundles import build_bundles_parser
+from hermes_cli.subcommands.checkpoints import build_checkpoints_parser
+from hermes_cli.subcommands.completion import build_completion_parser
+from hermes_cli.subcommands.computer_use import build_computer_use_parser
+from hermes_cli.subcommands.curator import build_curator_parser
+from hermes_cli.subcommands.egress import build_egress_parser
+from hermes_cli.subcommands.fallback import build_fallback_parser
+from hermes_cli.subcommands.journey import build_journey_parser
+from hermes_cli.subcommands.migrate import build_migrate_parser
+from hermes_cli.subcommands.moa import build_moa_parser
+from hermes_cli.subcommands.pets import build_pets_parser
+from hermes_cli.subcommands.secrets import build_secrets_parser
+from hermes_cli.subcommands.sessions import build_sessions_parser
+from hermes_cli.subcommands.whatsapp import build_whatsapp_cloud_parser
+from hermes_cli.subcommands.worktree import build_worktree_parser
+
+
+def _tree():
+    parser = argparse.ArgumentParser(prog="hermes")
+    return parser, parser.add_subparsers(dest="command")
+
+
+SELF_CONTAINED = [
+    ("moa", build_moa_parser, ["moa", "list"]),
+    ("fallback", build_fallback_parser, ["fallback", "add"]),
+    ("worktree", build_worktree_parser, ["worktree", "prune", "--dry-run"]),
+    ("browser", build_browser_parser, ["browser", "close-profile"]),
+    ("secrets", build_secrets_parser, ["secrets"]),
+    ("egress", build_egress_parser, ["egress"]),
+    ("migrate", build_migrate_parser, ["migrate", "xai", "--apply"]),
+    ("checkpoints", build_checkpoints_parser, ["checkpoints"]),
+    ("bundles", build_bundles_parser, ["bundles"]),
+    ("curator", build_curator_parser, ["curator"]),
+    ("pets", build_pets_parser, ["pets"]),
+    ("journey", build_journey_parser, ["journey"]),
+    ("computer-use", build_computer_use_parser, ["computer-use", "status"]),
+]
+
+
+@pytest.mark.parametrize("name,builder,argv", SELF_CONTAINED, ids=[c[0] for c in SELF_CONTAINED])
+def test_self_contained_builders_attach(name, builder, argv):
+    parser, sub = _tree()
+    builder(sub)
+    ns = parser.parse_args(argv)
+    assert ns.command == name
+    assert callable(getattr(ns, "func", None)) or name in ("checkpoints", "curator", "pets", "journey")
+
+
+def test_worktree_aliases_normalize_to_list(monkeypatch):
+    parser, sub = _tree()
+    build_worktree_parser(sub)
+    seen = {}
+    monkeypatch.setattr("hermes_cli.worktree_cmd.cmd_worktree", lambda a: seen.setdefault("action", a.worktree_action))
+    ns = parser.parse_args(["worktree", "audit"])
+    ns.func(ns)
+    assert seen["action"] == "list"
+
+
+def test_sessions_injects_handler_and_threads_parser():
+    parser, sub = _tree()
+    calls = []
+    build_sessions_parser(sub, cmd_sessions=lambda a, **kw: calls.append((a, kw)) or 0)
+    ns = parser.parse_args(["sessions", "prune", "--older-than", "2d", "--dry-run"])
+    assert ns.sessions_action == "prune" and ns.older_than == "2d" and ns.dry_run is True
+    assert ns.func(ns) == 0
+    (a, kw), = calls
+    assert a is ns
+    assert kw["sessions_parser"].prog.endswith("sessions")
+
+
+def test_completion_passes_top_level_parser():
+    parser, sub = _tree()
+    got = {}
+    build_completion_parser(sub, cmd_completion=lambda a, p: got.update(a=a, p=p), parser=parser)
+    ns = parser.parse_args(["completion", "zsh"])
+    ns.func(ns)
+    assert got["p"] is parser and got["a"].shell == "zsh"
+
+
+def test_whatsapp_cloud_dispatch():
+    parser, sub = _tree()
+    h = lambda a: "wa"  # noqa: E731
+    build_whatsapp_cloud_parser(sub, cmd_whatsapp_cloud=h)
+    assert parser.parse_args(["whatsapp-cloud"]).func is h
+
+
+def test_computer_use_no_action_prints_help(capsys):
+    parser, sub = _tree()
+    build_computer_use_parser(sub)
+    ns = parser.parse_args(["computer-use"])
+    ns.func(ns)
+    assert "install" in capsys.readouterr().out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subcommands_followup.py ===
+"""Smoke tests for the Phase 2 follow-up subcommand builders (promoted handlers).
+
+These 9 subcommands had their handler defined as a closure inside main(); the
+handler was promoted to top-level and the parser block extracted into a builder.
+Confirms each builder attaches its subcommand and wires func to the injected
+handler.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import pytest
+
+from hermes_cli.subcommands.acp import build_acp_parser
+from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.mcp import build_mcp_parser
+from hermes_cli.subcommands.memory import build_memory_parser
+from hermes_cli.subcommands.pairing import build_pairing_parser
+from hermes_cli.subcommands.plugins import build_plugins_parser
+from hermes_cli.subcommands.skills import build_skills_parser
+from hermes_cli.subcommands.tools import build_tools_parser
+
+
+def _h(name):
+    def handler(args):  # pragma: no cover - identity only
+        return name
+    handler.__name__ = f"cmd_{name}"
+    return handler
+
+
+# (subcommand, builder, handler_kwarg, sample argv that should dispatch to func)
+CASES = [
+    ("memory", build_memory_parser, "cmd_memory", ["memory"]),
+    ("acp", build_acp_parser, "cmd_acp", ["acp"]),
+    ("tools", build_tools_parser, "cmd_tools", ["tools"]),
+    ("insights", build_insights_parser, "cmd_insights", ["insights"]),
+    ("skills", build_skills_parser, "cmd_skills", ["skills"]),
+    ("pairing", build_pairing_parser, "cmd_pairing", ["pairing"]),
+    ("plugins", build_plugins_parser, "cmd_plugins", ["plugins"]),
+    ("mcp", build_mcp_parser, "cmd_mcp", ["mcp"]),
+    ("claw", build_claw_parser, "cmd_claw", ["claw"]),
+]
+
+
+@pytest.mark.parametrize("name,builder,kw,argv", CASES, ids=[c[0] for c in CASES])
+def test_followup_builders_dispatch(name, builder, kw, argv):
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    handler = _h(name)
+    builder(sub, **{kw: handler})
+    ns = parser.parse_args(argv)
+    assert ns.command == name
+    assert ns.func is handler
+
+
+def test_mcp_and_acp_accept_hooks_flag():
+    # mcp/acp parser blocks use the shared add_accept_hooks_flag helper.
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_mcp_parser(sub, cmd_mcp=_h("mcp"))
+    build_acp_parser(sub, cmd_acp=_h("acp"))
+    # acp takes --accept-hooks at top level
+    ns = parser.parse_args(["acp", "--accept-hooks"])
+    assert ns.accept_hooks is True
+

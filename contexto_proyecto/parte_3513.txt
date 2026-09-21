@@ -1,0 +1,310 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_resume_quiet_stderr.py ===
+"""Tests for /resume status lines going to stderr in quiet mode (#11793).
+
+The fix in cli._init_agent routes three messages to stderr when
+``tool_progress_mode == "off"`` (set by ``hermes chat --quiet``):
+
+  * "Session not found: ..."
+  * "↻ Resumed session ... (N user messages, M total messages)"
+  * "Session ... found but has no messages. Starting fresh."
+
+Interactive mode (tool_progress_mode == "full") still uses ChatConsole.
+"""
+
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+
+from cli import HermesCLI
+
+
+def _make_cli(quiet=False, session_id="20260524_111111_xyz", db=None):
+    """Build a minimal HermesCLI bound to only what _init_agent needs for
+    the resume code path: _resumed, _session_db, conversation_history,
+    session_id, and tool_progress_mode."""
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = session_id
+    cli._resumed = True
+    cli.conversation_history = []
+    cli._session_db = db
+    cli.tool_progress_mode = "off" if quiet else "full"
+    cli.session_start = datetime.now()
+    cli.agent = None
+    # We need _init_agent to reach the resume block (line ~4757) but not
+    # proceed into actual AIAgent construction. _ensure_runtime_credentials
+    # must return True (False returns early at line 4743). _install_tool_callbacks,
+    # _ensure_tirith_security are stubbed; the resume block will either return
+    # False (session-not-found) or reach the eventual AIAgent() call which
+    # we'll let raise — we only check stdout/stderr printed BEFORE that.
+    cli._install_tool_callbacks = lambda: None
+    cli._ensure_tirith_security = lambda: None
+    cli._ensure_runtime_credentials = lambda: True
+    return cli
+
+
+class TestResumeQuietStderr:
+    def test_session_not_found_goes_to_stderr_in_quiet_mode(self, capsys):
+        db = MagicMock()
+        db.get_session.return_value = None
+        cli = _make_cli(quiet=True, db=db)
+
+        with patch("cli._prepare_deferred_agent_startup"):
+            result = cli._init_agent()
+
+        captured = capsys.readouterr()
+        assert result is False
+        # stdout must stay clean
+        assert "Session not found" not in captured.out
+        # the resume status goes to stderr
+        assert "Session not found" in captured.err
+        assert "hermes sessions list" in captured.err
+
+    def test_session_not_found_goes_to_stdout_in_full_mode(self, capsys):
+        db = MagicMock()
+        db.get_session.return_value = None
+        cli = _make_cli(quiet=False, db=db)
+
+        with patch("cli._prepare_deferred_agent_startup"):
+            result = cli._init_agent()
+
+        captured = capsys.readouterr()
+        assert result is False
+        # Interactive mode keeps the existing _cprint path → stdout.
+        assert "Session not found" in captured.out
+
+    def test_resumed_banner_goes_to_stderr_in_quiet_mode(self, capsys):
+        db = MagicMock()
+        db.get_session.return_value = {"id": "20260524_111111_xyz", "title": "demo"}
+        db.resolve_resume_session_id.return_value = "20260524_111111_xyz"
+        db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hey"},
+        ]
+        db._conn = MagicMock()  # for the reopen execute() call
+
+        cli = _make_cli(quiet=True, db=db)
+        # Stop _init_agent right after the resume banner: prevent it from
+        # constructing a real AIAgent (the next code path).
+        with patch("cli._prepare_deferred_agent_startup"):
+            try:
+                cli._init_agent()
+            except Exception:
+                # The post-resume agent-init machinery may fail in this
+                # stubbed context (no API key, no real config) — we only
+                # care about the printed banner that comes earlier.
+                pass
+
+        captured = capsys.readouterr()
+        # Banner on stderr — stdout stays clean for automation.
+        assert "↻ Resumed session" not in captured.out
+        assert "↻ Resumed session" in captured.err
+        assert "20260524_111111_xyz" in captured.err
+        assert "demo" in captured.err
+
+    def test_no_messages_goes_to_stderr_in_quiet_mode(self, capsys):
+        db = MagicMock()
+        db.get_session.return_value = {"id": "20260524_111111_xyz"}
+        db.resolve_resume_session_id.return_value = "20260524_111111_xyz"
+        db.get_messages_as_conversation.return_value = []
+        db._conn = MagicMock()
+
+        cli = _make_cli(quiet=True, db=db)
+        with patch("cli._prepare_deferred_agent_startup"):
+            try:
+                cli._init_agent()
+            except Exception:
+                pass
+
+        captured = capsys.readouterr()
+        assert "has no messages" not in captured.out
+        assert "has no messages" in captured.err
+        assert "Starting fresh" in captured.err
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_retirement_atomicity.py ===
+"""Freeze admission before consulting ledgers, without holding a lock across their locks."""
+
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+
+def test_prepare_freezes_admission_without_blocking_other_work_locks(monkeypatch):
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_cli import web_server_idle_proof
+
+    fence = RetirementFence()
+    probing, release, attempted = (threading.Event() for _ in range(3))
+
+    def probe():
+        probing.set()
+        assert release.wait(10)
+        return {"idle": None}
+
+    def admit():
+        with fence.work() as admitted:
+            attempted.set()
+            return admitted
+
+    monkeypatch.setattr(web_server_idle_proof, "idle_proof", probe)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        preparing = pool.submit(fence.prepare)
+        try:
+            assert probing.wait(10)
+            arriving = pool.submit(admit)
+            assert attempted.wait(3), "admission must not wait on a ledger lock held by its own caller"
+            assert arriving.result(10) is False
+        finally:
+            release.set()
+        assert preparing.result(10) == {"ok": False, "idle": None}
+    with fence.work() as admitted:
+        assert admitted  # unreadable/busy probe did not leave a fence behind
+
+
+def test_probe_failure_refuses_the_permit_without_wedging_admission(monkeypatch):
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_cli import web_server_idle_proof
+
+    def broken_probe():
+        raise OSError("ledger unavailable")
+
+    fence = RetirementFence()
+    monkeypatch.setattr(web_server_idle_proof, "idle_proof", broken_probe)
+    assert fence.prepare() == {"ok": False, "idle": None}
+    with fence.work() as admitted:
+        assert admitted
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_router_provider.py ===
+"""Behavior contracts for the Ramp Router (api.router.com) provider.
+
+Router is Responses-native: the host implements GET /v1/models and
+POST /v1/responses, and /v1/chat/completions is only a minimal
+compatibility shim translated onto Responses.
+These tests pin the host mandate, the runtime URL detection that mirrors
+it, and the profile/auth registry wiring — same contract suite shape as
+tests/hermes_cli/test_meta_prompt_cache.py.
+"""
+
+import pytest
+
+from hermes_cli.providers import determine_api_mode, host_mandated_api_mode
+from hermes_cli import runtime_provider as rp
+
+
+class TestHostMandatedRouterResponses:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.router.com/v1",
+            "https://api.router.com/v1/",
+            "https://api.router.com/v1/chat/completions",
+            "https://API.ROUTER.COM/v1",
+            "https://api.router.com",
+            "https://api.router.com:443/v1",
+            "https://attacker.test@api.router.com/v1",
+        ],
+    )
+    def test_host_mandated_router_returns_codex_responses(self, url):
+        assert host_mandated_api_mode(url) == "codex_responses"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.router.com.attacker.test/v1",
+            "https://proxy.test/api.router.com/v1",
+            "https://api.router.com.evil/v1",
+            "https://router.com/v1",
+            "https://www.router.com/v1",
+            "https://app.router.com/v1",
+            "https://docs.router.com/v1",
+            "https://generic.example.com/v1",
+            "",
+        ],
+    )
+    def test_host_mandated_router_rejects_spoofs(self, url):
+        assert host_mandated_api_mode(url) != "codex_responses"
+        # Generic/unrelated hosts must stay None (contract: no clobber of an
+        # explicitly configured api_mode on endpoints we don't recognize).
+        if url in (
+            "https://api.router.com.attacker.test/v1",
+            "https://proxy.test/api.router.com/v1",
+            "https://generic.example.com/v1",
+            "https://app.router.com/v1",
+            "https://docs.router.com/v1",
+            "",
+        ):
+            assert host_mandated_api_mode(url) is None
+
+    def test_determine_api_mode_router_via_named_custom(self):
+        assert determine_api_mode("router", "https://api.router.com/v1") == "codex_responses"
+        assert determine_api_mode("custom", "https://api.router.com/v1") == "codex_responses"
+
+    def test_runtime_detect_router(self):
+        assert rp._detect_api_mode_for_url("https://api.router.com/v1") == "codex_responses"
+        assert rp._detect_api_mode_for_url("https://api.router.com/v1/chat/completions") == "codex_responses"
+        assert rp._detect_api_mode_for_url("https://API.ROUTER.COM/v1") == "codex_responses"
+
+    def test_runtime_detect_router_rejects_spoofs(self):
+        assert rp._detect_api_mode_for_url("https://api.router.com.attacker.test/v1") is None
+        assert rp._detect_api_mode_for_url("https://proxy.test/api.router.com/v1") is None
+        assert rp._detect_api_mode_for_url("https://router.com/v1") is None
+        assert rp._detect_api_mode_for_url("https://app.router.com/v1") is None
+
+    def test_fallback_api_mode_router(self):
+        assert rp._fallback_api_mode("router", "https://api.router.com/v1", "gpt-5.4-mini") == "codex_responses"
+        assert rp._fallback_api_mode("custom", "https://api.router.com/v1", "gpt-5.4-mini") == "codex_responses"
+        # generic endpoints stay chat_completions
+        assert rp._fallback_api_mode("custom", "https://generic.example.com/v1", "gpt-5.4-mini") == "chat_completions"
+
+
+class TestRouterProfileRegistration:
+    def test_profile_registered_with_responses_mode(self):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("router")
+        assert profile is not None
+        assert profile.api_mode == "codex_responses"
+        assert profile.auth_type == "api_key"
+        assert profile.base_url.startswith("https://api.router.com")
+
+    def test_profile_aliases_resolve(self):
+        from providers import get_provider_profile
+
+        canonical = get_provider_profile("router")
+        for alias in ("ramp-router", "ramp", "router.com"):
+            assert get_provider_profile(alias) is canonical, alias
+
+    def test_documented_env_var_is_primary(self):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("router")
+        # RAMP_ROUTER_API_KEY is the variable Router's docs tell users to
+        # set; it must stay first so key resolution prefers it.
+        assert profile.env_vars[0] == "RAMP_ROUTER_API_KEY"
+
+    def test_no_hardcoded_fallback_models(self):
+        # Router model IDs are account-scoped (BYOK accounts see extra
+        # entries) and the vendor docs say to read the catalog at runtime —
+        # an offline fallback list would advertise IDs a key may not have.
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("router")
+        assert profile.fallback_models == ()
+
+    def test_auth_registry_autowired(self):
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        config = PROVIDER_REGISTRY.get("router")
+        assert config is not None
+        assert config.auth_type == "api_key"
+        # Key vars must not contain the base-url override var, which is
+        # split out into base_url_env_var by the auto-registry.
+        assert "RAMP_ROUTER_API_KEY" in config.api_key_env_vars
+        assert "RAMP_ROUTER_BASE_URL" not in config.api_key_env_vars
+        assert config.base_url_env_var == "RAMP_ROUTER_BASE_URL"
+        assert config.inference_base_url.startswith("https://api.router.com")
+

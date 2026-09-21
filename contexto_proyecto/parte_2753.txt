@@ -1,0 +1,295 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_ogg_opus_transcode_routing.py ===
+"""Every voice-bubble transcode routes through ``gateway.platforms.base.transcode_to_ogg_opus``.
+
+Matrix, WhatsApp Cloud and the TTS tool each used to run their own ffmpeg argv; the shared
+helper is the only place the codec flags, the timeout and the in-place-safe write live.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import subprocess
+from types import SimpleNamespace
+
+
+def _capture_ffmpeg(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        out = argv[-1]
+        with open(out, "wb") as fh:
+            fh.write(b"OggS")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr("gateway.platforms.base.subprocess.run", fake_run)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+    return calls
+
+
+def _bitrate(argv):
+    return argv[argv.index("-b:a") + 1]
+
+
+def test_all_sites_share_one_ffmpeg_invocation(monkeypatch, tmp_path):
+    from gateway.platforms import whatsapp_cloud
+    from plugins.platforms.matrix import adapter as matrix
+    from tools import tts_tool_delivery as tts
+
+    calls = _capture_ffmpeg(monkeypatch)
+    src = tmp_path / "speech.mp3"
+    src.write_bytes(b"ID3")
+
+    # Matrix: temp output at 48k.
+    matrix_out = asyncio.run(asyncio.to_thread(matrix.transcode_to_ogg_opus, str(src), bitrate="48k", timeout=30))
+    assert matrix_out and matrix_out.endswith(".ogg") and _bitrate(calls[-1][0]) == "48k"
+    assert calls[-1][1]["timeout"] == 30
+
+    # WhatsApp Cloud: sibling .ogg at the 32k default, warn-once on missing ffmpeg untouched.
+    monkeypatch.setattr(whatsapp_cloud, "_FFMPEG_PATH", "/usr/bin/ffmpeg")
+    wa = object.__new__(whatsapp_cloud.WhatsAppCloudAdapter)
+    wa._warned_no_ffmpeg = False
+    wa_out = asyncio.run(wa._convert_to_opus(str(src)))
+    assert wa_out == str(tmp_path / "speech.ogg") and _bitrate(calls[-1][0]) == "32k"
+
+    # TTS tool: sibling .ogg at 48k, and in-place repair never writes straight over the source.
+    assert tts._convert_to_opus(str(src)) == str(tmp_path / "speech.ogg") and _bitrate(calls[-1][0]) == "48k"
+    bad = tmp_path / "bad.ogg"
+    bad.write_bytes(b"ID3")
+    assert tts._repair_ogg_container(str(bad)) == str(bad)
+    assert calls[-1][0][-1] == str(bad) + ".tmp.ogg" and bad.read_bytes() == b"OggS"
+
+    # Every argv carries the voice-tuned flag set exactly once.
+    for argv, kwargs in calls:
+        assert argv[argv.index("-application") + 1] == "voip" and "-compression_level" in argv
+        assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+def test_failed_in_place_repair_keeps_the_source(monkeypatch, tmp_path):
+    from gateway.platforms.base import transcode_to_ogg_opus
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("gateway.platforms.base.subprocess.run",
+                        lambda argv, **kw: SimpleNamespace(returncode=1, stderr=b"boom"))
+    bad = tmp_path / "bad.ogg"
+    bad.write_bytes(b"ID3")
+    assert transcode_to_ogg_opus(str(bad), output_path=str(bad)) is None
+    assert bad.read_bytes() == b"ID3" and not (tmp_path / "bad.ogg.tmp.ogg").exists()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_orphan_exit_grace.py ===
+"""A retiring gateway must get long enough to finish its WAL checkpoint.
+
+Regression for the 2026-08-31 corruption. ``gateway run --replace`` reaped the
+previous instance with SIGTERM, waited **5 seconds**, then SIGKILLed any
+survivor. A gateway closing a 500MB WAL store runs a PASSIVE checkpoint in
+``SessionDB.close()``; on a WAL that had grown to 3936 pages (4x the 1000-page
+autocheckpoint threshold) that does not reliably finish in 5s. A SIGKILL
+landing mid-checkpoint leaves half-written b-tree pages — macOS ``fsync``
+guarantees neither data-on-platter nor write ordering, which is exactly why
+``hermes_state_wal._enforce_macos_synchronous_full`` exists.
+
+The port-rebinding reason the 5s deadline was introduced still holds, so the
+force-kill stays — it just must not fire on a process that is still shutting
+down normally, and when it does fire it must say so.
+"""
+from __future__ import annotations
+
+import pytest
+
+import hermes_state_wal
+
+from hermes_cli.gateway import (
+    _ORPHAN_EXIT_GRACE_SECONDS,
+    _await_gateway_exit,
+)
+
+
+def _exits_after(polls: int):
+    """pid_exists() that reports the process gone after *polls* checks."""
+    seen = {"n": 0}
+
+    def pid_exists(_pid: int) -> bool:
+        seen["n"] += 1
+        return seen["n"] <= polls
+
+    return pid_exists
+
+
+def test_a_slow_but_healthy_shutdown_is_not_force_killed() -> None:
+    """12s of checkpointing — well past the old 5s budget — must survive."""
+    survivors = _await_gateway_exit(
+        [4242],
+        pid_exists=_exits_after(60),  # 60 polls x 0.2s = 12s
+        sleep=lambda _s: None,
+    )
+    assert survivors == []
+
+
+def test_a_truly_hung_process_is_still_reported_for_force_kill() -> None:
+    survivors = _await_gateway_exit(
+        [4242],
+        pid_exists=lambda _pid: True,
+        sleep=lambda _s: None,
+    )
+    assert survivors == [4242]
+
+
+def test_an_already_dead_process_returns_immediately() -> None:
+    slept = []
+    survivors = _await_gateway_exit(
+        [4242],
+        pid_exists=lambda _pid: False,
+        sleep=lambda s: slept.append(s),
+    )
+    assert survivors == []
+    assert slept == [], "waited on a process that was already gone"
+
+
+def test_the_grace_period_covers_a_large_wal_checkpoint() -> None:
+    """5s was the value that let the SIGKILL land mid-checkpoint."""
+    assert _ORPHAN_EXIT_GRACE_SECONDS >= 20.0
+
+
+def test_force_kill_is_logged_so_the_next_incident_has_evidence(caplog) -> None:
+    import logging
+
+    from hermes_cli import gateway as gw
+
+    killed = []
+    with caplog.at_level(logging.WARNING):
+        gw._force_kill_survivors([4242], kill=lambda pid, sig: killed.append(pid))
+
+    assert killed == [4242]
+    assert any("4242" in r.getMessage() for r in caplog.records), (
+        "a force-kill left no trace in the log"
+    )
+
+
+def test_a_pid_that_vanishes_in_the_final_interval_is_not_killed() -> None:
+    """The last sleep must still be followed by a check.
+
+    Without a re-check after the final sleep the process is reported as a
+    survivor and gets SIGKILL. That is normally a harmless
+    ProcessLookupError — but if the PID has already been recycled the signal
+    lands on an unrelated process.
+    """
+    polls = int(_ORPHAN_EXIT_GRACE_SECONDS / 0.2)  # every in-loop check says "alive"
+    survivors = _await_gateway_exit(
+        [4242],
+        pid_exists=_exits_after(polls),
+        sleep=lambda _s: None,
+    )
+    assert survivors == [], "a process that exited during the last interval was killed"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_output_caps_removed.py ===
+"""User configuration cannot impose generation caps; wire budgets remain internal."""
+
+import json
+
+
+def test_legacy_user_caps_do_not_change_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_MAX_TOKENS", "13")
+    config = {
+        "model": {"default": "fixture", "provider": "local-fixture", "max_tokens": 17},
+        "providers": {"local-fixture": {"api": "http://127.0.0.1:1/v1", "api_key": "fixture", "max_output_tokens": 19}},
+    }
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    from gateway.run import _resolve_runtime_agent_kwargs
+    from gateway.platforms.api_server import _resolve_request_runtime_agent_kwargs
+    from hermes_cli.moa_config import _normalize_preset
+    from agent.models_dev import _override_to_catalog_shape
+
+    runtime = _resolve_runtime_agent_kwargs()
+    assert runtime.get("max_tokens") is None
+    assert runtime["base_url"].startswith("http://127.0.0.1:1")
+    request = _resolve_request_runtime_agent_kwargs(provider="local-fixture", target_model="fixture")
+    assert request.get("max_tokens") is None
+    preset = _normalize_preset({"max_tokens": 23, "reference_max_tokens": 29})
+    assert "max_tokens" not in preset and "reference_max_tokens" not in preset
+    patch, _ = _override_to_catalog_shape({"context_window": 10000, "max_output_tokens": 31})
+    assert patch["limit"] == {"context": 10000}
+    from agent.auxiliary_client import _compression_fast_lane_controls
+    route = {"provider": "custom", "model": "fixture", "reasoning_effort": "none", "max_output_tokens": 47}
+    cap, body = _compression_fast_lane_controls(
+        "compression", actual_provider="custom", actual_model="fixture",
+        requested_provider="custom", requested_model="fixture", route_config=route,
+        leak_guard_config=route, max_tokens=None, extra_body={},
+    )
+    assert cap is None
+    assert body["reasoning"]["enabled"] is False
+
+
+def test_optional_wire_caps_omitted_required_and_internal_preserved():
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    from agent.transports.bedrock import BedrockTransport
+    from agent.transports.anthropic import AnthropicTransport
+
+    messages = [{"role": "user", "content": "fixture"}]
+    chat = ChatCompletionsTransport().build_kwargs(
+        "claude-fixture", messages, anthropic_max_output=65536,
+        max_tokens_param_fn=lambda value: {"max_tokens": value},
+    )
+    assert "max_tokens" not in chat
+    from providers import get_provider_profile
+    custom = ChatCompletionsTransport().build_kwargs(
+        "fixture", messages, provider_profile=get_provider_profile("custom"),
+        max_tokens_param_fn=lambda value: {"max_tokens": value},
+    )
+    assert "max_tokens" not in custom
+    bedrock = BedrockTransport().build_kwargs("amazon.nova-pro-v1:0", messages)
+    assert "maxTokens" not in bedrock.get("inferenceConfig", {})
+    native = AnthropicTransport().build_kwargs("claude-sonnet-4-5", messages)
+    assert native["max_tokens"] > 0
+    bounded = ChatCompletionsTransport().build_kwargs(
+        "fixture", messages, max_tokens=43,
+        max_tokens_param_fn=lambda value: {"max_tokens": value},
+    )
+    assert bounded["max_tokens"] == 43
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_own_policy_startup_gate.py ===
+"""Regression tests for own-policy open startup gate in gateway/run.py."""
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.run import GatewayRunner
+
+
+@pytest.mark.asyncio
+async def test_unrelated_allow_all_does_not_bypass_yuanbao_open_gate(
+    monkeypatch, tmp_path,
+):
+    """TELEGRAM_ALLOW_ALL_USERS must not satisfy Yuanbao's open-policy opt-in."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("YUANBAO_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("TELEGRAM_ALLOW_ALL_USERS", "true")
+
+    config = GatewayConfig(
+        platforms={
+            Platform.YUANBAO: PlatformConfig(
+                enabled=True,
+                extra={"dm_policy": "open"},
+            ),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is True
+    assert "yuanbao" in (runner.exit_reason or "").lower()
+
+
+

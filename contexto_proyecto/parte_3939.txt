@@ -1,0 +1,218 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_ascii_only.py ===
+"""Regression: install.ps1 must stay pure ASCII.
+
+Issues #66994 / #67000 reported the Windows GUI installer (Hermes-Setup.exe)
+crashing before it did anything, with a cascade of PowerShell parser errors at
+lines 1619 / 1770 ("Missing argument in parameter list", "A 'using' statement
+must appear before any other statements in a script").
+
+Root cause: ``scripts/install.ps1`` has no UTF-8 BOM, and a commit added two
+non-ASCII characters *inside double-quoted string literals* (a bullet and an
+em-dash). Windows PowerShell 5.1 -- which the bootstrap runs the cached script
+under -- reads a BOM-less ``.ps1`` in the system ANSI code page (e.g. CP1252),
+not UTF-8. The em-dash's UTF-8 tail byte (0x94) decodes to a "smart" close-quote
+(U+201D), which the PowerShell tokenizer treats as a string delimiter. That
+prematurely closes the string and desyncs the parser for the rest of the file,
+surfacing as unrelated syntax errors far downstream.
+
+Non-ASCII bytes inside ``#`` comments are harmless (the tokenizer skips a
+comment to end-of-line regardless of what it contains), which is why the file
+carried em-dashes in comments for months without breaking -- only a non-ASCII
+byte in *code* (a string literal) triggers the desync.
+
+This test is source-level because Linux CI cannot execute the PowerShell
+installer. Keeping the whole file ASCII-only is the transport-independent
+invariant: pure ASCII cannot be misdecoded under any code page, BOM or not, so
+the bug class cannot recur -- in a comment or a string.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
+
+
+def test_install_ps1_is_pure_ascii() -> None:
+    raw = INSTALL_PS1.read_bytes()
+
+    offenders = []
+    line_no = 1
+    for byte in raw:
+        if byte == 0x0A:
+            line_no += 1
+        elif byte >= 0x80:
+            offenders.append(line_no)
+
+    assert not offenders, (
+        "scripts/install.ps1 must be pure ASCII so Windows PowerShell 5.1 "
+        "(which reads a BOM-less .ps1 in the system ANSI code page, not UTF-8) "
+        "cannot misdecode a byte into a stray quote and desync the parser "
+        "(issues #66994 / #67000). Non-ASCII bytes found on line(s): "
+        f"{sorted(set(offenders))}. Use ASCII equivalents (em-dash -> '--', "
+        "bullet -> '-')."
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_browser_install.py ===
+"""Regression test for install.ps1 browser setup (PR #44772 review).
+
+agent-browser resolves lazily via npx everywhere else in the system
+(tools/browser_tool.py::_find_agent_browser); Install-AgentBrowser was the
+last place that still eagerly npm-installed a second, separately
+version-pinned copy of it. Removed: agent-browser acquisition now happens
+only via `hermes update`'s npx cache warm or an actual browser-tool call's
+lazy npx resolution.
+
+Linux CI cannot execute the PowerShell installer, so verification here is
+source-text-level only, matching tests/scripts/install/test_install_sh_browser_install.py
+and tests/scripts/install/test_install_ps1_ascii_only.py.
+"""
+
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
+
+
+def _extract_function_body(source: str, name: str) -> str:
+    m = re.search(
+        rf"^function {re.escape(name)} \{{.*?^\}}", source, re.MULTILINE | re.DOTALL
+    )
+    assert m, f"could not extract function {name} from install.ps1"
+    return m.group(0)
+
+
+def test_install_agent_browser_no_longer_npm_installs_agent_browser() -> None:
+    body = _extract_function_body(INSTALL_PS1.read_text(), "Install-AgentBrowser")
+
+    assert "agent-browser@" not in body
+    assert "Installing Chromium via agent-browser install" not in body
+    # camofox is unrelated to this change and must still be installed here.
+    assert "@askjo/camofox-browser@^1.5.2" in body
+    # System-browser detection is still cheap/valuable without agent-browser.
+    assert "Find-SystemBrowser" in body
+    assert "Write-BrowserEnv" in body
+
+
+def test_install_agent_browser_drops_unused_skip_chromium_param() -> None:
+    """$SkipChromium only existed to gate the now-removed Chromium-download
+    branch; grep confirms it's never passed at the one real call site, so a
+    lingering param would be dead code implying a control path that no
+    longer exists."""
+    body = _extract_function_body(INSTALL_PS1.read_text(), "Install-AgentBrowser")
+
+    assert "SkipChromium" not in body
+
+    # And the one real call site must not pass it either.
+    text = INSTALL_PS1.read_text()
+    call_site = re.search(r"^\s*Install-AgentBrowser.*$", text, re.MULTILINE)
+    assert call_site, "could not find Install-AgentBrowser call site"
+    assert "SkipChromium" not in call_site.group(0)
+
+
+def test_install_agent_browser_still_ignore_scripts_hardened() -> None:
+    """The removal of agent-browser must not have also dropped the
+    supply-chain hardening that still applies to the remaining camofox
+    install."""
+    body = _extract_function_body(INSTALL_PS1.read_text(), "Install-AgentBrowser")
+
+    assert "--ignore-scripts" in body
+
+
+def test_install_agent_browser_no_longer_references_agent_browser_cmd_shim() -> None:
+    """No dangling reference to the agent-browser.cmd shim should remain
+    now that this function never installs it."""
+    body = _extract_function_body(INSTALL_PS1.read_text(), "Install-AgentBrowser")
+
+    assert "agent-browser.cmd" not in body
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_managed_node_swap.py ===
+"""Regression: the Test-Node managed-Node stage-and-swap must stay same-directory.
+
+Review concern on #81500: ``Rename-Item`` rejects a path in ``-NewName`` --
+with one carve-out. PowerShell's FileSystemProvider strips the directory and
+keeps the leaf when the ``-NewName`` path shares the directory of ``-Path``
+(``FileSystemProvider.RenameItem``: ``Path.GetDirectoryName(path) ==
+Path.GetDirectoryName(newName)`` -> ``newName = Path.GetFileName(newName)``);
+only a path that *differs in directory* throws "represents a path or device
+name". The official docs state the same exception ("you can't supply a path
+for the value of the NewName parameter, unless the path is identical to the
+path specified in the Path parameter").
+
+The swap in ``Test-Node`` relies on exactly that carve-out: it renames
+between ``$HermesHome\node`` and sibling ``node.new-*`` / ``node.old-*``
+paths (same directory, same volume -- atomic rename). This test pins the
+invariant so a future refactor cannot silently introduce a cross-directory
+rename, which would throw on every Windows install and read as a false
+"in use" deferral.
+
+Source-level because Linux CI cannot execute the Windows installer (same
+rationale as the other ``tests/test_install_ps1_*.py`` probes).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
+
+
+def _swap_block() -> str:
+    text = INSTALL_PS1.read_text(encoding="utf-8")
+    start = text.index("# Rename-swap instead of delete-then-move:")
+    end = text.index("# Session PATH so the rest of this run sees node/npm.")
+    return text[start:end]
+
+
+def test_managed_node_swap_defines_staged_and_backup_as_siblings() -> None:
+    swap = _swap_block()
+    # $staged / $backup must be siblings of the live tree -- that is what
+    # makes every Rename-Item -NewName below a same-directory path.
+    assert re.search(r'\$staged\s*=\s*"\$HermesHome\\node\.new-\$stamp"', swap), (
+        "$staged must be defined as a sibling of the live tree "
+        '("$HermesHome\\node.new-$stamp")'
+    )
+    assert re.search(r'\$backup\s*=\s*"\$HermesHome\\node\.old-\$stamp"', swap), (
+        "$backup must be defined as a sibling of the live tree "
+        '("$HermesHome\\node.old-$stamp")'
+    )
+
+
+def test_managed_node_swap_renames_stay_within_hermes_home() -> None:
+    swap = _swap_block()
+
+    renames = re.findall(
+        r"Rename-Item\s+(\S+)\s+(\S+)\s+-ErrorAction", swap
+    )
+    assert len(renames) == 4, (
+        f"expected 4 Rename-Item calls in the swap block, found {len(renames)}"
+    )
+    # -NewName accepts a path only when it shares the directory of -Path.
+    # $staged / $backup are pinned to same-directory siblings by the test
+    # above, so every call is a same-directory rename. Pin the actual swap
+    # state machine too: live tree aside to $backup, staged tree into
+    # place, and $backup restored on the rollback path. A cross-directory
+    # path (e.g. "$HermesHome\sub\node") or a swapped direction must fail.
+    allowed_pairs = {
+        ('"$HermesHome\\node"', "$backup"),  # live tree aside
+        ("$staged", '"$HermesHome\\node"'),  # staged into place (existing + fresh)
+        ("$backup", '"$HermesHome\\node"'),  # rollback restore
+    }
+    for src, dst in renames:
+        assert (src, dst) in allowed_pairs, (
+            f"Rename-Item {src} {dst}: not one of the expected swap "
+            "transitions (live->backup, staged->live, backup->live rollback) "
+            "-- Rename-Item rejects paths that differ in directory from -Path"
+        )
+

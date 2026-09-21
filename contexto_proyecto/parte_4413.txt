@@ -1,0 +1,301 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_write_deny.py ===
+"""Tests for _is_write_denied() — verifies deny list blocks sensitive paths on all platforms."""
+
+import os
+
+from pathlib import Path
+from unittest.mock import patch
+
+from agent.file_safety import is_write_denied as _is_write_denied
+
+
+class TestWriteDenyExactPaths:
+    def test_etc_shadow(self):
+        assert _is_write_denied("/etc/shadow") is True
+
+
+    def test_ssh_authorized_keys(self):
+        assert _is_write_denied("~/.ssh/authorized_keys") is True
+
+
+    def test_ssh_id_ed25519(self):
+        path = os.path.join(str(Path.home()), ".ssh", "id_ed25519")
+        assert _is_write_denied(path) is True
+
+
+    def test_hermes_root_env_when_running_under_profile(self, tmp_path, monkeypatch):
+        """Top-level ``<root>/.env`` stays write-denied even when running under
+        a profile (#15981).
+
+        Before the fix, ``build_write_denied_paths`` only added
+        ``<active_profile>/.env`` to the deny list, so the global
+        ``~/.hermes/.env`` (whose credentials are inherited by every profile)
+        could be silently overwritten by ``write_file`` while a profile was
+        active.
+        """
+        root = tmp_path / "hermes_root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        global_env = root / ".env"
+        global_env.write_text("OPENAI_API_KEY=sk-real\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        # Sanity check: HERMES_HOME does point to the profile dir, not the root.
+        from hermes_constants import get_hermes_home, get_default_hermes_root
+        assert get_hermes_home() == profile_home
+        assert get_default_hermes_root() == root
+
+        assert _is_write_denied(str(global_env)) is True
+
+    def test_shell_profiles_are_writable(self):
+        home = str(Path.home())
+        for name in [".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile"]:
+            assert _is_write_denied(os.path.join(home, name)) is False, f"{name} should be writable"
+
+    def test_credential_config_files_denied(self):
+        home = str(Path.home())
+        for name in [".netrc", ".pgpass", ".npmrc", ".pypirc"]:
+            assert _is_write_denied(os.path.join(home, name)) is True, f"{name} should be denied"
+
+
+class TestWriteDenyPrefixes:
+    def test_ssh_prefix(self):
+        path = os.path.join(str(Path.home()), ".ssh", "some_key")
+        assert _is_write_denied(path) is True
+
+
+    def test_systemd_prefix(self, tmp_path):
+        # On NixOS, /etc/systemd is a symlink into /nix/store, so
+        # realpath() resolves it to a store path that doesn't match
+        # the /etc/systemd/ prefix.  Build a real directory tree so
+        # realpath is a no-op and prefix matching works.
+        fake_etc = tmp_path / "etc" / "systemd" / "system"
+        fake_etc.mkdir(parents=True)
+        target = str(fake_etc / "evil.service")
+        # Patch the prefix builder to include our tmp_path prefix
+        import agent.file_safety as _fs
+        _orig = _fs.build_write_denied_prefixes
+        _extra_prefix = str(tmp_path / "etc" / "systemd") + os.sep
+        def _patched(home):
+            return _orig(home) + [_extra_prefix]
+        with patch.object(_fs, "build_write_denied_prefixes", _patched):
+            assert _is_write_denied(target) is True
+
+
+class TestWriteAllowed:
+    def test_tmp_file(self):
+        assert _is_write_denied("/tmp/safe_file.txt") is False
+
+
+    def test_hermes_control_files_requested_writable(self):
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
+            assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_write_file_rewrite_hint.py ===
+"""write_file tells the caller when it just re-sent a large file that was already on disk.
+
+In one 1,393-agent run 661 read->whole-file-rewrites of >20k-char files cost ~25M output chars (~$155)
+while `patch` (1.3k chars/call) succeeded 99.7% of the time; the tool result is the only place to say so.
+"""
+import json
+
+from tools.file_tools import read_file_tool, write_file_tool
+
+
+def _big(n_lines=800):
+    return "\n".join(f"line {i}: " + "x" * 40 for i in range(n_lines)) + "\n"  # ~40k chars
+
+
+def test_rewrite_of_a_large_file_with_few_changes_gets_a_patch_hint(tmp_path):
+    f = tmp_path / "mod.py"
+    old = _big()
+    f.write_text(old, encoding="utf-8")
+    new = old.replace("line 400:", "line 400 (edited):").replace("line 401:", "line 401 (edited):")
+    assert "error" not in json.loads(read_file_tool(str(f), task_id="t"))  # the read→rewrite pattern the hint targets
+    r = json.loads(write_file_tool(str(f), new, task_id="t"))
+    assert r.get("error") is None and f.read_text(encoding="utf-8") == new  # the write still happens
+    assert "use patch" in r["hint"] and "798 of 800 lines were already on disk" in r["hint"]
+
+
+def test_new_files_small_files_and_real_rewrites_get_no_hint(tmp_path):
+    new_file = tmp_path / "new.py"
+    assert "hint" not in json.loads(write_file_tool(str(new_file), _big(), task_id="t"))
+    small = tmp_path / "small.py"
+    small.write_text("a\nb\n", encoding="utf-8")
+    read_file_tool(str(small), task_id="t")
+    assert "hint" not in json.loads(write_file_tool(str(small), "a\nc\n", task_id="t"))
+    big = tmp_path / "big.py"
+    big.write_text(_big(), encoding="utf-8")
+    read_file_tool(str(big), task_id="t")
+    rewritten = "\n".join(f"other {i}: " + "y" * 40 for i in range(800)) + "\n"
+    assert "hint" not in json.loads(write_file_tool(str(big), rewritten, task_id="t"))
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_write_file_syntax_gate.py ===
+"""Tests for the fail-closed pre-write syntax gate on write_file.
+
+Structured formats with an in-process linter (JSON/YAML/TOML) are validated
+BEFORE any bytes touch disk: a candidate write that doesn't parse is refused
+outright -- nothing lands on disk -- instead of being written and merely
+reported afterward via the post-write lint delta.
+
+These run against a REAL LocalEnvironment (actual shell commands / actual
+files under tmp_path), matching the existing pattern in
+tests/tools/test_file_write_safety.py::TestAtomicWrite.
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from tools.environments.local import LocalEnvironment
+from tools.file_operations import ShellFileOperations
+
+
+@pytest.fixture
+def ops(tmp_path: Path):
+    env = LocalEnvironment(cwd=str(tmp_path))
+    return ShellFileOperations(env, cwd=str(tmp_path))
+
+
+class TestFailClosedSyntaxGate:
+    def test_invalid_json_refused_file_not_created(self, ops, tmp_path: Path):
+        target = tmp_path / "config.json"
+        res = ops.write_file(str(target), '{"a": 1,')  # truncated / invalid
+        assert res.error is not None
+        assert "json" in res.error.lower()
+        assert not target.exists(), "invalid JSON must NOT be written to disk"
+
+
+    def test_valid_json_written_exactly(self, ops, tmp_path: Path):
+        target = tmp_path / "config.json"
+        content = json.dumps({"a": 1, "b": [1, 2, 3]})
+        res = ops.write_file(str(target), content)
+        assert res.error is None, res.error
+        assert target.read_text() == content
+
+
+    def test_invalid_python_is_NOT_hard_refused(self, ops, tmp_path: Path):
+        """Deliberate scope decision: .py keeps the pre-existing NON-BLOCKING
+        lint-delta report rather than a hard refusal (see
+        ``_FAIL_CLOSED_INPROC_EXTS`` in tools/file_operations.py for why --
+        this codebase's own test suite writes arbitrary non-Python content
+        through *.py paths as generic write-mechanics fixtures)."""
+        target = tmp_path / "broken.py"
+        bad_python = "def foo(:\n    pass\n"
+        res = ops.write_file(str(target), bad_python)
+        assert res.error is None, res.error
+        assert target.read_text() == bad_python
+        # Still surfaced via the (non-blocking) lint report:
+        assert res.lint is not None
+        assert res.lint.get("status") == "error"
+        assert "SyntaxError" in res.lint.get("output", "")
+
+
+    def test_custom_tagged_yaml_is_valid_and_written(self, ops, tmp_path: Path):
+        """Application-defined tags (CloudFormation !Sub/!Ref, Ansible !vault)
+        are valid YAML syntax; only the *consumer* defines their constructors.
+        The gate is syntax-only and must let them through."""
+        target = tmp_path / "template.yaml"
+        content = (
+            "Resources:\n"
+            "  Bucket:\n"
+            "    Type: AWS::S3::Bucket\n"
+            "    Properties:\n"
+            "      BucketName: !Sub '${AWS::StackName}-bucket'\n"
+        )
+        res = ops.write_file(str(target), content)
+        assert res.error is None, res.error
+        assert target.read_text() == content
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_write_verification.py ===
+"""Tests for write_file post-write content verification (verified flag)."""
+
+import json
+from unittest.mock import patch as mock_patch
+
+import pytest
+
+from tools.file_tools import write_file_tool
+
+
+@pytest.fixture
+def workdir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    return tmp_path
+
+
+class TestWriteVerification:
+    def test_successful_write_reports_verified(self, workdir):
+        f = workdir / "out.txt"
+        r = json.loads(write_file_tool(str(f), "hello verified world\n", task_id="t-wv"))
+        assert r.get("bytes_written") == len("hello verified world\n")
+        assert r.get("verified") is True
+
+    def test_unicode_content_verified(self, workdir):
+        f = workdir / "uni.txt"
+        content = "línea → uno · ✓\n"
+        r = json.loads(write_file_tool(str(f), content, task_id="t-wv"))
+        assert r.get("verified") is True
+
+    def test_crlf_preservation_still_verifies(self, workdir):
+        # Existing CRLF file: write_file converts LF content to CRLF before
+        # writing; verification hashes the shim-adjusted content, so it must
+        # still report verified.
+        f = workdir / "win.txt"
+        f.write_bytes(b"old line\r\n")
+        # Establish a full-read baseline: write_file refuses to overwrite
+        # existing files the task has never read (stale-write guard).
+        from tools.file_tools import read_file_tool
+        json.loads(read_file_tool(str(f), task_id="t-wv"))
+        r = json.loads(write_file_tool(str(f), "new line\nsecond\n", task_id="t-wv"))
+        assert "error" not in r
+        assert r.get("verified") is True
+        assert b"\r\n" in f.read_bytes()
+
+    def test_hash_mismatch_is_hard_error(self, workdir):
+        f = workdir / "bad.txt"
+        import tools.file_operations as fo
+        real_sha = fo.hashlib.sha256
+
+        class _WrongHash:
+            def __init__(self, *a, **k):
+                self._h = real_sha(b"different content entirely")
+            def hexdigest(self):
+                return self._h.hexdigest()
+
+        with mock_patch.object(fo.hashlib, "sha256", _WrongHash):
+            r = json.loads(write_file_tool(str(f), "actual content\n", task_id="t-wv"))
+        assert "error" in r
+        assert "did not persist" in r["error"]
+
+    def test_verification_failure_never_breaks_write(self, workdir):
+        # sha256sum unavailable/failing -> verified omitted, write still ok.
+        f = workdir / "ok.txt"
+        import tools.file_operations as fo
+
+        real_exec = fo.ShellFileOperations._exec
+
+        def flaky_exec(self, cmd, **kw):
+            if "sha256sum" in cmd:
+                raise RuntimeError("no hash binary")
+            return real_exec(self, cmd, **kw)
+
+        with mock_patch.object(fo.ShellFileOperations, "_exec", flaky_exec):
+            r = json.loads(write_file_tool(str(f), "content lands anyway\n", task_id="t-wv2"))
+        assert "error" not in r
+        assert f.read_text() == "content lands anyway\n"
+        assert "verified" not in r or r.get("verified") is None
+

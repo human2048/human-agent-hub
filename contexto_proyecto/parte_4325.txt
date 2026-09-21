@@ -1,0 +1,284 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_telegram_send_message_caption.py ===
+"""Standalone Telegram MEDIA:<path> caption delivery.
+
+When `hermes send --to telegram "MEDIA:/x.png This Caption"` carries a single
+captionable file plus short text, the text must ride on the media bubble as the
+sendPhoto/sendVideo/sendDocument ``caption`` rather than being posted as a
+separate sendMessage beforehand. Longer text (> Telegram's 1024 caption cap)
+falls back to a separate message. The ``telegram`` package is stubbed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+def _install_telegram_mock(monkeypatch: pytest.MonkeyPatch, bot_factory: MagicMock) -> None:
+    parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
+    constants_mod = SimpleNamespace(ParseMode=parse_mode)
+    _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
+    telegram_mod = SimpleNamespace(
+        Bot=bot_factory,
+        MessageEntity=_MessageEntity,
+        constants=constants_mod,
+    )
+    monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
+    monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
+
+
+def _make_bot() -> MagicMock:
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+    bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=2))
+    bot.send_video = AsyncMock(return_value=SimpleNamespace(message_id=3))
+    bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=4))
+    return bot
+
+
+def _no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        "TELEGRAM_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY",
+        "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None, raising=False)
+    # Neutralize macOS system-proxy auto-detection at its probe rather than by
+    # claiming the host is Linux: this keeps the test honest on the macOS
+    # runner (and on a developer's Mac), where a real scutil-configured proxy
+    # would otherwise leak into the assertion.
+    monkeypatch.setattr(
+        "gateway.platforms.base._detect_macos_system_proxy", lambda: None
+    )
+
+
+def _tmpfile(suffix: str) -> str:
+    f = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    f.write(b"x")
+    f.close()
+    return f.name
+
+
+def test_image_caption_rides_bubble_no_separate_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.send_message_tool import _send_telegram
+
+    _no_proxy(monkeypatch)
+    bot = _make_bot()
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+    img = _tmpfile(".png")
+    try:
+        res = asyncio.run(
+            _send_telegram("tok", "123", "This Caption", media_files=[(img, False)])
+        )
+        assert res["success"] is True
+        # No separate text message; caption rides the photo.
+        bot.send_message.assert_not_awaited()
+        bot.send_photo.assert_awaited_once()
+        assert bot.send_photo.await_args.kwargs.get("caption") == "This Caption"
+    finally:
+        os.unlink(img)
+
+
+def test_multi_file_keeps_separate_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.send_message_tool import _send_telegram
+
+    _no_proxy(monkeypatch)
+    bot = _make_bot()
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+    img = _tmpfile(".png")
+    img2 = _tmpfile(".jpg")
+    try:
+        res = asyncio.run(
+            _send_telegram("tok", "123", "two pics", media_files=[(img, False), (img2, False)])
+        )
+        assert res["success"] is True
+        # Ambiguous caption→file association: text stays a separate message.
+        bot.send_message.assert_awaited()
+        assert bot.send_photo.await_count == 2
+        for call in bot.send_photo.await_args_list:
+            assert not call.kwargs.get("caption")
+    finally:
+        os.unlink(img)
+        os.unlink(img2)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_backend_unavailable_reason.py ===
+"""Invariant: when a terminal backend's requirements check fails, the human reason is captured so the
+CLI startup notice / doctor can tell the user WHY the terminal tool is missing (tools-runtime-01)."""
+
+import subprocess
+
+import pytest
+
+import tools.terminal_tool as terminal_tool
+import tools.terminal_tool_backends as backends
+
+
+@pytest.fixture(autouse=True)
+def _reset_reason():
+    backends._last_unavailable_reason = None
+    yield
+    backends._last_unavailable_reason = None
+
+
+def test_docker_binary_missing_captures_reason(monkeypatch):
+    monkeypatch.setitem(backends._BACKEND_SPECS, "docker",
+                        {"binary": (lambda: None, "version", backends._BACKEND_SPECS["docker"]["binary"][2])})
+    assert backends._check_requirements("docker", {}) is False
+    reason = backends.terminal_backend_unavailable_reason()
+    assert reason and "Docker" in reason
+
+
+def test_docker_daemon_probe_failure_captures_daemon_reason(monkeypatch):
+    monkeypatch.setitem(backends._BACKEND_SPECS, "docker",
+                        {"binary": (lambda: "/usr/bin/docker", "version", "unused")})
+    monkeypatch.setattr(backends.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, b"", b""))
+    assert backends._check_requirements("docker", {}) is False
+    assert "daemon is not running" in backends.terminal_backend_unavailable_reason()
+
+
+def test_ssh_unconfigured_captures_reason():
+    assert backends._check_requirements("ssh", {"ssh_host": "", "ssh_user": ""}) is False
+    assert "SSH host and user are not configured" in backends.terminal_backend_unavailable_reason()
+
+
+def test_successful_check_clears_reason():
+    backends._last_unavailable_reason = "stale"
+    assert backends._check_requirements("local", {}) is True
+    assert backends.terminal_backend_unavailable_reason() is None
+
+
+def test_check_terminal_requirements_exception_captures_reason(monkeypatch):
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert terminal_tool.check_terminal_requirements() is False
+    assert "boom" in terminal_tool.terminal_backend_unavailable_reason()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_bounded_execute.py ===
+"""Foreground terminal execute must return when the inner wait loop wedges.
+
+#94285: a hung ``_wait_for_process`` (Windows pipe/poll, blocked loop thread)
+silently disabled every asyncio timer in the process. ``execute()`` now
+bounds spawn+wait with ``run_bounded_sync`` so the wall-clock deadline
+survives a wedged wait, and ``on_timeout`` kills the process tree.
+"""
+
+from __future__ import annotations
+
+import time
+from types import SimpleNamespace
+
+from tools.environments.local import LocalEnvironment
+import tools.environments.base as base_mod
+
+
+def test_execute_returns_when_wait_loop_never_returns(monkeypatch):
+    """A wedged inner wait cannot hold execute() past timeout + grace."""
+    monkeypatch.setattr(base_mod, "_EXECUTE_WAIT_BOUND_GRACE_S", 0.05)
+
+    env = LocalEnvironment()
+    fake_proc = SimpleNamespace(pid=424242)
+    monkeypatch.setattr(env, "_run_bash", lambda *a, **k: fake_proc)
+
+    def _hang(*_a, **_k):
+        time.sleep(30)
+        return {"output": "late", "returncode": 0}
+
+    monkeypatch.setattr(env, "_wait_for_process", _hang)
+    killed: list = []
+    monkeypatch.setattr(env, "_kill_process", lambda proc: killed.append(("kill", proc)))
+    monkeypatch.setattr(
+        "agent.deadline.kill_process_tree",
+        lambda pid, **_k: killed.append(("tree", pid)),
+    )
+    monkeypatch.setattr(env, "_update_cwd", lambda _result: None)
+
+    start = time.monotonic()
+    result = env.execute("sleep 30", timeout=1)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 4.0, f"execute hung {elapsed:.1f}s past the 1s bound"
+    assert result["returncode"] == 124
+    assert "timed out" in result["output"].lower()
+    assert ("kill", fake_proc) in killed
+    assert ("tree", 424242) in killed
+
+
+def test_execute_parent_interrupt_still_kills_wait_on_deadline_worker(monkeypatch):
+    """/stop targets the tool-worker tid; the deadline worker must honor it."""
+    from tools.interrupt import set_interrupt, is_interrupted
+
+    env = LocalEnvironment()
+    fake_proc = SimpleNamespace(pid=None, poll=lambda: None, stdout=None)
+    monkeypatch.setattr(env, "_run_bash", lambda *a, **k: fake_proc)
+
+    seen = {"parent": False}
+
+    def _wait(_proc, timeout=120, *, bounded_capture=False, watch_interrupt_tid=None):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            from tools.interrupt import is_thread_interrupted
+
+            if is_interrupted() or is_thread_interrupted(watch_interrupt_tid):
+                seen["parent"] = True
+                return {"output": "[Command interrupted]", "returncode": 130}
+            time.sleep(0.02)
+        return {"output": "missed interrupt", "returncode": 0}
+
+    monkeypatch.setattr(env, "_wait_for_process", _wait)
+    monkeypatch.setattr(env, "_kill_process", lambda _proc: None)
+    monkeypatch.setattr(env, "_update_cwd", lambda _result: None)
+
+    parent_tid = __import__("threading").get_ident()
+
+    def _interrupt_soon():
+        time.sleep(0.05)
+        set_interrupt(True, thread_id=parent_tid)
+
+    import threading
+
+    threading.Thread(target=_interrupt_soon, daemon=True).start()
+    result = env.execute("sleep 30", timeout=5)
+    set_interrupt(False, thread_id=parent_tid)
+
+    assert seen["parent"] is True
+    assert result["returncode"] == 130
+
+
+def test_execute_worker_sees_caller_activity_callback(monkeypatch):
+    """Heartbeats must fire on the deadline worker, not only the tool thread."""
+    env = LocalEnvironment()
+    fake_proc = SimpleNamespace(pid=None)
+    monkeypatch.setattr(env, "_run_bash", lambda *a, **k: fake_proc)
+    seen = {"cb": "unset"}
+
+    def _wait(*_a, **_k):
+        seen["cb"] = base_mod.get_activity_callback()
+        return {"output": "ok", "returncode": 0}
+
+    monkeypatch.setattr(env, "_wait_for_process", _wait)
+    monkeypatch.setattr(env, "_update_cwd", lambda _r: None)
+
+    def _cb(_msg):
+        pass
+
+    base_mod.set_activity_callback(_cb)
+    try:
+        result = env.execute("echo ok", timeout=5)
+    finally:
+        base_mod.set_activity_callback(None)
+
+    assert result["returncode"] == 0
+    assert seen["cb"] is _cb
+

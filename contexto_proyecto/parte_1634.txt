@@ -1,0 +1,426 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\manim-video\references\decorations.md ===
+# Decorations and Visual Polish
+
+Decorations are mobjects that annotate, highlight, or frame other mobjects. They turn a technically correct animation into a visually polished one.
+
+## SurroundingRectangle
+
+Draws a rectangle around any mobject. The go-to for highlighting:
+
+```python
+highlight = SurroundingRectangle(
+    equation[2],            # the term to highlight
+    color=YELLOW,
+    buff=0.15,              # padding between content and border
+    corner_radius=0.1,      # rounded corners
+    stroke_width=2
+)
+self.play(Create(highlight))
+self.wait(1)
+self.play(FadeOut(highlight))
+```
+
+### Around part of an equation
+
+```python
+eq = MathTex(r"E", r"=", r"m", r"c^2")
+box = SurroundingRectangle(eq[2:], color=YELLOW, buff=0.1)  # highlight "mc²"
+label = Text("mass-energy", font_size=18, font="Menlo", color=YELLOW)
+label.next_to(box, DOWN, buff=0.2)
+self.play(Create(box), FadeIn(label))
+```
+
+## BackgroundRectangle
+
+Semi-transparent background behind text for readability over complex scenes:
+
+```python
+bg = BackgroundRectangle(equation, fill_opacity=0.7, buff=0.2, color=BLACK)
+self.play(FadeIn(bg), Write(equation))
+
+# Or using set_stroke for a "backdrop" effect on the text itself:
+label.set_stroke(BLACK, width=5, background=True)
+```
+
+The `set_stroke(background=True)` approach is cleaner for text labels over graphs/diagrams.
+
+## Brace and BraceLabel
+
+Curly braces that annotate sections of a diagram or equation:
+
+```python
+brace = Brace(equation[2:4], DOWN, color=YELLOW)
+brace_label = brace.get_text("these terms", font_size=20)
+self.play(GrowFromCenter(brace), FadeIn(brace_label))
+
+# Between two specific points
+brace = BraceBetweenPoints(point_a, point_b, direction=UP)
+```
+
+### Brace placement
+
+```python
+# Below a group
+Brace(group, DOWN)
+# Above a group
+Brace(group, UP)
+# Left of a group
+Brace(group, LEFT)
+# Right of a group
+Brace(group, RIGHT)
+```
+
+## Arrows for Annotation
+
+### Straight arrows pointing to mobjects
+
+```python
+arrow = Arrow(
+    start=label.get_bottom(),
+    end=target.get_top(),
+    color=YELLOW,
+    stroke_width=2,
+    buff=0.1,                    # gap between arrow tip and target
+    max_tip_length_to_length_ratio=0.15  # small arrowhead
+)
+self.play(GrowArrow(arrow), FadeIn(label))
+```
+
+### Curved arrows
+
+```python
+arrow = CurvedArrow(
+    start_point=source.get_right(),
+    end_point=target.get_left(),
+    angle=PI/4,                  # curve angle
+    color=PRIMARY
+)
+```
+
+### Labeling with arrows
+
+```python
+# LabeledArrow: arrow with built-in text label
+arr = LabeledArrow(
+    Text("gradient", font_size=16, font="Menlo"),
+    start=point_a, end=point_b, color=RED
+)
+```
+
+## DashedLine and DashedVMobject
+
+```python
+# Dashed line (for asymptotes, construction lines, implied connections)
+asymptote = DashedLine(
+    axes.c2p(2, -3), axes.c2p(2, 3),
+    color=YELLOW, dash_length=0.15
+)
+
+# Make any VMobject dashed
+dashed_circle = DashedVMobject(Circle(radius=2, color=BLUE), num_dashes=30)
+```
+
+## Angle and RightAngle Markers
+
+```python
+line1 = Line(ORIGIN, RIGHT * 2)
+line2 = Line(ORIGIN, UP * 2 + RIGHT)
+
+# Angle arc between two lines
+angle = Angle(line1, line2, radius=0.5, color=YELLOW)
+angle_value = angle.get_value()  # radians
+
+# Right angle marker (the small square)
+right_angle = RightAngle(line1, Line(ORIGIN, UP * 2), length=0.3, color=WHITE)
+```
+
+## Cross (strikethrough)
+
+Mark something as wrong or deprecated:
+
+```python
+cross = Cross(old_equation, color=RED, stroke_width=4)
+self.play(Create(cross))
+# Then show the correct version
+```
+
+## Underline
+
+```python
+underline = Underline(important_text, color=ACCENT, stroke_width=3)
+self.play(Create(underline))
+```
+
+## Color Highlighting Workflow
+
+### Method 1: At creation with t2c
+
+```python
+text = Text("The gradient is negative here", t2c={"gradient": BLUE, "negative": RED})
+```
+
+### Method 2: set_color_by_tex after creation
+
+```python
+eq = MathTex(r"\nabla L = -\frac{\partial L}{\partial w}")
+eq.set_color_by_tex(r"\nabla", BLUE)
+eq.set_color_by_tex(r"\partial", RED)
+```
+
+### Method 3: Index into submobjects
+
+```python
+eq = MathTex(r"a", r"+", r"b", r"=", r"c")
+eq[0].set_color(RED)    # "a"
+eq[2].set_color(BLUE)   # "b"
+eq[4].set_color(GREEN)  # "c"
+```
+
+## Combining Annotations
+
+Layer multiple annotations for emphasis:
+
+```python
+# Highlight a term, add a brace, and an arrow — in sequence
+box = SurroundingRectangle(eq[2], color=YELLOW, buff=0.1)
+brace = Brace(eq[2], DOWN, color=YELLOW)
+label = brace.get_text("learning rate", font_size=18)
+
+self.play(Create(box))
+self.wait(0.5)
+self.play(FadeOut(box), GrowFromCenter(brace), FadeIn(label))
+self.wait(1.5)
+self.play(FadeOut(brace), FadeOut(label))
+```
+
+### The annotation lifecycle
+
+Annotations should follow a rhythm:
+1. **Appear** — draw attention (Create, GrowFromCenter)
+2. **Hold** — viewer reads and understands (self.wait)
+3. **Disappear** — clear the stage for the next thing (FadeOut)
+
+Never leave annotations on screen indefinitely — they become visual noise once their purpose is served.
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\manim-video\references\equations.md ===
+# Equations and LaTeX Reference
+
+## Basic LaTeX
+
+```python
+eq = MathTex(r"E = mc^2")
+eq = MathTex(r"f(x) &= x^2 + 2x + 1 \\ &= (x + 1)^2")  # multi-line aligned
+```
+
+**Always use raw strings (`r""`).**
+
+## Step-by-Step Derivations
+
+```python
+step1 = MathTex(r"a^2 + b^2 = c^2")
+step2 = MathTex(r"a^2 = c^2 - b^2")
+self.play(Write(step1), run_time=1.5)
+self.wait(1.5)
+self.play(TransformMatchingTex(step1, step2), run_time=1.5)
+```
+
+## Selective Color
+
+```python
+eq = MathTex(r"a^2", r"+", r"b^2", r"=", r"c^2")
+eq[0].set_color(RED)
+eq[4].set_color(GREEN)
+```
+
+## Building Incrementally
+
+```python
+parts = MathTex(r"f(x)", r"=", r"\sum_{n=0}^{\infty}", r"\frac{f^{(n)}(a)}{n!}", r"(x-a)^n")
+self.play(Write(parts[0:2]))
+self.wait(0.5)
+self.play(Write(parts[2]))
+self.wait(0.5)
+self.play(Write(parts[3:]))
+```
+
+## Highlighting
+
+```python
+highlight = SurroundingRectangle(eq[2], color=YELLOW, buff=0.1)
+self.play(Create(highlight))
+self.play(Indicate(eq[4], color=YELLOW))
+```
+
+## Annotation
+
+```python
+brace = Brace(eq, DOWN, color=YELLOW)
+label = brace.get_text("Fundamental Theorem", font_size=24)
+self.play(GrowFromCenter(brace), Write(label))
+```
+
+## Common LaTeX
+
+```python
+MathTex(r"\frac{a}{b}")                  # fraction
+MathTex(r"\alpha, \beta, \gamma")         # Greek
+MathTex(r"\sum_{i=1}^{n} x_i")           # summation
+MathTex(r"\int_{0}^{\infty} e^{-x} dx")  # integral
+MathTex(r"\vec{v}")                       # vector
+MathTex(r"\lim_{x \to \infty} f(x)")    # limit
+```
+
+## Matrices
+
+`MathTex` supports standard LaTeX matrix environments via `amsmath` (loaded by default):
+
+```python
+# Bracketed matrix
+MathTex(r"\begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}")
+
+# Parenthesized matrix
+MathTex(r"\begin{pmatrix} a & b \\ c & d \end{pmatrix}")
+
+# Determinant (vertical bars)
+MathTex(r"\begin{vmatrix} a & b \\ c & d \end{vmatrix}")
+
+# Plain (no delimiters)
+MathTex(r"\begin{matrix} x_1 \\ x_2 \\ x_3 \end{matrix}")
+```
+
+For matrices you need to animate element-by-element or color individual entries, use the `IntegerMatrix`, `DecimalMatrix`, or `MobjectMatrix` mobjects instead — see `mobjects.md`.
+
+## Cases and Piecewise Functions
+
+```python
+MathTex(r"""
+    f(x) = \begin{cases}
+        x^2    & \text{if } x \geq 0 \\
+        -x^2   & \text{if } x < 0
+    \end{cases}
+""")
+```
+
+## Aligned Environments
+
+For multi-line derivations with alignment, use `aligned` inside `MathTex`:
+
+```python
+MathTex(r"""
+    \begin{aligned}
+        \nabla \cdot \mathbf{E} &= \frac{\rho}{\epsilon_0} \\
+        \nabla \cdot \mathbf{B} &= 0 \\
+        \nabla \times \mathbf{E} &= -\frac{\partial \mathbf{B}}{\partial t} \\
+        \nabla \times \mathbf{B} &= \mu_0 \mathbf{J} + \mu_0 \epsilon_0 \frac{\partial \mathbf{E}}{\partial t}
+    \end{aligned}
+""")
+```
+
+Note: `MathTex` wraps content in `align*` by default. Override with `tex_environment` if needed:
+```python
+MathTex(r"...", tex_environment="gather*")
+```
+
+## Derivation Pattern
+
+```python
+class DerivationScene(Scene):
+    def construct(self):
+        self.camera.background_color = BG
+        s1 = MathTex(r"ax^2 + bx + c = 0")
+        self.play(Write(s1))
+        self.wait(1.5)
+        s2 = MathTex(r"x^2 + \frac{b}{a}x + \frac{c}{a} = 0")
+        s2.next_to(s1, DOWN, buff=0.8)
+        self.play(s1.animate.set_opacity(0.4), TransformMatchingTex(s1.copy(), s2))
+```
+
+## substrings_to_isolate for Complex Equations
+
+For dense equations where manually splitting into parts is impractical, use `substrings_to_isolate` to tell Manim which substrings to track as individual elements:
+
+```python
+# Without isolation — the whole expression is one blob
+lagrangian = MathTex(
+    r"\mathcal{L} = \bar{\psi}(i \gamma^\mu D_\mu - m)\psi - \tfrac{1}{4}F_{\mu\nu}F^{\mu\nu}"
+)
+
+# With isolation — each named substring is a separate submobject
+lagrangian = MathTex(
+    r"\mathcal{L} = \bar{\psi}(i \gamma^\mu D_\mu - m)\psi - \tfrac{1}{4}F_{\mu\nu}F^{\mu\nu}",
+    substrings_to_isolate=[r"\psi", r"D_\mu", r"\gamma^\mu", r"F_{\mu\nu}"]
+)
+# Now you can color individual terms
+lagrangian.set_color_by_tex(r"\psi", BLUE)
+lagrangian.set_color_by_tex(r"F_{\mu\nu}", YELLOW)
+```
+
+Essential for `TransformMatchingTex` on complex equations — without isolation, matching fails on dense expressions.
+
+## Multi-Line Complex Equations
+
+For equations with multiple related lines, pass each line as a separate argument:
+
+```python
+maxwell = MathTex(
+    r"\nabla \cdot \mathbf{E} = \frac{\rho}{\epsilon_0}",
+    r"\nabla \times \mathbf{B} = \mu_0\mathbf{J} + \mu_0\epsilon_0\frac{\partial \mathbf{E}}{\partial t}"
+).arrange(DOWN)
+
+# Each line is a separate submobject — animate independently
+self.play(Write(maxwell[0]))
+self.wait(1)
+self.play(Write(maxwell[1]))
+```
+
+## TransformMatchingTex with key_map
+
+Map specific substrings between source and target equations during transformation:
+
+```python
+eq1 = MathTex(r"A^2 + B^2 = C^2")
+eq2 = MathTex(r"A^2 = C^2 - B^2")
+
+self.play(TransformMatchingTex(
+    eq1, eq2,
+    key_map={"+": "-"},   # map "+" in source to "-" in target
+    path_arc=PI / 2,      # arc the pieces into position
+))
+```
+
+## set_color_by_tex — Color by Substring
+
+```python
+eq = MathTex(r"E = mc^2")
+eq.set_color_by_tex("E", BLUE)
+eq.set_color_by_tex("m", RED)
+eq.set_color_by_tex("c", GREEN)
+```
+
+## TransformMatchingTex with matched_keys
+
+When matching substrings are ambiguous, specify which to align explicitly:
+
+```python
+kw = dict(font_size=72, t2c={"A": BLUE, "B": TEAL, "C": GREEN})
+lines = [
+    MathTex(r"A^2 + B^2 = C^2", **kw),
+    MathTex(r"A^2 = C^2 - B^2", **kw),
+    MathTex(r"A^2 = (C + B)(C - B)", **kw),
+    MathTex(r"A = \sqrt{(C + B)(C - B)}", **kw),
+]
+
+self.play(TransformMatchingTex(
+    lines[0].copy(), lines[1],
+    matched_keys=["A^2", "B^2", "C^2"],  # explicitly match these
+    key_map={"+": "-"},                    # map + to -
+    path_arc=PI / 2,                       # arc pieces into position
+))
+```
+
+Without `matched_keys`, the animation matches the longest common substrings, which can produce unexpected results on complex equations (e.g., "^2 = C^2" matching across terms).
+

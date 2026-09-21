@@ -1,0 +1,11 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\finance\dcf-model\requirements.txt ===
+# DCF Model Builder - Python Dependencies
+
+# Excel file handling
+openpyxl>=3.0.0
+
+# HTTP requests
+requests>=2.28.0
+

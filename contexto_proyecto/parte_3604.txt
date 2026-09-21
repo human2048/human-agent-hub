@@ -1,0 +1,364 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_uninstall_node_symlinks.py ===
+"""Tests for hermes_cli.uninstall.remove_node_symlinks.
+
+Regression for #34536: the POSIX installer drops node/npm/npx symlinks in
+~/.local/bin pointing into $HERMES_HOME/node and prepends ~/.local/bin to
+PATH, shadowing an existing nvm. Uninstall must remove those symlinks, but
+only when they still resolve into the Hermes-managed node dir.
+"""
+
+import os
+from pathlib import Path
+
+import pytest
+
+import hermes_cli.uninstall as uninstall
+
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    """Redirect Path.home() at the home both the installer-symlink target and
+    the ~/.local/bin links live under the same temp dir."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    (home / ".local" / "bin").mkdir(parents=True)
+    return home
+
+
+def _make_hermes_node(hermes_home: Path) -> Path:
+    """Create a fake $HERMES_HOME/node/bin/{node,npm,npx} tree."""
+    node_bin = hermes_home / "node" / "bin"
+    node_bin.mkdir(parents=True)
+    for name in ("node", "npm", "npx"):
+        (node_bin / name).write_text("#!/bin/sh\n")
+        (node_bin / name).chmod(0o755)
+    return node_bin
+
+
+
+
+def test_leaves_unrelated_symlinks_untouched(fake_home):
+    """A node symlink the user repointed at nvm must survive uninstall."""
+    hermes_home = fake_home / ".hermes"
+    _make_hermes_node(hermes_home)
+    local_bin = fake_home / ".local" / "bin"
+
+    # Simulate nvm's node living elsewhere; user's ~/.local/bin/node -> nvm.
+    nvm_bin = fake_home / ".nvm" / "versions" / "node" / "v20.0.0" / "bin"
+    nvm_bin.mkdir(parents=True)
+    (nvm_bin / "node").write_text("#!/bin/sh\n")
+    (local_bin / "node").symlink_to(nvm_bin / "node")
+
+    removed = uninstall.remove_node_symlinks(hermes_home)
+
+    assert removed == []
+    assert (local_bin / "node").is_symlink()
+    assert (local_bin / "node").resolve() == (nvm_bin / "node").resolve()
+
+
+
+
+
+
+
+
+
+
+def test_removes_fhs_symlinks_in_usr_local_bin(fake_home, tmp_path, monkeypatch):
+    """Root FHS installs place node symlinks in /usr/local/bin.
+
+    We monkeypatch _node_symlink_candidate_dirs to return a temp dir standing
+    in for /usr/local/bin so the test doesn't need real root privileges.
+    """
+    hermes_home = fake_home / ".hermes"
+    node_bin = _make_hermes_node(hermes_home)
+
+    # Fake /usr/local/bin as a temp dir with our symlinks.
+    fhs_bin = tmp_path / "usr_local_bin"
+    fhs_bin.mkdir()
+    for name in ("node", "npm", "npx"):
+        (fhs_bin / name).symlink_to(node_bin / name)
+
+    # Ensure ~/.local/bin has NO symlinks (simulate pure FHS install).
+    local_bin = fake_home / ".local" / "bin"
+    for name in ("node", "npm", "npx"):
+        p = local_bin / name
+        if p.exists() or p.is_symlink():
+            p.unlink()
+
+    # Return only our fake FHS dir as a candidate.
+    monkeypatch.setattr(
+        uninstall, "_node_symlink_candidate_dirs", lambda: [fhs_bin]
+    )
+
+    removed = uninstall.remove_node_symlinks(hermes_home)
+
+    assert sorted(p.name for p in removed) == ["node", "npm", "npx"]
+    for name in ("node", "npm", "npx"):
+        assert not (fhs_bin / name).is_symlink()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_uninstall_shell_configs.py ===
+"""Tests for ``remove_path_from_shell_configs`` — the uninstaller's shell-rc rewrite.
+
+This rewrites files Hermes does not own (``~/.bashrc``, ``~/.zshrc``, ...) and
+takes no backup of them, so the rewrite has to be atomic: a bare
+``write_text()`` truncates the rc file before the new content lands, and the
+caller wraps everything in ``except Exception: log_warn(...)``, so a partial
+write is downgraded to a warning and the user's next login starts a bare shell.
+"""
+from __future__ import annotations
+
+import os
+import stat
+import sys
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import uninstall
+
+
+ZSHRC = (
+    "export EDITOR=vim\n"
+    "alias ll='ls -la'\n"
+    "\n"
+    "# Hermes Agent\n"
+    'export PATH="$HOME/.local/bin:$PATH"\n'
+    "\n"
+    "source ~/.work-profile\n"
+)
+
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point both ``Path.home()`` and ``HERMES_HOME`` at a throwaway dir."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+    return home
+
+
+class TestHappyPath:
+    def test_hermes_path_block_is_removed(self, fake_home: Path):
+        rc = fake_home / ".zshrc"
+        rc.write_text(ZSHRC, encoding="utf-8")
+
+        removed = uninstall.remove_path_from_shell_configs()
+
+        assert removed == [rc]
+        text = rc.read_text(encoding="utf-8")
+        assert "# Hermes Agent" not in text
+        # The user's own lines are untouched.
+        assert "export EDITOR=vim" in text
+        assert "source ~/.work-profile" in text
+
+    def test_untouched_rc_is_not_reported(self, fake_home: Path):
+        rc = fake_home / ".zshrc"
+        rc.write_text("export EDITOR=vim\n", encoding="utf-8")
+
+        assert uninstall.remove_path_from_shell_configs() == []
+        assert rc.read_text(encoding="utf-8") == "export EDITOR=vim\n"
+
+
+class TestCrashDurability:
+    def test_shell_config_survives_an_interrupted_rewrite(self, fake_home: Path):
+        """An interrupted rewrite must leave the rc file byte-identical.
+
+        There is no backup of the user's shell rc anywhere in this code path,
+        so a truncated write is unrecoverable.
+        """
+        rc = fake_home / ".zshrc"
+        rc.write_text(ZSHRC, encoding="utf-8")
+        original = rc.read_bytes()
+
+        def boom(fd):
+            raise OSError("simulated crash mid-write")
+
+        # Scoped context so restoring os.fsync doesn't also undo the
+        # Path.home()/HERMES_HOME patches the fake_home fixture installed.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "fsync", boom)
+            removed = uninstall.remove_path_from_shell_configs()
+
+        # The write failed, so the rc must not be reported as modified...
+        assert removed == []
+        # ...and it must still be exactly what the user had.
+        assert rc.read_bytes() == original
+        # The aborted write must not leave a temp file behind in $HOME.
+        assert list(fake_home.glob("*.tmp")) == []
+
+    def test_symlinked_shell_config_stays_a_symlink(self, fake_home: Path):
+        """A dotfiles-repo ``~/.zshrc`` is a symlink; replacing it with a
+        regular file silently detaches the user's dotfiles."""
+        dotfiles = fake_home / "dotfiles"
+        dotfiles.mkdir()
+        real = dotfiles / "zshrc"
+        real.write_text(ZSHRC, encoding="utf-8")
+        rc = fake_home / ".zshrc"
+        rc.symlink_to(real)
+
+        removed = uninstall.remove_path_from_shell_configs()
+
+        assert removed == [rc]
+        assert rc.is_symlink(), "the symlink was replaced by a regular file"
+        assert "# Hermes Agent" not in real.read_text(encoding="utf-8")
+        assert "export EDITOR=vim" in real.read_text(encoding="utf-8")
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_existing_file_mode_is_preserved(self, fake_home: Path):
+        """Shell rc files are normally 0644; uninstalling must not change that."""
+        rc = fake_home / ".zshrc"
+        rc.write_text(ZSHRC, encoding="utf-8")
+        os.chmod(rc, 0o644)
+
+        uninstall.remove_path_from_shell_configs()
+
+        mode = stat.S_IMODE(rc.stat().st_mode)
+        assert mode == 0o644, f"mode changed to {oct(mode)}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_uninstall_windows_bin_launchers.py ===
+"""Uninstall must not leave a dangling ``hermes`` command on Windows.
+
+Every uninstall mode deletes the code checkout, but the launchers install.ps1
+staged in the managed binary dir (the default Hermes root's ``bin``, shared
+with the managed uv) live outside it. A surviving launcher makes ``hermes``
+in a new terminal resolve and then error on its missing venv target — worse
+than command-not-found. The managed uv next to them must survive keep-data
+uninstalls, so the PATH sweep takes the ``bin`` entry only on a full wipe.
+
+Platform verdicts are injected parameters (input→output, not host fakes).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import uninstall
+from hermes_cli._install_repair import _WINDOWS_BIN_LAUNCHERS
+
+
+@pytest.fixture
+def managed_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Default-root ``bin`` holding launchers of both forms plus managed uv."""
+    home = tmp_path / "hermes"
+    bin_dir = home / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "hermes.exe").write_bytes(b"MZ launcher")
+    (bin_dir / "hermes-acp.cmd").write_text("@echo off\r\n", encoding="ascii")
+    (bin_dir / "uv.exe").write_bytes(b"MZ managed uv")
+    (bin_dir / "uvx.exe").write_bytes(b"MZ managed uvx")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return bin_dir
+
+
+def test_removes_both_launcher_forms_and_keeps_managed_uv(managed_bin: Path):
+    removed = uninstall.remove_windows_bin_launchers(windows=True)
+
+    assert sorted(p.name for p in removed) == ["hermes-acp.cmd", "hermes.exe"]
+    assert not (managed_bin / "hermes.exe").exists()
+    assert not (managed_bin / "hermes-acp.cmd").exists()
+    # The managed uv stays — keep-data reinstalls still need it.
+    assert (managed_bin / "uv.exe").exists()
+    assert (managed_bin / "uvx.exe").exists()
+
+
+def test_anchors_on_default_root_not_profile_home(
+    managed_bin: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The launcher dir is per-machine; a profile HERMES_HOME must not
+    redirect the sweep into ``profiles/<name>/bin``."""
+    home = managed_bin.parent
+    monkeypatch.setenv("HERMES_HOME", str(home / "profiles" / "work"))
+
+    removed = uninstall.remove_windows_bin_launchers(windows=True)
+
+    assert sorted(p.name for p in removed) == ["hermes-acp.cmd", "hermes.exe"]
+    assert not (managed_bin / "hermes.exe").exists()
+
+
+def test_noop_on_posix(managed_bin: Path):
+    assert uninstall.remove_windows_bin_launchers(windows=False) == []
+    assert (managed_bin / "hermes.exe").exists()
+
+
+def test_noop_when_no_launchers_staged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert uninstall.remove_windows_bin_launchers(windows=True) == []
+
+
+def test_launcher_names_stay_in_lockstep_with_install_ps1():
+    """The sweep must cover exactly the names install.ps1 stages, and no
+    generic name it could clobber. Reads the real installer list so the two
+    sides cannot drift apart silently."""
+    import re
+
+    install_ps1 = (
+        Path(uninstall.__file__).resolve().parents[1] / "scripts" / "install.ps1"
+    ).read_text(encoding="ascii")
+    match = re.search(r"foreach \(\$launcher in @\(([^)]*)\)\)", install_ps1)
+    assert match, "launcher staging loop not found in install.ps1"
+    staged = set(re.findall(r'"([^"]+)"', match.group(1)))
+
+    assert staged == set(_WINDOWS_BIN_LAUNCHERS)
+    for name in _WINDOWS_BIN_LAUNCHERS:
+        assert name.startswith("hermes")  # never a generic name it could clobber
+
+
+class TestManagedBinPathMarker:
+    """The managed ``bin`` PATH entry goes only when the dir itself goes.
+
+    Markers match against Windows registry PATH entries, so the inputs here
+    are Windows-shaped path strings regardless of the host — feeding
+    ``tmp_path`` would make the test pass only on Windows hosts.
+    """
+
+    HOME = r"C:\Users\me\AppData\Local\hermes"
+    BIN_ENTRY = r"C:\Users\me\AppData\Local\hermes\bin"
+
+    def test_keep_data_markers_spare_the_managed_bin(self):
+        markers = [m.lower() for m in uninstall._hermes_path_markers(Path(self.HOME))]
+
+        assert not any(self.BIN_ENTRY.lower().startswith(m) for m in markers)
+
+    def test_full_wipe_markers_take_the_managed_bin(self):
+        markers = [
+            m.lower()
+            for m in uninstall._hermes_path_markers(
+                Path(self.HOME), include_managed_bin=True
+            )
+        ]
+
+        assert any(self.BIN_ENTRY.lower().startswith(m) for m in markers)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_unsupervised_pid1_warning.py ===
+"""The PID-1-with-no-init startup warning (#111577): a Compose ``entrypoint:`` override
+makes hermes PID 1 with no reaper above it, so orphaned children pile up as zombies."""
+
+from hermes_cli.main import _warn_if_unsupervised_pid1
+
+
+def test_warns_when_process_is_pid_1(capsys):
+    _warn_if_unsupervised_pid1(pid=1)
+    err = capsys.readouterr().err
+    assert "PID 1" in err and "init: true" in err
+
+
+def test_silent_when_not_pid_1(capsys):
+    _warn_if_unsupervised_pid1(pid=4242)
+    captured = capsys.readouterr()
+    assert captured.err == "" and captured.out == ""
+

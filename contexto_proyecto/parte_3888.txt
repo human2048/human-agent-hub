@@ -1,0 +1,436 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\memory\test_openviking_shutdown.py ===
+"""Tests for OpenViking memory-provider shutdown teardown.
+
+The runtime-autostart waiter is a tracked ``daemon=True`` thread that blocks
+on network health probes. If ``shutdown()`` doesn't join it (and the waiter
+doesn't bail on the shutdown flag), it can be left alive at interpreter exit,
+which crashes CPython with SIGABRT at ``Py_FinalizeEx``. These tests assert
+the waiter short-circuits on shutdown and that ``shutdown()`` waits for the
+runtime-start thread.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from unittest.mock import patch
+
+import plugins.memory.openviking as openviking_module
+from plugins.memory.openviking import OpenVikingMemoryProvider
+
+
+def test_wait_for_health_short_circuits_on_should_stop():
+    """The health waiter returns False without probing when should_stop is set,
+    so the daemon thread running it can be join()ed promptly at shutdown."""
+    probes: list[str] = []
+
+    def _reach(endpoint):
+        probes.append(endpoint)
+        return (False, "down")
+
+    with patch.object(
+        openviking_module, "_validate_openviking_reachability", _reach
+    ):
+        result = openviking_module._wait_for_openviking_health(
+            "http://example.invalid",
+            timeout_seconds=60.0,
+            should_stop=lambda: True,
+        )
+
+    assert result is False
+    assert probes == []  # bailed before the first network probe
+
+
+def test_shutdown_waits_for_runtime_start_thread():
+    """shutdown() must join the runtime-autostart waiter thread.
+
+    The fake waiter does post-stop work (a short sleep) once it observes the
+    shutdown flag. If shutdown() joins it, that work has completed by the time
+    shutdown() returns; without the join, shutdown() returns early and the
+    thread is still running (the SIGABRT-at-exit failure mode).
+    """
+    provider = OpenVikingMemoryProvider()
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _runtime():
+        started.set()
+        while not provider._shutting_down:
+            time.sleep(0.01)
+        time.sleep(0.2)  # work that must finish during shutdown's join
+        finished.set()
+
+    t = threading.Thread(target=_runtime, daemon=True, name="openviking-runtime-start")
+    provider._runtime_start_thread = t
+    t.start()
+    assert started.wait(2.0)
+
+    provider.shutdown()
+
+    assert finished.is_set()
+    assert not t.is_alive()
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\memory\test_provider_threads_inherit_profile.py ===
+"""Multiplex invariant: every memory provider's background thread runs under the spawner's profile.
+
+Profile isolation is a ContextVar-scoped HERMES_HOME override; a plain ``threading.Thread`` starts
+with an EMPTY context, so a provider's prefetch/sync/writer thread would silently resolve the DEFAULT
+profile's home (and fail closed on scoped secrets). Each case drives the provider's real spawn path
+with a fake backend and asserts the thread saw the parent's home.
+"""
+from __future__ import annotations
+
+import threading
+from unittest.mock import MagicMock
+
+import pytest
+
+from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+
+def _probe_home(seen: dict, key: str = "home"):
+    def _record(*_args, **_kwargs):
+        seen[key] = get_hermes_home()
+    return _record
+
+
+def _mem0(seen, tmp_path):
+    from plugins.memory.mem0 import Mem0MemoryProvider
+
+    p = Mem0MemoryProvider()
+    p._backend = MagicMock()
+    p._config = {"mode": "platform"}
+    p._add = _probe_home(seen)
+    p.sync_turn("a long enough user message", "assistant reply")
+    return [p._sync_thread]
+
+
+def _retaindb(seen, tmp_path):
+    import plugins.memory.retaindb as retaindb
+
+    p = retaindb.RetainDBMemoryProvider()
+    p._client = MagicMock()
+    p._context_overlay = lambda query: {"context": seen.setdefault("home", get_hermes_home()) and "ctx"}
+    p._client.ask_user.return_value = {"answer": ""}
+    p._client.get_agent_model.return_value = {}
+    p.queue_prefetch("what do you know")
+    return list(p._prefetch_threads)
+
+
+def _byterover(seen, tmp_path):
+    import plugins.memory.byterover as byterover
+
+    p = byterover.ByteRoverMemoryProvider()
+    p._curate = _probe_home(seen)
+    return [p._curate_in_background("content", name="brv-test", what="test")]
+
+
+def _supermemory(seen, tmp_path):
+    import plugins.memory.supermemory as supermemory
+
+    p = supermemory.SupermemoryMemoryProvider()
+    p._active = p._write_enabled = True
+    p._client = MagicMock()
+    p._client.add_memory = _probe_home(seen)
+    p.on_memory_write("add", "user", "a fact")
+    return [p._write_thread]
+
+
+def _openviking(seen, tmp_path):
+    import plugins.memory.openviking as openviking
+
+    p = openviking.OpenVikingMemoryProvider()
+    workers: set = set()
+    p._spawn_tracked("ov-test", _probe_home(seen), threading.Lock(), lambda: workers)
+    return list(workers)
+
+
+def _hindsight(seen, tmp_path):
+    import plugins.memory.hindsight as hindsight
+
+    p = hindsight.HindsightMemoryProvider()
+    p._recall_sync, p._memory_mode, p._auto_recall, p._prefetch_waits_for_retain = False, "hybrid", True, False
+    p._do_recall = lambda query: (seen.setdefault("home", get_hermes_home()) and "text", 1)
+    p.queue_prefetch("remember this")
+    return [p._prefetch_thread]
+
+
+def _honcho(seen, tmp_path):
+    from plugins.memory.honcho import HonchoMemoryProvider
+
+    return [HonchoMemoryProvider()._spawn_write(_probe_home(seen), "honcho-test", "failed %s")]
+
+
+_PROVIDERS = {
+    "mem0": _mem0, "retaindb": _retaindb, "byterover": _byterover, "supermemory": _supermemory,
+    "openviking": _openviking, "hindsight": _hindsight, "honcho": _honcho,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PROVIDERS))
+def test_provider_background_thread_sees_spawner_profile_home(name, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+    profile_home = tmp_path / "profiles" / "b"
+    profile_home.mkdir(parents=True)
+    seen: dict = {}
+    token = set_hermes_home_override(profile_home)
+    try:
+        threads = _PROVIDERS[name](seen, tmp_path)
+    finally:
+        reset_hermes_home_override(token)
+    for t in threads:
+        if t is not None:
+            t.join(timeout=10)
+    assert seen.get("home") == profile_home, f"{name}: background thread resolved {seen.get('home')}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\memory\test_retaindb_provider.py ===
+from __future__ import annotations
+
+import sqlite3
+from unittest.mock import MagicMock
+
+import agent.file_safety as fs
+
+import pytest
+
+import plugins.memory.retaindb as retaindb
+from plugins.memory.retaindb import RetainDBMemoryProvider
+
+
+def test_write_queue_closes_owner_connection(tmp_path):
+    queue = retaindb._WriteQueue(object(), tmp_path / "retaindb.db")
+    owner_conn = queue._local.conn
+    worker = retaindb.threading.Thread(target=queue._get_conn)
+    worker.start()
+    worker.join()
+    queue.shutdown()
+    assert not queue._connections
+    with pytest.raises(sqlite3.ProgrammingError):
+        owner_conn.execute("SELECT 1")
+
+
+def test_write_queue_ignores_enqueue_after_shutdown(tmp_path):
+    queue = retaindb._WriteQueue(object(), tmp_path / "retaindb.db")
+    queue.shutdown()
+
+    queue.enqueue("user", "session", [])
+
+    assert not queue._connections
+
+
+def test_prefetch_does_not_spawn_when_previous_batch_is_alive(monkeypatch):
+    provider = RetainDBMemoryProvider()
+    provider._client = object()
+
+    class _RunningThread:
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return True
+
+    previous = _RunningThread()
+    provider._prefetch_threads = [previous]
+    created = []
+
+    class _Thread:
+        def __init__(self, *args, **kwargs):
+            created.append((args, kwargs))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(retaindb.threading, "Thread", _Thread)
+    provider.queue_prefetch("query")
+    assert provider._prefetch_threads == [previous]
+    assert not created
+
+
+def test_upload_file_rejects_hermes_credential_store(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    auth_json = hermes_home / "auth.json"
+    auth_json.write_text('{"OPENAI_API_KEY":"sk-test-secret"}', encoding="utf-8")
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: hermes_home)
+
+    provider = RetainDBMemoryProvider()
+    provider._client = MagicMock()
+
+    result = provider._dispatch("retaindb_upload_file", {"local_path": str(auth_json)})
+
+    assert "error" in result
+    assert "credential store" in result["error"]
+    provider._client.upload_file.assert_not_called()
+
+
+def test_upload_file_allows_regular_file(tmp_path):
+    note = tmp_path / "note.md"
+    note.write_text("# Note\n", encoding="utf-8")
+    provider = RetainDBMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.upload_file.return_value = {
+        "file": {"id": "file-1", "name": "note.md"},
+    }
+
+    result = provider._dispatch("retaindb_upload_file", {"local_path": str(note)})
+
+    provider._client.upload_file.assert_called_once()
+    assert provider._client.upload_file.call_args.args[0] == note.read_bytes()
+    assert result["file"]["id"] == "file-1"
+
+
+def _capture_initialized_client(monkeypatch, tmp_path):
+    """Patch _Client/_WriteQueue/get_hermes_home; return a dict capturing args."""
+    import hermes_constants
+
+    import plugins.memory.retaindb as retaindb_module
+
+    captured: dict = {}
+
+    class _FakeClient:
+        def __init__(self, api_key, base_url, project):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["project"] = project
+            self.project = project
+
+    monkeypatch.setattr(retaindb_module, "_Client", _FakeClient)
+    monkeypatch.setattr(retaindb_module, "_WriteQueue", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    return retaindb_module, captured
+
+
+def test_retaindb_config_loader_uses_readonly_config(monkeypatch):
+    import hermes_cli.config as config_mod
+    import plugins.memory.retaindb as retaindb_module
+
+    backing_config = {
+        "memory": {
+            "retaindb": {
+                "base_url": "https://saved.example",
+                "project": "saved-project",
+            }
+        }
+    }
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: backing_config)
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        MagicMock(side_effect=AssertionError("read-only provider path must not load a mutable copy")),
+    )
+
+    config = retaindb_module._load_retaindb_config()
+
+    assert config == backing_config["memory"]["retaindb"]
+    assert config is not backing_config["memory"]["retaindb"]
+
+
+def test_initialize_reads_real_dashboard_config_file(tmp_path, monkeypatch):
+    for var in ("RETAINDB_API_KEY", "RETAINDB_BASE_URL", "RETAINDB_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        """\
+memory:
+  provider: retaindb
+  retaindb:
+    base_url: https://retaindb.saved.example/
+    project: dashboard-project
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _retaindb_module, captured = _capture_initialized_client(monkeypatch, tmp_path)
+
+    RetainDBMemoryProvider().initialize("sess-1")
+
+    assert captured["base_url"] == "https://retaindb.saved.example"
+    assert captured["project"] == "dashboard-project"
+
+
+def test_initialize_reads_base_url_and_project_from_config_yaml(tmp_path, monkeypatch):
+    """#68209: non-secret base_url/project come from config.yaml when env is unset."""
+    for var in ("RETAINDB_API_KEY", "RETAINDB_BASE_URL", "RETAINDB_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+    retaindb_module, captured = _capture_initialized_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        retaindb_module,
+        "_load_retaindb_config",
+        lambda: {"base_url": "https://retaindb.example.com/", "project": "cfg-project"},
+    )
+
+    RetainDBMemoryProvider().initialize("sess-1")
+
+    assert captured["base_url"] == "https://retaindb.example.com"  # trailing slash stripped
+    assert captured["project"] == "cfg-project"
+
+
+def test_initialize_env_overrides_config_yaml(tmp_path, monkeypatch):
+    for var in ("RETAINDB_API_KEY", "RETAINDB_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("RETAINDB_BASE_URL", "https://env.example.com")
+    retaindb_module, captured = _capture_initialized_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        retaindb_module,
+        "_load_retaindb_config",
+        lambda: {"base_url": "https://cfg.example.com", "project": "cfg-project"},
+    )
+
+    RetainDBMemoryProvider().initialize("sess-1")
+
+    assert captured["base_url"] == "https://env.example.com"
+
+
+def test_initialize_combines_scoped_secret_with_dashboard_config(tmp_path, monkeypatch):
+    """Rebase regression: scoped secrets and non-secret config must coexist."""
+    from agent.secret_scope import (
+        is_multiplex_active,
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
+
+    monkeypatch.setenv("RETAINDB_API_KEY", "env-other-profile")
+    monkeypatch.delenv("RETAINDB_BASE_URL", raising=False)
+    monkeypatch.delenv("RETAINDB_PROJECT", raising=False)
+    retaindb_module, captured = _capture_initialized_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        retaindb_module,
+        "_load_retaindb_config",
+        lambda: {"base_url": "https://dashboard.example.com/", "project": "dashboard-project"},
+    )
+
+    previous_multiplex_state = is_multiplex_active()
+    set_multiplex_active(True)
+    token = set_secret_scope({"RETAINDB_API_KEY": "scoped-key"})
+    try:
+        RetainDBMemoryProvider().initialize("sess-1")
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(previous_multiplex_state)
+
+    assert captured == {
+        "api_key": "scoped-key",
+        "base_url": "https://dashboard.example.com",
+        "project": "dashboard-project",
+    }
+
+
+def test_initialize_falls_back_to_default_base_url(tmp_path, monkeypatch):
+    for var in ("RETAINDB_API_KEY", "RETAINDB_BASE_URL", "RETAINDB_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+    retaindb_module, captured = _capture_initialized_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(retaindb_module, "_load_retaindb_config", lambda: {})
+
+    RetainDBMemoryProvider().initialize("sess-1")
+
+    assert captured["base_url"] == retaindb_module._DEFAULT_BASE_URL
+    assert captured["project"] == "default"
+

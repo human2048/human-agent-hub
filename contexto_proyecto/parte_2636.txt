@@ -1,0 +1,306 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_feishu_bot_auth_bypass.py ===
+"""Regression guard for Feishu bot-sender authorization bypass.
+
+Mirrors tests/gateway/test_discord_bot_auth_bypass.py for Platform.FEISHU.
+Without the bypass in gateway/run.py, Feishu bot senders admitted by the
+adapter would be rejected at _is_user_authorized with "Unauthorized user"
+— same class of bug as Discord #4466.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.session import Platform, SessionSource
+
+
+@pytest.fixture(autouse=True)
+def _isolate_feishu_env(monkeypatch):
+    for var in (
+        "FEISHU_ALLOW_BOTS",
+        "FEISHU_ALLOWED_USERS",
+        "FEISHU_ALLOW_ALL_USERS",
+        "TELEGRAM_ALLOW_BOTS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _make_bare_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
+    return runner
+
+
+def _make_feishu_bot_source(open_id: str = "ou_peer"):
+    return SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_1",
+        chat_type="group",
+        user_id=open_id,
+        user_name="PeerBot",
+        is_bot=True,
+    )
+
+
+def _make_feishu_human_source(open_id: str = "ou_human"):
+    return SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_1",
+        chat_type="group",
+        user_id=open_id,
+        user_name="Human",
+        is_bot=False,
+    )
+
+
+def test_feishu_human_still_checked_against_allowlist_when_bot_policy_set(monkeypatch):
+    """FEISHU_ALLOW_BOTS=all must NOT open the gate for humans."""
+    runner = _make_bare_runner()
+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "all")
+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_human")
+
+    assert runner._is_user_authorized(_make_feishu_human_source("ou_stranger")) is False
+    assert runner._is_user_authorized(_make_feishu_human_source("ou_human")) is True
+
+
+def test_feishu_bot_bypass_does_not_leak_to_other_platforms(monkeypatch):
+    """FEISHU_ALLOW_BOTS=all must not authorize Telegram/Discord bot sources."""
+    runner = _make_bare_runner()
+    monkeypatch.setenv("FEISHU_ALLOW_BOTS", "all")
+
+    telegram_bot = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="channel",
+        user_id="999",
+        is_bot=True,
+    )
+    assert runner._is_user_authorized(telegram_bot) is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_feishu_channel_prompts.py ===
+"""Tests for Feishu per-channel prompt resolution.
+
+Feishu previously ignored ``channel_prompts`` config (unlike Discord/Slack).
+These tests verify that ``_resolve_channel_prompt`` reads the adapter's
+``config.extra`` and that the resolved prompt is attached to the dispatched
+``MessageEvent`` for the inbound, reaction, and card-action paths.
+"""
+
+import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+from gateway.config import PlatformConfig
+
+
+def _build_adapter(extra=None):
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    adapter = FeishuAdapter.__new__(FeishuAdapter)
+    adapter.config = PlatformConfig(extra=extra or {})
+    adapter._bot_open_id = "ou_bot"
+    adapter._bot_user_id = ""
+    adapter._bot_name = "Hermes"
+    adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
+    adapter._fetch_message_text = AsyncMock(return_value=None)
+    adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
+    )
+    adapter._resolve_source_chat_type = Mock(return_value="group")
+    adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
+    adapter._dispatch_inbound_event = AsyncMock()
+    return adapter
+
+
+def _run_inbound(adapter, chat_id="oc_chat"):
+    message = SimpleNamespace(
+        content=json.dumps({"text": "plain message"}),
+        message_type="text",
+        message_id="m",
+        mentions=[],
+        chat_id=chat_id,
+        parent_id=None,
+        upper_message_id=None,
+        thread_id=None,
+    )
+    asyncio.run(
+        adapter._process_inbound_message(
+            data=message, message=message, sender_id=None, chat_type="group", message_id="m",
+        )
+    )
+    return adapter._dispatch_inbound_event.call_args.args[0]
+
+
+def test_resolve_channel_prompt_missing_config_is_safe():
+    # __new__ adapter without a config attribute (defensive getattr path).
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    bare = FeishuAdapter.__new__(FeishuAdapter)
+    assert bare._resolve_channel_prompt("oc_chat") is None
+
+
+def test_inbound_event_carries_channel_prompt():
+    adapter = _build_adapter({"channel_prompts": {"oc_chat": "Feishu role prompt."}})
+    event = _run_inbound(adapter, chat_id="oc_chat")
+    assert event.channel_prompt == "Feishu role prompt."
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_feishu_comment.py ===
+"""Tests for feishu_comment — event filtering, access control integration, wiki reverse lookup."""
+
+import asyncio
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+from plugins.platforms.feishu.feishu_comment import (
+    parse_drive_comment_event,
+    _ALLOWED_NOTICE_TYPES,
+    _sanitize_comment_text,
+)
+
+
+def _make_event(
+    comment_id="c1",
+    reply_id="r1",
+    notice_type="add_reply",
+    file_token="docx_token",
+    file_type="docx",
+    from_open_id="ou_user",
+    to_open_id="ou_bot",
+    is_mentioned=True,
+):
+    """Build a minimal drive comment event SimpleNamespace."""
+    return SimpleNamespace(event={
+        "event_id": "evt_1",
+        "comment_id": comment_id,
+        "reply_id": reply_id,
+        "is_mentioned": is_mentioned,
+        "timestamp": "1713200000",
+        "notice_meta": {
+            "file_token": file_token,
+            "file_type": file_type,
+            "notice_type": notice_type,
+            "from_user_id": {"open_id": from_open_id},
+            "to_user_id": {"open_id": to_open_id},
+        },
+    })
+
+
+class TestParseEvent(unittest.TestCase):
+    def test_parse_valid_event(self):
+        evt = _make_event()
+        parsed = parse_drive_comment_event(evt)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["comment_id"], "c1")
+        self.assertEqual(parsed["file_type"], "docx")
+        self.assertEqual(parsed["from_open_id"], "ou_user")
+        self.assertEqual(parsed["to_open_id"], "ou_bot")
+
+
+class TestEventFiltering(unittest.TestCase):
+    """Test the filtering logic in handle_drive_comment_event."""
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    @patch("plugins.platforms.feishu.feishu_comment_rules.load_config")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.resolve_rule")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.is_user_allowed")
+    def test_self_reply_filtered(self, mock_allowed, mock_resolve, mock_load):
+        """Events where from_open_id == self_open_id should be dropped."""
+        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
+
+        evt = _make_event(from_open_id="ou_bot", to_open_id="ou_bot")
+        self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
+        mock_load.assert_not_called()
+
+    @patch("plugins.platforms.feishu.feishu_comment_rules.load_config")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.resolve_rule")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.is_user_allowed")
+    def test_wrong_receiver_filtered(self, mock_allowed, mock_resolve, mock_load):
+        """Events where to_open_id != self_open_id should be dropped."""
+        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
+
+        evt = _make_event(to_open_id="ou_other_bot")
+        self._run(handle_drive_comment_event(Mock(), evt, self_open_id="ou_bot"))
+        mock_load.assert_not_called()
+
+
+class TestAccessControlIntegration(unittest.TestCase):
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    @patch("plugins.platforms.feishu.feishu_comment_rules.has_wiki_keys", return_value=False)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.is_user_allowed", return_value=False)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.resolve_rule")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.load_config")
+    def test_denied_user_no_side_effects(self, mock_load, mock_resolve, mock_allowed, mock_wiki_keys):
+        """Denied user should not trigger typing reaction or agent."""
+        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
+        from plugins.platforms.feishu.feishu_comment_rules import ResolvedCommentRule
+
+        mock_resolve.return_value = ResolvedCommentRule(True, "allowlist", frozenset(), "top")
+        mock_load.return_value = Mock()
+
+        client = Mock()
+        evt = _make_event()
+        self._run(handle_drive_comment_event(client, evt, self_open_id="ou_bot"))
+
+        # No API calls should be made for denied users
+        client.request.assert_not_called()
+
+
+class TestSanitizeCommentText(unittest.TestCase):
+    def test_angle_brackets_escaped(self):
+        self.assertEqual(_sanitize_comment_text("List<String>"), "List&lt;String&gt;")
+
+    def test_ampersand_escaped_first(self):
+        self.assertEqual(_sanitize_comment_text("a & b"), "a &amp; b")
+
+    def test_ampersand_not_double_escaped(self):
+        result = _sanitize_comment_text("a < b & c > d")
+        self.assertEqual(result, "a &lt; b &amp; c &gt; d")
+        self.assertNotIn("&amp;lt;", result)
+        self.assertNotIn("&amp;gt;", result)
+
+
+class TestWikiReverseLookup(unittest.TestCase):
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    @patch("plugins.platforms.feishu.feishu_comment._exec_request")
+    def test_reverse_lookup_success(self, mock_exec):
+        from plugins.platforms.feishu.feishu_comment import _reverse_lookup_wiki_token
+
+        mock_exec.return_value = (0, "Success", {
+            "node": {"node_token": "WIKI_TOKEN_123", "obj_token": "docx_abc"},
+        })
+        result = self._run(_reverse_lookup_wiki_token(Mock(), "docx", "docx_abc"))
+        self.assertEqual(result, "WIKI_TOKEN_123")
+        # Verify correct API params
+        call_args = mock_exec.call_args
+        queries = call_args[1].get("queries") or call_args[0][3]
+        query_dict = dict(queries)
+        self.assertEqual(query_dict["token"], "docx_abc")
+        self.assertEqual(query_dict["obj_type"], "docx")
+
+
+if __name__ == "__main__":
+    unittest.main()
+

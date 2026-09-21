@@ -1,0 +1,168 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\box\references\hubs.md ===
+# Box Hubs
+
+Use a Box Hub for recurring Q&A over a curated knowledge base. A direct Box AI Ask request handles up to 25 selected files; a Hub request sends one `hubs` item and searches the Hub's indexed content. Do not use a Hub for metadata extraction or text generation.
+
+## Check availability and discover an existing Hub
+
+The Box Free Developer Plan includes the Hubs API, Box AI APIs, and a monthly AI-unit allowance for building and testing. Do not apply Box web-app plan wording as a blanket API restriction. The CLI calls the same APIs and does not bypass account entitlements: production availability still depends on the organization's plan and Box configuration.
+
+Before the first Hub AI request, explain that Box AI must be enabled and consumes AI units; do not wait for acknowledgement. Explain that answers only use indexed files the current actor can access. Hubs are not files or folders: never use `folders:items 0` to discover or reject a Hub invitation. Confirm the current actor, then list accessible Hubs before proposing a new one:
+
+```bash
+box users:get me --json --fields id,name,login
+box hubs --scope all --max-items 1000 --json
+box hubs --query "Product" --scope all --sort relevance --json
+box hubs:get <HUB_ID> --json
+box hubs:items <HUB_ID> --max-items 100 --json
+```
+
+For a known Hub URL or ID, run `box hubs:get <HUB_ID>` directly even if the list is empty. Report each Hub as `https://app.box.com/hubs/<HUB_ID>`. Check `is_ai_enabled` before asking a question, then make one bounded Hub Ask request to verify actual API availability. Box AI for Hubs must have been enabled before the Hub was created so Box can index its content. If Hub AI is unavailable, distinguish a disabled feature, a Hub created before AI enablement, indexing delay, missing Hub collaboration, missing access to underlying files, and exhausted AI units; do not silently download source files into Hermes' model context.
+
+## Ask questions across a Hub
+
+Use one Hub item and `single_item_qa`. Request citations so Hermes can report the source files behind an answer. Use `box request` (or the SDK) for Hub Q&A rather than relying on `box ai:ask`, whose installed CLI versions may not accept Hub item types. This uses the Box AI Ask endpoint; the `box-version: 2025.0` header is required for `/hubs` management endpoints, not this request.
+
+```bash
+box request /ai/ask -X POST \
+  --body '{"mode":"single_item_qa","items":[{"id":"<HUB_ID>","type":"hubs"}],"prompt":"Summarize the approved renewal terms and cite each source.","include_citations":true}' \
+  --json
+```
+
+State the Hub ID and navigation link with the answer. List cited file IDs, names, and file links when Box returns citations. Treat an answer as bounded by indexed, accessible Hub content; do not claim it searched files that have not indexed or that the actor cannot access.
+
+## Create and populate a Hub
+
+Do not create a Hub automatically. For Q&A over more than 25 files or a reusable curated collection, discover an existing accessible Hub first. If none fits, offer to create a curated Hub and obtain explicit approval before creating or populating it. If the user declines, narrow the one-off scope with search or metadata instead.
+
+After approval, create it, report its link, and verify it:
+
+```bash
+box hubs:create "Policy knowledge base" --description "Approved policy reference" --json
+box hubs:get <HUB_ID> --json
+```
+
+Adding an item curates a reference; it does not move the underlying file or folder. A clearly requested small addition may proceed without a redundant prompt. Confirm before bulk additions or removals, then verify every returned result and read back the Hub items. The API can return partial success for multi-item changes, so do not treat a successful request alone as proof that every item was added.
+
+```bash
+box hubs:items:manage <HUB_ID> \
+  --add id=<FILE_ID>,type=file --json
+box hubs:items:manage <HUB_ID> \
+  --add id=<FOLDER_ID>,type=folder --json
+box hubs:items <HUB_ID> --max-items 100 --json
+```
+
+Without `parent-id`, the CLI adds the item to the first Item List block. To target a specific Item List block, first list pages with `box hubs:document:pages <HUB_ID> --json`, retrieve blocks with `box hubs:document:blocks <HUB_ID> <PAGE_ID> --json`, then pass the returned Item List block ID as `parent-id`.
+
+Confirm before enabling or disabling Hub AI, deleting or copying a Hub, or changing shared access. Verify each change with `box hubs:get`, `box hubs:items`, or `box hubs:collaborations`:
+
+```bash
+box hubs:update <HUB_ID> --ai-enabled --json
+box hubs:collaborations <HUB_ID> --max-items 100 --json
+box hubs:collaborations:create <HUB_ID> --role viewer --user-id <USER_ID> --json
+```
+
+## Handle indexing, permissions, and limits
+
+Newly added content usually indexes within minutes but can take up to an hour. Verify the item addition, wait or retry a bounded number of times, and report a retryable indexing state instead of declaring the source absent. Diagnose permissions separately: a successful `box hubs` or `box hubs:get` proves Hub access, not access to every underlying file. Hub answers respect the querying actor's access to underlying files.
+
+Box AI for Hubs has a service limit per Hub and across the enterprise. Box's dedicated Hubs guidance currently documents 20,000 files per Hub; verify current account or product documentation when operating near the boundary. Do not present that number as an immutable guarantee. Only the first 4 MB of a supported document's text representation is indexed. Explain AI-unit use before the first request and confirm a material batch or broad Hub population.
+
+## Sources
+
+- [Box Hubs API overview](https://developer.box.com/guides/hubs-api/)
+- [Box Free Developer Plan](https://developer.box.com/guides/getting-started/free-developer-plan/)
+- [Box AI Ask API](https://developer.box.com/reference/post-ai-ask/)
+- [Ask questions about a Hub](https://developer.box.com/guides/box-ai/ai-tutorials/ask-questions/)
+- [Box AI for Hubs](https://support.box.com/hc/en-us/articles/29347206309395-Box-AI-for-Hubs)
+- [Box Hubs limits](https://support.box.com/hc/en-us/articles/28323495455123-Box-Hubs-Known-Issues-and-Limitations)
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\box\references\oauth-setup.md ===
+# OAuth setup
+
+Use OAuth for every Hermes-to-Box connection. OAuth follows the signed-in Box user's permissions and the app's scopes; it does not grant enterprise-wide access.
+
+## Choose the OAuth account
+
+Authorize the Box account that Hermes should act as. OAuth follows that account's permissions. If the user wants a narrower permission boundary, authorize an account that is invited only to the files, folders, or Hubs Hermes should access. Do not make that account an administrator merely to unlock an exceptional operation.
+
+Everyone who uses a shared or background Hermes deployment receives the access of the one Box account it authorizes, so do not connect it to a broader personal or administrator account. Before starting the browser flow, make sure the authorization browser is signed in as the intended Box account.
+
+Choose a descriptive environment name, such as `hermes-box-oauth`. Do not overwrite or reauthorize an existing environment until its identity is confirmed.
+
+## Same-host interactive path
+
+First resolve the Box command runner using [CLI guide](cli-guide.md). Then ask whether Hermes runs on the same computer as the browser the user will use to authorize Box. Use this path only when they confirm that it does. This is normally a local computer setup. Do not infer this from the operating system alone. Use the resolved runner; do not reconstruct a local npm prefix unless Hermes installed and verified that exact local copy.
+
+Start one official local login operation without `--code`, leave its terminal process running until it exits, then verify the actor. The examples below use `box`; replace that executable with the previously verified local runner only when Hermes installed and verified a private CLI copy:
+
+```bash
+box login --default-box-app --name <ENVIRONMENT_NAME>
+box users:get me --json --fields id,name,login
+```
+
+The browser flow creates and selects the named environment. Run the action through Hermes's terminal rather than asking the user to copy a runner command. Announce the pending authorization, wait for the CLI process to finish, then continue with the actor check. Let the CLI open the authorization page and receive the local callback. Do not use browser tools, inspect browser tabs, request the resulting URL, navigate to Box, or ask the user to paste a code.
+
+If the callback server cannot bind port 3000, the browser opens an unusable authorization result, or the callback never reaches the waiting CLI, stop that login process before retrying. Retry the official app on the supported ports `3001`, `4000`, `5000`, and `8080`, one at a time, and verify the actor after each successful completion:
+
+```bash
+box login --default-box-app --port 3001 --name <ENVIRONMENT_NAME>
+```
+
+Do not switch a same-host setup to `--code` merely because port 3000 failed. Use `--code` only after the supported local ports fail or the user confirms that the authorization browser is on another host.
+
+## Separate-host or headless path
+
+Use this path only after the user explicitly confirms that Hermes runs on a remote host—such as a VPS, container, or cloud VM—or that it is headless and the authorization browser is on a different computer. Use the same previously resolved runner and run:
+
+```bash
+box login --default-box-app --code --name <ENVIRONMENT_NAME>
+```
+
+Open the displayed URL with a browser tool only when it controls the human's authorization browser. Otherwise present the URL and pause for the user to sign in and approve access, then continue the CLI's code-and-state prompts and verify the actor. Do not use this path when the same-host callback is available.
+
+## Existing environments
+
+The Box CLI stores multiple named environments but uses one current default:
+
+```bash
+box configure:environments:list
+box configure:environments:set-current <ENVIRONMENT_NAME>
+box users:get me --json --fields id,name,login
+```
+
+Request approval before switching the current environment, especially on a shared or background installation. Switch it only after approval and verify the resulting actor. If the returned identity is API-only or has no normal Box login, do not use it for Hermes; connect a normal Box account through OAuth instead.
+
+## Custom OAuth Platform App
+
+Use this path only when the requested operation needs a scope unavailable through the official CLI app, such as **Manage webhooks**. Open the [Box Developer Console](https://app.box.com/developers/console), create or select a Platform App with **User Authentication (OAuth 2.0)**, and enable only the required scopes. Never broaden scopes merely to avoid an authorization error.
+
+Use the same topology decision as the official app. For a same-host browser, add `http://localhost:3000/callback` as an OAuth redirect URI in the app's **Configuration** tab, save it, then run:
+
+```bash
+box login --platform-app --port 3000 --name <ENVIRONMENT_NAME>
+```
+
+If port 3000 cannot bind, choose another free local port, add the exact `http://localhost:<PORT>/callback` URI to the Platform App, save the configuration, stop the failed login process, and retry with the matching `--port`. Unlike the official app, a custom Platform App may use any port whose exact callback URI is registered.
+
+For a remote or headless Hermes runtime whose authorization browser is on a different computer, register the same loopback callback URI and add `--code`:
+
+```bash
+box login --platform-app --code --port 3000 --name <ENVIRONMENT_NAME>
+```
+
+Before starting the remote flow, explain that the browser may finish on an unreachable localhost page; this is expected. The resulting URL contains both `code` and `state`, which the waiting CLI requests. Ask the user for only those two values, submit them to the existing process, and then verify the actor. Do not inspect unrelated browser tabs or switch to the local callback workflow on a remote host.
+
+Let the CLI prompt for the Client ID and Client Secret. Do not ask the user to paste the Client Secret into chat, write it to Hermes configuration, or give the user an unverified local-runner command to copy. Authenticate the intended user in the browser, then verify the resulting actor. Keep administrator-only operations outside the normal Hermes OAuth identity.
+
+## Official links
+
+- [Box CLI quick start](https://developer.box.com/guides/cli/quick-start/)
+- [Box CLI headless login](https://developer.box.com/guides/cli/headless-login/)
+- [OAuth 2.0 guide](https://developer.box.com/guides/authentication/oauth2/)
+- [Box OAuth scopes](https://developer.box.com/guides/api-calls/permissions-and-errors/scopes/)
+

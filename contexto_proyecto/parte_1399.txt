@@ -1,0 +1,348 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\google_meet\node\cli.py ===
+"""`hermes meet node ...` subcommand tree, wired under the ``hermes meet`` parser."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+
+from plugins.google_meet.node.client import NodeClient
+from plugins.google_meet.node.registry import NodeRegistry
+from plugins.google_meet.node.server import NodeServer
+
+
+def register_cli(subparser: argparse.ArgumentParser) -> None:
+    """Add ``run / list / approve / remove / status / ping`` subparsers to the ``node`` parser."""
+    sp = subparser.add_subparsers(dest="node_cmd", required=True)
+    run = sp.add_parser("run", help="Start a node server on this machine.")
+    run.add_argument("--host", default="0.0.0.0")
+    run.add_argument("--port", type=int, default=18789)
+    run.add_argument("--display-name", default="hermes-meet-node")
+    sp.add_parser("list", help="List approved remote nodes.")
+    app = sp.add_parser("approve", help="Register a remote node on the gateway.")
+    for arg in ("name", "url", "token"):
+        app.add_argument(arg)
+    for name, help_ in (("remove", "Forget a registered node."), ("status", "Ping a registered node."),
+                        ("ping", "Alias for status.")):
+        sp.add_parser(name, help=help_).add_argument("name")
+    for p in sp.choices.values():
+        p.set_defaults(func=node_command)
+
+
+def _cmd_run(args: argparse.Namespace, reg: NodeRegistry) -> int:
+    server = NodeServer(host=args.host, port=args.port, display_name=args.display_name)
+    token = server.ensure_token()
+    print(f"[meet-node] display_name={server.display_name}\n"
+          f"[meet-node] listening on ws://{args.host}:{args.port}\n"
+          f"[meet-node] token (copy to gateway): {token}\n[meet-node] approve with:\n"
+          f"             hermes meet node approve <name> ws://<host>:{args.port} {token}")
+    try:
+        asyncio.run(server.serve())
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError as exc:
+        print(f"[meet-node] error: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _cmd_list(args: argparse.Namespace, reg: NodeRegistry) -> int:
+    nodes = reg.list_all()
+    if not nodes:
+        print("no nodes registered")
+    for n in nodes:
+        print(f"{n['name']}\t{n['url']}\ttoken={n['token'][:6]}…")
+    return 0
+
+
+def _cmd_approve(args: argparse.Namespace, reg: NodeRegistry) -> int:
+    reg.add(args.name, args.url, args.token)
+    print(f"approved node {args.name!r} at {args.url}")
+    return 0
+
+
+def _cmd_remove(args: argparse.Namespace, reg: NodeRegistry) -> int:
+    ok = reg.remove(args.name)
+    print(f"removed {args.name!r}" if ok else f"no such node: {args.name!r}")
+    return 0 if ok else 1
+
+
+def _cmd_ping(args: argparse.Namespace, reg: NodeRegistry) -> int:
+    entry = reg.get(args.name)
+    if entry is None:
+        print(f"no such node: {args.name!r}", file=sys.stderr)
+        return 1
+    try:
+        result = NodeClient(entry["url"], entry["token"]).ping()
+    except Exception as exc:  # noqa: BLE001 — surface any connection error
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+    print(json.dumps({"ok": True, "node": args.name, **result}))
+    return 0
+
+
+_COMMANDS = {
+    "run": _cmd_run,
+    "list": _cmd_list,
+    "approve": _cmd_approve,
+    "remove": _cmd_remove,
+    "status": _cmd_ping,
+    "ping": _cmd_ping}
+
+
+def node_command(args: argparse.Namespace) -> int:
+    """Dispatch for ``hermes meet node ...``; returns a process exit code."""
+    cmd = getattr(args, "node_cmd", None)
+    handler = _COMMANDS.get(cmd or "")
+    if handler is None:
+        print(f"unknown node command: {cmd!r}", file=sys.stderr)
+        return 2
+    # ``run`` never touches the registry; constructing it is side-effect free.
+    return handler(args, NodeRegistry())
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from typing import Any  # noqa: F401,E402
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\google_meet\node\client.py ===
+"""Gateway-side RPC client for a remote meet node: one short-lived sync WebSocket per call, so
+non-async tool handlers need no persistent connection. ``websockets`` is imported lazily."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from plugins.google_meet.node import protocol as _proto
+
+
+class NodeClient:
+    """Thin synchronous WS client matching the server's request surface."""
+
+    def __init__(self, url: str, token: str, timeout: float = 10.0) -> None:
+        if not isinstance(url, str) or not url:
+            raise ValueError("url must be a non-empty string")
+        if not isinstance(token, str) or not token:
+            raise ValueError("token must be a non-empty string")
+        self.url = url
+        self.token = token
+        self.timeout = float(timeout)
+
+    def _rpc(self, type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Send one request, return its payload dict; RuntimeError on error envelope / id mismatch."""
+        try:
+            from websockets.sync.client import connect  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("NodeClient requires the 'websockets' package. "
+                               "Install it with: pip install websockets") from exc
+        req = _proto.make_request(type, self.token, payload)
+        with connect(self.url, open_timeout=self.timeout, close_timeout=self.timeout) as ws:
+            ws.send(_proto.encode(req))
+            resp = _proto.decode(ws.recv(timeout=self.timeout))
+        if resp.get("type") == "error":
+            raise RuntimeError(f"node error: {resp.get('error', '<unknown>')}")
+        if resp.get("id") != req["id"]:
+            raise RuntimeError(f"response id mismatch: sent {req['id']}, got {resp.get('id')!r}")
+        payload_out = resp.get("payload")
+        if not isinstance(payload_out, dict):  # pong envelopes also carry a dict payload
+            raise RuntimeError("response missing payload dict")
+        return payload_out
+
+    def start_bot(self, url: str, guest_name: str = "Hermes Agent", duration: Optional[str] = None,
+                  headed: bool = False, mode: str = "transcribe") -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"url": url, "guest_name": guest_name, "headed": bool(headed), "mode": mode}
+        if duration is not None:
+            payload["duration"] = duration
+        return self._rpc("start_bot", payload)
+
+    def stop(self) -> Dict[str, Any]:
+        return self._rpc("stop", {})
+
+    def status(self) -> Dict[str, Any]:
+        return self._rpc("status", {})
+
+    def transcript(self, last: Optional[int] = None) -> Dict[str, Any]:
+        return self._rpc("transcript", {} if last is None else {"last": int(last)})
+
+    def say(self, text: str) -> Dict[str, Any]:
+        return self._rpc("say", {"text": str(text)})
+
+    def ping(self) -> Dict[str, Any]:
+        return self._rpc("ping", {})
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\google_meet\node\protocol.py ===
+"""Wire protocol for gateway ↔ node RPC (JSON envelopes).
+
+    Request:   {"type": <str>, "id": <str>, "token": <str>, "payload": <dict>}
+    Response:  {"type": "response", "id": <req-id>, "payload": <dict>}
+    Error:     {"type": "error", "id": <req-id>, "error": <str>}
+
+Requests carry the shared bearer token (``hermes meet node approve`` on the gateway, read off
+disk on the server); mismatched tokens are rejected before dispatch.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any, Dict, Tuple
+
+
+VALID_REQUEST_TYPES = frozenset({"start_bot", "stop", "status", "transcript", "say", "ping"})
+
+
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def make_request(type: str, token: str, payload: Dict[str, Any], req_id: str | None = None) -> Dict[str, Any]:
+    """Construct a request envelope; ``req_id`` defaults to a uuid4 hex."""
+    if not _nonempty_str(type):
+        raise ValueError("type must be a non-empty string")
+    if type not in VALID_REQUEST_TYPES:
+        raise ValueError(f"unknown request type: {type!r}")
+    if not isinstance(token, str):
+        raise ValueError("token must be a string")
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    return {"type": type, "id": req_id or uuid.uuid4().hex, "token": token, "payload": payload}
+
+
+def make_response(req_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a success envelope; clients correlate replies by ``id``, not type."""
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    return {"type": "response", "id": req_id, "payload": payload}
+
+
+def make_error(req_id: str, error: str) -> Dict[str, Any]:
+    return {"type": "error", "id": req_id, "error": str(error)}
+
+
+def encode(msg: Dict[str, Any]) -> str:
+    """Serialize a message envelope to a JSON string."""
+    return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+
+
+def decode(raw) -> Dict[str, Any]:
+    """Parse a JSON envelope (object with string ``type`` + ``id``) from str/bytes; ValueError otherwise.
+    Token match and payload shape are checked server-side in :func:`validate_request`."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    try:
+        obj = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"malformed JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("envelope must be a JSON object")
+    for key in ("type", "id"):
+        if not isinstance(obj.get(key), str):
+            raise ValueError(f"envelope missing string '{key}'")
+    return obj
+
+
+def validate_request(msg: Dict[str, Any], expected_token: str) -> Tuple[bool, str]:
+    """Return ``(True, "")`` or ``(False, <reason>)``; reasons are safe to send back to the client."""
+    if not isinstance(msg, dict):
+        return False, "envelope must be a dict"
+    t, token = msg.get("type"), msg.get("token")
+    checks = (  # ordered, lazily evaluated: first failing check wins
+        (lambda: _nonempty_str(t), "missing or non-string 'type'"),
+        (lambda: t in VALID_REQUEST_TYPES, f"unknown request type: {t!r}"),
+        (lambda: _nonempty_str(msg.get("id")), "missing or non-string 'id'"),
+        (lambda: _nonempty_str(token), "missing token"),
+        (lambda: token == expected_token, "token mismatch"),
+        (lambda: isinstance(msg.get("payload"), dict), "payload must be a dict"))
+    return next(((False, reason) for ok, reason in checks if not ok()), (True, ""))
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\google_meet\node\registry.py ===
+"""Local JSON registry of approved remote meet nodes.
+
+``$HERMES_HOME/workspace/meetings/nodes.json``::
+
+    {"nodes": {"<name>": {"url": "ws://host:port", "token": "...", "added_at": <epoch>}}}
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from hermes_constants import get_hermes_home
+
+from plugins.google_meet._jsonfile import read_json
+from utils import atomic_json_write
+
+
+def _default_path() -> Path:
+    return Path(get_hermes_home()) / "workspace" / "meetings" / "nodes.json"
+
+
+class NodeRegistry:
+    """File-backed registry; single writer assumed (the gateway CLI)."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = Path(path) if path is not None else _default_path()
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        """The ``nodes`` map (name → entry); empty when the file is missing or malformed."""
+        data = read_json(self.path)
+        nodes = data.get("nodes") if isinstance(data, dict) else None
+        return nodes if isinstance(nodes, dict) else {}
+
+    def _save(self, nodes: Dict[str, Dict[str, Any]]) -> None:
+        atomic_json_write(self.path, {"nodes": nodes})
+
+    def get(self, name: str) -> Optional[Dict[str, Any]]:
+        entry = self._load().get(name)
+        return None if entry is None else {"name": name, **entry}
+
+    def add(self, name: str, url: str, token: str) -> None:
+        for label, value in (("node name", name), ("url", url), ("token", token)):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{label} must be a non-empty string")
+        nodes = self._load()
+        nodes[name] = {"url": url, "token": token, "added_at": time.time()}
+        self._save(nodes)
+
+    def remove(self, name: str) -> bool:
+        nodes = self._load()
+        if name not in nodes:
+            return False
+        del nodes[name]
+        self._save(nodes)
+        return True
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        return [{"name": name, **entry} for name, entry in sorted(self._load().items())]
+
+    def resolve(self, chrome_node: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Named node's entry, or (``chrome_node`` falsy) the sole registered node; None if unknown
+        or when zero / several nodes are registered (ambiguous)."""
+        if chrome_node:
+            return self.get(chrome_node)
+        nodes = self.list_all()
+        return nodes[0] if len(nodes) == 1 else None
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import json  # noqa: F401,E402
+# ---- END PLUGIN-COMPAT ----
+

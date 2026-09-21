@@ -1,0 +1,403 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_curses_color_compat.py ===
+"""Tests for curses color compatibility on low-color terminals (Docker).
+
+Regression test for #13688: ``hermes plugins`` crashes with
+``curses.error: init_pair() : color number is greater than COLORS-1``
+in Docker containers where curses.COLORS == 8 (only colors 0-7 exist).
+
+The bug was ``curses.init_pair(4, 8, -1)`` using raw color 8 ("bright
+black" / dim gray) which does not exist on 8-color terminals.  The fix
+clamps with ``min(8, curses.COLORS - 1)``.
+"""
+import sys
+
+import pytest
+
+# curses (and its _curses C extension) is Unix-only; skip the whole module on Windows.
+if sys.platform == "win32":
+    pytest.skip("curses is not available on Windows", allow_module_level=True)
+
+import curses
+import re
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+
+# Path to the source files under test
+_SRC_ROOT = Path(__file__).parent.parent.parent / "hermes_cli"
+
+
+class TestInitPairClampingBehavior:
+    """Simulate curses color initialization on low-color terminals.
+
+    Patches curses.COLORS to 8 (Docker default) and verifies that
+    init_pair is never called with a color >= COLORS.
+    """
+
+    def _collect_init_pair_calls(self, draw_fn, colors_value):
+        """Run a curses draw function with a mock stdscr and patched COLORS.
+
+        Returns list of (pair_number, fg, bg) tuples from init_pair calls.
+        """
+        calls = []
+        real_init_pair = curses.init_pair
+
+        def tracking_init_pair(pair, fg, bg):
+            calls.append((pair, fg, bg))
+
+        mock_stdscr = MagicMock()
+        mock_stdscr.getmaxyx.return_value = (24, 80)
+        mock_stdscr.getch.return_value = 27  # ESC to exit
+
+        with patch("curses.COLORS", colors_value, create=True), \
+             patch("curses.init_pair", side_effect=tracking_init_pair), \
+             patch("curses.has_colors", return_value=True), \
+             patch("curses.start_color"), \
+             patch("curses.use_default_colors"), \
+             patch("curses.curs_set"):
+            try:
+                draw_fn(mock_stdscr)
+            except (SystemExit, StopIteration, Exception):
+                pass  # draw functions loop until keypress
+
+        return calls
+
+    def test_8_color_terminal_no_color_exceeds_limit(self):
+        """On an 8-color terminal (Docker), no init_pair fg color >= 8."""
+        # Simulate the color init pattern from plugins_cmd.py
+        def _simulated_color_init(stdscr):
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_GREEN, -1)
+                curses.init_pair(2, curses.COLOR_YELLOW, -1)
+                curses.init_pair(3, curses.COLOR_CYAN, -1)
+                curses.init_pair(4, 8 if curses.COLORS > 8 else curses.COLOR_WHITE, -1)
+
+        calls = self._collect_init_pair_calls(_simulated_color_init, 8)
+        for pair, fg, bg in calls:
+            assert fg < 8, (
+                f"init_pair({pair}, {fg}, {bg}) uses color {fg} which "
+                f"does not exist on an 8-color terminal (valid: 0-7)"
+            )
+
+    def test_256_color_terminal_uses_color_8(self):
+        """On a 256-color terminal, color 8 (dim gray) should be used."""
+        def _simulated_color_init(stdscr):
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(4, 8 if curses.COLORS > 8 else curses.COLOR_WHITE, -1)
+
+        calls = self._collect_init_pair_calls(_simulated_color_init, 256)
+        assert any(fg == 8 for _, fg, _ in calls), (
+            "On 256-color terminals, color 8 (dim gray) should be used"
+        )
+
+
+class TestSourceCodeGuardrails:
+    """Regression guardrails: raw color 8 must not reappear in source.
+
+    These complement the behavioral tests above — they catch regressions
+    introduced by copy-paste of the old pattern.
+    """
+
+    _RAW_COLOR_8_PATTERN = re.compile(r'init_pair\(\d+,\s*8\s*,')
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_curses_radiolist_viewport.py ===
+"""Exercise radiolist rendering and navigation with a bounded terminal surface."""
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_cli import curses_ui
+
+
+class Screen:
+    def __init__(self, keys, heights):
+        self.keys = iter(keys)
+        self.heights = iter(heights)
+        self.height = 24
+        self.frames = []
+
+    def clear(self):
+        self.rows = {}
+
+    def getmaxyx(self):
+        self.height = next(self.heights, self.height)
+        return self.height, 100
+
+    def addnstr(self, y, x, text, n, attr):
+        assert 0 <= y < self.height, f"off-screen write at row {y}"
+        self.rows[y] = self.rows.get(y, "") + text[:n]
+
+    def refresh(self):
+        self.frames.append(dict(self.rows))
+
+    def getch(self):
+        return next(self.keys)
+
+
+@pytest.fixture
+def run_menu(monkeypatch):
+    def run(keys, heights, *, description=None, selected=0):
+        screen = Screen(keys, heights)
+        curses = SimpleNamespace(
+            error=type("CursesError", (Exception,), {}),
+            A_BOLD=1, A_DIM=2, A_NORMAL=0,
+            KEY_UP=259, KEY_DOWN=258, KEY_LEFT=260, KEY_ENTER=343,
+            KEY_BACKSPACE=263,
+            has_colors=lambda: False, curs_set=lambda value: None,
+            wrapper=lambda draw: draw(screen),
+        )
+        monkeypatch.setitem(sys.modules, "curses", curses)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(curses_ui, "flush_stdin", lambda: None)
+        result = curses_ui.curses_radiolist(
+            "Select default model:", [f"model-{i:02}" for i in range(20)],
+            selected=selected, description=description, searchable=True,
+        )
+        return result, screen.frames
+    return run
+
+
+LONG_DESCRIPTION = "\n".join(f"Unavailable model {i}" for i in range(40))
+
+
+@pytest.mark.parametrize("height", [5, 8, 12, 24, 50])
+def test_long_description_keeps_selected_choice_and_hint_visible(run_menu, height):
+    result, frames = run_menu([10], [height], description=LONG_DESCRIPTION, selected=19)
+    assert result == 19
+    rows = list(frames[0].values())
+    assert any("model-19" in row and "\u2192" in row for row in rows)
+    assert any("/ search" in row for row in rows)
+    choices = [row for row in rows if "model-" in row]
+    assert len(choices) >= min(5, height - 4)
+    if height < 12:
+        # No room for any description row: it is dropped entirely, notice included.
+        assert not any("Unavailable model" in row for row in rows)
+        assert not any("more description lines" in row for row in rows)
+    if 12 <= height < 50:
+        assert any("more description lines" in row for row in rows)
+    if height == 50:
+        assert all(f"Unavailable model {i}" in rows for i in range(40))
+
+
+def test_choice_scrolls_after_terminal_shrinks(run_menu):
+    result, frames = run_menu([258] * 19 + [10], [50, 12], description=LONG_DESCRIPTION)
+    assert result == 19
+    for index, frame in enumerate(frames):
+        assert any(f"model-{index:02}" in row and "\u2192" in row for row in frame.values())
+
+
+def test_search_result_stays_visible_with_long_description(run_menu):
+    result, frames = run_menu(
+        [ord("/"), ord("1"), ord("9"), 10], [12], description=LONG_DESCRIPTION)
+    assert result == 19
+    assert any("Search: 19" in row for row in frames[-1].values())
+    assert any("model-19" in row and "\u2192" in row for row in frames[-1].values())
+
+
+@pytest.mark.parametrize("description", [None, "First line\nSecond line"])
+def test_short_description_layout_is_unchanged(run_menu, description):
+    result, frames = run_menu([10], [24], description=description)
+    assert result == 0
+    start = 3 + (2 if description else 0)
+    assert "model-00" in frames[0][start]
+    assert not any("more description lines" in row for row in frames[0].values())
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_curses_ui_fuzzy_rank.py ===
+"""Tests for the ranked fuzzy scorer used by the searchable curses pickers."""
+from hermes_cli.curses_ui import (
+    _SearchState,
+    _filter_indices,
+    _fuzzy_score,
+    _handle_active_search_key,
+    _is_boundary,
+    _token_score,
+)
+
+
+class _FakeCurses:
+    KEY_BACKSPACE = 263
+    KEY_DOWN = 258
+    KEY_ENTER = 343
+
+
+
+
+def test_scorer_matches_typescript_reference():
+    """Score parity with ui-tui/web fuzzy.ts. These exact values are produced
+    by the TS fuzzyScoreMulti for the same inputs (verified via a cross-language
+    harness); keep the Python port byte-identical so all three surfaces rank
+    consistently. If you change the scoring constants, update the TS copies too.
+    """
+    cases = {
+        ("gpt-4o", "g4o"): 15.94,
+        ("gpt-4o", "gpt"): 28.94,
+        ("claude-sonnet-4", "sonnet"): 33.85,
+        ("claude-sonnet-4", "clad snnt"): 30.70,
+        ("GptO", "gpto"): 57.96,  # camelCase boundary on the original-case 'O'
+    }
+    for (label, query), expected in cases.items():
+        score = _fuzzy_score(label, query)
+        assert score is not None
+        assert round(score, 2) == expected, f"{label!r}/{query!r}: {score} != {expected}"
+
+
+
+
+def test_esc_clears_query_and_signals_changed():
+    # Esc during active search clears the filter (restores full list) and
+    # signals `changed` so the driver resets scroll/cursor.
+    search = _SearchState(active=True, query="gpt")
+    handled, confirm, changed = _handle_active_search_key(_FakeCurses, 27, search)
+    assert (handled, confirm, changed) == (True, False, True)
+    assert search.active is False
+    assert search.query == ""
+
+    # Esc with no query: still stops search, but nothing changed.
+    search2 = _SearchState(active=True, query="")
+    assert _handle_active_search_key(_FakeCurses, 27, search2) == (True, False, False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_curses_ui_search.py ===
+from hermes_cli.curses_ui import (
+    _SearchState,
+    _filter_indices,
+    _handle_active_search_key,
+    _move_filtered_cursor,
+    _reconcile_cursor,
+)
+
+
+class _FakeCurses:
+    KEY_BACKSPACE = 263
+    KEY_DOWN = 258
+    KEY_ENTER = 343
+
+
+
+
+def test_reconcile_cursor_moves_to_first_visible_match():
+    assert _reconcile_cursor([2, 4], 0) == (2, 0)
+    assert _reconcile_cursor([2, 4], 4) == (4, 1)
+
+
+
+
+def test_active_search_consumes_query_editing_and_confirm_keys():
+    search = _SearchState(active=True, query="op")
+
+    assert _handle_active_search_key(_FakeCurses, ord("u"), search) == (True, False, True)
+    assert search.query == "opu"
+
+    assert _handle_active_search_key(_FakeCurses, _FakeCurses.KEY_ENTER, search) == (
+        True,
+        True,
+        False,
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_custom_opencode_family_runtime.py ===
+"""Custom OpenCode-family provider runtime resolution (#85589).
+
+A user-defined provider whose name extends an OpenCode family slug
+(``opencode-go-bridge``) — or whose base_url is hosted on opencode.ai —
+must get the same per-model api_mode derivation and /v1 base-url
+normalization as the built-in ``opencode-go`` / ``opencode-zen``
+providers. Before the fix, such providers resolved with a static
+api_mode (chat_completions), so /v1/responses-only models like
+``grok-4.5`` failed with HTTP 503 "Endpoint unavailable".
+"""
+
+import os
+import tempfile
+
+import pytest
+
+
+@pytest.fixture()
+def _bridge_env(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENCODE_GO_BRIDGE_API_KEY", "sk-test-bridge")
+
+    def write_config(provider_name: str, extra: str = "", default: str = "grok-4.5"):
+        (hermes_home / "config.yaml").write_text(
+            f"""
+model:
+  provider: {provider_name}
+  default: {default}
+providers:
+  {provider_name}:
+    base_url: https://opencode.ai/zen/go/v1
+    key_env: OPENCODE_GO_BRIDGE_API_KEY
+{extra}"""
+        )
+
+    return write_config
+
+
+def _resolve(provider, model):
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    return resolve_runtime_provider(requested=provider, target_model=model)
+
+
+class TestCustomOpencodeFamilyRuntime:
+    def test_family_provider_routes_grok_to_responses(self, _bridge_env):
+        """The #85589 repro: grok-4.5 on opencode-go-bridge → codex_responses."""
+        _bridge_env("opencode-go-bridge")
+        r = _resolve("opencode-go-bridge", "grok-4.5")
+        assert r["api_mode"] == "codex_responses"
+        assert r["base_url"].rstrip("/").endswith("/zen/go/v1")
+
+    def test_family_provider_routes_minimax_to_messages_and_strips_v1(self, _bridge_env):
+        _bridge_env("opencode-go-bridge")
+        r = _resolve("opencode-go-bridge", "minimax-m2.7")
+        assert r["api_mode"] == "anthropic_messages"
+        # /v1 stripped so the Anthropic SDK's own /v1/messages doesn't double up
+        assert r["base_url"].rstrip("/").endswith("/zen/go")
+
+    def test_family_provider_keeps_chat_models_on_v1(self, _bridge_env):
+        _bridge_env("opencode-go-bridge")
+        r = _resolve("opencode-go-bridge", "deepseek-v4-flash")
+        assert r["api_mode"] == "chat_completions"
+        assert r["base_url"].rstrip("/").endswith("/zen/go/v1")
+
+    def test_explicit_transport_in_config_wins(self, _bridge_env):
+        """A user-declared transport is authoritative — no family override."""
+        _bridge_env("opencode-go-bridge", extra="    transport: chat_completions\n")
+        r = _resolve("opencode-go-bridge", "grok-4.5")
+        assert r["api_mode"] == "chat_completions"
+
+    def test_arbitrary_name_on_opencode_host_derives_family(self, _bridge_env):
+        """A provider with a non-family name pointing at opencode.ai still
+        gets per-model routing (host match)."""
+        _bridge_env("my-oc-proxy", default="gpt-5.6-luna")
+        r = _resolve("my-oc-proxy", "gpt-5.6-luna")
+        assert r["api_mode"] == "codex_responses"
+

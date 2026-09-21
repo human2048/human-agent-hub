@@ -1,0 +1,321 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_shared_metrics_surface_attribution.py ===
+"""Every AIAgent construction path must attribute its execution surface.
+
+The shared-metrics contract normalises a missing or unrecognised ``platform``
+to ``unknown`` / ``other``. That is the correct behaviour for a *bounded*
+schema, but it means a construction site that forgets to declare its surface
+is silently mis-attributed rather than loudly broken: fleet telemetry then
+reports "unknown" for real, attributable traffic.
+
+These are contract tests between two pieces of data -- the surfaces the
+contract accepts, and the surface each construction path actually declares --
+not snapshots of any current value.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_cli.observability import shared_metrics_contract as contract
+
+
+def test_acp_editor_sessions_get_their_own_surface():
+    """ACP (VS Code / Zed / JetBrains) is a real interactive surface, not 'other'.
+
+    The ACP adapter declares ``platform="acp"``. If that value is not an
+    accepted surface, the contract's closed-schema fallback buckets every
+    editor session into ``other`` alongside genuinely unclassifiable traffic.
+    """
+    assert contract.execution_surface({"platform": "acp"}) == "acp"
+
+
+def test_acp_sessions_are_interactive():
+    """An editor session is a human at a keyboard, like cli/tui/desktop."""
+    fields = contract.task_start_fields({"platform": "acp"})
+    assert fields["entrypoint"] == "interactive"
+    assert fields["execution_surface"] == "acp"
+
+
+def test_batch_runs_declare_their_surface():
+    """batch_runner builds agents from a fixed passthrough tuple.
+
+    ``batch`` is already an accepted surface, so the only defect is that the
+    runner never declares it -- every batch task run reports 'unknown'.
+    """
+    import batch_runner
+
+    assert "platform" in batch_runner._AGENT_PASSTHROUGH, (
+        "batch_runner._AGENT_PASSTHROUGH omits 'platform', so batch task runs are "
+        f"attributed to {contract.execution_surface({})!r} despite 'batch' being a "
+        "valid execution surface"
+    )
+
+
+@pytest.mark.parametrize(
+    "platform",
+    ["cli", "tui", "desktop", "batch", "acp", "api_server", "cron", "telegram"],
+)
+def test_declared_platforms_resolve_to_a_named_surface(platform):
+    """No production construction path should resolve to unknown/other.
+
+    'unknown' must mean "this run genuinely could not be attributed", not
+    "a construction site forgot to say who it was".
+    """
+    surface = contract.execution_surface({"platform": platform})
+    assert surface not in {"unknown", "other"}, (
+        f"platform={platform!r} resolves to {surface!r}; a real surface is being "
+        "folded into the catch-all bucket"
+    )
+
+
+def test_unattributed_runs_still_report_unknown():
+    """The catch-all must survive: a genuinely undeclared run is 'unknown'.
+
+    This is the counterpart to the tests above -- fixing attribution must not
+    be achieved by inventing a default that hides real gaps.
+    """
+    assert contract.execution_surface({}) == "unknown"
+    assert contract.task_start_fields({})["entrypoint"] == "unknown"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_shared_metrics_tools_toggle.py ===
+"""Tests for the `hermes tools` shared-metrics consent toggle.
+
+AGENTS.md requires outbound telemetry to be reachable from a config gate, the
+setup prompt, AND `hermes tools`. These cover the third surface.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_cli.tools_config import (
+    _configure_shared_metrics_interactive,
+    _shared_metrics_menu_label,
+    _shared_metrics_state,
+)
+
+
+def _config(**shared):
+    return {"telemetry": {"shared_metrics": shared}}
+
+
+class TestState:
+    def test_missing_telemetry_section_is_off(self):
+        assert _shared_metrics_state({}) == (False, False)
+
+    def test_malformed_section_does_not_raise(self):
+        assert _shared_metrics_state({"telemetry": "nonsense"}) == (False, False)
+
+    def test_reads_both_flags(self):
+        assert _shared_metrics_state(_config(enabled=True, send=True)) == (True, True)
+
+
+class TestMenuLabel:
+    def test_off_state(self):
+        assert "off" in _shared_metrics_menu_label({})
+
+    def test_local_only_state(self):
+        label = _shared_metrics_menu_label(_config(enabled=True))
+        assert "collecting locally" in label
+        assert "Nous" not in label
+
+    def test_sending_state_names_the_destination(self):
+        label = _shared_metrics_menu_label(_config(enabled=True, send=True))
+        assert "sending to Nous" in label
+
+
+class TestToggle:
+    def test_enabling_send_persists(self, monkeypatch):
+        config = _config(enabled=True)
+        saved = {}
+        monkeypatch.setattr(
+            "hermes_cli.setup.prompt_yes_no", lambda *_a, **_k: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.setup._record_send_consent_change", lambda **_k: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config.save_config",
+            lambda cfg: saved.update({"cfg": cfg}),
+        )
+        _configure_shared_metrics_interactive(config)
+        assert config["telemetry"]["shared_metrics"]["send"] is True
+        assert saved, "a consent change must be written to disk"
+
+    def test_no_write_when_nothing_changed(self, monkeypatch):
+        config = _config(enabled=False, send=False)
+        saved = []
+        monkeypatch.setattr(
+            "hermes_cli.setup.prompt_yes_no", lambda *_a, **_k: False
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config.save_config", lambda cfg: saved.append(cfg)
+        )
+        _configure_shared_metrics_interactive(config)
+        assert saved == []
+
+    def test_disabling_collection_also_disables_sending(self, monkeypatch):
+        """The toggle must not leave send=true with nothing to send."""
+        config = _config(enabled=True, send=True)
+        monkeypatch.setattr(
+            "hermes_cli.setup.prompt_yes_no", lambda *_a, **_k: False
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config.save_config", lambda cfg: None
+        )
+        _configure_shared_metrics_interactive(config)
+        shared = config["telemetry"]["shared_metrics"]
+        assert shared["enabled"] is False
+        assert shared["send"] is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_shared_owner_message.py ===
+"""The owner refusal never claims a turn is running, and leads with plain words."""
+
+from hermes_cli.active_sessions import session_already_owned_message
+
+
+def test_owner_refusal_is_plain_and_never_claims_a_running_turn():
+    message = session_already_owned_message("session", {
+        "surface": "desktop", "pid": 123, "started_at": 1,
+    })
+    first, details = message.splitlines()
+    assert first.startswith("This chat is open in another Hermes window/terminal.")
+    assert "start a new chat here" in first
+    assert details.startswith("Details: ") and "desktop" in details and "ago" in details
+    assert "running " not in message
+    assert "lease" not in message and "pid" not in message
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_shared_session_attach.py ===
+"""Local owner discovery must fence profile and lease identity."""
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from hermes_cli.active_sessions import try_acquire_active_session
+
+
+def test_discovery_uses_exact_profile_and_owner_handshake(tmp_path):
+    from hermes_cli.shared_session_attach import discover_attach_url
+
+    home = tmp_path / "profile"
+    other = tmp_path / "other"
+    reply = {}
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            payload = json.dumps(reply).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    lease, error = try_acquire_active_session(
+        session_id="same-id", surface="desktop", config={}, registry_home=home,
+        metadata={"live_session_id": "live", "shared_runtime_url": origin},
+    )
+    assert error is None
+    reply.update(session_id="same-id", lease_id=lease.lease_id,
+                 profile_home=str(home.resolve()), websocket_url=origin.replace("http:", "ws:") + "/api/ws?token=real-token")
+    try:
+        assert discover_attach_url("same-id", registry_home=other) is None
+        assert requests == []
+        assert discover_attach_url("same-id", registry_home=home) == reply["websocket_url"]
+        assert len(requests) == 1
+        from hermes_cli.shared_session_attach import configure_tui_attachment
+        env = {"HERMES_TUI_GATEWAY_URL": "   "}
+        configure_tui_attachment(env, "same-id", registry_home=home)
+        assert env["HERMES_TUI_GATEWAY_URL"] == reply["websocket_url"]
+        reply["profile_home"] = str(other.resolve())
+        with pytest.raises(ValueError, match="identity"):
+            discover_attach_url("same-id", registry_home=home)
+        reply["profile_home"] = str(home.resolve())
+        reply["websocket_url"] = "ws://example.com/api/ws?token=secret"
+        with pytest.raises(ValueError, match="endpoint"):
+            discover_attach_url("same-id", registry_home=home)
+    finally:
+        lease.release()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_discovery_refuses_unsupported_owner_without_releasing_lease(tmp_path, monkeypatch):
+    from hermes_cli.shared_session_attach import discover_attach_url
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    lease, error = try_acquire_active_session(
+        session_id="old", surface="desktop", config={}, registry_home=tmp_path,
+    )
+    assert error is None
+    try:
+        with pytest.raises(ValueError, match="not available in this build") as caught:
+            discover_attach_url("old", registry_home=tmp_path)
+        first, details = str(caught.value).splitlines()
+        assert "hermes --resume old" in first
+        assert details.startswith("Details: ")
+        assert active_session_registry_snapshot(tmp_path)[0]["lease_id"] == lease.lease_id
+        registry = tmp_path / "runtime" / "active_sessions.json"
+        before = registry.read_bytes()
+        with monkeypatch.context() as patch:
+            def denied(pid):
+                raise PermissionError("process inspection denied")
+            patch.setattr("gateway.status._pid_exists", denied)
+            with pytest.raises(RuntimeError, match="liveness is unknown"):
+                discover_attach_url("old", registry_home=tmp_path)
+        assert registry.read_bytes() == before
+    finally:
+        lease.release()
+
+
+def test_discovery_failure_message_names_state_and_resume_path(tmp_path):
+    """A refused handshake keeps the lease and points at the working alternative."""
+    from hermes_cli.shared_session_attach import discover_attach_url
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    lease, error = try_acquire_active_session(
+        session_id="held", surface="desktop", config={}, registry_home=tmp_path,
+        metadata={"live_session_id": "live", "shared_runtime_url": origin},
+    )
+    assert error is None
+    try:
+        with pytest.raises(ValueError, match="just failed") as caught:
+            discover_attach_url("held", registry_home=tmp_path)
+        first, details = str(caught.value).splitlines()
+        assert "hermes --resume held" in first
+        assert details.startswith("Details: ")
+    finally:
+        lease.release()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+

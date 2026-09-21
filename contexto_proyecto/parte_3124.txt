@@ -1,0 +1,328 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_delegate_background_notice.py ===
+"""The CLI spells out auto-resume when a delegate_task goes to the background.
+
+A top-level ``delegate_task`` returns a handle immediately and runs the subagent
+in the background; the result re-enters the conversation as a fresh turn when it
+finishes. ``_on_tool_complete`` prints a one-line, no-spinner reassurance at
+dispatch so the idle prompt doesn't read as "nothing happened".
+"""
+
+import json
+
+import cli
+from cli import HermesCLI
+
+
+def _make_cli():
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj._pending_edit_snapshots = {}
+    return cli_obj
+
+
+def _capture(monkeypatch):
+    printed: list[str] = []
+    monkeypatch.setattr(cli, "_cprint", lambda text: printed.append(text))
+    return printed
+
+
+def test_background_dispatch_prints_resume_notice(monkeypatch):
+    cli_obj = _make_cli()
+    printed = _capture(monkeypatch)
+
+    result = json.dumps({"status": "dispatched", "mode": "background", "count": 1})
+    cli_obj._on_tool_complete("tc1", "delegate_task", {"goal": "x"}, result)
+
+    joined = "\n".join(printed)
+    assert "resume" in joined.lower()
+    assert "it finishes" in joined
+
+
+def test_background_batch_dispatch_pluralizes(monkeypatch):
+    cli_obj = _make_cli()
+    printed = _capture(monkeypatch)
+
+    result = json.dumps({"status": "dispatched", "mode": "background", "count": 3})
+    cli_obj._on_tool_complete("tc2", "delegate_task", {"tasks": []}, result)
+
+    joined = "\n".join(printed)
+    assert "3 tasks" in joined
+    assert "they finish" in joined
+
+
+def test_synchronous_delegate_result_prints_no_notice(monkeypatch):
+    """A non-background result (e.g. the stateless sync fallback) must not claim
+    a background dispatch."""
+    cli_obj = _make_cli()
+    printed = _capture(monkeypatch)
+
+    result = json.dumps({"results": [{"status": "completed", "summary": "done"}]})
+    cli_obj._on_tool_complete("tc3", "delegate_task", {"goal": "x"}, result)
+
+    assert not any("resume" in p.lower() for p in printed)
+
+
+def test_non_delegate_tool_prints_no_notice(monkeypatch):
+    cli_obj = _make_cli()
+    printed = _capture(monkeypatch)
+
+    cli_obj._on_tool_complete("tc4", "read_file", {"path": "a"}, '{"ok": true}')
+
+    assert not any("resume" in p.lower() for p in printed)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_extension_hooks.py ===
+"""Tests for protected HermesCLI TUI extension hooks.
+
+Verifies that wrapper CLIs can extend the TUI via:
+  - _get_extra_tui_widgets()
+  - _register_extra_tui_keybindings()
+  - _build_tui_layout_children()
+without overriding run().
+"""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from unittest.mock import MagicMock, patch
+
+from prompt_toolkit.key_binding import KeyBindings
+
+
+def _make_cli(**kwargs):
+    """Create a HermesCLI with prompt_toolkit stubs (same pattern as test_cli_init)."""
+    _clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {"compact": False, "tool_progress": "all"},
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    prompt_toolkit_stubs = {
+        "prompt_toolkit": MagicMock(),
+        "prompt_toolkit.history": MagicMock(),
+        "prompt_toolkit.styles": MagicMock(),
+        "prompt_toolkit.patch_stdout": MagicMock(),
+        "prompt_toolkit.application": MagicMock(),
+        "prompt_toolkit.layout": MagicMock(),
+        "prompt_toolkit.layout.processors": MagicMock(),
+        "prompt_toolkit.filters": MagicMock(),
+        "prompt_toolkit.layout.dimension": MagicMock(),
+        "prompt_toolkit.layout.menus": MagicMock(),
+        "prompt_toolkit.widgets": MagicMock(),
+        "prompt_toolkit.key_binding": MagicMock(),
+        "prompt_toolkit.completion": MagicMock(),
+        "prompt_toolkit.formatted_text": MagicMock(),
+        "prompt_toolkit.auto_suggest": MagicMock(),
+    }
+    with patch.dict(sys.modules, prompt_toolkit_stubs), patch.dict(
+        "os.environ", clean_env, clear=False
+    ):
+        import cli as _cli_mod
+
+        _cli_mod = importlib.reload(_cli_mod)
+        with patch.object(_cli_mod, "get_tool_definitions", return_value=[]), patch.dict(
+            _cli_mod.__dict__, {"CLI_CONFIG": _clean_config}
+        ):
+            return _cli_mod.HermesCLI(**kwargs)
+
+
+class TestExtensionHookDefaults:
+    def test_extra_tui_widgets_default_empty(self):
+        cli = _make_cli()
+        assert cli._get_extra_tui_widgets() == []
+
+    def test_register_extra_tui_keybindings_default_noop(self):
+        cli = _make_cli()
+        kb = KeyBindings()
+        result = cli._register_extra_tui_keybindings(kb, input_area=None)
+        assert result is None
+        assert kb.bindings == []
+
+    def test_build_tui_layout_children_returns_all_widgets_in_order(self):
+        cli = _make_cli()
+        children = cli._build_tui_layout_children(
+            sudo_widget="sudo",
+            secret_widget="secret",
+            approval_widget="approval",
+            clarify_widget="clarify",
+            spinner_widget="spinner",
+            spacer="spacer",
+            status_bar="status",
+            input_rule_top="top-rule",
+            image_bar="image-bar",
+            input_area="input-area",
+            input_rule_bot="bottom-rule",
+            voice_status_bar="voice-status",
+            completions_menu="completions-menu",
+        )
+        # First element is Window(height=0), rest are the named widgets
+        assert children[1:] == [
+            "sudo", "secret", "approval", "clarify", "spinner",
+            "spacer", "status", "top-rule", "image-bar", "input-area",
+            "bottom-rule", "voice-status", "completions-menu",
+        ]
+
+
+class TestExtensionHookSubclass:
+    def test_extra_widgets_inserted_before_status_bar(self):
+        cli = _make_cli()
+        # Monkey-patch to simulate subclass override
+        cli._get_extra_tui_widgets = lambda: ["radio-menu", "mini-player"]
+
+        children = cli._build_tui_layout_children(
+            sudo_widget="sudo",
+            secret_widget="secret",
+            approval_widget="approval",
+            clarify_widget="clarify",
+            spinner_widget="spinner",
+            spacer="spacer",
+            status_bar="status",
+            input_rule_top="top-rule",
+            image_bar="image-bar",
+            input_area="input-area",
+            input_rule_bot="bottom-rule",
+            voice_status_bar="voice-status",
+            completions_menu="completions-menu",
+        )
+        # Extra widgets should appear between spacer and status bar
+        spacer_idx = children.index("spacer")
+        status_idx = children.index("status")
+        assert children[spacer_idx + 1] == "radio-menu"
+        assert children[spacer_idx + 2] == "mini-player"
+        assert children[spacer_idx + 3] == "status"
+        assert status_idx == spacer_idx + 3
+
+    def test_extra_keybindings_can_add_bindings(self):
+        cli = _make_cli()
+        kb = KeyBindings()
+
+        def _custom_hook(kb, *, input_area):
+            @kb.add("f2")
+            def _toggle(event):
+                return None
+
+        cli._register_extra_tui_keybindings = _custom_hook
+        cli._register_extra_tui_keybindings(kb, input_area=None)
+        assert len(kb.bindings) == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_external_editor.py ===
+"""Tests for CLI external-editor support."""
+
+from unittest.mock import patch
+
+from cli import HermesCLI
+
+
+class _FakeBuffer:
+    def __init__(self, text=""):
+        self.calls = []
+        self.text = text
+        self.cursor_position = len(text)
+
+    def open_in_editor(self, validate_and_handle=False):
+        self.calls.append(validate_and_handle)
+
+
+class _FakeApp:
+    def __init__(self):
+        self.current_buffer = _FakeBuffer()
+
+
+def _make_cli(with_app=True):
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj._app = _FakeApp() if with_app else None
+    cli_obj._command_running = False
+    cli_obj._command_status = ""
+    cli_obj._command_display = ""
+    cli_obj._sudo_state = None
+    cli_obj._secret_state = None
+    cli_obj._approval_state = None
+    cli_obj._clarify_state = None
+    cli_obj._skip_paste_collapse = False
+    return cli_obj
+
+def test_open_external_editor_uses_prompt_toolkit_buffer_editor():
+    cli_obj = _make_cli()
+
+    assert cli_obj._open_external_editor() is True
+    assert cli_obj._app.current_buffer.calls == [False]
+
+
+def test_open_external_editor_rejects_when_no_tui():
+    cli_obj = _make_cli(with_app=False)
+
+    with patch("cli._cprint") as mock_cprint:
+        assert cli_obj._open_external_editor() is False
+
+    assert mock_cprint.called
+    assert "interactive cli" in str(mock_cprint.call_args).lower()
+
+
+
+
+
+
+
+def test_open_external_editor_expands_paste_placeholders_before_open(tmp_path):
+    cli_obj = _make_cli()
+    paste_file = tmp_path / "paste.txt"
+    paste_file.write_text("alpha\nbeta", encoding="utf-8")
+    buffer = _FakeBuffer(text=f"[Pasted text #1: 2 lines → {paste_file}]")
+
+    assert cli_obj._open_external_editor(buffer=buffer) is True
+    assert buffer.text == "alpha\nbeta"
+    assert buffer.cursor_position == len("alpha\nbeta")
+    assert buffer.calls == [False]
+
+
+def test_open_external_editor_sets_skip_collapse_flag_during_expansion(tmp_path):
+    cli_obj = _make_cli()
+    paste_file = tmp_path / "paste.txt"
+    paste_file.write_text("a\nb\nc\nd\ne\nf", encoding="utf-8")
+    buffer = _FakeBuffer(text=f"[Pasted text #1: 6 lines \u2192 {paste_file}]")
+
+    # After expansion the flag should have been set (to prevent re-collapse)
+    assert cli_obj._open_external_editor(buffer=buffer) is True
+    # Flag is consumed by _on_text_changed, but since no handler is attached
+    # in tests it stays True until the handler resets it.
+    assert cli_obj._skip_paste_collapse is True
+
+
+def test_inline_pastes_stores_full_content(tmp_path):
+    """History should recall the actual pasted text, not the placeholder."""
+    cli_obj = _make_cli()
+    paste_file = tmp_path / "paste.txt"
+    paste_file.write_text("line one\nline two", encoding="utf-8")
+    buffer = _FakeBuffer(text=f"[Pasted text #1: 2 lines \u2192 {paste_file}]")
+
+    cli_obj._inline_pastes(buffer)
+
+    assert buffer.text == "line one\nline two"
+    assert buffer.cursor_position == len("line one\nline two")
+    # Skip flag set so the resulting text-change doesn't re-collapse.
+    assert cli_obj._skip_paste_collapse is True
+
+
+
+
+def test_inline_pastes_missing_file_keeps_placeholder(tmp_path):
+    """A recalled reference whose file is gone stays as the placeholder."""
+    cli_obj = _make_cli()
+    placeholder = f"[Pasted text #1: 2 lines \u2192 {tmp_path / 'gone.txt'}]"
+    buffer = _FakeBuffer(text=placeholder)
+
+    cli_obj._inline_pastes(buffer)
+
+    assert buffer.text == placeholder
+    assert cli_obj._skip_paste_collapse is False
+

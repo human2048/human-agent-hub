@@ -1,0 +1,405 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_lazy_install_typehandler.py ===
+"""Regression test for the Telegram lazy-install rebind path (#85272).
+
+When ``plugins.platforms.telegram.adapter`` is imported before
+python-telegram-bot is available, the top-level ``except ImportError`` block
+binds every SDK symbol to a placeholder. ``check_telegram_requirements()`` then
+lazy-installs the package and re-imports, rebinding those module globals.
+
+Any symbol the rebind misses stays a placeholder while ``TELEGRAM_AVAILABLE``
+flips to ``True``, so the adapter believes the SDK is present and fails at the
+first use of that symbol. ``TypeHandler`` was missed, and handler registration
+raised ``TypeError: Any cannot be instantiated`` — see #85272.
+
+The test drives the real transition rather than asserting on one name, so it
+also catches the next symbol that gets dropped from the rebind list.
+"""
+
+import sys
+import types
+from typing import Any
+
+import pytest
+
+
+# Symbols the fallback block binds to a placeholder, paired with the fake the
+# rebind is expected to install. Keep in sync with the `except ImportError`
+# block in plugins/platforms/telegram/adapter.py.
+PLACEHOLDER = Any
+
+
+@pytest.fixture
+def fake_telegram_sdk(monkeypatch):
+    """Install a fake python-telegram-bot into sys.modules.
+
+    ``check_telegram_requirements()`` runs its imports at call time, so seeding
+    sys.modules is enough to make them resolve without touching the filesystem
+    or the network.
+    """
+    fakes = {
+        name: type(f"Fake{name}", (), {})
+        for name in (
+            "Update",
+            "Bot",
+            "Message",
+            "InlineKeyboardButton",
+            "InlineKeyboardMarkup",
+            "LinkPreviewOptions",
+            "Application",
+            "CommandHandler",
+            "CallbackQueryHandler",
+            "InlineQueryHandler",
+            "MessageHandler",
+            "TypeHandler",
+            "HTTPXRequest",
+        )
+    }
+
+    telegram_pkg = types.ModuleType("telegram")
+    for name in (
+        "Update",
+        "Bot",
+        "Message",
+        "InlineKeyboardButton",
+        "InlineKeyboardMarkup",
+        "LinkPreviewOptions",
+    ):
+        setattr(telegram_pkg, name, fakes[name])
+
+    ext_mod = types.ModuleType("telegram.ext")
+    for name in (
+        "Application",
+        "CommandHandler",
+        "CallbackQueryHandler",
+        "InlineQueryHandler",
+        "MessageHandler",
+        "TypeHandler",
+    ):
+        setattr(ext_mod, name, fakes[name])
+    ext_mod.ContextTypes = types.SimpleNamespace(DEFAULT_TYPE=object)
+    ext_mod.filters = types.SimpleNamespace()
+
+    constants_mod = types.ModuleType("telegram.constants")
+    constants_mod.ParseMode = types.SimpleNamespace(MARKDOWN_V2="MarkdownV2")
+    constants_mod.ChatType = types.SimpleNamespace(
+        GROUP="group",
+        SUPERGROUP="supergroup",
+        CHANNEL="channel",
+        PRIVATE="private",
+    )
+
+    request_mod = types.ModuleType("telegram.request")
+    request_mod.HTTPXRequest = fakes["HTTPXRequest"]
+
+    for name, module in {
+        "telegram": telegram_pkg,
+        "telegram.ext": ext_mod,
+        "telegram.constants": constants_mod,
+        "telegram.request": request_mod,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    return fakes
+
+
+def test_lazy_install_rebinds_every_placeholder(monkeypatch, fake_telegram_sdk):
+    """Every symbol the fallback stubbed must be rebound by the lazy install."""
+    import plugins.platforms.telegram.adapter as adapter
+
+    from tools import lazy_deps
+
+    # The package is already in sys.modules; installing it would be a no-op.
+    monkeypatch.setattr(lazy_deps, "ensure", lambda key, prompt=False: None)
+
+    # Reconstruct the imported-before-installed state the fallback leaves behind.
+    monkeypatch.setattr(adapter, "TELEGRAM_AVAILABLE", False)
+    stubbed = (
+        "Update",
+        "Bot",
+        "Message",
+        "InlineKeyboardButton",
+        "InlineKeyboardMarkup",
+        "Application",
+        "CommandHandler",
+        "CallbackQueryHandler",
+        "InlineQueryHandler",
+        "TelegramMessageHandler",
+        "TypeHandler",
+        "ContextTypes",
+        "HTTPXRequest",
+    )
+    for name in stubbed:
+        monkeypatch.setattr(adapter, name, PLACEHOLDER)
+    for name in ("LinkPreviewOptions", "filters", "ParseMode", "ChatType"):
+        monkeypatch.setattr(adapter, name, None)
+
+    assert adapter.check_telegram_requirements() is True
+    assert adapter.TELEGRAM_AVAILABLE is True
+
+    survivors = [name for name in stubbed if getattr(adapter, name) is PLACEHOLDER]
+    assert not survivors, (
+        "lazy install left these bound to the import-time placeholder: "
+        f"{survivors}"
+    )
+
+    # Spot-check that the rebind wired up the real objects, not just anything
+    # that is no longer the placeholder.
+    assert adapter.TypeHandler is fake_telegram_sdk["TypeHandler"]
+    assert adapter.Update is fake_telegram_sdk["Update"]
+    assert adapter.TelegramMessageHandler is fake_telegram_sdk["MessageHandler"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_long_command_batching.py ===
+"""Regression tests for long slash-command pastes split by Telegram clients.
+
+Telegram splits messages above 4096 chars into multiple updates.  A long
+``/queue <huge prompt>`` paste arrives as a COMMAND chunk near the limit plus
+plain TEXT continuation chunk(s).  Before the fix, `_handle_command`
+dispatched the command chunk immediately, orphaning the continuation — which
+then landed as a separate plain message and interrupted the running agent.
+
+Near-limit command chunks must route through the text-batching pipeline so
+continuations merge in before dispatch; short commands stay immediate.
+"""
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+
+
+def _make_adapter():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(enabled=True, token="fake-token", extra={})
+    adapter._bot = SimpleNamespace(id=999, username="test_bot")
+    adapter._message_handler = AsyncMock()
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay_seconds = 0.01
+    adapter._text_batch_split_delay_seconds = 0.05
+    adapter._mention_patterns = adapter._compile_mention_patterns()
+    adapter._forum_lock = asyncio.Lock()
+    adapter._forum_command_registered = set()
+    adapter._active_sessions = {}
+    adapter._pending_messages = {}
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+def _make_message(text, *, chat_id=12345):
+    return SimpleNamespace(
+        message_id=42,
+        text=text,
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        is_topic_message=False,
+        chat=SimpleNamespace(id=chat_id, type="private", title=None, is_forum=False),
+        from_user=SimpleNamespace(id=111, full_name="Test User", first_name="Test"),
+        reply_to_message=None,
+        date=None,
+        location=None,
+        photo=None,
+        video=None,
+        audio=None,
+        voice=None,
+        document=None,
+        sticker=None,
+        media_group_id=None,
+    )
+
+
+def _make_update(text):
+    return SimpleNamespace(update_id=1, message=_make_message(text), effective_message=None)
+
+
+@pytest.mark.asyncio
+async def test_short_command_dispatched_immediately():
+    adapter = _make_adapter()
+
+    await adapter._handle_command(_make_update("/stop"), SimpleNamespace())
+
+    adapter.handle_message.assert_awaited_once()
+    assert not adapter._pending_text_batches
+
+
+@pytest.mark.asyncio
+async def test_near_limit_command_is_batched_not_dispatched():
+    adapter = _make_adapter()
+    long_cmd = "/queue " + "x" * 4090  # near Telegram's 4096 split point
+
+    await adapter._handle_command(_make_update(long_cmd), SimpleNamespace())
+
+    # Must NOT dispatch immediately — a continuation chunk is almost certain.
+    adapter.handle_message.assert_not_awaited()
+    assert len(adapter._pending_text_batches) == 1
+
+
+@pytest.mark.asyncio
+async def test_split_queue_command_merges_with_continuation():
+    adapter = _make_adapter()
+    first = "/queue " + "x" * 4089  # 4096-char first chunk
+    continuation = "y" * 500
+
+    await adapter._handle_command(_make_update(first), SimpleNamespace())
+    adapter.handle_message.assert_not_awaited()
+
+    # Continuation arrives as a plain text update moments later.
+    await adapter._handle_text_message(_make_update(continuation), SimpleNamespace())
+
+    # Wait past the split-delay flush window.
+    await asyncio.sleep(0.3)
+
+    adapter.handle_message.assert_awaited_once()
+    dispatched = adapter.handle_message.call_args[0][0]
+    assert dispatched.text.startswith("/queue ")
+    assert "y" * 500 in dispatched.text
+    # One merged event — the continuation never dispatched on its own.
+    assert not adapter._pending_text_batches
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_max_doc_bytes.py ===
+"""Tests for Telegram document-size cap.
+
+The public Telegram Bot API caps `getFile` at 20MB. A locally-hosted
+`telegram-bot-api` server raises that ceiling to 2GB. We treat the presence
+of `extra.base_url` as the explicit opt-in to the higher cap.
+"""
+
+
+from gateway.config import PlatformConfig
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+def test_max_doc_bytes_raised_to_2gb_when_base_url_set():
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"base_url": "http://localhost:8081/bot"},
+        )
+    )
+    assert adapter._max_doc_bytes == 2 * 1024 * 1024 * 1024
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_media_read_timeout.py ===
+"""Every Telegram media upload passes the long media read timeout.
+
+Telegram processes an uploaded photo/video/document server-side before it
+answers, so the wait for the response is unrelated to how fast the bytes went
+out and can outlast the short read timeout the rest of the Bot API is tuned
+for. ``_MEDIA_SEND_READ_TIMEOUT`` is the longer budget; a media send that
+misses it fails on a slow upload and falls back to posting the bare URL as
+text, so the picture never arrives as a picture.
+
+``send_image`` was the gap: both of its ``send_photo`` calls -- the URL send
+and the byte-upload fallback that handles up to 10MB -- went out on the short
+timeout. Both are driven for real below and asserted on the ``read_timeout``
+that actually reaches the Bot API.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from gateway.config import PlatformConfig  # noqa: E402
+from plugins.platforms.telegram import adapter as tg  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+@pytest.fixture
+def adapter():
+    a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    a._bot = MagicMock()
+    a._metadata_thread_id = lambda metadata: None
+    a._thread_kwargs_for_send = lambda *args, **kwargs: {}
+    a._notification_kwargs = lambda metadata: {}
+    a._reply_to_message_id_for_send = lambda *args, **kwargs: None
+
+    async def _direct(fn, payload, *args, **kwargs):
+        return await fn(**payload)
+
+    a._send_with_dm_topic_reply_anchor_retry = _direct
+    return a
+
+
+def _stub_download(monkeypatch, size: int):
+    """Make the fallback's SSRF-safe client return ``size`` bytes."""
+
+    class _Resp:
+        content = b"x" * size
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    import tools.url_safety as url_safety
+
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", lambda **kw: _Client())
+
+
+@pytest.mark.asyncio
+async def test_send_image_url_path_uses_media_read_timeout(adapter):
+    calls = []
+
+    async def _photo(**kwargs):
+        calls.append(kwargs)
+        msg = MagicMock()
+        msg.message_id = 1
+        return msg
+
+    adapter._bot.send_photo = AsyncMock(side_effect=_photo)
+
+    result = await adapter.send_image("123", "https://example.com/pic.png", caption="hi")
+
+    assert result.success
+    assert calls[0]["read_timeout"] == tg._MEDIA_SEND_READ_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_send_image_upload_fallback_uses_media_read_timeout(adapter, monkeypatch):
+    """The >5MB fallback is the slowest send in the file — it needs it most."""
+    _stub_download(monkeypatch, 8 * 1024 * 1024)
+    calls = []
+
+    async def _photo(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("Photo too big for a URL send")
+        msg = MagicMock()
+        msg.message_id = 2
+        return msg
+
+    adapter._bot.send_photo = AsyncMock(side_effect=_photo)
+
+    result = await adapter.send_image("123", "https://example.com/big.png", caption="hi")
+
+    assert result.success
+    assert len(calls) == 2, "expected the byte-upload fallback to run"
+    upload = calls[1]
+    assert isinstance(upload["photo"], (bytes, bytearray))
+    assert upload["read_timeout"] == tg._MEDIA_SEND_READ_TIMEOUT
+

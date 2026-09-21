@@ -1,0 +1,256 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_doctor_command_install.py ===
+"""Tests for the Command Installation check in hermes doctor."""
+
+import sys
+import types
+from argparse import Namespace
+from pathlib import Path
+
+import pytest
+
+import hermes_cli.doctor as doctor_mod
+
+
+def _setup_doctor_env(monkeypatch, tmp_path, venv_name="venv"):
+    """Create a minimal HERMES_HOME + PROJECT_ROOT for doctor tests."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+
+    # Create a fake venv entry point
+    venv_bin_dir = project / venv_name / "bin"
+    venv_bin_dir.mkdir(parents=True, exist_ok=True)
+    hermes_bin = venv_bin_dir / "hermes"
+    hermes_bin.write_text("#!/usr/bin/env python\n# entry point\n")
+    hermes_bin.chmod(0o755)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+
+    # Stub model_tools so doctor doesn't fail on import
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    # Stub auth checks
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    # Stub httpx.get to avoid network calls
+    try:
+        import httpx
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: types.SimpleNamespace(status_code=200))
+    except Exception:
+        pass
+
+    return home, project, hermes_bin
+
+
+def _run_doctor(fix=False):
+    """Run doctor and capture stdout."""
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=fix))
+    return buf.getvalue()
+
+
+class TestDoctorCommandInstallation:
+    """Tests for the ◆ Command Installation section."""
+
+
+
+
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Symlink check is Unix-only")
+    def test_fix_repairs_wrong_symlink(self, monkeypatch, tmp_path):
+        home, project, hermes_bin = _setup_doctor_env(monkeypatch, tmp_path)
+
+        # Create a symlink pointing to wrong target
+        cmd_link_dir = tmp_path / ".local" / "bin"
+        cmd_link_dir.mkdir(parents=True)
+        cmd_link = cmd_link_dir / "hermes"
+        wrong_target = tmp_path / "wrong_hermes"
+        wrong_target.write_text("#!/usr/bin/env python\n")
+        cmd_link.symlink_to(wrong_target)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out = _run_doctor(fix=True)
+        assert "Fixed symlink" in out
+
+        # Verify the symlink now points to the correct target
+        assert cmd_link.is_symlink()
+        assert cmd_link.resolve() == hermes_bin.resolve()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Symlink check is Unix-only")
+    def test_missing_venv_entry_point_shows_warn(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+
+        project = tmp_path / "project"
+        project.mkdir(exist_ok=True)
+        # Do NOT create any venv entry point
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+        try:
+            from hermes_cli import auth as _auth_mod
+            monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+            monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        except Exception:
+            pass
+        try:
+            import httpx
+            monkeypatch.setattr(httpx, "get", lambda *a, **kw: types.SimpleNamespace(status_code=200))
+        except Exception:
+            pass
+
+        out = _run_doctor(fix=False)
+        assert "Command Installation" in out
+        assert "Venv entry point not found" in out
+
+
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Symlink check is Unix-only")
+    def test_termux_uses_prefix_bin(self, monkeypatch, tmp_path):
+        """On Termux, the command link dir is $PREFIX/bin."""
+        prefix_dir = tmp_path / "termux_prefix"
+        prefix_bin = prefix_dir / "bin"
+        prefix_bin.mkdir(parents=True)
+
+        home, project, hermes_bin = _setup_doctor_env(monkeypatch, tmp_path)
+
+        monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
+        monkeypatch.setenv("PREFIX", str(prefix_dir))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out = _run_doctor(fix=False)
+        assert "Command Installation" in out
+        assert "$PREFIX/bin" in out
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_doctor_dedicated_provider_skip.py ===
+"""Regression: hermes doctor must not run a generic Bearer-auth health
+check for providers that already have a dedicated check (Anthropic,
+OpenRouter, Bedrock).
+
+Anthropic's native API requires `x-api-key` + `anthropic-version` headers;
+the generic loop sends `Authorization: Bearer ...` which Anthropic answers
+with HTTP 404. The dedicated check at hermes_cli/doctor.py already covers
+Anthropic with the right headers, so the pluggable profile must be
+skipped by `_build_apikey_providers_list()`.
+
+See: NousResearch/hermes-agent#22346
+"""
+
+from __future__ import annotations
+from hermes_cli import doctor_connectivity
+
+
+def test_build_apikey_providers_list_skips_dedicated_check_providers():
+    from hermes_cli import doctor
+
+    # Force a rebuild — the module caches the list on first call.
+    doctor._APIKEY_PROVIDERS_CACHE = None
+    entries = doctor_connectivity._build_apikey_providers_list()
+
+    # Tuple shape: (display_name, env_vars, default_url, base_env, supports_health_check)
+    names = {entry[0].lower() for entry in entries}
+    # Exact-name checks, not substring: third-party gateways that expose an
+    # Anthropic-compatible endpoint under Bearer auth (e.g. "CommandCode
+    # (Anthropic)") legitimately belong in the generic loop. Only the native
+    # Anthropic profile (x-api-key headers) must be skipped.
+    assert "anthropic" not in names, (
+        f"Anthropic provider profile leaked into generic Bearer-auth health "
+        f"check loop. Dedicated check above already covers it with "
+        f"x-api-key headers. Got entries: {sorted(names)}"
+    )
+    assert "openrouter" not in names, (
+        f"OpenRouter has a dedicated check; generic loop must skip it. "
+        f"Got: {sorted(names)}"
+    )
+    assert not any("bedrock" in name for name in names), (
+        f"Bedrock uses AWS SDK creds, not Bearer auth; generic loop must skip. "
+        f"Got: {sorted(names)}"
+    )
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_doctor_ipv6_probe.py ===
+"""``hermes doctor`` dead-IPv6 probe (#114265 secondary finding 1).
+
+An advertised-but-blackholed IPv6 route stalls every serial connect for the full timeout;
+the racer hides most of it, but nothing told the user that ``network.force_ipv4`` exists.
+The probe connects to one known AAAA host over IPv6 with a short timeout and, on a
+timeout, names the remedy. No IPv6 route at all is healthy (skip), as is an explicit
+``force_ipv4: true``.
+"""
+
+from __future__ import annotations
+
+import socket
+
+from hermes_cli import doctor_connectivity as dc
+
+_AAAA = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0))]
+
+
+def _run(monkeypatch, connect, *, config=None, addrinfo=_AAAA):
+    monkeypatch.setattr(dc, "_load_network_config", lambda: config or {})
+    monkeypatch.setattr(dc.socket, "getaddrinfo", lambda *_a, **_k: addrinfo)
+    monkeypatch.setattr(dc, "_tcp_connect", connect)
+    return dc._probe_ipv6_path()
+
+
+def test_dead_ipv6_route_warns_and_names_force_ipv4(monkeypatch):
+    def timed_out(_sockaddr, _timeout):
+        raise TimeoutError("timed out")
+
+    result = _run(monkeypatch, timed_out)
+    (glyph, _label, detail), = result.lines
+    assert "⚠" in glyph and "network.force_ipv4" in detail
+    assert result.issues and "network.force_ipv4" in result.issues[0]
+
+
+def test_healthy_or_absent_ipv6_never_warns(monkeypatch):
+    def reachable(_sockaddr, _timeout):
+        return None
+
+    def no_route(_sockaddr, _timeout):
+        raise OSError(101, "Network is unreachable")
+
+    assert _run(monkeypatch, reachable).issues == []
+    assert _run(monkeypatch, no_route).issues == []
+    assert "✓" in _run(monkeypatch, reachable).lines[0][0]
+    # force_ipv4 already set, or no AAAA record: nothing to probe, nothing to say.
+    assert _run(monkeypatch, reachable, config={"force_ipv4": True}).lines == []
+    assert _run(monkeypatch, reachable, addrinfo=[]).lines == []
+

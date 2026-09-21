@@ -1,0 +1,426 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_managed_scope_config.py ===
+"""Config integration tests — managed scope wins over user config at the leaf."""
+import textwrap
+
+import pytest
+
+
+@pytest.fixture
+def homes(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    import hermes_cli.config as cfg
+    from hermes_cli import managed_scope
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    return home, managed
+
+
+def _write(path, body):
+    path.write_text(textwrap.dedent(body), encoding="utf-8")
+    import hermes_cli.config as cfg
+    from hermes_cli import managed_scope
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+
+
+def test_managed_beats_user(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "model:\n  default: user/model\n")
+    _write(managed / "config.yaml", "model:\n  default: managed/model\n")
+    assert cfg_get(load_config(), "model", "default") == "managed/model"
+
+
+def test_managed_list_wins_wholesale(homes):
+    """D3: a managed list value replaces the user's wholesale."""
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "toolsets:\n  enabled: [a, b, c]\n")
+    _write(managed / "config.yaml", "toolsets:\n  enabled: [x]\n")
+    assert cfg_get(load_config(), "toolsets", "enabled") == ["x"]
+
+
+def test_user_cannot_shadow_managed_literal_via_envref(homes, monkeypatch):
+    """A managed literal must NOT be expandable via a ${VAR} the user controls.
+
+    The managed value is a plain literal 'managed/locked' with no ${...}, so a
+    user-defined env var has nothing to substitute. This asserts the managed
+    literal survives verbatim regardless of user env, and that managed wins.
+    """
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    monkeypatch.setenv("EVIL", "user/override")
+    _write(home / "config.yaml", "model:\n  default: ${EVIL}\n")
+    _write(managed / "config.yaml", "model:\n  default: managed/locked\n")
+    assert cfg_get(load_config(), "model", "default") == "managed/locked"
+
+
+def test_managed_nested_dict_default_flattens_on_load(homes):
+    """A dict-valued managed ``model.default`` must flatten on load.
+
+    ``load_config()`` merges the managed overlay after its single
+    normalization pass, so a managed ``model.default: {provider: ...,
+    model: ...}`` used to reach runtime readers as a raw dict. The overlay
+    is now normalized before merging (parity with
+    ``managed_scope.apply_managed_overlay``), so the merged config exposes a
+    string ``default`` paired with the nested ``provider``.
+    """
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "model:\n  default: user/model\n")
+    _write(managed / "config.yaml", "model:\n  default:\n    provider: nous\n    model: managed/nested\n")
+    cfg = load_config()
+    assert cfg_get(cfg, "model", "default") == "managed/nested"
+    assert cfg_get(cfg, "model", "provider") == "nous"
+
+
+def test_managed_bare_string_model_flattens_to_default_on_load(homes):
+    """A bare ``model: <string>`` in the managed file stays a dict shape.
+
+    Mirrors the existing managed-overlay contract: a bare string model must
+    merge as ``model.default`` so readers that do
+    ``cfg["model"]["default"]`` keep working (never a bare string at
+    ``cfg["model"]``).
+    """
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "model:\n  default: user/model\n")
+    _write(managed / "config.yaml", "model: managed/bare\n")
+    cfg = load_config()
+    assert cfg_get(cfg, "model", "default") == "managed/bare"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_managed_scope_env.py ===
+"""Env integration tests — managed .env applied last with override."""
+import os
+
+import pytest
+
+
+@pytest.fixture
+def env_homes(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    return home, managed
+
+
+def test_managed_env_beats_user_env(env_homes, monkeypatch):
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home, managed = env_homes
+    (home / ".env").write_text("OPENAI_API_BASE=https://user.example/v1\n", encoding="utf-8")
+    (managed / ".env").write_text("OPENAI_API_BASE=https://org.example/v1\n", encoding="utf-8")
+    load_hermes_dotenv(hermes_home=str(home))
+    assert os.environ["OPENAI_API_BASE"] == "https://org.example/v1"
+
+
+def test_no_managed_env_is_noop(env_homes, monkeypatch):
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home, managed = env_homes  # managed dir exists but has no .env
+    monkeypatch.setenv("SOME_VALUE", "from_shell")
+    (home / ".env").write_text("SOME_VALUE=from_user\n", encoding="utf-8")
+    load_hermes_dotenv(hermes_home=str(home))
+    assert os.environ["SOME_VALUE"] == "from_user"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_managed_scope_loaders.py ===
+"""Each standalone config loader (gateway, TUI/desktop, cron) must honor managed scope.
+
+These loaders build their own config dict instead of routing through
+hermes_cli.config.load_config, so the managed overlay has to be wired into each.
+This is the regression guard for the whole bug class (a managed display.skin was
+silently ignored by the TUI; the same gap existed in the gateway and cron).
+"""
+import textwrap
+
+import pytest
+
+
+@pytest.fixture
+def homes(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    import hermes_cli.config as cfg
+    from hermes_cli import managed_scope
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    return home, managed
+
+
+def _seed(home, managed, *, user, mgd):
+    (home / "config.yaml").write_text(textwrap.dedent(user), encoding="utf-8")
+    (managed / "config.yaml").write_text(textwrap.dedent(mgd), encoding="utf-8")
+    import hermes_cli.config as cfg
+    from hermes_cli import managed_scope
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+
+
+
+
+
+
+
+
+def test_timezone_honors_managed(homes, monkeypatch):
+    home, managed = homes
+    # hermes_time checks an env override first; ensure it's unset so config wins.
+    monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    _seed(home, managed, user="timezone: America/New_York\n", mgd="timezone: Asia/Tokyo\n")
+    import hermes_time
+
+    assert hermes_time._resolve_timezone_name() == "Asia/Tokyo"
+
+
+def test_gateway_env_bridge_honors_managed(homes, monkeypatch):
+    """The gateway config→env bridge must bridge MANAGED values, not user ones.
+
+    gateway/run.py bridges config.yaml settings into os.environ at startup and on
+    every turn (HERMES_TIMEZONE, HERMES_REDACT_SECRETS, HERMES_MAX_ITERATIONS,
+    ...). A managed value must win at that env layer too — otherwise the bridge
+    writes the user's value into the env that the whole process then reads. This
+    is the regression that manual verification caught (managed timezone was
+    overridden by the user's value via the env bridge).
+
+    We assert on the managed-overlaid config the bridge consumes (rather than the
+    os.environ side effect, which leaks across same-process tests under the
+    runner) — the bridge writes whatever this dict carries, so a managed value
+    here proves the env var gets the managed value.
+    """
+    home, managed = homes
+    _seed(home, managed, user="timezone: America/New_York\n", mgd="timezone: Asia/Tokyo\n")
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    # The bridge loads config.yaml, expands env, then applies this overlay before
+    # writing HERMES_TIMEZONE = cfg["timezone"]. Prove the overlay flips the value.
+    import yaml
+
+    raw = yaml.safe_load((home / "config.yaml").read_text())
+    bridged = managed_scope.apply_managed_overlay(raw)
+    assert bridged.get("timezone") == "Asia/Tokyo"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_managed_scope_overlay.py ===
+"""apply_managed_overlay() — the shared helper used by every standalone loader."""
+import textwrap
+
+import pytest
+
+
+@pytest.fixture
+def managed(tmp_path, monkeypatch):
+    md = tmp_path / "managed"
+    md.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(md))
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    return md
+
+
+def _write(md, body):
+    (md / "config.yaml").write_text(textwrap.dedent(body), encoding="utf-8")
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+
+
+def test_overlay_noop_without_scope(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "nope"))
+    managed_scope.invalidate_managed_cache()
+    src = {"display": {"skin": "user"}}
+    assert managed_scope.apply_managed_overlay(src) == {"display": {"skin": "user"}}
+
+
+def test_overlay_preserves_user_siblings(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, "display:\n  skin: charizard\n")
+    out = managed_scope.apply_managed_overlay(
+        {"display": {"skin": "user", "show_reasoning": True}}
+    )
+    assert out["display"]["skin"] == "charizard"
+    assert out["display"]["show_reasoning"] is True
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_managed_scope_regression.py ===
+"""Regression harness — pins config/env load behavior BEFORE managed scope exists.
+
+Every test here must keep passing through all later phases when NO managed scope
+is present. They are the 'managed scope is invisible when absent' contract.
+"""
+import os
+import textwrap
+
+import pytest
+
+
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # No managed dir: point the override at a guaranteed-absent path so a real
+    # /etc/hermes on the dev/CI box can't influence the test.
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "no_such_managed_dir"))
+    # Clear caches so each test re-reads from disk.
+    import hermes_cli.config as cfg
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    cfg.invalidate_env_cache()
+    return home
+
+
+def _write_user_config(home, body: str):
+    (home / "config.yaml").write_text(textwrap.dedent(body), encoding="utf-8")
+    import hermes_cli.config as cfg
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+
+
+def test_user_config_overrides_default(hermes_home, monkeypatch):
+    from hermes_cli.config import load_config, cfg_get
+
+    _write_user_config(
+        hermes_home,
+        """
+        model:
+          default: user/model-x
+        """,
+    )
+    cfg = load_config()
+    assert cfg_get(cfg, "model", "default") == "user/model-x"
+
+
+def test_env_expansion_in_user_config(hermes_home, monkeypatch):
+    from hermes_cli.config import load_config, cfg_get
+
+    monkeypatch.setenv("MY_BASE", "https://example.test")
+    _write_user_config(
+        hermes_home,
+        """
+        providers:
+          custom:
+            base_url: ${MY_BASE}/v1
+        """,
+    )
+    cfg = load_config()
+    assert cfg_get(cfg, "providers", "custom", "base_url") == "https://example.test/v1"
+
+
+def test_user_env_overrides_shell(tmp_path, monkeypatch):
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("FOO_TOKEN=from_user_env\n", encoding="utf-8")
+    monkeypatch.setenv("FOO_TOKEN", "from_shell")
+    load_hermes_dotenv(hermes_home=str(home))
+    assert os.environ["FOO_TOKEN"] == "from_user_env"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_managed_scope_surfacing.py ===
+"""Surfacing tests — managed scope shown in `config show` and `hermes doctor`."""
+import pytest
+from hermes_cli import doctor_config
+
+
+@pytest.fixture
+def homes(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    (home / "config.yaml").write_text("model:\n  default: user/model\n", encoding="utf-8")
+    (managed / "config.yaml").write_text(
+        "model:\n  default: managed/model\n", encoding="utf-8"
+    )
+    import hermes_cli.config as cfg
+    from hermes_cli import managed_scope
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    return home, managed
+
+
+
+
+def test_config_show_no_managed_scope_silent(tmp_path, monkeypatch, capsys):
+    """With no managed scope, the managed header must not appear."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "nope"))
+    (home / "config.yaml").write_text("model:\n  default: user/model\n", encoding="utf-8")
+    import hermes_cli.config as cfg
+    from hermes_cli import managed_scope
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    from hermes_cli.config import show_config
+
+    show_config()
+    out = capsys.readouterr().out.lower()
+    assert "managed by your administrator" not in out
+
+
+
+
+def test_doctor_silent_with_no_managed_scope(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "nope"))
+    from hermes_cli import managed_scope, doctor
+
+    managed_scope.invalidate_managed_cache()
+    doctor_config.managed_scope_check()
+    assert capsys.readouterr().out.strip() == ""
+

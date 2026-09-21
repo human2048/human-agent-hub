@@ -1,0 +1,347 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_webhook_deliver_only.py ===
+"""Tests for the webhook adapter's ``deliver_only`` route mode.
+
+``deliver_only`` lets external services (Supabase webhooks, monitoring
+alerts, background jobs, other agents) push plain-text notifications to
+a user's chat via the webhook adapter WITHOUT invoking the agent.  The
+rendered prompt template becomes the literal message body.
+
+Covers:
+- Agent is NOT invoked (``handle_message`` never called)
+- Rendered content is delivered to the target platform adapter
+- HTTP returns 200 OK on success, 502 on delivery failure
+- Startup validation rejects ``deliver_only`` without a real delivery target
+- HMAC auth, rate limiting, and idempotency still apply
+"""
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import SendResult
+from gateway.platforms.event import MessageEvent
+from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_adapter(routes, **extra_kw) -> WebhookAdapter:
+    extra = {"host": "127.0.0.1", "port": 0, "routes": routes}
+    extra.update(extra_kw)
+    config = PlatformConfig(enabled=True, extra=extra)
+    return WebhookAdapter(config)
+
+
+def _create_app(adapter: WebhookAdapter) -> web.Application:
+    app = web.Application()
+    app.router.add_get("/health", adapter._handle_health)
+    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    return app
+
+
+def _wire_mock_target(adapter: WebhookAdapter, platform_name: str = "telegram"):
+    """Attach a gateway_runner with a mocked target adapter."""
+    mock_target = AsyncMock()
+    mock_target.send = AsyncMock(return_value=SendResult(success=True))
+
+    mock_runner = MagicMock()
+    mock_runner.adapters = {Platform(platform_name): mock_target}
+    mock_runner._authorization_adapter = lambda platform, profile=None: mock_runner.adapters.get(platform)
+    mock_runner.config.get_home_channel.return_value = None
+
+    adapter.gateway_runner = mock_runner
+    return mock_target
+
+
+# ===================================================================
+# Core behaviour: agent bypass
+# ===================================================================
+
+class TestDeliverOnlyBypassesAgent:
+    """The whole point of the feature — handle_message must not be called."""
+
+    @pytest.mark.asyncio
+    async def test_post_delivers_directly_without_agent(self):
+        routes = {
+            "match-alert": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "12345"},
+                "prompt": "{payload.user} matched with {payload.other}!",
+            }
+        }
+        adapter = _make_adapter(routes)
+        mock_target = _wire_mock_target(adapter)
+
+        # Guard: handle_message must NOT be called in deliver_only mode
+        handle_message_calls: list[MessageEvent] = []
+
+        async def _capture(event):
+            handle_message_calls.append(event)
+
+        adapter.handle_message = _capture
+
+        app = _create_app(adapter)
+        body = json.dumps(
+            {"payload": {"user": "alice", "other": "bob"}}
+        ).encode()
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/match-alert",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GitHub-Delivery": "delivery-1",
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "delivered"
+            assert data["route"] == "match-alert"
+            assert data["target"] == "telegram"
+
+        # Let any background tasks settle before asserting no agent call
+        await asyncio.sleep(0.05)
+
+        # Agent was NOT invoked
+        assert handle_message_calls == []
+
+        # Target adapter.send() WAS called with the rendered template
+        mock_target.send.assert_awaited_once()
+        call_args = mock_target.send.await_args
+        chat_id_arg, content_arg = call_args.args[0], call_args.args[1]
+        assert chat_id_arg == "12345"
+        assert content_arg == "alice matched with bob!"
+
+
+# ===================================================================
+# HTTP status codes
+# ===================================================================
+
+class TestDeliverOnlyStatusCodes:
+
+    @pytest.mark.asyncio
+    async def test_delivery_failure_returns_502(self):
+        """If the target adapter returns SendResult(success=False), 502."""
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "c-1"},
+                "prompt": "hi",
+            }
+        }
+        adapter = _make_adapter(routes)
+        mock_target = _wire_mock_target(adapter)
+        mock_target.send = AsyncMock(
+            return_value=SendResult(success=False, error="rate limited by tg")
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/r",
+                json={},
+                headers={"X-GitHub-Delivery": "d-fail-1"},
+            )
+            assert resp.status == 502
+            data = await resp.json()
+            # Generic error — no adapter-level detail leaks
+            assert data["error"] == "Delivery failed"
+            assert "rate limited" not in json.dumps(data)
+
+
+# ===================================================================
+# Startup validation
+# ===================================================================
+
+class TestDeliverOnlyStartupValidation:
+
+
+    @pytest.mark.asyncio
+    async def test_deliver_only_with_real_target_accepted(self):
+        """Sanity check — a valid deliver_only config passes validation."""
+        routes = {
+            "good": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "c-1"},
+                "prompt": "hi",
+            }
+        }
+        adapter = _make_adapter(routes)
+        # connect() does more than validation (binds a socket) — we just
+        # want to verify the validation doesn't raise.  Call it and tear
+        # down immediately.
+        try:
+            started = await adapter.connect()
+            if started:
+                await adapter.disconnect()
+        except ValueError:
+            pytest.fail("valid deliver_only config should not raise ValueError")
+
+
+# ===================================================================
+# Security + reliability invariants still hold
+# ===================================================================
+
+class TestDeliverOnlySecurityInvariants:
+
+    @pytest.mark.asyncio
+    async def test_hmac_still_enforced(self):
+        """deliver_only does NOT bypass HMAC validation."""
+        secret = "real-secret-123"
+        routes = {
+            "r": {
+                "secret": secret,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "c-1"},
+                "prompt": "hi",
+            }
+        }
+        adapter = _make_adapter(routes)
+        mock_target = _wire_mock_target(adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # No signature header → reject
+            resp = await cli.post(
+                "/webhooks/r",
+                json={},
+                headers={"X-GitHub-Delivery": "d-noauth-1"},
+            )
+            assert resp.status == 401
+
+        # Target never called
+        mock_target.send.assert_not_awaited()
+
+
+# ===================================================================
+# Unit: _direct_deliver dispatch
+# ===================================================================
+
+class TestDirectDeliverUnit:
+
+
+    @pytest.mark.asyncio
+    async def test_dispatches_to_github_comment(self):
+        adapter = _make_adapter({})
+        with patch.object(
+            adapter, "_deliver_github_comment",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as mock_gh:
+            result = await adapter._direct_deliver(
+                "review body",
+                {
+                    "deliver": "github_comment",
+                    "deliver_extra": {"repo": "org/r", "pr_number": "1"},
+                },
+            )
+            assert result.success is True
+            mock_gh.assert_awaited_once()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_webhook_dynamic_routes.py ===
+"""Tests for webhook adapter dynamic route loading."""
+
+import json
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.webhook import (
+    WebhookAdapter,
+    _DYNAMIC_ROUTES_FILENAME,
+    _INSECURE_NO_AUTH,
+)
+
+
+def _make_adapter(routes=None, extra=None):
+    _extra = extra or {}
+    if routes:
+        _extra["routes"] = routes
+    _extra.setdefault("secret", "test-global-secret")
+    config = PlatformConfig(enabled=True, extra=_extra)
+    return WebhookAdapter(config)
+
+
+@pytest.fixture(autouse=True)
+def _isolate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+
+class TestDynamicRouteLoading:
+    def test_no_dynamic_file(self):
+        adapter = _make_adapter(routes={"static": {"secret": "s"}})
+        adapter._reload_dynamic_routes()
+        assert "static" in adapter._routes
+        assert len(adapter._dynamic_routes) == 0
+
+    def test_loads_dynamic_routes(self, tmp_path):
+        subs = {"my-hook": {"secret": "dynamic-secret", "prompt": "test", "events": []}}
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(json.dumps(subs))
+
+        adapter = _make_adapter(routes={"static": {"secret": "s"}})
+        adapter._reload_dynamic_routes()
+        assert "my-hook" in adapter._routes
+        assert "static" in adapter._routes
+
+
+class TestDynamicRouteSecretValidation:
+    """Empty/missing secrets must be rejected during hot-reload.
+
+    Regression for HMAC bypass: prior to the fix, an agent-induced
+    dynamic route with `"secret": ""` would be merged into self._routes
+    by _reload_dynamic_routes(), then _handle_webhook's
+    `if secret and secret != _INSECURE_NO_AUTH` would skip signature
+    validation because empty string is falsy. Unauthenticated POSTs
+    would then execute the webhook prompt.
+    """
+
+    def test_empty_secret_rejected(self, tmp_path):
+        # Explicit empty-string secret must NOT fall back to the global
+        # secret, and the route must be skipped entirely.
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
+            json.dumps({"evil": {"secret": "", "prompt": "rm -rf"}})
+        )
+        adapter = _make_adapter()  # has global secret
+        adapter._reload_dynamic_routes()
+        assert "evil" not in adapter._routes
+        assert "evil" not in adapter._dynamic_routes
+
+    def test_missing_secret_no_global_rejected(self, tmp_path):
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
+            json.dumps({"orphan": {"prompt": "test"}})
+        )
+        # No global secret configured
+        adapter = _make_adapter(extra={"secret": ""})
+        adapter._reload_dynamic_routes()
+        assert "orphan" not in adapter._routes
+        assert "orphan" not in adapter._dynamic_routes
+
+    def test_missing_secret_inherits_global(self, tmp_path):
+        # No per-route secret but a global one is set → route is kept,
+        # the global secret protects it. Preserves existing fallback.
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
+            json.dumps({"valid": {"prompt": "ok"}})
+        )
+        adapter = _make_adapter()  # global secret set
+        adapter._reload_dynamic_routes()
+        assert "valid" in adapter._routes
+
+
+

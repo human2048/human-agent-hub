@@ -1,0 +1,404 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\test_case_collision_check.py ===
+"""Wrappers for scripts/check-case-collisions.py.
+
+Same pattern as tests/scripts/test_windows_footguns_full_repo_scan.py: run
+the real checker and assert its outcomes, so a normal pytest run catches a
+regression — someone committing a case-colliding pair — without anyone
+having to remember to run the script by hand.
+
+The collision cases are built with ``git update-index --cacheinfo`` (index
+only, never touching the working tree), so they exercise the same index the
+checker reads and work even on a case-insensitive filesystem, where the two
+spellings cannot coexist on disk.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "check-case-collisions.py"
+
+
+def _git_blob_sha(data: bytes) -> str:
+    """The git object hash for a blob with ``data`` as its content."""
+    header = f"blob {len(data)}\0".encode("ascii")
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def _run_check(*args, root=None):
+    cmd = [sys.executable, str(SCRIPT)] + list(args)
+    if root is not None:
+        cmd.append(str(root))
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+        cwd=REPO_ROOT,
+    )
+
+
+def _git_init(tmp_path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    return repo
+
+
+def test_full_repo_has_no_case_colliding_paths():
+    """The real checker against the whole tracked tree must exit clean."""
+    result = _run_check()
+    assert result.returncode == 0, (
+        f"Case-collision check failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_detects_case_colliding_paths(tmp_path):
+    """Same-directory Foo.txt + foo.txt must fail, naming both paths."""
+    repo = _git_init(tmp_path)
+    subprocess.run(
+        [
+            "git", "update-index", "--add", "--cacheinfo",
+            f"100644,{_git_blob_sha(b'a')},Foo.txt",
+        ],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        [
+            "git", "update-index", "--add", "--cacheinfo",
+            f"100644,{_git_blob_sha(b'b')},foo.txt",
+        ],
+        cwd=repo, check=True,
+    )
+
+    result = _run_check(root=repo)
+    assert result.returncode == 1, f"expected failure, got:\n{result.stdout}"
+    assert "Foo.txt" in result.stdout
+    assert "foo.txt" in result.stdout
+
+
+def test_detects_directory_case_collisions(tmp_path):
+    """The comparison is on the FULL path — dir/Foo.txt vs DIR/foo.txt too."""
+    repo = _git_init(tmp_path)
+    subprocess.run(
+        [
+            "git", "update-index", "--add", "--cacheinfo",
+            f"100644,{_git_blob_sha(b'a')},src/Helper.py",
+        ],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        [
+            "git", "update-index", "--add", "--cacheinfo",
+            f"100644,{_git_blob_sha(b'b')},SRC/helper.py",
+        ],
+        cwd=repo, check=True,
+    )
+
+    result = _run_check(root=repo)
+    assert result.returncode == 1, f"expected failure, got:\n{result.stdout}"
+    assert "src/Helper.py" in result.stdout
+    assert "SRC/helper.py" in result.stdout
+
+
+def test_same_name_in_different_dirs_is_not_a_collision(tmp_path):
+    """a/Readme.txt and b/readme.txt share a basename but not a path."""
+    repo = _git_init(tmp_path)
+    (repo / "a").mkdir()
+    (repo / "b").mkdir()
+    (repo / "a" / "Readme.txt").write_text("a", encoding="utf-8")
+    (repo / "b" / "readme.txt").write_text("b", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+
+    result = _run_check(root=repo)
+    assert result.returncode == 0, f"expected clean, got:\n{result.stdout}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\test_check_compat_pointers.py ===
+"""The compatibility-pointer scanner only traverses first-party Python trees."""
+
+import importlib.util
+import os
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check_compat_pointers.py"
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("check_compat_pointers", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_py_files_prunes_dependency_trees_before_descent(tmp_path, monkeypatch):
+    mod = _load()
+    (tmp_path / "package").mkdir()
+    (tmp_path / "package" / "source.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "package" / "apps").mkdir()
+    (tmp_path / "package" / "apps" / "nested.py").write_text("VALUE = 3\n", encoding="utf-8")
+    excluded = [
+        tmp_path / ".venv",
+        tmp_path / "venv",
+        tmp_path / "node_modules",
+        tmp_path / "package" / "__pycache__",
+        tmp_path / "package" / "node_modules",
+    ]
+    for directory in excluded:
+        directory.mkdir(parents=True)
+        (directory / "dependency.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    visited = []
+    real_walk = os.walk
+
+    def tracking_walk(root):
+        for dirpath, dirnames, filenames in real_walk(root):
+            visited.append(Path(dirpath))
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    monkeypatch.setattr(mod.os, "walk", tracking_walk)
+
+    assert set(mod._py_files()) == {
+        tmp_path / "package" / "source.py",
+        tmp_path / "package" / "apps" / "nested.py",
+    }
+    assert tmp_path in visited
+    assert not set(excluded) & set(visited)
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\test_check_profile_archive_boundary.py ===
+"""Behavioral tests for the profile archive CI guard."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "ci"
+    / "check_profile_archive_boundary.py"
+)
+
+
+def _run(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--root", str(root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_clean_root_passes(tmp_path):
+    result = _run(tmp_path)
+
+    assert result.returncode == 0
+    assert "No profile export archives" in result.stdout
+
+
+def test_root_profile_archive_fails_without_printing_contents(tmp_path):
+    default_archive = tmp_path / "default.tar.gz"
+    alternate_archive = tmp_path / "backup.TGZ"
+    default_archive.write_bytes(b"profile webhook secret must never be printed")
+    alternate_archive.write_bytes(b"another archive")
+
+    result = _run(tmp_path)
+
+    assert result.returncode == 1
+    assert "default.tar.gz" in result.stdout
+    assert "backup.TGZ" in result.stdout
+    assert "profile webhook secret" not in result.stdout
+    assert "another archive" not in result.stdout
+
+
+def test_nested_profile_archive_is_also_rejected(tmp_path):
+    nested = tmp_path / "fixtures"
+    nested.mkdir()
+    (nested / "fixture.tar.gz").write_bytes(b"test fixture")
+
+    result = _run(tmp_path)
+
+    assert result.returncode == 1
+    assert "fixtures/fixture.tar.gz" in result.stdout
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\test_check_profile_scope_patterns.py ===
+"""scripts/check_profile_scope_patterns.py flags a known profile-scope hazard and stays silent on clean code.
+
+Advisory lint over the validated pattern set (``scripts/ci/profile_scope_patterns.json``): a child env
+built from ``os.environ`` is the shape that leaked the launch profile's secrets into served-profile
+children; the same spawn through ``served_profile_child_env`` is the fix and must not be flagged.
+"""
+import importlib.util
+import sys
+import textwrap
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check_profile_scope_patterns.py"
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("check_profile_scope_patterns", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    # dataclasses resolve string annotations through sys.modules[cls.__module__] (3.11).
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_child_env_from_environ_is_flagged_and_the_scoped_builder_is_not():
+    mod = _load()
+    patterns = mod.load_patterns()
+    assert patterns and all(p["scope_hint"] and p["why"] for p in patterns)
+
+    hazard = textwrap.dedent('''
+        import os, subprocess
+
+        def delivery_env(author):
+            env = dict(os.environ)
+            env["HERMES_TURN_AUTHOR"] = author
+            return env
+
+        def run(cmd):
+            return subprocess.Popen(cmd, env=os.environ.copy())
+    ''')
+    clean = textwrap.dedent('''
+        import subprocess
+        from tools.environments.local import served_profile_child_env
+
+        def delivery_env(author, profile_home):
+            env = served_profile_child_env(target_home=profile_home, inherit_credentials=True)
+            env["HERMES_TURN_AUTHOR"] = author
+            return env
+
+        def run(cmd, env):
+            return subprocess.Popen(cmd, env=env)
+    ''')
+    flagged = mod.scan_text("tools/x.py", hazard, patterns)
+    assert {(f.line, f.pattern_id) for f in flagged} >= {(5, "P05"), (10, "P05")}
+    assert all(f.pattern_class == "C2" and f.why for f in flagged if f.pattern_id == "P05")
+    assert mod.scan_text("tools/x.py", clean, patterns) == []
+
+    # Diff mode only reports lines the change added: restricting to the untouched line hides the hit.
+    assert mod.scan_text("tools/x.py", hazard, patterns, lines={6}) == []
+    assert [f.line for f in mod.scan_text("tools/x.py", hazard, patterns, lines={5})] == [5]
+
+
+def test_lint_is_advisory_and_exits_zero_with_findings(tmp_path, capsys):
+    mod = _load()
+    bad = tmp_path / "bad.py"
+    bad.write_text("import os\nenv = os.environ.copy()\n", encoding="utf-8")
+    assert mod.main(["--files", str(bad)]) == 0
+    out = capsys.readouterr().out
+    assert "P05/C2" in out and ":2 " in out and "ADVISORY" in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\test_check_public_surface.py ===
+"""scripts/ci/check_public_surface.py detects silently dropped public names, methods and test defs.
+
+Replayed against the Sep 2026 refactor PR at open it reports 1,703 public names dropped in 341 modules
+(the figure reviewers had to find ~30 of by hand); here the contract is pinned on a throwaway repo.
+"""
+import importlib.util
+import subprocess
+import textwrap
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "check_public_surface.py"
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("check_public_surface", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                        "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin:/usr/local/bin"})
+
+
+def test_dropped_public_names_methods_and_test_defs_are_reported_and_moves_are_not(tmp_path, monkeypatch):
+    repo = tmp_path
+    (repo / "agent").mkdir(); (repo / "tests").mkdir(); (repo / "docs").mkdir()
+    (repo / "agent" / "mod.py").write_text(textwrap.dedent('''
+        import os
+        from json import loads as parse
+
+        LIMIT = 3
+        def keep(): ...
+        def gone(): ...
+        def _private(): ...
+        class K:
+            def pub(self): ...
+            def __len__(self): return 0
+            def _hidden(self): ...
+        class Big:
+            def stays(self): ...
+            def extracted(self): ...
+    '''), encoding="utf-8")
+    (repo / "agent" / "moved.py").write_text("def relocated(): ...\n", encoding="utf-8")
+    (repo / "tests" / "test_x.py").write_text("def test_a(): ...\ndef test_b(): ...\nasync def test_c(): ...\n", encoding="utf-8")
+    (repo / "docs" / "notes.py").write_text("def doc_helper(): ...\n", encoding="utf-8")
+    _git(repo, "init", "-q", "-b", "main"); _git(repo, "add", "."); _git(repo, "commit", "-qm", "base")
+
+    # HEAD: drop `gone`, `parse`, `K.pub`, `K.__len__`; drop `_private`/`K._hidden` (private: fine);
+    # move `relocated` into mod with a re-export left behind (fine); lose one test def; change a
+    # non-source module (ignored).
+    (repo / "agent" / "mod.py").write_text(textwrap.dedent('''
+        import os
+        from agent.moved import relocated  # re-export
+
+        LIMIT = 3
+        def keep(): ...
+        class K: ...
+        class _BigMixin:
+            def extracted(self): ...   # moved into an in-module base: still reachable on Big
+        class Big(_BigMixin):
+            def stays(self): ...
+    '''), encoding="utf-8")
+    (repo / "agent" / "moved.py").write_text("def relocated(): ...\ndef relocated2(): ...\n", encoding="utf-8")
+    (repo / "tests" / "test_x.py").write_text("def test_a(): ...\nasync def test_c(): ...\n", encoding="utf-8")
+    (repo / "docs" / "notes.py").write_text("def other(): ...\n", encoding="utf-8")
+    _git(repo, "add", "."); _git(repo, "commit", "-qm", "head")
+
+    monkeypatch.chdir(repo)
+    mod = _load()
+    report = mod.diff_surface("HEAD~1", "HEAD")
+    assert report["dropped_names"] == {"agent/mod.py": ["gone", "parse"]}
+    assert report["dropped_methods"] == {"agent/mod.py": ["K.__len__", "K.pub"]}
+    assert report["test_drops"] == {"tests/test_x.py": (3, 2)}
+    assert mod.main(["--base", "HEAD~1", "--head", "HEAD"]) == 0          # advisory
+    assert mod.main(["--base", "HEAD~1", "--head", "HEAD", "--strict"]) == 1
+    assert mod.main(["--base", "HEAD", "--head", "HEAD", "--strict"]) == 0  # nothing dropped
+
+
+def test_unresolvable_refs_are_an_error_not_a_clean_report(tmp_path, monkeypatch):
+    """Independent-review witness: a nonexistent base ref under --strict reported zero drops and exited 0,
+    which would make a mis-fetched CI job look clean."""
+    repo = tmp_path
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "init", "-q", "-b", "main"); _git(repo, "add", "."); _git(repo, "commit", "-qm", "base")
+    monkeypatch.chdir(repo)
+    mod = _load()
+    assert mod.main(["--base", "origin/does-not-exist", "--head", "HEAD", "--strict"]) == 2
+    assert mod.main(["--base", "origin/does-not-exist", "--head", "HEAD"]) == 2
+

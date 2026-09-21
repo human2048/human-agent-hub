@@ -1,0 +1,379 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_verify_console_scripts.py ===
+"""Tests for _verify_console_scripts_installed (issue #52931)."""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from hermes_cli import main_install_repair
+
+
+@pytest.fixture
+def temp_pyproject(tmp_path, monkeypatch):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        textwrap.dedent(
+            """\
+        [project]
+        name = "fake"
+        version = "0.0.0"
+
+        [project.scripts]
+        hermes = "hermes_cli.main:main"
+        hermes-agent = "run_agent:main"
+        hermes-acp = "acp_adapter.entry:main"
+    """
+        )
+    )
+    import hermes_cli.main as main_mod
+
+    monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def fake_scripts_dir(tmp_path):
+    scripts = tmp_path / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    return scripts
+
+
+class TestVerifyConsoleScriptsInstalled:
+    def test_no_action_when_all_shims_present(self, temp_pyproject, fake_scripts_dir):
+        for name in ("hermes", "hermes-agent", "hermes-acp"):
+            (fake_scripts_dir / f"{name}.exe").write_bytes(b"fake")
+
+        with patch("hermes_cli.main_install_repair._is_windows", return_value=True), \
+             patch("hermes_cli.main_install_repair._venv_scripts_dir", return_value=fake_scripts_dir), \
+             patch("hermes_cli.main_install_repair._run_quarantined_install") as mock_install:
+            from hermes_cli.main_install_repair import _verify_console_scripts_installed
+
+            _verify_console_scripts_installed(["uv", "pip"], env={})
+
+        mock_install.assert_not_called()
+
+
+
+
+    def test_quarantine_shims_include_declared_console_scripts(
+        self, temp_pyproject, fake_scripts_dir
+    ):
+        import hermes_cli.main as main_mod
+
+        with patch("hermes_cli.main_install_repair._is_windows", return_value=True):
+            names = {path.name for path in main_install_repair._hermes_exe_shims(fake_scripts_dir)}
+
+        assert {"hermes.exe", "hermes-agent.exe", "hermes-acp.exe"} <= names
+        assert "hermes-gateway.exe" in names
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_verify_core_dependencies.py ===
+"""Tests for _verify_core_dependencies_installed.
+
+Regression coverage for the partial-install bug where uv's incremental
+resolver silently failed to land ``pathspec`` (and similar newly-added
+base deps) during ``hermes update``, leaving the venv in a broken state
+that only surfaced hours later when a downstream subprocess imported the
+missing module.
+
+The verification step:
+  1. Reads pyproject.toml's [project.dependencies] directly.
+  2. Filters by environment markers so cross-platform exclusions don't
+     false-positive (e.g. ``ptyprocess ; sys_platform != 'win32'`` on Windows).
+  3. Probes ``importlib.metadata.version()`` in the venv interpreter.
+  4. Reinstalls with --reinstall, then per-package, if anything's missing.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture
+def temp_pyproject(tmp_path, monkeypatch):
+    """Point hermes_cli.main.PROJECT_ROOT at a tmp dir with a minimal pyproject.
+
+    The verification helper opens ``PROJECT_ROOT / 'pyproject.toml'`` directly;
+    redirecting PROJECT_ROOT keeps the test hermetic.
+    """
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(textwrap.dedent("""\
+        [project]
+        name = "fake"
+        version = "0.0.0"
+        dependencies = [
+          "pathspec==1.1.1",
+          "pydantic==2.13.4",
+          "ptyprocess>=0.7.0,<1; sys_platform != 'win32'",
+          "tzdata>=2024.1; sys_platform == 'win32'",
+        ]
+    """))
+    import hermes_cli.main as main_mod
+    monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def fake_venv_python(tmp_path):
+    """Create a fake venv python shim path that exists on disk."""
+    venv_root = tmp_path / "venv"
+    scripts = venv_root / "Scripts"
+    scripts.mkdir(parents=True)
+    py = scripts / "python.exe"
+    py.write_text("#!/bin/sh\necho fake python")
+    return py, venv_root
+
+
+class TestVerifyCoreDependencies:
+
+
+
+    def test_skips_deps_excluded_by_environment_markers(self, temp_pyproject, fake_venv_python):
+        """A dep whose ``sys_platform`` marker excludes THIS host must not be
+        probed (and so never reported missing). Without marker evaluation the
+        verification step would false-positive on every cross-platform
+        exclusion and chase its tail installing something inapplicable here.
+
+        Deliberately host-invariant rather than ``windows_only``: the subject
+        is ``packaging``'s marker *evaluation*, not any OS facility. The
+        pyproject fixture declares one dep gated to non-Windows and one gated
+        to Windows, so exactly one of the pair is filtered on any host — the
+        old ``patch("sys.platform", "win32")`` bought nothing but a fake host.
+        """
+        py, venv_root = fake_venv_python
+        env = {"VIRTUAL_ENV": str(venv_root)}
+        captured_argv: list[list[str]] = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            captured_argv.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("hermes_cli.main_install_repair._resolve_install_target_python", return_value=py), \
+             patch("hermes_cli.main_install_repair.subprocess.run", side_effect=fake_subprocess_run), \
+             patch("hermes_cli.main_install_repair._run_install_with_heartbeat"):
+
+            from hermes_cli.main_install_repair import _verify_core_dependencies_installed
+            _verify_core_dependencies_installed(["uv", "pip"], env=env)
+
+        # Find the probe argv — it's the call that passed the dep names.
+        probe = next(
+            (argv for argv in captured_argv if any("importlib.metadata" in str(a) for a in argv)),
+            None,
+        )
+        assert probe is not None, "verification probe should have run"
+        # The dep names are tacked on after the -c script. Exactly one of the
+        # marker-gated pair applies to this host; the other must be filtered.
+        on_windows = sys.platform == "win32"
+        assert ("ptyprocess" in probe) is not on_windows, (
+            "ptyprocess is gated by sys_platform != 'win32', so it must be "
+            f"probed off Windows and filtered on it; probe argv was: {probe}"
+        )
+        assert ("tzdata" in probe) is on_windows, (
+            "tzdata is gated by sys_platform == 'win32', so it must be probed "
+            f"on Windows and filtered elsewhere; probe argv was: {probe}"
+        )
+        assert "pathspec" in probe, "core deps without markers must be checked"
+
+    def test_no_pyproject_is_noop(self, tmp_path, monkeypatch):
+        """If pyproject.toml is missing (unusual but possible in some test
+        envs), the verification step must short-circuit, not crash."""
+        import hermes_cli.main as main_mod
+        monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
+        # No pyproject.toml in tmp_path.
+        with patch("hermes_cli.main_install_repair._resolve_install_target_python") as mock_resolve, \
+             patch("hermes_cli.main_install_repair._run_install_with_heartbeat") as mock_install:
+            from hermes_cli.main_install_repair import _verify_core_dependencies_installed
+            _verify_core_dependencies_installed(["uv", "pip"], env={})
+            assert not mock_resolve.called
+            assert not mock_install.called
+
+
+
+class TestResolveInstallTargetPython:
+    def test_uses_virtual_env_from_environment(self, tmp_path):
+        """When VIRTUAL_ENV is set, the verification step must probe THAT
+        venv's interpreter — not the outer Python that drove `hermes update`.
+        If we probed sys.executable instead, we'd false-positive every dep
+        the outer interpreter happens to lack."""
+        venv_root = tmp_path / "newvenv"
+        scripts = venv_root / "Scripts"
+        scripts.mkdir(parents=True)
+        py = scripts / "python.exe"
+        py.write_text("fake")
+
+        with patch("hermes_cli.main_install_repair._is_windows", return_value=True):
+            from hermes_cli.main_install_repair import _resolve_install_target_python
+            result = _resolve_install_target_python(
+                ["uv", "pip"], env={"VIRTUAL_ENV": str(venv_root)}
+            )
+            assert result == py
+
+    def test_returns_none_when_venv_python_missing(self, tmp_path):
+        """If the path we'd point at doesn't exist (uv install failed before
+        the python shim landed), return None so the verification step
+        cleanly short-circuits instead of crashing on FileNotFoundError."""
+        with patch("hermes_cli.main_install_repair._is_windows", return_value=True):
+            from hermes_cli.main_install_repair import _resolve_install_target_python
+            result = _resolve_install_target_python(
+                ["uv", "pip"], env={"VIRTUAL_ENV": str(tmp_path / "does_not_exist")}
+            )
+            assert result is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_version_command.py ===
+"""Tests for the /version slash command."""
+
+from unittest.mock import patch
+
+from cli import HermesCLI
+from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command
+
+
+def test_version_command_is_registered():
+    cmd = resolve_command("version")
+    assert cmd is not None
+    assert cmd.name == "version"
+    assert cmd.category == "Info"
+    assert resolve_command("v") is cmd
+
+
+def test_version_is_gateway_known():
+    assert "version" in GATEWAY_KNOWN_COMMANDS
+    assert "v" in GATEWAY_KNOWN_COMMANDS
+
+
+def test_process_command_version_prints_version_info():
+    cli_obj = HermesCLI.__new__(HermesCLI)
+
+    with patch("hermes_cli.main._print_version_info") as mock_print:
+        assert cli_obj.process_command("/version") is True
+
+    mock_print.assert_called_once_with(check_updates=True)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_vertex_model_picker.py ===
+"""Vertex visibility in the /model picker (follow-up to PR #56688).
+
+Community verification of the vertex-registration fix found two remaining
+gaps that kept the provider invisible/unusable in the /model menu:
+
+1. ``list_authenticated_providers`` had no credential gate for the
+   ``vertex`` auth_type (only ``aws_sdk`` was special-cased), so the
+   provider was silently hidden even when fully configured.
+2. Vertex's OpenAI-compatible endpoint has no ``/models`` listing route,
+   so without a curated ``_PROVIDER_MODELS["vertex"]`` entry the picker
+   only ever showed the currently-configured model.
+
+No network calls.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from hermes_cli.model_switch import list_authenticated_providers
+from hermes_cli.models import _PROVIDER_MODELS
+
+
+def test_vertex_has_curated_model_list():
+    """Vertex has no /models route — the picker needs a static curated list."""
+    models = _PROVIDER_MODELS.get("vertex")
+    assert models, "_PROVIDER_MODELS must have a non-empty 'vertex' entry"
+    # Vertex's openapi endpoint expects the google/ publisher prefix.
+    assert all(m.startswith("google/") for m in models)
+
+
+def test_vertex_appears_when_credentials_configured():
+    """has_vertex_credentials() == True must surface vertex in the picker."""
+    with patch("agent.vertex_adapter.has_vertex_credentials", return_value=True):
+        providers = list_authenticated_providers(current_provider="openrouter", max_models=50)
+
+    vertex = next((p for p in providers if p["slug"] == "vertex"), None)
+    assert vertex is not None, "vertex should appear when credentials are configured"
+    assert vertex["models"], "vertex row must carry the curated model list"
+    assert "google/gemini-3-pro-preview" in vertex["models"]
+
+
+def test_vertex_hidden_without_credentials():
+    """No service-account path / project override → vertex stays hidden."""
+    with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
+        providers = list_authenticated_providers(current_provider="openrouter", max_models=50)
+
+    vertex = next((p for p in providers if p["slug"] == "vertex"), None)
+    assert vertex is None, "vertex should not appear without credentials"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_vertex_provider.py ===
+"""Tests for Vertex AI runtime-provider resolution and profile registration.
+
+Covers: provider-profile registration + aliases, alias canonicalization,
+resolve_runtime_provider(vertex) minting an OAuth token, and the friendly
+AuthError when credentials can't be resolved. No network calls.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+
+
+
+
+
+
+def test_resolve_runtime_provider_raises_autherror_when_unresolved(monkeypatch):
+    import agent.vertex_adapter as va
+    from hermes_cli import runtime_provider as rp
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(va, "get_vertex_config", lambda: (None, None))
+    with pytest.raises(AuthError) as exc:
+        rp.resolve_runtime_provider(requested="vertex")
+    msg = str(exc.value)
+    assert "OAuth2" in msg
+    assert "not a static API key" in msg
+
+
+def test_vertex_registered_in_provider_registry():
+    """PROVIDER_REGISTRY (hermes_cli.auth) is what agent/auxiliary_client.py's
+    resolve_provider_client() looks up before dispatching on auth_type. Without
+    an entry here, the ``elif pconfig.auth_type == "vertex":`` branch there is
+    unreachable dead code — every auxiliary Vertex call (vision, title
+    generation, MoA reference/aggregator slots, ...) fails at the
+    ``pconfig is None`` guard before ever reaching it."""
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    cfg = PROVIDER_REGISTRY.get("vertex")
+    assert cfg is not None
+    assert cfg.auth_type == "vertex"
+
+
+def test_vertex_registered_in_hermes_overlays():
+    """hermes_cli.providers.get_provider("vertex") backs
+    _preserve_provider_with_base_url() in agent/auxiliary_client.py, which
+    decides whether a MoA slot's resolved Vertex (base_url, api_key) pair
+    keeps its "vertex" provider identity or silently collapses to "custom" —
+    losing the identity _refresh_provider_credentials() needs to re-mint an
+    expired OAuth2 token on a 401."""
+    from hermes_cli.providers import get_provider
+
+    resolved = get_provider("vertex")
+    assert resolved is not None
+    assert resolved.auth_type == "vertex"
+

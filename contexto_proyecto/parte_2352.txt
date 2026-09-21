@@ -1,0 +1,327 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\transports\test_codex_worker_mcp_overrides.py ===
+"""Kanban worker MCP overrides must target the server entry the runtime migration registers.
+
+Regression for #111707: dispatcher-owned workers on the codex app-server runtime injected
+``mcp_servers.hermes-mcp.env.*`` while the migration writes ``[mcp_servers.hermes-tools]``;
+codex then saw an env-only entry with no transport and refused to start.
+"""
+
+import subprocess
+import tomllib
+
+import pytest
+
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS, non_dispatcher_owned_context
+from agent.transports import codex_app_server as cas
+from hermes_cli.codex_runtime_plugin_migration import migrate
+
+
+class _RecordingPopen:
+    commands: list[list[str]] = []
+
+    def __init__(self, cmd, *args, **kwargs):
+        type(self).commands.append(list(cmd))
+        self.stdin = self.stdout = self.stderr = None
+        self.pid = 1
+        self.returncode = None
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+@pytest.fixture
+def launch(monkeypatch, tmp_path):
+    """Return ``launch(env) -> list[str]`` of the ``mcp_servers.*`` overrides in the worker argv."""
+    _RecordingPopen.commands = []
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+    for key in (*KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(key, raising=False)
+
+    def _launch(env: dict[str, str]) -> list[str]:
+        with monkeypatch.context() as ctx:
+            for key, value in env.items():
+                ctx.setenv(key, value)
+            client = cas.CodexAppServerClient(codex_bin="codex", codex_home=str(tmp_path / "codex"))
+            client._closed = True
+        cmd = _RecordingPopen.commands.pop()
+        return [arg for arg in cmd if arg.startswith("mcp_servers.")]
+
+    return _launch
+
+
+def _migrated_server_names(tmp_path) -> set[str]:
+    codex_home = tmp_path / "codex"
+    report = migrate({"mcp_servers": {}}, codex_home=codex_home, discover_plugins=False, expose_hermes_tools=True)
+    assert not report.errors
+    return set(tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))["mcp_servers"])
+
+
+def test_worker_overrides_target_the_migrated_server(launch, tmp_path):
+    """Producer/consumer contract: every ``-c mcp_servers.<name>.env.*`` override the worker
+    launcher emits names an entry the migration actually writes to config.toml."""
+    overrides = launch({
+        "HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111",
+        "HERMES_KANBAN_RUN_ID": "42",
+        "HERMES_KANBAN_DB": str(tmp_path / "board" / "kanban.db"),
+    })
+    assert overrides, "dispatcher-owned worker must scope the managed MCP endpoint"
+    targeted = {arg.split(".env.", 1)[0].removeprefix("mcp_servers.") for arg in overrides}
+    migrated = _migrated_server_names(tmp_path)
+    assert targeted <= migrated, f"overrides target {targeted - migrated}, which codex has no transport for"
+    assert any(arg.startswith(f"mcp_servers.{next(iter(targeted))}.env.HERMES_KANBAN_TASK=") for arg in overrides)
+
+
+def test_only_dispatcher_owned_workers_get_mcp_overrides(launch):
+    """An ordinary launch and a worker that does not own the dispatcher's task emit no
+    ``mcp_servers.*`` override at all (nothing to scope, nothing for codex to reject)."""
+    assert launch({}) == []
+    with non_dispatcher_owned_context():
+        assert launch({"HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111"}) == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\transports\test_finish_reason_normalization.py ===
+"""Uppercase wire finish reasons (STOP / MAX_TOKENS from Gemini-fronting
+OpenAI-compatible gateways) must fold to the lowercase OpenAI contract at both
+wire-intake choke points — the chat_completions transport and the streaming
+chunk loop — so stop handling and length recovery see the values they compare
+against.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agent.message_sanitization import normalize_finish_reason
+from agent.transports.chat_completions import ChatCompletionsTransport
+from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("STOP", "stop"),
+        ("MAX_TOKENS", "length"),
+        ("Tool_Calls", "tool_calls"),
+        ("end", "stop"),
+        ("function_call", "tool_calls"),
+        ("content_filter", "content_filter"),  # contract values pass through byte-identical
+    ],
+)
+def test_normalize_finish_reason_folds_to_contract(raw, expected):
+    assert normalize_finish_reason(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "", 24])
+def test_normalize_finish_reason_passes_falsy_and_non_string_unchanged(raw):
+    # Callers keep their ``or "stop"`` defaults; Poolside int reasons are untouched.
+    assert normalize_finish_reason(raw) is raw
+
+
+def _fake_response(finish_reason):
+    msg = SimpleNamespace(content="hello", tool_calls=None, refusal=None)
+    choice = SimpleNamespace(finish_reason=finish_reason, message=msg)
+    return SimpleNamespace(choices=[choice], usage=None, model="gemini-3-pro")
+
+
+@pytest.mark.parametrize("raw,expected", [("STOP", "stop"), ("MAX_TOKENS", "length"), (24, "24"), (None, "stop")])
+def test_transport_normalize_response_folds_finish_reason(raw, expected):
+    assert ChatCompletionsTransport().normalize_response(_fake_response(raw)).finish_reason == expected
+
+
+def _make_stream_chunk(content=None, finish_reason=None):
+    delta = SimpleNamespace(content=content, tool_calls=None, reasoning_content=None, reasoning=None)
+    return SimpleNamespace(choices=[SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)],
+                           model=None, usage=None)
+
+
+@pytest.mark.parametrize("raw,expected", [("STOP", "stop"), ("MAX_TOKENS", "length")])
+@patch("run_agent.AIAgent._create_request_openai_client")
+@patch("run_agent.AIAgent._close_request_openai_client")
+def test_streaming_capture_folds_uppercase_finish_reason(_mock_close, mock_create, monkeypatch, raw, expected):
+    from run_agent import AIAgent
+
+    def _stream():
+        yield _make_stream_chunk(content="partial answer")
+        yield _make_stream_chunk(finish_reason=raw)
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = lambda *a, **kw: _stream()
+    mock_create.return_value = mock_client
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+
+    agent = AIAgent(api_key="test-key", base_url="https://example.com/v1", model="test/model",
+                    quiet_mode=True, skip_context_files=True, skip_memory=True)
+    agent.api_mode = "chat_completions"
+    agent._interrupt_requested = False
+    response = agent._interruptible_streaming_api_call({})
+
+    assert response.id != PARTIAL_STREAM_STUB_ID
+    assert response.choices[0].finish_reason == expected
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\transports\test_hermes_tools_mcp_server.py ===
+"""Tests for the hermes-tools-as-MCP server module surface.
+
+We don't run a live MCP session in unit tests — that requires the codex
+subprocess + client + an event loop. These tests pin the static
+contract: the module imports, the EXPOSED_TOOLS list is sane, and the
+build helper assembles a server when the SDK is present.
+"""
+
+from __future__ import annotations
+
+import inspect
+from typing import get_args
+
+from agent.transports.hermes_tools_mcp_server import (
+    _signature_from_schema,
+)
+
+
+class TestSignatureFromSchema:
+    """Test the JSON Schema -> Python signature conversion."""
+
+    def test_simple_required_string_param(self):
+        """A required string param becomes str with no default."""
+        schema = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        sig, annots = _signature_from_schema(schema)
+
+        assert len(sig.parameters) == 1
+        param = sig.parameters["query"]
+        assert param.name == "query"
+        assert param.kind == inspect.Parameter.KEYWORD_ONLY
+        assert annots["query"] == str
+        assert param.default is inspect.Parameter.empty
+
+
+
+    def test_skip_private_params(self):
+        """Params starting with '_' are excluded from the signature."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "_internal": {"type": "string"},
+            },
+            "required": ["query", "_internal"],
+        }
+        sig, annots = _signature_from_schema(schema)
+
+        assert "_internal" not in sig.parameters
+        assert "_internal" not in annots
+        assert "query" in sig.parameters
+
+    def test_all_json_types(self):
+        """All JSON schema types map to correct Python types."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "s": {"type": "string"},
+                "i": {"type": "integer"},
+                "n": {"type": "number"},
+                "b": {"type": "boolean"},
+                "a": {"type": "array"},
+                "o": {"type": "object"},
+            },
+            "required": ["s", "i", "n", "b", "a", "o"],
+        }
+        sig, annots = _signature_from_schema(schema)
+
+        assert annots["s"] == str
+        assert annots["i"] == int
+        assert annots["n"] == float
+        assert annots["b"] == bool
+        assert annots["a"] == list
+        assert annots["o"] == dict
+
+
+
+
+
+
+
+
+class TestModuleSurface:
+    def test_module_imports_clean(self):
+        from agent.transports import hermes_tools_mcp_server as m
+        assert callable(m.main)
+        assert callable(m._build_server)
+        assert isinstance(m.EXPOSED_TOOLS, tuple)
+        assert len(m.EXPOSED_TOOLS) > 0
+
+    def test_exposed_tools_are_safe_subset(self):
+        """We MUST NOT expose tools codex already has, because codex'
+        own builtins are better-integrated with its sandbox + approvals.
+        Specifically: no terminal/shell, no read_file/write_file, no
+        patch — those are codex's built-in tools."""
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        forbidden = {
+            "terminal", "shell", "read_file", "write_file", "patch",
+            "search_files", "process",
+        }
+        leaked = forbidden & set(EXPOSED_TOOLS)
+        assert not leaked, (
+            f"these tools must NOT be exposed via the codex callback "
+            f"because codex has built-in equivalents: {leaked}"
+        )
+
+
+
+
+
+
+class TestMain:
+    def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):
+        """When the mcp package isn't installed, main() should exit
+        cleanly with code 2 and an install hint, not crash."""
+        import agent.transports.hermes_tools_mcp_server as m
+
+        def boom_build(*a, **kw):
+            raise ImportError("mcp not installed")
+
+        monkeypatch.setattr(m, "_build_server", boom_build)
+        rc = m.main(["--verbose"])
+        assert rc == 2
+
+    def test_main_handles_keyboard_interrupt(self, monkeypatch):
+        import agent.transports.hermes_tools_mcp_server as m
+
+        class FakeServer:
+            def run(self):
+                raise KeyboardInterrupt()
+
+        monkeypatch.setattr(m, "_build_server", lambda: FakeServer())
+        rc = m.main([])
+        assert rc == 0
+
+    def test_main_returns_1_on_runtime_error(self, monkeypatch):
+        import agent.transports.hermes_tools_mcp_server as m
+
+        class CrashingServer:
+            def run(self):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
+        rc = m.main([])
+        assert rc == 1
+

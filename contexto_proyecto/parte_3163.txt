@@ -1,0 +1,119 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_configured_builtin_models.py ===
+"""Configured models extend built-in picker rows."""
+
+from unittest.mock import patch
+
+from hermes_cli.model_switch import list_authenticated_providers
+
+
+def _provider_row(configured_models, *, max_models=None):
+    with (
+        patch(
+            "agent.models_dev.fetch_models_dev",
+            return_value={"deepseek": {"env": ["DEEPSEEK_API_KEY"], "name": "DeepSeek"}},
+        ),
+        patch(
+            "agent.models_dev.PROVIDER_TO_MODELS_DEV",
+            {"deepseek": "deepseek"},
+        ),
+        patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=["live-a", "shared"],
+        ),
+        patch("hermes_cli.providers.HERMES_OVERLAYS", {}),
+        patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}),
+    ):
+        rows = list_authenticated_providers(
+            current_provider="deepseek",
+            user_providers={"deepseek": {"models": configured_models}},
+            max_models=max_models,
+        )
+    return next(row for row in rows if row["slug"] == "deepseek")
+
+
+def test_configured_models_precede_and_deduplicate_discovered_models():
+    row = _provider_row({"configured-x": {}, "shared": {}})
+
+    assert row["models"] == ["configured-x", "shared", "live-a"]
+    assert row["total_models"] == 3
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_config_backups.py ===
+"""config.yaml backups: one dir, deduped, bounded — never a pile of siblings in HERMES_HOME."""
+from pathlib import Path
+
+from hermes_cli.config_backups import backup_config, list_config_backups
+
+
+def test_repeat_backups_dedupe_and_rotate(tmp_path: Path, monkeypatch):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("model: a\n")
+    stamps = iter(f"2026010100000{i}" for i in range(10))
+    monkeypatch.setattr("hermes_cli.config_backups.time.strftime", lambda _fmt: next(stamps))
+
+    first = backup_config(cfg, "pre-setup", keep=2)
+    assert first is not None and first.parent == tmp_path / "backups" / "config"
+    # Same bytes again → no new file (the hermes-setup-three-times case).
+    assert backup_config(cfg, "pre-setup", keep=2) is None
+    for i in range(3):
+        cfg.write_text(f"model: {i}\n")
+        backup_config(cfg, "pre-setup", keep=2)
+    kept = list_config_backups(cfg, "pre-setup")
+    assert len(kept) == 2 and kept[0].read_text() == "model: 2\n"
+    # Nothing left beside config.yaml in the home root.
+    assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["config.yaml"]
+
+
+def test_legacy_siblings_move_but_user_named_copies_stay(tmp_path: Path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("model: a\n")
+    for name in ("config.yaml.bak.1778718391", "config.yaml.corrupt.20260729-093706.bak",
+                 "config.yaml.bak-pre-migrate-xai-20260515-120000"):
+        (tmp_path / name).write_text("old")
+    (tmp_path / "config.yaml.bak-my-note").write_text("mine")
+
+    backup_config(cfg, "corrupt")
+
+    root = tmp_path / "backups" / "config"
+    assert (root / "config.yaml.bak.1778718391").exists()
+    assert (root / "config.yaml.corrupt.20260729-093706.bak").exists()
+    assert (tmp_path / "config.yaml.bak-my-note").read_text() == "mine"
+    assert not list(tmp_path.glob("config.yaml.bak.*")) and not list(tmp_path.glob("config.yaml.corrupt.*"))
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_config_cache_signature.py ===
+"""#111105: a config.yaml replacement that keeps mtime and size (``cp -p``, ``rsync -t``, a
+timestamp-pinning writer) must still invalidate the load_config() cache, while an unchanged
+file keeps serving the cached object."""
+import os
+import shutil
+from unittest.mock import patch
+
+from hermes_cli import config as config_mod
+
+
+def _replace_pinning_mtime(path, content: str) -> None:
+    before = path.stat()
+    other = path.with_name("other.yaml")
+    other.write_text(content, encoding="utf-8")
+    shutil.copy2(other, path)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+
+def test_load_config_sees_replacement_with_pinned_mtime_and_size(tmp_path):
+    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        config_mod._LOAD_CONFIG_CACHE.clear()
+        config_mod._RAW_CONFIG_CACHE.clear()
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("model:\n  default: aaaa-route\n", encoding="utf-8")
+        first = config_mod._load_config_impl(want_deepcopy=False)
+        assert config_mod._load_config_impl(want_deepcopy=False) is first  # unchanged file: cache hit
+        _replace_pinning_mtime(cfg, "model:\n  default: bbbb-route\n")
+        assert config_mod.load_config()["model"]["default"] == "bbbb-route"
+

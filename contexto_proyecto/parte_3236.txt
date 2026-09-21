@@ -1,0 +1,242 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dump_env_visibility.py ===
+"""`hermes debug` must not report a shell-only API key as plainly "set".
+
+The dump reads ``os.getenv`` — the invoking terminal's environment — but the
+managed backends (launchd / systemd / the desktop-spawned ``serve`` process)
+load credentials from ``~/.hermes/.env``, not the login shell. A key exported
+in the shell but absent from ``.env`` is invisible to the backend, yet the dump
+used to print a bare "set", sending support down a phantom "the key is
+configured" path (the real cause behind gated tools like ``web_search`` going
+missing on Desktop). The dump now flags that mismatch.
+"""
+
+from pathlib import Path
+from types import SimpleNamespace
+
+
+def _api_key_line(out: str, label: str) -> str:
+    for line in out.splitlines():
+        if line.strip().startswith(f"{label} "):
+            return line
+    raise AssertionError(f"no '{label}' api_keys line in dump output:\n{out}")
+
+
+def test_dump_flags_shell_only_key_not_in_dotenv(monkeypatch, capsys, tmp_path):
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    # .env has some OTHER key but NOT firecrawl.
+    (home / ".env").write_text("OPENROUTER_API_KEY=sk-or-xxxx\n")
+    # firecrawl is exported in the (test) shell only.
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-shell-only")
+
+    dump.run_dump(SimpleNamespace(show_keys=False))
+
+    line = _api_key_line(capsys.readouterr().out, "firecrawl")
+    assert "set" in line
+    assert "shell only" in line
+    assert ".env" in line
+
+
+def test_dump_leaves_unset_key_untouched(monkeypatch, capsys, tmp_path):
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".env").write_text("OPENROUTER_API_KEY=sk-or-xxxx\n")
+
+    dump.run_dump(SimpleNamespace(show_keys=False))
+
+    line = _api_key_line(capsys.readouterr().out, "keenable")
+    assert "not set" in line
+    assert "shell only" not in line
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dump_git_commit.py ===
+"""Tests for hermes_cli.dump._get_git_commit — git SHA resolution for ``hermes dump``.
+
+``hermes dump`` prints the running commit so support bug reports identify the
+exact version.  Source installs resolve it live via ``git rev-parse``; the
+published Docker image excludes ``.git`` and falls back to the baked SHA
+written by the Dockerfile's ``HERMES_GIT_SHA`` build-arg.
+
+These tests cover both paths plus the failure modes (no git, no baked file).
+"""
+
+from unittest.mock import MagicMock, patch
+
+
+def test_get_git_commit_uses_live_git_when_available(tmp_path):
+    """Source install: ``git rev-parse --short=8 HEAD`` wins; no fallback."""
+    from hermes_cli import dump
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    git_result = MagicMock(returncode=0, stdout="deadbeef\n")
+    # build_info should NOT be consulted when live git succeeds.
+    with patch("hermes_cli.dump.subprocess.run", return_value=git_result) as mock_run, \
+         patch("hermes_cli.build_info.get_build_sha") as mock_build:
+        commit = dump._get_git_commit(repo_dir)
+
+    assert commit == "deadbeef"
+    mock_run.assert_called_once()
+    mock_build.assert_not_called()
+
+
+def test_get_git_commit_output_format_identical_between_sources(tmp_path):
+    """Regression guard: live-git and baked-SHA outputs share the same shape.
+
+    Ben explicitly asked for identical output between Docker and source installs
+    so support tooling that parses ``hermes dump`` doesn't have to special-case
+    container builds.  Both paths must return a bare 8-char SHA — no prefix,
+    no suffix, no annotation.
+    """
+    from hermes_cli import dump
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    # Live-git path.
+    git_result = MagicMock(returncode=0, stdout="b2f477a3\n")
+    with patch("hermes_cli.dump.subprocess.run", return_value=git_result):
+        live = dump._get_git_commit(repo_dir)
+
+    # Baked-SHA path.
+    failed = MagicMock(returncode=128, stdout="")
+    with patch("hermes_cli.dump.subprocess.run", return_value=failed), \
+         patch("hermes_cli.build_info.get_build_sha", return_value="b2f477a3"):
+        baked = dump._get_git_commit(repo_dir)
+
+    assert live == baked == "b2f477a3"
+    # Same length, same charset — no decoration in either branch.
+    assert len(live) == 8
+    assert all(c in "0123456789abcdef" for c in live)
+
+
+def test_get_git_commit_date_empty_when_git_fails(tmp_path):
+    """Docker image / pip wheel: no git → '' so the dump line drops the date."""
+    from hermes_cli import dump
+
+    repo_dir = tmp_path / "no-git-here"
+    repo_dir.mkdir()
+
+    failed = MagicMock(returncode=128, stdout="")
+    with patch("hermes_cli.dump.subprocess.run", return_value=failed):
+        date = dump._get_git_commit_date(repo_dir)
+
+    assert date == ""
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dump_terminal_backend.py ===
+"""`hermes debug` must report the EFFECTIVE terminal backend.
+
+``terminal.backend`` in config.yaml is bridged to the ``TERMINAL_ENV`` env var,
+but a ``TERMINAL_ENV`` set in .env / the shell overrides config and is what
+``terminal_tool`` actually uses.  The dump used to print only the config value,
+which hid the override and made users believe the agent was running ``local``
+while it was really jailed in a docker/podman sandbox (and vice-versa).
+"""
+
+from pathlib import Path
+from types import SimpleNamespace
+
+
+def _terminal_line(out: str) -> str:
+    for line in out.splitlines():
+        if line.startswith("terminal:"):
+            return line
+    raise AssertionError(f"no 'terminal:' line in dump output:\n{out}")
+
+
+def _seed(home: Path, *, config_yaml: str, env_text: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(config_yaml)
+    (home / ".env").write_text(env_text)
+
+
+def test_dump_surfaces_terminal_env_override(monkeypatch, capsys, tmp_path):
+    """A TERMINAL_ENV override that survives dotenv loading is surfaced.
+
+    Since the #29186 fix, config.yaml's explicit terminal keys are re-applied
+    after every .env load, so a stale .env value can no longer produce this
+    mismatch. The dump's override line remains as defense-in-depth for env
+    values set AFTER load (in-process mutation, config-bridge failure), so
+    pin it with a config.yaml that has no explicit backend key.
+    """
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    # Keep run_dump's project-.env fallback from touching the real repo.
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+
+    home = get_hermes_home()
+    # No explicit terminal.backend in config.yaml — merged default is 'local',
+    # the env override is what actually runs.
+    _seed(home, config_yaml="display:\n  streaming: true\n", env_text="")
+
+    dump.run_dump(SimpleNamespace(show_keys=False))
+
+    line = _terminal_line(capsys.readouterr().out)
+    # Effective backend (docker) is what actually runs, not the config 'local'.
+    assert "docker" in line
+    assert "overrides config.yaml" in line
+    # The shadowed config value is still shown so the mismatch is obvious.
+    assert "terminal.backend=local" in line
+
+
+def test_dump_reports_config_backend_winning_over_stale_env(monkeypatch, capsys, tmp_path):
+    """Regression for #29186: a stale TERMINAL_ENV=docker in .env no longer
+    beats config.yaml terminal.backend=local — load_hermes_dotenv re-applies
+    the explicit config keys, so the dump reports local with no override
+    warning."""
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+
+    home = get_hermes_home()
+    _seed(home, config_yaml="terminal:\n  backend: local\n", env_text="TERMINAL_ENV=docker\n")
+
+    dump.run_dump(SimpleNamespace(show_keys=False))
+
+    line = _terminal_line(capsys.readouterr().out)
+    assert "local" in line
+    assert "overrides" not in line
+
+
+def test_dump_reports_config_backend_when_no_override(monkeypatch, capsys, tmp_path):
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+
+    home = get_hermes_home()
+    _seed(home, config_yaml="terminal:\n  backend: docker\n", env_text="")
+
+    dump.run_dump(SimpleNamespace(show_keys=False))
+
+    line = _terminal_line(capsys.readouterr().out)
+    assert "docker" in line
+    assert "overrides" not in line
+
+
+

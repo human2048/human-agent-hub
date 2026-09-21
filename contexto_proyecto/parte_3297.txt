@@ -1,0 +1,381 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_journey_render.py ===
+"""Behavior contracts for /journey output routing.
+
+The interactive CLI captures Rich output and re-renders it through
+prompt_toolkit, so it needs forced ANSI (``--force-color``); chat surfaces
+render plain text, so the default captured path must stay escape-free.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+
+
+def _relative_luminance(color: str) -> float:
+    value = color.lstrip("#")
+    channels = [int(value[index : index + 2], 16) / 255 for index in (0, 2, 4)]
+    red, green, blue = (
+        channel / 12.92 if channel <= 0.03928 else ((channel + 0.055) / 1.055) ** 2.4
+        for channel in channels
+    )
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def _contrast_ratio(foreground: str, background: str) -> float:
+    high, low = sorted(
+        (_relative_luminance(foreground), _relative_luminance(background)), reverse=True
+    )
+    return (high + 0.05) / (low + 0.05)
+
+
+def _capture(argv: list[str], *, force: bool) -> str:
+    from hermes_cli.journey import register_cli
+
+    parser = argparse.ArgumentParser(add_help=False)
+    register_cli(parser)
+    args = parser.parse_args(argv)
+    if force:
+        args.force_color = True
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        args.func(args)
+    return buf.getvalue()
+
+
+def test_force_color_emits_ansi_for_reemission():
+    assert "\x1b[" in _capture([], force=True)
+    assert "\x1b[" in _capture(["list"], force=True)
+
+
+def test_default_capture_is_plain_for_chat_bubbles():
+    # Rich auto-detects the StringIO as non-tty → no color, no raw escapes.
+    assert "\x1b[" not in _capture([], force=False)
+    assert "\x1b[" not in _capture(["list"], force=False)
+
+
+def test_charted_signal_labels_clear_readable_contrast_floor(monkeypatch):
+    from rich.text import Text
+
+    from hermes_cli import journey
+
+    palette = {
+        "bg": "#08080C",
+        "dim": "#525255",
+        "label": "#A9A9AA",
+        "memory": "#FFDC1F",
+        "skill": "#043D92",
+    }
+    monkeypatch.setattr(journey, "_palette", lambda: palette)
+    payload = {
+        "nodes": [
+            {
+                "id": "old-skill",
+                "label": "old-skill",
+                "kind": "skill",
+                "timestamp": 1_700_000_000,
+                "category": "research",
+                "useCount": 0,
+            },
+            {
+                "id": "new-skill",
+                "label": "new-skill",
+                "kind": "skill",
+                "timestamp": 1_800_000_000,
+                "category": "research",
+                "useCount": 1,
+            },
+        ],
+        "edges": [],
+        "clusters": [{"category": "research", "count": 2}],
+        "stats": {
+            "learned_skills": 2,
+            "memory_nodes": 0,
+            "related_edges": 0,
+            "memory_skill_edges": 0,
+        },
+    }
+
+    output = journey._frame_renderable(
+        payload, cols=72, rows=24, reveal=1.0, color=True
+    )
+    label_row = next(
+        renderable
+        for renderable in output.renderables
+        if isinstance(renderable, Text) and "old-skill" in renderable.plain
+    )
+    label_offset = label_row.plain.index("old-skill")
+    label_span = next(
+        span for span in label_row.spans if span.start <= label_offset < span.end
+    )
+
+    assert isinstance(label_span.style, str)
+    assert (
+        _contrast_ratio(label_span.style, palette["bg"])
+        >= journey._CHARTED_SIGNAL_MIN_CONTRAST
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_aux_affinity.py ===
+"""Kanban specify/decompose run headless (no agent turn), yet their auxiliary calls must still carry a
+relay-affinity key — the OpenCode Go relay rejects a request without ``x-opencode-session`` with
+400 MissingSessionID (#112043). ``_call_aux`` declares a per-task affinity scope unless one is bound."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli import kanban_decompose as decompose
+from hermes_cli import kanban_specify as specify
+
+
+def _capturing_call_llm(seen: list):
+    def call_llm(**kwargs):
+        from agent.opencode_affinity import opencode_session_headers
+        seen.append(opencode_session_headers("opencode-go", None).get("x-opencode-session"))
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+    return call_llm
+
+
+@pytest.mark.parametrize("caller", [specify._call_aux, decompose._call_aux])
+def test_headless_kanban_aux_call_declares_a_stable_per_task_affinity_key(caller):
+    from agent.portal_tags import get_affinity_scope
+    seen: list = []
+    with patch("agent.auxiliary_client.call_llm", _capturing_call_llm(seen)):
+        for task_id in ("t_123", "t_123", "t_456"):
+            reply, reason = caller(
+                "specify", task_id, aux_task="triage_specifier", system="s", user="u",
+                max_tokens=10, timeout=5)
+            assert (reply, reason) == ("ok", "")
+    assert seen == ["kanban:t_123", "kanban:t_123", "kanban:t_456"]
+    assert get_affinity_scope() is None  # nothing leaks past the call
+
+
+def test_in_turn_caller_keeps_its_declared_affinity_key():
+    from agent.portal_tags import reset_affinity_scope, set_affinity_scope
+    seen: list = []
+    token = set_affinity_scope("conversation-root")
+    try:
+        with patch("agent.auxiliary_client.call_llm", _capturing_call_llm(seen)):
+            specify._call_aux("specify", "t_123", aux_task="triage_specifier", system="s", user="u",
+                              max_tokens=10, timeout=5)
+    finally:
+        reset_affinity_scope(token)
+    assert seen == ["conversation-root"]
+
+
+def _dashboard_plugin_api():
+    mod_name = "hermes_dashboard_plugin_kanban_aux_affinity_test"
+    if mod_name not in sys.modules:
+        plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+        spec = importlib.util.spec_from_file_location(mod_name, plugin_file)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules[mod_name]
+
+
+def test_dashboard_estimate_declares_an_affinity_key_too():
+    """The dashboard estimate endpoints are the same headless aux call: per task when one exists,
+    one stable key for the create dialog (no task yet)."""
+    from agent.portal_tags import get_affinity_scope
+    api = _dashboard_plugin_api()
+    seen: list = []
+    with patch("agent.auxiliary_client.call_llm", _capturing_call_llm(seen)):
+        api._run_estimate("title", "body", task_id="t_1")
+        api._run_estimate("title", "body", task_id=None)
+    assert seen == ["kanban:t_1", "kanban:estimate"]
+    assert get_affinity_scope() is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_blocked_sticky.py ===
+"""Regression tests for #28712 — kanban dispatcher must not auto-promote
+worker-initiated ``kanban_block`` (sticky blocks), but must keep
+auto-recovering circuit-breaker blocks.
+
+The bug: when a worker called ``kanban_block(reason="review-required:
+...")`` to hand off to a human, the dispatcher's ``recompute_ready``
+would promote the task back to ``ready`` on the next tick.  The fresh
+worker found nothing to do (work already applied), exited cleanly, and
+got recorded as a ``protocol_violation`` → ``gave_up`` → promote → loop
+until manual intervention.
+
+These tests pin down:
+
+* Worker / operator-initiated blocks are sticky and survive
+  ``recompute_ready``.
+* Circuit-breaker blocks (``gave_up`` event, status flipped via
+  ``_record_task_failure``) still auto-recover — the original intent
+  of #40c1decb3 is preserved.
+* An explicit ``kanban_unblock`` clears the sticky state.
+* The full block → promote → crash → ``gave_up`` loop is broken after
+  this fix: subsequent ticks leave the task blocked.
+
+The tangentially related schema-init ordering bug originally reported
+in #28712 (``init_db`` crashing on legacy DBs that pre-dated the
+``session_id`` migration) is covered separately by
+``test_kanban_db.py::test_connect_migrates_legacy_db_before_optional_column_indexes``,
+landed via #28754 / #28781 ahead of this fix.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Isolated HERMES_HOME with an empty kanban DB."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+# ---------------------------------------------------------------------------
+# Worker-initiated kanban_block must be sticky
+# ---------------------------------------------------------------------------
+
+
+def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
+    """A standalone task that a worker explicitly blocks for review
+    must stay blocked across an arbitrary number of dispatcher ticks.
+    Before #28712's fix, ``recompute_ready`` would silently flip it
+    back to ``ready`` on the very next tick."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs human review")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid,
+            reason="review-required: please verify ACL change",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Hammer the promotion code — exactly the dispatcher loop's
+        # behaviour, just compressed in time.
+        for _ in range(5):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0, "worker-blocked task must not auto-promote"
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+
+
+# ---------------------------------------------------------------------------
+# Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# unblock_task clears the sticky state
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Full bug-shaped loop: block → promote → crash → gave_up → next tick
+# ---------------------------------------------------------------------------
+
+
+def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
+    """Reproduces the exact #28712 loop and asserts the dispatcher
+    leaves the task blocked instead of cycling.
+
+    Loop shape from the issue:
+
+    1. Worker calls ``kanban_block`` → status='blocked',
+       ``task_runs.outcome='blocked'``, ``blocked`` event.
+    2. (Bug) Dispatcher promotes back to ``ready``.
+    3. Fresh worker exits cleanly without terminal tool call →
+       ``protocol_violation`` event.
+    4. ``_record_task_failure(failure_limit=1)`` → ``gave_up`` event,
+       status='blocked' again.
+    5. (Bug) Dispatcher promotes again → infinite loop.
+
+    With the fix in place, step 2 never happens — the test simulates
+    one would-be loop cycle by faking the crash-then-gave_up entries
+    that *would* have been written and asserts the *next* tick still
+    leaves the task blocked.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="loop reproducer")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="review-required: human eyes please",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # First dispatcher tick — must NOT promote.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Simulate the (hypothetical) protocol_violation + gave_up
+        # entries that the dispatcher would have written if the bug
+        # were still present.  Even with those event rows in place,
+        # the worker-initiated ``blocked`` event is the most recent
+        # of the ``{blocked, unblocked}`` pair, so the sticky guard
+        # still fires.
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'protocol_violation', NULL, ?)",
+            (tid, now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'gave_up', NULL, ?)",
+            (tid, now + 1),
+        )
+        conn.commit()
+
+        # Subsequent ticks must still leave it blocked.
+        for _ in range(3):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_created_with_initial_status_blocked_is_not_promoted_by_recompute_ready(kanban_home: Path) -> None:
+    """Verify a task created with initial_status='blocked' remains blocked when parents complete."""
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(
+            conn, title="gated child task", parents=[parent_id], initial_status="blocked"
+        )
+        assert kb.get_task(conn, child_id).status == "blocked"
+
+        # Complete parent task
+        kb.claim_task(conn, parent_id)
+        kb.complete_task(conn, parent_id, result="done")
+        assert kb.get_task(conn, parent_id).status == "done"
+
+        # recompute_ready must NOT promote the blocked child task
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, child_id).status == "blocked"
+
+

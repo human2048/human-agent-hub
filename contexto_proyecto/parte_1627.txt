@@ -1,0 +1,190 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\styles\retro-pop-grid.md ===
+# retro-pop-grid
+
+1970s retro pop art with strict Swiss international grid, thick black outlines, and flat color blocks.
+
+## Color Palette
+
+- Background: Warm vintage cream/beige (#F5F0E6)
+- Flat accents: Salmon pink, sky blue, mustard yellow, mint green—all muted retro tones
+- Contrast blocks: Solid pure black (#000000) and solid pure white (#FFFFFF) used strategically for extreme contrast
+- Line art and outlines: Solid thick black
+
+## Visual Elements
+
+- Uniform thick black outlines on all illustrations, text boxes, and grid dividers
+- Pure 2D flat vector aesthetic with subtle screen print texture
+- Strict Swiss international grid: poster divided into square and rectangular cells by thick black lines
+- Black-background cells with white text for warnings or key categories (inverted contrast)
+- Geometric fill patterns in empty cells: checkerboards, diagonal lines, dots
+- Flat abstract symbols, warning signs, keyholes, stars, arrows
+- Vintage comic-style smiley/frowny faces for quality indicators
+- Colored cells used for breathing room—some with minimal/no content
+
+## Typography
+
+- Headers: Bold brutalist or retro thick display fonts, high legibility
+- Body: Clean sans-serif, structured typographic alignment
+- Decorative English text acceptable for stylistic labels ("WARNING", "INFO", "BEST")
+- All content text in specified language
+
+## Style Enforcement
+
+- Absolutely no gradients, shading, drop shadows, or 3D effects
+- Everything anchored in grid cells—no floating or unorganized elements
+- Maintain 1970s retro pop art and underground comic illustration feel
+- Visual density balanced with rhythmic grid—some cells intentionally sparse for contrast
+
+## Avoid
+
+- 3D rendering, realistic details, gradients, soft shadows
+- Soft, thin, or sketch-like pencil lines
+- Free-flowing, unorganized, or floating layouts (everything must be grid-anchored)
+- Pure white background canvas
+- Organic or hand-drawn imperfections
+
+## Best For
+
+Trendy product guides, design-conscious content, visually striking comparisons, content targeting design-savvy audiences, bold social media posts
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\styles\storybook-watercolor.md ===
+# storybook-watercolor
+
+Soft hand-painted illustration with whimsical charm
+
+## Color Palette
+
+- Primary: Soft watercolor washes - muted blues, greens, warm earth
+- Background: Watercolor paper texture, white or cream
+- Accents: Deeper pigment pools, splatter effects
+
+## Visual Elements
+
+- Visible brushstrokes
+- Soft color bleeds and gradients
+- White space as design element
+- Delicate line work over washes
+- Natural, organic shapes
+- Dreamy, atmospheric quality
+
+## Typography
+
+- Elegant hand-lettering
+- Watercolor-style text
+- Flowing, organic letterforms
+- Integrated with illustrations
+
+## Best For
+
+Storytelling, emotional journeys, nature topics, children's education, artistic presentations
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\styles\subway-map.md ===
+# subway-map
+
+Transit diagram style with colored lines and stations
+
+## Color Palette
+
+- Primary: Transit line colors - red, blue, green, yellow, orange
+- Background: White or light gray
+- Accents: Station dots, interchange markers
+
+## Visual Elements
+
+- Colored route lines
+- 45° and 90° angles only
+- Station circle markers
+- Interchange symbols
+- Simplified geography
+- Line thickness hierarchy
+
+## Typography
+
+- Clean sans-serif
+- Station name labels
+- Line number/name badges
+- Horizontal or angled text
+
+## Best For
+
+Journey maps, process flows, network diagrams, route explanations
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\styles\technical-schematic.md ===
+# technical-schematic
+
+Technical diagrams with engineering precision and clean geometry.
+
+## Color Palette
+
+- Primary: Blues (#2563EB), teals, grays, white lines
+- Background: Deep blue (#1E3A5F), white, or light gray with grid
+- Accents: Amber highlights (#F59E0B), cyan callouts
+
+## Variants
+
+| Variant | Focus | Visual Emphasis |
+|---------|-------|-----------------|
+| **Blueprint** | Engineering schematics | White on blue, measurements, grid |
+| **Isometric** | 3D spatial representation | 30° angle blocks, clean fills |
+
+## Visual Elements
+
+- Geometric precision throughout
+- Grid pattern or isometric angle
+- Dimension lines and measurements
+- Technical symbols and annotations
+- Clean vector shapes
+- Consistent stroke weights
+
+## Typography
+
+- Technical stencil or clean sans-serif
+- All-caps labels
+- Measurement annotations
+- Floating labels for isometric
+
+## Best For
+
+Technical architecture, system diagrams, engineering specs, product breakdowns, data visualization
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\baoyu-infographic\references\styles\ui-wireframe.md ===
+# ui-wireframe
+
+Grayscale interface mockup style
+
+## Color Palette
+
+- Primary: Grays - light (#E5E5E5), medium (#9CA3AF), dark (#374151)
+- Background: White (#FFFFFF), light gray
+- Accents: Blue for interactive (#3B82F6), red for emphasis
+
+## Visual Elements
+
+- Wireframe boxes and placeholders
+- X marks for image placeholders
+- Simple line icons
+- Grid-based layout
+- Annotation callouts
+- Redline specifications
+
+## Typography
+
+- System fonts
+- Placeholder "Lorem ipsum"
+- UI label style
+- Sans-serif throughout
+
+## Best For
+
+Product designs, UI explanations, app concepts, user flow diagrams
+

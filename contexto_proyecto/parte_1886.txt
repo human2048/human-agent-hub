@@ -1,0 +1,358 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_title_timeout_bound.py ===
+"""Auto-title timeouts are bounded by ONE ``auxiliary.title_generation.timeout`` window and named as
+timeouts (#89445, #66251).
+
+On a slow local model the title request used to be retried on the same provider after every
+full-budget timeout (three windows plus backoff ≈ 4x the configured deadline) and the failure was
+logged at INFO as a ``connection error`` — indistinguishable from an unreachable endpoint — while
+the only WARNING came from the fallback provider complaining about a model it never had."""
+
+import logging
+from unittest.mock import MagicMock, patch
+
+from agent.auxiliary_client import call_llm
+
+
+class _Timeout(Exception):
+    pass
+
+
+_Timeout.__name__ = "APITimeoutError"
+
+
+def _route_patches(client):
+    return (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("mac-ollama", "qwen3.6:27b", None, None, None)),
+        patch("agent.auxiliary_client._get_cached_client", return_value=(client, "qwen3.6:27b")),
+        patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task, **_kw: resp),
+        patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")),
+        patch("agent.auxiliary_client._try_main_agent_model_fallback", return_value=(None, None, "")),
+    )
+
+
+def test_title_timeout_hits_the_provider_once_and_names_the_deadline(caplog):
+    primary = MagicMock()
+    primary.base_url = "http://100.121.173.79:11434/v1"
+    primary.chat.completions.create.side_effect = _Timeout("Request timed out.")
+    p = _route_patches(primary)
+    caplog.set_level(logging.INFO, logger="agent.auxiliary_client")
+    with p[0], p[1], p[2], p[3], p[4]:
+        try:
+            call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}], timeout=30)
+        except _Timeout:
+            pass
+        else:
+            raise AssertionError("timeout must surface once every fallback is exhausted")
+    # One request per deadline: the auto-title thread may not outlive the configured budget.
+    assert primary.chat.completions.create.call_count == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    timed_out = [m for m in warnings if "timed out after 30s" in m]
+    assert timed_out, warnings
+    assert "http://100.121.173.79:11434/v1" in timed_out[0]
+    assert "auxiliary.title_generation.timeout" in timed_out[0]
+    assert not any("connection error on" in m for m in warnings), warnings
+
+
+def test_connection_refused_is_still_a_connection_error(caplog):
+    """Control: a genuinely unreachable endpoint keeps its own label — the timeout rung must not swallow it."""
+    class _ConnErr(Exception):
+        pass
+    _ConnErr.__name__ = "APIConnectionError"
+    primary = MagicMock()
+    primary.base_url = "http://127.0.0.1:1/v1"
+    primary.chat.completions.create.side_effect = _ConnErr("Connection refused")
+    p = _route_patches(primary)
+    caplog.set_level(logging.INFO, logger="agent.auxiliary_client")
+    with p[0], p[1], p[2], p[3], p[4]:
+        try:
+            call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}], timeout=30)
+        except _ConnErr:
+            pass
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("connection error on mac-ollama" in m for m in messages), messages
+    assert not any("timed out after" in m for m in messages), messages
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_transient_retry.py ===
+"""Transient-transport retry count + per-model client-cache isolation.
+
+Two related hardening behaviors for auxiliary calls (which include MoA
+reference advisors, a pinned-model path where provider fallback is not a
+meaningful recovery):
+
+1. A transient transport blip (connection reset / timeout / 5xx) is retried
+   on the SAME provider several times with backoff before giving up — a single
+   upstream blip should not silently lose a pinned auxiliary call (root of the
+   run2 double-advisor "Connection error" collapse).
+2. Two auxiliary calls to the same provider/base_url/key but DIFFERENT models
+   get DISTINCT client-cache keys, so a concurrent fan-out (e.g. opus + gpt-5.5
+   advisors) never shares one client entry.
+"""
+
+from __future__ import annotations
+
+import os
+import types
+from unittest.mock import patch
+
+import pytest
+
+
+
+
+def test_transient_retry_count_default(monkeypatch):
+    from agent import auxiliary_client as ac
+
+    # No config value -> default.
+    monkeypatch.setattr(ac, "load_config", lambda: {}, raising=False)
+    with patch("hermes_cli.config.load_config", return_value={}), \
+         patch("hermes_cli.config.cfg_get", return_value=None):
+        assert ac._transient_retry_count() == ac._DEFAULT_TRANSIENT_RETRIES
+
+
+
+
+def test_model_participates_in_client_cache_key():
+    """Same provider/base_url/key, different model -> different cache key.
+
+    This is what stops two concurrent advisors from sharing (and racing on)
+    one cached client entry."""
+    from agent.auxiliary_client import _client_cache_key
+
+    k_opus = _client_cache_key(
+        "openrouter", async_mode=False, base_url="https://openrouter.ai/api/v1",
+        api_key="K", model="anthropic/claude-opus-4.8",
+    )
+    k_gpt = _client_cache_key(
+        "openrouter", async_mode=False, base_url="https://openrouter.ai/api/v1",
+        api_key="K", model="openai/gpt-5.5",
+    )
+    assert k_opus != k_gpt
+    # Same model still collides (cache still works for reuse).
+    k_opus2 = _client_cache_key(
+        "openrouter", async_mode=False, base_url="https://openrouter.ai/api/v1",
+        api_key="K", model="anthropic/claude-opus-4.8",
+    )
+    assert k_opus == k_opus2
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_transport_autodetect.py ===
+"""Tests for transport auto-detection in agent.auxiliary_client.
+
+Auxiliary clients must pick the correct wire protocol (OpenAI
+chat.completions vs native Anthropic Messages) based on the endpoint,
+regardless of which resolve_provider_client branch built them.
+
+Regression target (April 2026): Kimi Coding Plan's ``api.kimi.com/coding``
+endpoint only speaks Anthropic Messages — sending ``kimi-for-coding`` over
+chat.completions returns 404 "resource_not_found_error".  The named
+``kimi-coding`` provider branch in resolve_provider_client used to build a
+plain OpenAI client, so title generation / vision / compression /
+web_extract all failed on Kimi Coding Plan users.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for key in (
+        "OPENAI_API_KEY", "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
+        "KIMI_API_KEY", "KIMI_CODING_API_KEY", "KIMI_BASE_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# URL detection helper
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url,expected,label", [
+    ("https://api.kimi.com/coding/v1", True, "Kimi Coding Plan /v1"),
+    ("https://api.kimi.com/coding", True, "Kimi Coding Plan no /v1"),
+    ("https://api.moonshot.ai/v1", False, "Moonshot legacy"),
+    ("https://api.minimax.io/anthropic", True, "MiniMax /anthropic"),
+    ("https://litellm.example.com/v1/anthropic", True, "/anthropic suffix"),
+    ("https://litellm.example.com/anthropic/v1", True, "/anthropic/v1 base"),
+    ("https://litellm.example.com/anthropic/v1/models", False, "/anthropic/v1 subpath"),
+    ("https://api.anthropic.com", True, "native Anthropic"),
+    ("https://api.anthropic.com/v1", True, "native Anthropic /v1"),
+    ("https://openrouter.ai/api/v1", False, "OpenRouter"),
+    ("https://api.openai.com/v1", False, "OpenAI"),
+    ("https://inference-api.nousresearch.com/v1", False, "Nous"),
+    ("", False, "empty"),
+    (None, False, "None"),
+])
+def test_endpoint_speaks_anthropic_messages(url, expected, label):
+    from agent.auxiliary_client import _endpoint_speaks_anthropic_messages
+    assert _endpoint_speaks_anthropic_messages(url) is expected, (
+        f"{label}: {url!r} should be {expected}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _maybe_wrap_anthropic decision table
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_maybe_wrap_anthropic_sdk_missing_falls_back():
+    """ImportError on anthropic SDK returns plain client with warning."""
+    from agent.auxiliary_client import _maybe_wrap_anthropic, AnthropicAuxiliaryClient
+
+    plain_client = MagicMock(name="plain_openai")
+
+    def _raise_import(*args, **kwargs):
+        raise ImportError("no anthropic SDK")
+
+    with patch(
+        "agent.anthropic_adapter.build_anthropic_client",
+        side_effect=_raise_import,
+    ):
+        # The ImportError is caught on the `from ... import` line inside
+        # _maybe_wrap_anthropic, which runs before build_anthropic_client is
+        # called. To exercise the ImportError path we need to patch the
+        # module lookup itself.
+        import sys as _sys
+        saved = _sys.modules.get("agent.anthropic_adapter")
+        _sys.modules["agent.anthropic_adapter"] = None  # force ImportError
+        try:
+            result = _maybe_wrap_anthropic(
+                plain_client, "kimi-for-coding", "sk-kimi-test",
+                "https://api.kimi.com/coding", api_mode=None,
+            )
+        finally:
+            if saved is not None:
+                _sys.modules["agent.anthropic_adapter"] = saved
+            else:
+                _sys.modules.pop("agent.anthropic_adapter", None)
+
+    assert result is plain_client
+    assert not isinstance(result, AnthropicAuxiliaryClient)
+
+
+# ---------------------------------------------------------------------------
+# Integration: resolve_provider_client for named kimi-coding provider
+# ---------------------------------------------------------------------------
+
+def test_resolve_provider_client_kimi_coding_wraps_anthropic(monkeypatch, tmp_path):
+    """End-to-end: resolve_provider_client('kimi-coding', 'kimi-for-coding')
+    must return AnthropicAuxiliaryClient because /coding speaks Anthropic.
+
+    This is the primary regression guard: the bug that caused title
+    generation 404s on every Kimi Coding Plan user after the "main model
+    for every user" aux design shipped.
+    """
+    from agent.auxiliary_client import (
+        resolve_provider_client,
+        AnthropicAuxiliaryClient,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # sk-kimi- prefix triggers /coding endpoint auto-detection
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-faketesttoken123")
+
+    client, model = resolve_provider_client("kimi-coding", "kimi-for-coding")
+    assert client is not None, "Should resolve a client"
+    assert isinstance(client, AnthropicAuxiliaryClient), (
+        "Kimi Coding Plan endpoint (api.kimi.com/coding) speaks Anthropic "
+        "Messages — aux client MUST be AnthropicAuxiliaryClient, got "
+        f"{type(client).__name__}"
+    )
+    assert "kimi.com/coding" in str(client.base_url)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_unavailable_nous_reason.py ===
+"""The goal judge names a Nous auxiliary auth failure instead of an opaque judge error (#42177).
+
+``_resolve_nous_runtime_api`` swallows the Nous resolver's ``AuthError`` so the ladder can fall
+back; the failure must still reach the operator (one WARNING) and the goal-loop status line.
+"""
+import logging
+
+import yaml
+
+import agent.auxiliary_unavailable as unavailable
+from hermes_cli.auth_constants import AuthError
+
+
+def _reset(monkeypatch):
+    monkeypatch.setattr(unavailable, "_last_nous_detail", None)
+    monkeypatch.setattr(unavailable, "_warned_nous_details", set())
+
+
+def test_goal_judge_reason_names_nous_auth_failure_and_still_fails_open(tmp_path, monkeypatch):
+    """Real judge_goal → call_llm → ladder with goal_judge pinned to nous and no Nous login."""
+    _reset(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"provider": "nous", "default": "test-model"},
+        "auxiliary": {"goal_judge": {"provider": "nous", "model": "test-model"}},
+    }), encoding="utf-8")
+    from hermes_cli.goals import judge_goal
+
+    verdict, reason, parse_failed, wait_directive, judge_errored = judge_goal(
+        "ship the fix", "edited the file and ran the tests", timeout=5)
+
+    assert (verdict, parse_failed, wait_directive, judge_errored) == ("continue", False, None, True)
+    assert reason.startswith("goal_judge auxiliary client unavailable: Nous Portal runtime credentials unavailable:")
+    assert "hermes model" in reason, reason
+    assert "judge error" not in reason
+
+
+def test_nous_credential_failure_is_remembered_and_warned_once(caplog, monkeypatch):
+    _reset(monkeypatch)
+    exc = AuthError("Invalid refresh token", provider="nous", code="invalid_grant", relogin_required=True)
+    with caplog.at_level(logging.WARNING, logger="agent.auxiliary_unavailable"):
+        detail = unavailable.record_nous_credential_failure(exc)
+        unavailable.record_nous_credential_failure(exc)
+
+    assert detail.startswith("Nous Portal runtime credentials unavailable: ")
+    assert "invalid_grant" in detail and "Run `hermes model` to re-authenticate." in detail
+    assert "Invalid refresh token. Run" in detail, detail  # sentence-terminated before the remediation
+    assert unavailable.nous_credential_failure_detail() == detail
+    assert sum(detail in rec.getMessage() for rec in caplog.records) == 1
+    unavailable.clear_nous_credential_failure()
+    assert unavailable.nous_credential_failure_detail() is None
+
+
+def test_never_logged_in_is_debug_but_a_dead_credential_warns(caplog, monkeypatch, tmp_path):
+    """The auto-route walk resolves Nous on every pass; users who never chose Nous must not be nagged."""
+    _reset(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    not_logged_in = AuthError("Hermes is not logged into Nous Portal.", provider="nous", relogin_required=True)
+    dead = AuthError("Invalid refresh token", provider="nous", code="invalid_grant", relogin_required=True)
+    with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_unavailable"):
+        quiet = unavailable.record_nous_credential_failure(not_logged_in)
+        loud = unavailable.record_nous_credential_failure(dead)
+
+    levels = {rec.levelno for rec in caplog.records if quiet in rec.getMessage()}
+    assert levels == {logging.DEBUG}, caplog.records
+    assert {rec.levelno for rec in caplog.records if loud in rec.getMessage()} == {logging.WARNING}
+    assert "hermes model" in quiet  # the goal judge still gets the remediation text
+

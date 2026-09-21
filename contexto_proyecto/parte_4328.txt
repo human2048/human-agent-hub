@@ -1,0 +1,359 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_cwd_echo.py ===
+"""Tests for the terminal result cwd echo (feat/terminal-cwd-echo).
+
+When a command changes the session working directory, the tool result
+gains a "cwd" field so the model stops prefixing every command with
+'cd X && ' (60% of production terminal calls) and stops running pwd
+diagnostics after directory changes.
+"""
+
+import json
+import os
+import tempfile
+
+import pytest
+
+from tools.terminal_tool import terminal_tool
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    return tmp_path
+
+
+class TestCwdEcho:
+    def test_cd_reports_new_cwd(self, isolated_home, tmp_path):
+        target = tmp_path / "projdir"
+        target.mkdir()
+        r = json.loads(terminal_tool(f"cd {target}", task_id="t-cwd-1"))
+        assert r["exit_code"] == 0
+        assert "cwd" in r
+        assert os.path.realpath(r["cwd"]) == os.path.realpath(str(target))
+
+    def test_non_cd_command_has_no_cwd_field(self, isolated_home):
+        r = json.loads(terminal_tool("echo hello", task_id="t-cwd-2"))
+        assert r["exit_code"] == 0
+        assert "cwd" not in r
+
+    def test_cwd_persists_and_stops_reporting_when_stable(self, isolated_home, tmp_path):
+        target = tmp_path / "stable"
+        target.mkdir()
+        r1 = json.loads(terminal_tool(f"cd {target}", task_id="t-cwd-3"))
+        assert "cwd" in r1
+        # Next command runs IN the new cwd without changing it: no echo.
+        r2 = json.loads(terminal_tool("pwd", task_id="t-cwd-3"))
+        assert "cwd" not in r2
+        assert os.path.realpath(r2["output"].strip()) == os.path.realpath(str(target))
+
+    def test_cd_within_chain_reports_final_dir(self, isolated_home, tmp_path):
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        a.mkdir(); b.mkdir()
+        r = json.loads(terminal_tool(f"cd {a} && cd {b} && echo done", task_id="t-cwd-4"))
+        assert r["exit_code"] == 0
+        assert os.path.realpath(r.get("cwd", "")) == os.path.realpath(str(b))
+
+    def test_workdir_override_does_not_echo(self, isolated_home, tmp_path):
+        # Per-command workdir is transient by contract; it must not surface
+        # a cwd field (the session cwd did not change).
+        sub = tmp_path / "transient"
+        sub.mkdir()
+        r = json.loads(terminal_tool("echo hi", workdir=str(sub), task_id="t-cwd-5"))
+        assert r["exit_code"] == 0
+        assert "cwd" not in r
+
+    def test_failed_cd_no_echo(self, isolated_home):
+        r = json.loads(terminal_tool("cd /nonexistent_dir_zzz_42", task_id="t-cwd-6"))
+        assert r["exit_code"] != 0
+        assert "cwd" not in r
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_degraded_mode.py ===
+"""Remote terminal backend graceful degradation (terminal.degraded_mode).
+
+Connection-class infrastructure failures (SSH unreachable, Docker daemon
+down) must come back to the model as a structured ``status: "degraded"``
+tool result with a reason and a retry hint — not as a raised traceback
+blob.  Command failures (nonzero exit codes) are NOT infrastructure
+failures and must stay untouched.  ``terminal.degraded_mode: fail``
+preserves the historical raise/traceback behavior for anyone relying
+on it.
+
+Inspired by: Claude Cowork degraded-backend behavior (idea-level,
+docs-only evidence).
+"""
+
+import json
+import subprocess
+from unittest.mock import MagicMock
+
+import pytest
+
+from tools.environments.base import EnvironmentConnectionError
+
+
+@pytest.fixture
+def isolated_env(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME + a clean environment cache for terminal_tool."""
+    import tools.terminal_tool as tt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    # The one-shot config bridge would overwrite our TERMINAL_* test vars
+    # from the developer's real config.yaml; mark it as already attempted.
+    monkeypatch.setattr(tt, "_terminal_config_bridge_attempted", True)
+
+    def _clear():
+        with tt._env_lock:
+            tt._active_environments.clear()
+            tt._last_activity.clear()
+
+    _clear()
+    yield tt
+    _clear()
+
+
+def _mock_ssh_unreachable(monkeypatch, stderr="ssh: connect to host unreachable.invalid port 22: Connection refused"):
+    """Make every ssh subprocess in the ssh backend fail like a dead host."""
+    monkeypatch.setattr("tools.environments.ssh.shutil.which", lambda _x: "/usr/bin/ssh")
+    monkeypatch.setattr(
+        "tools.environments.ssh.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess([], 255, stdout="", stderr=stderr),
+    )
+
+
+def _ssh_backend_env(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "unreachable.invalid")
+    monkeypatch.setenv("TERMINAL_SSH_USER", "nobody")
+    monkeypatch.delenv("TERMINAL_SSH_PORT", raising=False)
+    monkeypatch.delenv("TERMINAL_SSH_KEY", raising=False)
+
+
+class TestExceptionClassification:
+    """Backends raise EnvironmentConnectionError for connection-class failures."""
+
+    def test_ssh_connect_refused_raises_connection_error(self, monkeypatch):
+        from tools.environments.ssh import SSHEnvironment
+
+        _mock_ssh_unreachable(monkeypatch)
+        with pytest.raises(EnvironmentConnectionError):
+            SSHEnvironment(host="unreachable.invalid", user="nobody")
+
+    def test_ssh_connect_timeout_raises_connection_error(self, monkeypatch):
+        from tools.environments.ssh import SSHEnvironment
+
+        monkeypatch.setattr("tools.environments.ssh.shutil.which", lambda _x: "/usr/bin/ssh")
+
+        def _timeout(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="ssh", timeout=15)
+
+        monkeypatch.setattr("tools.environments.ssh.subprocess.run", _timeout)
+        with pytest.raises(EnvironmentConnectionError):
+            SSHEnvironment(host="unreachable.invalid", user="nobody")
+
+    def test_docker_missing_executable_raises_connection_error(self, monkeypatch):
+        from tools.environments import docker as docker_env
+
+        monkeypatch.setattr(docker_env, "find_docker", lambda: None)
+        with pytest.raises(EnvironmentConnectionError):
+            docker_env._ensure_docker_available()
+
+    def test_docker_daemon_timeout_raises_connection_error(self, monkeypatch):
+        from tools.environments import docker as docker_env
+
+        monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+        def _timeout(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="docker version", timeout=5)
+
+        monkeypatch.setattr(docker_env.subprocess, "run", _timeout)
+        with pytest.raises(EnvironmentConnectionError):
+            docker_env._ensure_docker_available()
+
+    def test_connection_error_is_a_runtime_error(self):
+        # Existing catchers of RuntimeError must keep working unchanged.
+        assert issubclass(EnvironmentConnectionError, RuntimeError)
+        err = EnvironmentConnectionError("boom")
+        assert err.reason == "boom"
+        assert err.retry_hint  # non-empty default hint
+
+
+class TestDegradedToolResult:
+    """terminal_tool returns structured degraded results in warn mode."""
+
+    def test_ssh_unreachable_returns_degraded_result(self, isolated_env, monkeypatch):
+        _ssh_backend_env(monkeypatch)
+        _mock_ssh_unreachable(monkeypatch)
+        monkeypatch.delenv("TERMINAL_DEGRADED_MODE", raising=False)
+
+        r = json.loads(isolated_env.terminal_tool("echo hi", task_id="t-degraded-ssh"))
+        assert r["status"] == "degraded"
+        assert r["exit_code"] == -1
+        assert "reason" in r and r["reason"]
+        assert "retry_hint" in r and r["retry_hint"]
+        assert "traceback" not in r
+
+    def test_docker_daemon_down_returns_degraded_result(self, isolated_env, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.delenv("TERMINAL_DEGRADED_MODE", raising=False)
+        monkeypatch.setattr(isolated_env, "_maybe_reap_docker_orphans", lambda _cc: None)
+        monkeypatch.setattr("tools.environments.docker.find_docker", lambda: None)
+
+        r = json.loads(isolated_env.terminal_tool("echo hi", task_id="t-degraded-docker"))
+        assert r["status"] == "degraded"
+        assert "reason" in r and r["reason"]
+        assert "retry_hint" in r and r["retry_hint"]
+        assert "traceback" not in r
+
+    def test_degraded_env_is_not_cached(self, isolated_env, monkeypatch):
+        """A degraded backend must not be cached — a later call must retry."""
+        _ssh_backend_env(monkeypatch)
+        _mock_ssh_unreachable(monkeypatch)
+
+        r = json.loads(isolated_env.terminal_tool("echo hi", task_id="t-degraded-cache"))
+        assert r["status"] == "degraded"
+        with isolated_env._env_lock:
+            assert not isolated_env._active_environments
+
+    def test_recovery_after_degraded(self, isolated_env, monkeypatch):
+        """When the backend comes back, the next call just works."""
+        import shutil as real_shutil
+
+        real_run = subprocess.run
+        real_which = real_shutil.which
+        _ssh_backend_env(monkeypatch)
+        _mock_ssh_unreachable(monkeypatch)
+        r1 = json.loads(isolated_env.terminal_tool("echo hi", task_id="t-degraded-recover"))
+        assert r1["status"] == "degraded"
+
+        # Backend "recovers" — restore the real subprocess machinery (the
+        # ssh-module patch hits the shared subprocess/shutil modules) and
+        # switch to a reachable backend; the tool path must not be poisoned.
+        monkeypatch.setattr(subprocess, "run", real_run)
+        monkeypatch.setattr(real_shutil, "which", real_which)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        r2 = json.loads(isolated_env.terminal_tool("echo back", task_id="t-degraded-recover"))
+        assert r2["exit_code"] == 0
+        assert "back" in r2["output"]
+
+
+class TestNonInfrastructureFailuresUntouched:
+    def test_nonzero_exit_is_not_degraded(self, isolated_env, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        r = json.loads(isolated_env.terminal_tool("exit 3", task_id="t-degraded-exit3"))
+        assert r["exit_code"] == 3
+        assert r.get("status") != "degraded"
+
+    def test_command_not_found_is_not_degraded(self, isolated_env, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        r = json.loads(isolated_env.terminal_tool(
+            "definitely_not_a_real_command_zzz_42", task_id="t-degraded-notfound"))
+        assert r["exit_code"] != 0
+        assert r.get("status") != "degraded"
+
+
+class TestFailModePreservesRaiseBehavior:
+    def test_fail_mode_returns_error_with_traceback(self, isolated_env, monkeypatch):
+        _ssh_backend_env(monkeypatch)
+        _mock_ssh_unreachable(monkeypatch)
+        monkeypatch.setenv("TERMINAL_DEGRADED_MODE", "fail")
+
+        r = json.loads(isolated_env.terminal_tool("echo hi", task_id="t-degraded-fail"))
+        assert r["status"] == "error"
+        assert "traceback" in r
+        assert "SSH connection failed" in r["error"]
+
+    def test_invalid_mode_falls_back_to_warn(self, isolated_env, monkeypatch):
+        _ssh_backend_env(monkeypatch)
+        _mock_ssh_unreachable(monkeypatch)
+        monkeypatch.setenv("TERMINAL_DEGRADED_MODE", "bogus-value")
+
+        r = json.loads(isolated_env.terminal_tool("echo hi", task_id="t-degraded-bogus"))
+        assert r["status"] == "degraded"
+
+
+class TestConfigBridging:
+    def test_degraded_mode_is_bridged_everywhere(self):
+        """terminal.degraded_mode must ride every config->env bridge path,
+        same four-site invariant as the docker_* keys."""
+        from tests.tools.test_terminal_config_env_sync import (
+            _cli_env_map_keys,
+            _gateway_env_map_keys,
+            _save_config_env_sync_keys,
+            _terminal_tool_env_var_names,
+        )
+
+        assert "degraded_mode" in _cli_env_map_keys()
+        assert "degraded_mode" in _gateway_env_map_keys()
+        assert "degraded_mode" in _save_config_env_sync_keys()
+        assert "TERMINAL_DEGRADED_MODE" in _terminal_tool_env_var_names()
+
+    def test_default_config_carries_degraded_mode(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["terminal"].get("degraded_mode") == "warn"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_environment_recreated_notice.py ===
+"""The model must be told when the backend replaced its container/sandbox
+mid-command (ported from lobehub/lobehub#19329): silent recovery leaves the
+agent assuming background processes and unsynced files survived."""
+
+import json
+
+from tools.environments import docker as docker_env
+from tools.environments.local import LocalEnvironment
+from tools.terminal_tool_result import finalize_foreground_result
+
+
+def test_execute_folds_recreation_flag_once():
+    """A pending recreation mark surfaces as ``environment_recreated: True``
+    on the next execute() result and is consumed — the following command
+    reports a clean result. Exercises the real BaseEnvironment.execute path."""
+    env = LocalEnvironment(cwd=".", timeout=30)
+    try:
+        env._mark_recreated()
+        result = env.execute("echo hi")
+        assert result["returncode"] == 0
+        assert result.get("environment_recreated") is True
+
+        result2 = env.execute("echo again")
+        assert "environment_recreated" not in result2
+    finally:
+        env.cleanup()
+
+
+def test_docker_recovery_marks_pending_and_finalizer_warns(monkeypatch):
+    """Docker's out-of-band recovery sets the pending mark, and the tool-layer
+    finalizer turns the flag into a model-facing warning — omitted entirely
+    when the backend never flagged a recreation."""
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "old"
+    env._labels = {}
+    env._image = ""
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_find_reusable_container",
+        lambda self, *a: ("newcid", "running"))
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
+    assert env._recreate_container() is True
+    assert getattr(env, "_recreated_notice_pending", False) is True
+
+    common: dict = dict(
+        command="echo hi", env=env, env_type="docker", effective_task_id="t",
+        task_id="t", session_id="s", session_key="k", workdir=None,
+        command_cwd=None, approval_note=None)
+
+    flagged = json.loads(finalize_foreground_result(
+        result={"output": "hi", "returncode": 0, "environment_recreated": True}, **common))
+    assert "recreated" in flagged.get("environment_recreated", "")
+    assert "may be lost" in flagged["environment_recreated"]
+
+    clean = json.loads(finalize_foreground_result(
+        result={"output": "hi", "returncode": 0}, **common))
+    assert "environment_recreated" not in clean
+

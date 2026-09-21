@@ -1,0 +1,244 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_relay_seal_failure.py ===
+"""Regression: seal-time transport failure must never lose or duplicate
+the final answer (silent-loss class — PR 85796 review finding B1/B3-adjacent).
+
+Three invariants:
+
+1. A transport exception during the sealing draft frame retries the SAME
+   idempotent frame once (the connector's sealed-key tombstone returns the
+   original stream ts for a repeated final, so a retry can never open a
+   second stream or post a duplicate).
+
+2. When the seal cannot be delivered at all, the adapter reports failure —
+   and the consumer must NOT record final delivery.  The prior behavior
+   let the turn-final retry re-enter the draft-frame path, whose no-op
+   dedupe compared against the last UNSEALED frame and reported success
+   with zero transport calls: flags went green, the gateway suppressed its
+   fallback, and the user never received the answer.
+
+3. The turn-final retry path always calls with finalize=True so it can
+   never be routed through the draft-frame branch at all.
+"""
+
+import asyncio
+
+import pytest
+
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from tests.gateway.relay.test_relay_live_cards import _connected_adapter
+
+
+class FlakyTransport:
+    """Raises on selected ops; records everything that got through."""
+
+    def __init__(self, raise_on=(), raise_times=None):
+        self.ops = []
+        self.attempts = []
+        self.raise_on = set(raise_on)
+        # op -> remaining raise count (None = raise forever)
+        self.raise_times = dict(raise_times or {})
+
+    def _should_raise(self, op, final):
+        key = "seal" if (op == "draft" and final) else op
+        if key not in self.raise_on:
+            return False
+        remaining = self.raise_times.get(key)
+        if remaining is None:
+            return True
+        if remaining <= 0:
+            return False
+        self.raise_times[key] = remaining - 1
+        return True
+
+    async def send_outbound(self, payload, platform=None):
+        op = payload.get("op")
+        final = bool(payload.get("final"))
+        self.attempts.append((op, final))
+        if self._should_raise(op, final):
+            raise ConnectionError("socket dropped mid-write")
+        self.ops.append(dict(payload))
+        return {"success": True, "message_id": "1723600000.42"}
+
+
+def _armed_adapter(transport):
+    adapter, _ = _connected_adapter()
+    adapter._transport = transport
+    return adapter
+
+
+class TestSealTransportError:
+    @pytest.mark.asyncio
+    async def test_seal_exception_retries_same_idempotent_frame(self):
+        """One transport drop during the seal → the SAME final frame is
+        retried and its success (with the stream ts) is the send result."""
+        t = FlakyTransport(raise_on=("seal",), raise_times={"seal": 1})
+        adapter = _armed_adapter(t)
+        md = {"thread_ts": "1700.1"}
+        await adapter.send_draft("C1", 7, "answer", metadata=md)
+        result = await adapter.send("C1", "answer complete", metadata=md)
+        assert result.success
+        assert result.message_id == "1723600000.42"
+        seal_attempts = [a for a in t.attempts if a == ("draft", True)]
+        assert len(seal_attempts) == 2, "seal must be retried exactly once"
+        # Both attempts carried the identical frame (idempotent replay).
+        finals = [o for o in t.ops if o.get("op") == "draft" and o.get("final")]
+        assert len(finals) == 1 and finals[0]["content"] == "answer complete"
+        # No plain send: a landed retry means no duplicate.
+        assert not [o for o in t.ops if o.get("op") == "send"]
+
+    @pytest.mark.asyncio
+    async def test_seal_exception_twice_reports_failure(self):
+        """Both attempts down → SendResult failure (fail-open plain send in
+        send() then also fails on the dead transport; the caller sees the
+        error instead of a phantom success)."""
+        t = FlakyTransport(raise_on=("seal", "send"))
+        adapter = _armed_adapter(t)
+        md = {"thread_ts": "1700.2"}
+        await adapter.send_draft("C1", 8, "answer", metadata=md)
+        with pytest.raises(ConnectionError):
+            # Seal fails twice -> falls through to plain send -> transport
+            # still down -> the plain-send exception propagates (existing
+            # plain-send contract; callers catch).
+            await adapter.send("C1", "answer complete", metadata=md)
+        # The seal was attempted twice, never recorded as delivered.
+        assert [a for a in t.attempts if a == ("draft", True)] == [
+            ("draft", True),
+            ("draft", True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_consumer_never_records_delivery_on_dead_transport(self):
+        """THE silent-loss regression: transport dead at seal time → the
+        consumer's delivery flags must stay False so the gateway's normal
+        fallback send path still owns the final."""
+        t = FlakyTransport(raise_on=("seal", "send"))
+        adapter = _armed_adapter(t)
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=1, cursor="",
+        )
+        sc = GatewayStreamConsumer(
+            adapter, "C1", cfg, metadata={"thread_ts": "1700.3"},
+        )
+        task = asyncio.create_task(sc.run())
+        sc.on_delta("complete answer")
+        await asyncio.sleep(0.08)
+        sc.finish("complete answer")
+        await task
+        # Frames streamed, but the final never reached the wire:
+        assert [o for o in t.ops if o.get("op") == "draft" and not o.get("final")]
+        assert not [o for o in t.ops if o.get("op") == "draft" and o.get("final")]
+        assert not [o for o in t.ops if o.get("op") == "send"]
+        # The consumer must not claim delivery — this is what previously
+        # suppressed the gateway fallback and silently ate the answer.
+        assert sc.final_response_sent is False
+        assert getattr(sc, "_final_content_delivered", False) is False
+        assert sc.delivered_final_matches("complete answer") is not True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_relay_teardown_drain.py ===
+"""Regression: relay transport teardown must drain in-flight outbound frames.
+
+Staging incident 2026-08-09 (frozen preview "It launched but ▉"): a trailing
+finalize edit was in flight — awaiting its ``outbound_result`` — when the
+gateway tore down the relay transport. ``disconnect()`` failed the pending
+future immediately with "relay transport closed", so the finalize edit never
+reached the platform even though the connector socket was still perfectly
+able to serve it.
+
+Contract under test: ``disconnect()`` gives in-flight outbound requests a
+bounded grace window to resolve before failing them; requests that resolve
+inside the window succeed, and the teardown still completes promptly when
+the connector never answers.
+"""
+
+import asyncio
+
+import pytest
+
+from gateway.relay.ws_transport import WebSocketRelayTransport
+
+
+def _transport():
+    t = object.__new__(WebSocketRelayTransport)
+    t._closing = False
+    t._supervisor = None
+    t._reader = None
+    t._ws = None
+    t._pending = {}
+    t._going_idle_ack = None
+    return t
+
+
+@pytest.mark.asyncio
+async def test_disconnect_waits_for_inflight_outbound():
+    """An outbound frame whose result arrives during teardown must resolve
+    successfully, not be failed with 'relay transport closed'."""
+    t = _transport()
+    fut = asyncio.get_running_loop().create_future()
+    t._pending["req-1"] = fut
+
+    async def _connector_answers_soon():
+        await asyncio.sleep(0.05)
+        if not fut.done():
+            fut.set_result({"success": True, "message_id": "m9"})
+
+    answer_task = asyncio.create_task(_connector_answers_soon())
+    await t.disconnect()
+    await answer_task
+
+    assert fut.done()
+    assert fut.exception() is None, (
+        "in-flight finalize edit was failed at teardown instead of being "
+        "allowed to complete within the drain grace window"
+    )
+    assert fut.result()["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_disconnect_still_bounded_when_connector_silent():
+    """No answer ever arrives: the drain must give up within the grace
+    bound and fail the future so callers don't hang."""
+    t = _transport()
+    fut = asyncio.get_running_loop().create_future()
+    t._pending["req-2"] = fut
+
+    started = asyncio.get_running_loop().time()
+    await t.disconnect()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert fut.done() and fut.exception() is not None
+    assert elapsed < 10.0, f"teardown took {elapsed:.1f}s — grace must be bounded"
+
+
+def test_drain_grace_clamps_to_disconnect_budget(monkeypatch):
+    """Drain + the three sequential teardown awaits must fit the runner's
+    adapter-disconnect budget (default 5s): grace = budget - 3*1.0s - margin."""
+    from gateway.relay import ws_transport as wt
+
+    monkeypatch.delenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", raising=False)
+    grace = wt._disconnect_drain_grace_s()
+    budget = 5.0
+    reserved = 3 * wt._TEARDOWN_AWAIT_TIMEOUT_S
+    assert grace + reserved < budget, (
+        f"grace {grace}s + teardown awaits {reserved}s exceeds the runner's "
+        f"{budget}s disconnect budget — wait_for would cancel teardown "
+        "mid-drain and skip the fail-pending loop"
+    )
+    assert grace > 0, "budget default must still leave usable drain time"
+
+
+def test_drain_grace_honors_env_budget(monkeypatch):
+    from gateway.relay import ws_transport as wt
+
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "12")
+    assert wt._disconnect_drain_grace_s() == wt._DISCONNECT_DRAIN_GRACE_S
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "3.5")
+    grace = wt._disconnect_drain_grace_s()
+    assert 0 <= grace <= 3.5 - 3 * wt._TEARDOWN_AWAIT_TIMEOUT_S
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "1")
+    assert wt._disconnect_drain_grace_s() == 0.0
+

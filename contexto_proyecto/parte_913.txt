@@ -1,0 +1,230 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\observability\shared_metrics_send_config.py ===
+"""Configuration for shared-metrics transmission."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
+#: Production ingest endpoint. Overridable through config only — deliberately NOT by an
+#: environment variable: AGENTS.md reserves HERMES_* for secrets, and an inherited variable
+#: could silently redirect consented metrics to any host with nothing visible in config.
+#: Tests and the staging E2E write this key into a throwaway profile instead.
+DEFAULT_ENDPOINT = "https://telemetry.nousresearch.com/v1/telemetry"
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+# Module-level latch: the enabled/send mismatch is a static misconfiguration,
+# so it is reported once per process instead of on every hook fire.
+_warned_send_without_collection = False
+
+
+@dataclass(frozen=True)
+class SendConfig:
+    """Resolved transmission settings."""
+
+    #: Collection is on. Nothing is packaged or sent without it.
+    enabled: bool
+    #: Transmission is on AND permitted (that is, collection is also on).
+    send: bool
+    #: Where packages are POSTed.
+    endpoint: str
+
+
+def _endpoint_is_safe(endpoint: str) -> bool:
+    """Reject plaintext destinations unless they are loopback (so tests can use local HTTP)."""
+    try:
+        parsed = urlparse(endpoint)
+    except ValueError:
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and (parsed.hostname or "") in _LOCAL_HOSTS
+
+
+def resolve_send_config(config: dict | None) -> SendConfig:
+    """Resolve transmission settings from config (endpoint: config > production default).
+
+    ``send`` is False whenever transmission cannot legitimately happen, so callers never
+    have to re-check the combination.
+    """
+    global _warned_send_without_collection
+
+    raw = config if isinstance(config, dict) else {}
+    telemetry = raw.get("telemetry")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    shared = telemetry.get("shared_metrics")
+    shared = shared if isinstance(shared, dict) else {}
+
+    enabled = shared.get("enabled") is True
+    send_requested = shared.get("send") is True
+
+    if send_requested and not enabled:
+        # Loud, not silent: the user believes telemetry is being sent, and it never will be.
+        if not _warned_send_without_collection:
+            _warned_send_without_collection = True
+            logger.error(
+                "telemetry.shared_metrics.send is true but "
+                "telemetry.shared_metrics.enabled is false — nothing is "
+                "collected, so nothing can be sent. Enable collection or "
+                "turn sending off."
+            )
+        return SendConfig(enabled=False, send=False, endpoint=DEFAULT_ENDPOINT)
+
+    endpoint = shared.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        endpoint = DEFAULT_ENDPOINT
+    endpoint = endpoint.strip()
+
+    if send_requested and not _endpoint_is_safe(endpoint):
+        logger.error(
+            "Refusing to send shared metrics to %r: telemetry must use https "
+            "(or a localhost http endpoint for testing).",
+            endpoint,
+        )
+        return SendConfig(enabled=enabled, send=False, endpoint=endpoint)
+
+    return SendConfig(enabled=enabled, send=send_requested, endpoint=endpoint)
+
+
+def reset_warning_latch_for_tests() -> None:
+    """Clear the once-per-process error latch (test support only)."""
+    global _warned_send_without_collection
+    _warned_send_without_collection = False
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\observability\shared_metrics_subscriber.py ===
+"""Relay subscriber for the persisted Hermes shared-metrics slice."""
+
+from __future__ import annotations
+
+import logging
+import platform
+import threading
+from typing import Any
+
+from agent.relay_runtime import RUNTIME_INSTANCE_KEY
+from hermes_cli.config import detect_install_method
+
+from .shared_metrics import SharedMetricsStore
+from .shared_metrics_contract import (
+    CLIENT_ACTIVE_METRIC,
+    MODEL_ROUTE_METRIC,
+    TOOL_CALL_METRIC,
+    client_active_counter,
+    client_resource,
+    model_call_dimensions,
+    skill_counter,
+    task_counter,
+    tool_approval_counter,
+    tool_call_dimensions,
+)
+
+logger = logging.getLogger(__name__)
+
+# Contract projections in match order; each yields (metric_name, dimensions) or None.
+_COUNTERS = (
+    client_active_counter,
+    lambda event: _named(MODEL_ROUTE_METRIC, model_call_dimensions(event)),
+    lambda event: _named(TOOL_CALL_METRIC, tool_call_dimensions(event)),
+    task_counter,
+    tool_approval_counter,
+    skill_counter,
+)
+
+
+def _named(metric_name: str, dimensions: dict | None) -> tuple[str, dict] | None:
+    return None if dimensions is None else (metric_name, dimensions)
+
+
+class SharedMetricsSubscriber:
+    """Persist validated Hermes counters from Relay lifecycle events."""
+
+    def __init__(
+        self,
+        store: SharedMetricsStore,
+        hermes_version: str,
+        *,
+        runtime_id: str | None = None,
+    ) -> None:
+        self.store = store
+        self._client_resource = client_resource(
+            hermes_version,
+            os_name=platform.system(),
+            architecture=platform.machine(),
+            install_method=detect_install_method(),
+        )
+        self._runtime_id = runtime_id
+        self._active = True
+        self._lock = threading.RLock()
+
+    def deactivate(self) -> None:
+        """Stop accepting events before telemetry is disabled or torn down."""
+        with self._lock:
+            self._active = False
+
+    @staticmethod
+    def _classify(event: Any) -> tuple[str, dict] | None:
+        """Return ``(metric_name, dimensions)`` for the first matching contract, else None."""
+        return next((m for m in (project(event) for project in _COUNTERS) if m is not None), None)
+
+    def __call__(self, event: Any) -> None:
+        if self._runtime_id is not None:
+            metadata = getattr(event, "metadata", None)
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get(RUNTIME_INSTANCE_KEY) != self._runtime_id
+            ):
+                return
+        metric = self._classify(event)
+        if metric is None:
+            return
+        metric_name, dimensions = metric
+        with self._lock:
+            if not self._active:
+                return
+            try:
+                if metric_name == CLIENT_ACTIVE_METRIC:
+                    self.store.record_client_active(self._client_resource)
+                else:
+                    self.store.record_counter(metric_name, dimensions, self._client_resource)
+            except Exception:
+                logger.warning(
+                    "Unable to persist the Hermes shared metric: %s", metric_name, exc_info=True
+                )
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\observability\__init__.py ===
+"""First-party Hermes observability integrations."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
+    """Dispatch a Hermes lifecycle event to built-in observability features."""
+    from . import relay_shared_metrics
+
+    try:
+        relay_shared_metrics.observe_lifecycle(hook_name, **kwargs)
+    except Exception:
+        logger.warning("Built-in observability hook failed: %s", hook_name, exc_info=True)
+
+
+def handles_hook(hook_name: str) -> bool:
+    """Return whether any built-in observability feature handles a hook."""
+    from . import relay_shared_metrics
+
+    return relay_shared_metrics.handles_hook(hook_name)
+

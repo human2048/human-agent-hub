@@ -1,0 +1,308 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\local_runtime\hf_browse.py ===
+"""Browse Hugging Face for GGUF models the user can run.
+
+The curated catalog is the front page; this module is the firehose behind it — day-0 models not yet
+in the catalog, community quants, anything. Acquisition only: nothing here serves a model. A browsed
+download lands in the machine-scoped models dir and from that moment the normal machinery owns it —
+staleness bounce, preset generation from the real GGUF header, fit policy, placement pills.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, replace
+
+logger = logging.getLogger(__name__)
+
+_HF = "https://huggingface.co"
+_TIMEOUT_S = 15
+# Rough-fit fill-in for pre-download pricing: a mid-size model's 64K-floor KV plus runtime
+# overhead. Deliberately round — the verdict bands are coarse, not window grants.
+_ROUGH_KV_AND_OVERHEAD = 4 << 30
+
+# Tiny TTL cache: the pane fires a search per keystroke pause and re-opens repos the user flips
+# between. Process-local, size-capped; upstream truth changes slowly at this granularity.
+_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_TTL_S = 300
+_CACHE_MAX = 128
+
+
+def _get_json(url: str) -> object:
+    now = time.monotonic()
+    hit = _CACHE.get(url)
+    if hit and now - hit[0] < _CACHE_TTL_S:
+        return hit[1]
+    req = urllib.request.Request(url, headers={"User-Agent": "hermes-local-models"})
+    with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as r:
+        data = json.load(r)
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.pop(min(_CACHE, key=lambda k: _CACHE[k][0]))
+    _CACHE[url] = (now, data)
+    return data
+
+
+@dataclass(frozen=True)
+class HFModelHit:
+    repo: str                   # e.g. "unsloth/Qwen3.8-27B-GGUF"
+    downloads: int
+    likes: int
+    updated: str                # ISO date from HF
+    gated: bool
+
+
+@dataclass(frozen=True)
+class HFFileGroup:
+    """One downloadable quant: a single GGUF or all parts of a split one."""
+
+    label: str                  # e.g. "Q4_K_M" or the file stem
+    paths: tuple[str, ...]      # repo-relative, split parts in order
+    total_bytes: int
+    fit: str = "unknown"        # fits-gpu | needs-ram | too-big | unknown
+
+
+_QUANT_RE = re.compile(r"(?:IQ|Q)\d[_A-Z0-9]*|F16|BF16|F32", re.IGNORECASE)
+_SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+
+
+def search_models(query: str, limit: int = 20) -> list[HFModelHit]:
+    """Full-text search over HF models that ship GGUF files, most downloaded first (the closest
+    public signal to 'trending')."""
+    q = urllib.parse.quote(query.strip())
+    url = (f"{_HF}/api/models?search={q}&filter=gguf&sort=downloads"
+           f"&direction=-1&limit={max(1, min(int(limit), 50))}")
+    return [HFModelHit(repo=str(m.get("id", "")),
+                       downloads=int(m.get("downloads") or 0),
+                       likes=int(m.get("likes") or 0),
+                       updated=str(m.get("lastModified") or ""),
+                       gated=bool(m.get("gated")))
+            for m in _get_json(url)]
+
+
+def _quant_label(filename: str) -> str:
+    m = _QUANT_RE.search(filename)
+    return m.group(0).upper() if m else filename
+
+
+def repo_files(repo: str) -> list[HFFileGroup]:
+    """The servable GGUFs in a repo, grouped: split parts collapse into one entry (first part is
+    what llama.cpp loads); mmproj/draft companions are excluded. Largest quant first."""
+    url = f"{_HF}/api/models/{urllib.parse.quote(repo)}/tree/main?recursive=true"
+    files = _get_json(url)
+
+    singles: list[tuple[str, int]] = []
+    splits: dict[str, list[tuple[int, str, int]]] = {}
+    for f in files:
+        path = str(f.get("path", ""))
+        if not path.lower().endswith(".gguf"):
+            continue
+        name = path.rsplit("/", 1)[-1].lower()
+        if name.startswith(("mmproj", "dspark")) or "draft" in name:
+            continue
+        size = int(f.get("size") or 0)
+        m = _SPLIT_RE.search(path)
+        if m:
+            splits.setdefault(path[: m.start()], []).append((int(m.group(1)), path, size))
+        else:
+            singles.append((path, size))
+
+    groups = [HFFileGroup(label=_quant_label(path), paths=(path,), total_bytes=size)
+              for path, size in singles]
+    for stem, parts in splits.items():
+        parts.sort()
+        groups.append(HFFileGroup(label=_quant_label(stem), paths=tuple(p for _, p, _ in parts),
+                                  total_bytes=sum(s for _, _, s in parts)))
+    groups.sort(key=lambda g: g.total_bytes, reverse=True)
+    return groups
+
+
+def rough_fit(total_bytes: int, budget) -> str:
+    """Coarse pre-download verdict from file size alone (GGUF file size ≈ in-memory weights);
+    the GGUF header refines this after download. Bands match the catalog pills' language."""
+    need = total_bytes + _ROUGH_KV_AND_OVERHEAD
+    if need <= budget.usable_vram_bytes:
+        return "fits-gpu"
+    if need <= budget.usable_vram_bytes + budget.ram_available_bytes:
+        return "needs-ram"
+    return "too-big"
+
+
+def priced_repo_files(repo: str, budget) -> list[HFFileGroup]:
+    return [replace(g, fit=rough_fit(g.total_bytes, budget)) for g in repo_files(repo)]
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from dataclasses import field  # noqa: F401,E402
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\local_runtime\load_progress.py ===
+"""Live model-load progress from the managed llama-server router.
+
+Children emit per-tensor progress ({stages, current, value}) which the router relays ONLY over its
+/models/sse stream — GET /models carries just the coarse status. The watcher starts on first call,
+reconnects with backoff (the router bounces on download/eject), and never raises into callers: no
+router, no state file, or no SSE support (older engines) all read as "nothing loading".
+"""
+
+from __future__ import annotations
+
+from contextlib import suppress
+import json
+import logging
+import threading
+import time
+import urllib.request
+
+logger = logging.getLogger(__name__)
+
+_TEXT_STAGE_SHARE = 0.85     # composite range share for the text model
+_RECONNECT_DELAY_S = 3.0
+_STALE_ENTRY_TTL_S = 120.0   # a loading entry with no events this long is dead
+_LOAD_EVENTS = ("status_change", "model_status")
+
+_lock = threading.Lock()
+_watcher: threading.Thread | None = None
+_snapshot: dict[str, dict] = {}
+
+
+def _pct(x: float) -> int:
+    return max(0, min(100, round(x * 100)))
+
+
+def _composite_percent(stages: list[str], current: str, value: float) -> int:
+    """Map (stage, in-stage value) onto one 0-100 range, text-heavy."""
+    if not stages or current not in stages or len(stages) == 1:
+        return _pct(value)
+    extras = [s for s in stages if s != "text_model"]
+    extra_share = (1.0 - _TEXT_STAGE_SHARE) / len(extras) if extras else 0.0
+    offset = 0.0
+    for stage in stages:
+        share = _TEXT_STAGE_SHARE if stage == "text_model" else extra_share
+        if stage == current:
+            return _pct(offset + share * value)
+        offset += share
+    return _pct(value)
+
+
+def _endpoint() -> "tuple[str, str] | None":
+    """(base_root, api_key) of the managed router via the ownership-guarded reader, or None."""
+    from hermes_cli.local_runtime.endpoint import managed_root
+
+    return managed_root()
+
+
+def _apply_event(model: str, event: str, data: dict) -> None:
+    with _lock:
+        status = str(data.get("status", ""))
+        if event in _LOAD_EVENTS and status == "loading":
+            progress = data.get("progress") or {}
+            stages = [str(s) for s in (progress.get("stages") or [])]
+            current = str(progress.get("current", ""))
+            value = progress.get("value")
+            entry = _snapshot.setdefault(model, {"stage": "", "value": 0.0, "percent": 0, "ts": 0.0})
+            entry["ts"] = time.monotonic()
+            if current and isinstance(value, (int, float)):
+                entry["stage"] = current
+                entry["value"] = float(value)
+                entry["percent"] = _composite_percent(stages, current, float(value))
+        elif event in (*_LOAD_EVENTS, "model_remove") and status != "loading":
+            # Any terminal status (loaded/unloaded/failed) ends the load.
+            _snapshot.pop(model, None)
+
+
+def _clear_snapshot() -> None:
+    with _lock:
+        _snapshot.clear()
+
+
+def _watch() -> None:
+    while True:
+        endpoint = _endpoint()
+        if endpoint is None:
+            _clear_snapshot()
+            time.sleep(_RECONNECT_DELAY_S)
+            continue
+        base, key = endpoint
+        try:
+            req = urllib.request.Request(f"{base}/models/sse", headers={
+                "Authorization": f"Bearer {key}", "Accept": "text/event-stream"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                buf = b""
+                while True:
+                    chunk = r.read1(4096) if hasattr(r, "read1") else r.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        text = line.decode("utf-8", "replace").strip()
+                        if not text.startswith("data:"):
+                            continue
+                        with suppress(json.JSONDecodeError, TypeError):
+                            msg = json.loads(text[5:].strip())
+                            _apply_event(str(msg.get("model", "")), str(msg.get("event", "")),
+                                         msg.get("data") or {})
+        except Exception as exc:  # noqa: BLE001 — watcher must never die loud
+            logger.debug("load-progress SSE reconnecting: %s", exc)
+        # Stream ended (router bounce, timeout, error): loading entries from the dead connection
+        # are unverifiable — drop rather than freeze.
+        _clear_snapshot()
+        time.sleep(_RECONNECT_DELAY_S)
+
+
+def _ensure_watcher() -> None:
+    global _watcher
+    with _lock:
+        if _watcher is None or not _watcher.is_alive():
+            _watcher = threading.Thread(target=_watch, daemon=True, name="llamacpp-load-progress")
+            _watcher.start()
+
+
+def get_loading_progress() -> dict[str, dict]:
+    """{model_id: {"stage", "value", "percent"}} for models loading right now. Empty when
+    nothing is loading (or nothing is knowable)."""
+    _ensure_watcher()
+    now = time.monotonic()
+    with _lock:
+        return {m: {"stage": e["stage"], "value": e["value"], "percent": e["percent"]}
+                for m, e in _snapshot.items() if now - e["ts"] < _STALE_ENTRY_TTL_S}
+
+
+def get_prefill_progress(model: str) -> "dict | None":
+    """{"processed": tokens} while the managed server is prompt-processing for ``model``, or None
+    (idle, decoding, unreachable, or foreign server).
+
+    /slots exposes ``n_prompt_tokens_processed`` but no total, so callers supply the denominator.
+    The busiest processing slot wins: a parallel small request freezes its counter during decode
+    while a live prefill keeps climbing. One HTTP call per poll; every failure reads as "no
+    prefill" — garnish, never load-bearing.
+    """
+    ep = _endpoint()
+    if ep is None:
+        return None
+    try:
+        from urllib.parse import quote
+
+        from hermes_cli.local_runtime.endpoint import managed_get_json
+
+        slots = managed_get_json(*ep, f"/slots?model={quote(model)}", timeout_s=2)
+    except Exception:  # noqa: BLE001
+        return None
+    best = 0
+    for slot in slots if isinstance(slots, list) else []:
+        with suppress(TypeError, ValueError):
+            if slot.get("is_processing"):
+                best = max(best, int(slot.get("n_prompt_tokens_processed") or 0))
+    return {"processed": best} if best > 0 else None
+

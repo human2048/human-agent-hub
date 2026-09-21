@@ -1,0 +1,227 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_seeded_session_create.py ===
+"""session.create with seeded messages: the seed is durable before the first prompt, and durable once."""
+
+from hermes_state import SessionDB
+from tui_gateway import server
+
+
+def _quiet_create(monkeypatch, db):
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+
+
+def _create(params: dict) -> dict:
+    resp = server.handle_request({"id": "create", "method": "session.create", "params": params})
+    assert "result" in resp, resp
+    return resp["result"]
+
+
+def test_parentless_seed_survives_a_restart_and_hides_its_runbook(monkeypatch, tmp_path):
+    """A client that opens a chat with its first turns already written (no parent) gets a durable row and
+    transcript at create: a restart before the first prompt resumes it, the hidden runbook stays out of the
+    transcript on the wire, and the seed is not written a second time by the first-submit path."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    _quiet_create(monkeypatch, db)
+    sids = []
+    try:
+        result = _create({
+            "cols": 96, "source": "desktop", "title": "Welcome to Hermes",
+            "messages": [
+                {"role": "user", "content": "Private setup runbook", "display_kind": "hidden"},
+                {"role": "assistant", "content": "Welcome to Hermes"},
+                # Only "hidden" is accepted from the wire; other kinds are stamped by the gateway itself.
+                {"role": "user", "content": "Second question", "display_kind": "steer"},
+            ]})
+        sids.append(result["session_id"])
+        key = result["stored_session_id"]
+        assert [m["role"] for m in result["messages"]] == ["assistant", "user"]
+        assert result["message_count"] == 2  # counts what is on the wire, as session.resume does
+        live = server.handle_request({"id": "live", "method": "session.resume", "params": {"session_id": key, "cols": 96}})["result"]
+        assert (live["message_count"], len(live["messages"])) == (2, 2)  # the reuse-live path counts the wire too
+
+        assert db.get_session(key)["title"] == "Welcome to Hermes"
+        rows = db.get_messages_as_conversation(key)
+        assert [r["content"] for r in rows] == ["Private setup runbook", "Welcome to Hermes", "Second question"]
+        assert rows[0]["display_kind"] == "hidden"
+        assert rows[2].get("display_kind") is None
+        listed = server.handle_request({"id": "list", "method": "session.list", "params": {}})["result"]["sessions"]
+        assert next(s for s in listed if s["id"] == key)["preview"].startswith("Second question")  # the hidden row is not the preview
+
+        server._sessions.pop(sids.pop())  # the gateway restarts; only state.db remains
+        resumed = server.handle_request({"id": "resume", "method": "session.resume", "params": {"session_id": key, "cols": 96}})
+        assert "result" in resumed, resumed
+        sids.append(resumed["result"]["session_id"])
+        assert [m["role"] for m in resumed["result"]["messages"]] == ["assistant", "user"]
+
+        assert server._persist_session_row_for_submit("rid", server._sessions[sids[-1]]) is None  # the first prompt.submit
+        assert len(db.get_messages_as_conversation(key)) == 3
+        assert [hit["session_id"] for hit in db.search_messages("Second question")] == [key]
+        assert db.search_messages("Private setup runbook") == []  # the hidden row is not searchable either
+    finally:
+        for sid in sids:
+            server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_branch_child_seed_is_written_once(monkeypatch, tmp_path):
+    """A seeded branch child persists its copied transcript at create (#93959); the first prompt's seed
+    persist is the fallback for a failed create-time copy, not a second copy."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    _quiet_create(monkeypatch, db)
+    seed = [{"role": "user", "content": "hello from parent"}, {"role": "assistant", "content": "parent reply"}]
+    db.create_session("parent-1", source="desktop")
+    db.append_messages_batch("parent-1", seed)
+    db.set_session_title("parent-1", "Parent chat")
+    sid = None
+    try:
+        result = _create({"cols": 96, "source": "desktop", "parent_session_id": "parent-1", "messages": seed})
+        sid, key = result["session_id"], result["stored_session_id"]
+        assert [r["content"] for r in db.get_messages_as_conversation(key)] == ["hello from parent", "parent reply"]
+
+        assert server._persist_session_row_for_submit("rid", server._sessions[sid]) is None  # the first prompt.submit
+        assert [r["content"] for r in db.get_messages_as_conversation(key)] == ["hello from parent", "parent reply"]
+    finally:
+        if sid:
+            server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_partial_seed_copy_is_rolled_back_not_duplicated(monkeypatch, tmp_path):
+    """A seed copy that fails after the row exists leaves no row behind: the first prompt's retry copies the
+    whole seed again, so a kept partial copy would double it."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    _quiet_create(monkeypatch, db)
+    real_append, calls = db.append_messages_batch, []
+
+    def flaky_append(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("copy failed after the row was committed")
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(db, "append_messages_batch", flaky_append)
+    sid = None
+    try:
+        result = _create({"cols": 96, "source": "desktop", "title": "Welcome",
+                          "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]})
+        sid, key = result["session_id"], result["stored_session_id"]
+        assert db.get_session(key) is None  # rolled back, so the first prompt starts clean
+
+        assert server._persist_session_row_for_submit("rid", server._sessions[sid]) is None
+        assert [r["content"] for r in db.get_messages_as_conversation(key)] == ["hi", "hello"]
+        assert server._sessions[sid]["pending_title"] == "Welcome"  # still queued: the turn applies it, as for any lazy row
+    finally:
+        if sid:
+            server._sessions.pop(sid, None)
+        db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_served_profile_child_env.py ===
+"""A child spawned FOR a served profile carries that profile's env, never the launch profile's.
+
+Under ``gateway.multiplex_profiles`` one process serves several profiles and ``os.environ`` holds the
+LAUNCH profile's ``.env``. Every ``hermes -p X`` / helper child (slash worker, relay delivery, A2A
+forward, ``key_cmd`` helper, browser driver) must start from X's env: X's home pinned, X's own
+secrets, and none of the launch profile's residue. The same build reaches every site through
+``served_profile_child_env``; the slash worker is spawned through its production class here.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from agent.secret_scope import set_multiplex_active
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+_PROBE = ("import json,os;print(json.dumps({k:os.environ.get(k) for k in "
+          "('HERMES_HOME','A_MARKER','B_MARKER','TERMINAL_ENV','HERMES_MODEL','FIRECRAWL_API_KEY')}))")
+
+
+@pytest.fixture
+def mux_homes(tmp_path, monkeypatch):
+    """Launch home A (its .env mirrored into os.environ, as the multiplexer loads it) and served home B."""
+    a = tmp_path / ".hermes"
+    b = a / "profiles" / "b"
+    b.mkdir(parents=True)
+    (a / ".env").write_text("A_MARKER=a\nHERMES_MODEL=a-model\nTERMINAL_ENV=docker\nFIRECRAWL_API_KEY=a-fc\n", encoding="utf-8")
+    (b / ".env").write_text("B_MARKER=b\nFIRECRAWL_API_KEY=b-fc\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(a))
+    for key, val in (("A_MARKER", "a"), ("HERMES_MODEL", "a-model"), ("TERMINAL_ENV", "docker"),
+                     ("FIRECRAWL_API_KEY", "a-fc")):
+        monkeypatch.setenv(key, val)
+    monkeypatch.delenv("B_MARKER", raising=False)
+    set_multiplex_active(True)
+    try:
+        yield a, b
+    finally:
+        set_multiplex_active(False)
+
+
+def _child_view(env: dict) -> dict:
+    out = subprocess.run([sys.executable, "-c", _PROBE], env=env, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def _assert_is_b_env(seen: dict, b: Path, *, with_secrets: bool):
+    assert seen["HERMES_HOME"] == str(b)
+    assert seen["A_MARKER"] is None and seen["TERMINAL_ENV"] is None and seen["HERMES_MODEL"] is None
+    assert seen["B_MARKER"] == ("b" if with_secrets else None)
+
+
+def test_slash_worker_child_runs_in_the_served_profiles_env(mux_homes, monkeypatch):
+    """The real ``_SlashWorker`` spawn, observed from INSIDE the child: B's home and secrets, no A residue."""
+    import tui_gateway.server as server
+
+    a, b = mux_homes
+    captured = {}
+
+    class _Popen:
+        def __init__(self, argv, **kw):
+            captured["env"] = kw["env"]
+            self.stdout = self.stderr = iter(())
+            self.stdin = None
+
+        def poll(self):
+            return 0
+
+    with monkeypatch.context() as m:  # restored before the probe child spawns through the real Popen
+        m.setattr(server.subprocess, "Popen", _Popen)
+        token = set_hermes_home_override(str(b))
+        try:
+            server._SlashWorker("sess", "", profile_home=str(b))
+        finally:
+            reset_hermes_home_override(token)
+        served_env = captured["env"]
+        # Outside multiplex the launch profile's own worker keeps its env untouched.
+        set_multiplex_active(False)
+        server._SlashWorker("sess", "", profile_home=None)
+        assert captured["env"]["A_MARKER"] == "a" and captured["env"]["HERMES_HOME"] == str(a)
+    _assert_is_b_env(_child_view(served_env), b, with_secrets=True)
+
+
+def test_helper_children_resolve_secrets_through_the_served_profile(mux_homes):
+    """``key_cmd`` helpers and the browser driver spawned during B's turn see B's key, never A's."""
+    from agent.command_token_source import _mint
+    from gateway.run import _profile_runtime_scope
+    from tools.browser_tool import _build_browser_env
+
+    a, b = mux_homes
+    helper = (f"{sys.executable} -c \"import os;print(os.environ.get('B_MARKER','-')+'|'"
+              f"+os.environ.get('A_MARKER','-')+'|'+os.environ.get('HERMES_HOME',''))\"")
+    with _profile_runtime_scope(b, hydrate_secrets=False):
+        token, _ttl = _mint(helper, "b-provider")
+        browser_env = _build_browser_env()
+    assert token == f"b|-|{b}"
+    seen = _child_view(browser_env)
+    _assert_is_b_env(seen, b, with_secrets=False)  # provider tier stays scrubbed for the browser
+    assert seen["FIRECRAWL_API_KEY"] == "b-fc"  # the passthrough key is B's, not the launch profile's
+

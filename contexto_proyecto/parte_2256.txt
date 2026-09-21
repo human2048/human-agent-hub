@@ -1,0 +1,396 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_soul_md_profile_isolation.py ===
+"""Regression (#50233, SOUL.md half): a profile agent's SOUL.md must load from
+ITS OWN home, never the ambient/launch home — even on a thread that did not
+bind the HERMES_HOME ContextVar. Same bug class as the skills-index leak
+fixed in #86313; load_soul_md now accepts home_override.
+"""
+
+import threading
+
+
+def test_soul_md_scoped_to_home_override_not_ambient(tmp_path, monkeypatch):
+    from agent import prompt_builder
+
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    (default_home / "SOUL.md").write_text(
+        "DEFAULT SOUL — must never leak into a profile prompt", encoding="utf-8"
+    )
+
+    bot_home = tmp_path / "profiles" / "mybot"
+    bot_home.mkdir(parents=True)
+    (bot_home / "SOUL.md").write_text("BOT SOUL", encoding="utf-8")
+
+    # Ambient home points at default (mimics a build thread that lost the
+    # profile's ContextVar override and fell back to launch).
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    result = {}
+
+    def build():
+        result["soul"] = prompt_builder.load_soul_md(home_override=bot_home)
+
+    t = threading.Thread(target=build)
+    t.start()
+    t.join()
+
+    assert result["soul"] == "BOT SOUL"
+
+
+def test_soul_md_override_missing_file_returns_none(tmp_path, monkeypatch):
+    from agent import prompt_builder
+
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    (default_home / "SOUL.md").write_text("DEFAULT SOUL", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    empty_bot = tmp_path / "profiles" / "emptybot"
+    empty_bot.mkdir(parents=True)
+
+    # No SOUL.md in the bot home -> None, NOT default's soul.
+    assert prompt_builder.load_soul_md(home_override=empty_bot) is None
+
+
+def test_soul_md_ambient_unchanged_without_override(tmp_path, monkeypatch):
+    from agent import prompt_builder
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "SOUL.md").write_text("AMBIENT SOUL", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert prompt_builder.load_soul_md() == "AMBIENT SOUL"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_sql_injection.py ===
+"""Tests that verify SQL injection mitigations in insights and state modules."""
+
+import re
+
+from agent.insights import InsightsEngine
+
+
+def test_session_cols_no_injection_chars():
+    """_SESSION_COLS must not contain SQL injection vectors."""
+    cols = InsightsEngine._SESSION_COLS
+    assert ";" not in cols
+    assert "--" not in cols
+    assert "'" not in cols
+    assert "DROP" not in cols.upper()
+
+
+def test_get_sessions_all_query_is_parameterized():
+    """_GET_SESSIONS_ALL must use a ? placeholder for the cutoff value."""
+    query = InsightsEngine._GET_SESSIONS_ALL
+    assert "?" in query
+    assert "started_at >= ?" in query
+    # Must not embed any runtime-variable content via brace interpolation
+    assert "{" not in query
+
+
+def test_get_sessions_with_source_query_is_parameterized():
+    """_GET_SESSIONS_WITH_SOURCE must use ? placeholders for both parameters."""
+    query = InsightsEngine._GET_SESSIONS_WITH_SOURCE
+    assert query.count("?") == 2
+    assert "started_at >= ?" in query
+    assert "source = ?" in query
+    assert "{" not in query
+
+
+def test_session_col_names_are_safe_identifiers():
+    """Every column name listed in _SESSION_COLS must be a simple identifier."""
+    cols = InsightsEngine._SESSION_COLS
+    identifiers = [c.strip() for c in cols.split(",")]
+    safe_identifier = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+    for col in identifiers:
+        assert safe_identifier.match(col), (
+            f"Column name {col!r} is not a safe SQL identifier"
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_ssl_ca_guard.py ===
+"""Tests for the preventive SSL CA bundle guard."""
+
+from pathlib import Path
+
+import certifi
+import pytest
+
+from agent.errors import SSLConfigurationError
+from agent.ssl_guard import verify_ca_bundle
+
+
+def test_healthy_bundle_passes(monkeypatch):
+    """A real, non-empty certifi bundle must verify without raising."""
+    for key in ("HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        monkeypatch.delenv(key, raising=False)
+    bundle = Path(certifi.where())
+    assert bundle.exists()
+    assert bundle.stat().st_size > 1024
+    verify_ca_bundle()
+
+
+def test_empty_certifi_bundle_raises_ssl_error(monkeypatch, tmp_path):
+    """Empty file is treated as a corrupted bundle."""
+    fake = tmp_path / "empty.pem"
+    fake.write_bytes(b"")
+    monkeypatch.setattr(certifi, "where", lambda: str(fake))
+    with pytest.raises(SSLConfigurationError) as exc:
+        verify_ca_bundle()
+    assert "too small" in str(exc.value).lower()
+
+
+@pytest.mark.parametrize("env_var", ["HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"])
+def test_missing_explicit_ca_bundle_env_raises_before_httpx(monkeypatch, tmp_path, env_var):
+    """Bad CA-bundle env vars should be reported before OpenAI/httpx init."""
+    fake = tmp_path / "missing.pem"
+    monkeypatch.setenv(env_var, str(fake))
+    with pytest.raises(SSLConfigurationError) as exc:
+        verify_ca_bundle()
+    message = str(exc.value)
+    assert env_var in message
+    assert str(fake) in message
+    assert "force-reinstall" in message
+
+
+def test_truststore_get_ca_certs_not_implemented_is_accepted(monkeypatch, tmp_path):
+    """A truststore-backed SSLContext (Windows OS trust store) raises
+    NotImplementedError from get_ca_certs(). The guard must accept the
+    already-loaded bundle rather than fail.
+
+    Regression for the empty-message ``Failed to initialize OpenAI client:``
+    seen on every fresh agent init on Windows (str(NotImplementedError()) == "").
+    """
+    from agent import ssl_guard
+
+    bundle = tmp_path / "bundle.pem"
+    bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+
+    class _TruststoreLikeContext:
+        def get_ca_certs(self, binary_form=False):  # noqa: ARG002 - mirror ssl API
+            raise NotImplementedError()
+
+    # create_default_context(cafile=...) loads the bundle fine; only the
+    # post-load introspection is unsupported under truststore.
+    monkeypatch.setattr(
+        ssl_guard.ssl, "create_default_context", lambda *a, **k: _TruststoreLikeContext()
+    )
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+
+    # Must not raise on the explicit env bundle nor the certifi check.
+    verify_ca_bundle()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_ssl_verify.py ===
+"""Tests for agent.ssl_verify.resolve_httpx_verify."""
+
+import ssl
+
+import certifi
+import pytest
+
+from agent.ssl_verify import resolve_httpx_verify
+
+_CA_ENV_VARS = ("HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+
+
+@pytest.fixture
+def clean_ca_env(monkeypatch):
+    for var in _CA_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+
+
+def test_hermes_ca_bundle_returns_ssl_context(clean_ca_env, monkeypatch):
+    monkeypatch.setenv("HERMES_CA_BUNDLE", certifi.where())
+    result = resolve_httpx_verify()
+    assert isinstance(result, ssl.SSLContext)
+
+
+
+
+
+
+def test_default_without_env_is_true(clean_ca_env):
+    assert resolve_httpx_verify() is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_stale_replay_prune.py ===
+"""Tests for stale codex_reasoning_items pruning during compaction (#71058).
+
+Salvaged from PR #71077 (@webtecnica) with two correctness fixes:
+the prune boundary is the last USER message (a Codex turn spans multiple
+assistant messages whose reasoning items must replay together), and native
+compaction checkpoints (type="compaction") are exempt because they carry
+already-pruned history, not per-turn reasoning.
+"""
+
+from agent.context_compressor import (
+    _STALE_REPLAY_PRUNE_KEYS,
+    _prune_stale_reasoning_replay,
+)
+
+
+def _reasoning(item_id="rs_1"):
+    return {"type": "reasoning", "encrypted_content": "blob-" + item_id, "id": item_id}
+
+
+def _compaction():
+    return {"type": "compaction", "encrypted_content": "checkpoint-blob"}
+
+
+def test_prior_turn_reasoning_items_are_pruned():
+    messages = [
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": "a1", "codex_reasoning_items": [_reasoning("rs_a")]},
+        {"role": "user", "content": "turn 2"},
+        {"role": "assistant", "content": "a2", "codex_reasoning_items": [_reasoning("rs_b")]},
+    ]
+    pruned = _prune_stale_reasoning_replay(messages)
+    assert pruned == 1
+    assert "codex_reasoning_items" not in messages[1]
+    # Active turn (after last user message) keeps its items.
+    assert messages[3]["codex_reasoning_items"] == [_reasoning("rs_b")]
+
+
+def test_multi_message_active_turn_chain_is_never_pruned():
+    """A Codex turn spans assistant+tool_calls -> tool -> assistant; ALL of
+    the active turn's reasoning items must survive (the #71077 review gap)."""
+    messages = [
+        {"role": "user", "content": "old turn"},
+        {"role": "assistant", "content": "old", "codex_reasoning_items": [_reasoning("rs_old")]},
+        {"role": "user", "content": "active turn"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
+            "codex_reasoning_items": [_reasoning("rs_chain1")],
+        },
+        {"role": "tool", "content": "result", "tool_call_id": "c1"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
+            "codex_reasoning_items": [_reasoning("rs_chain2")],
+        },
+        {"role": "tool", "content": "result", "tool_call_id": "c2"},
+        {"role": "assistant", "content": "done", "codex_reasoning_items": [_reasoning("rs_final")]},
+    ]
+    pruned = _prune_stale_reasoning_replay(messages)
+    assert pruned == 1  # only the old turn
+    assert "codex_reasoning_items" not in messages[1]
+    for idx in (3, 5, 7):
+        assert messages[idx].get("codex_reasoning_items"), f"active-chain msg {idx} lost its items"
+
+
+def test_native_compaction_checkpoints_survive_pruning():
+    """type="compaction" items are cumulative context carriers — they must
+    survive on stale messages even when reasoning items are stripped."""
+    messages = [
+        {"role": "user", "content": "turn 1"},
+        {
+            "role": "assistant",
+            "content": "a1",
+            "codex_reasoning_items": [_compaction(), _reasoning("rs_a")],
+        },
+        {"role": "user", "content": "turn 2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    pruned = _prune_stale_reasoning_replay(messages)
+    assert pruned == 1
+    # Reasoning stripped, checkpoint kept.
+    assert messages[1]["codex_reasoning_items"] == [_compaction()]
+
+
+def test_checkpoint_only_sidecar_untouched_and_uncounted():
+    messages = [
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": "a1", "codex_reasoning_items": [_compaction()]},
+        {"role": "user", "content": "turn 2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    pruned = _prune_stale_reasoning_replay(messages)
+    assert pruned == 0
+    assert messages[1]["codex_reasoning_items"] == [_compaction()]
+
+
+def test_no_user_boundary_prunes_nothing():
+    messages = [
+        {"role": "assistant", "content": "a1", "codex_reasoning_items": [_reasoning("rs_a")]},
+        {"role": "assistant", "content": "a2", "codex_reasoning_items": [_reasoning("rs_b")]},
+    ]
+    assert _prune_stale_reasoning_replay(messages) == 0
+    assert messages[0]["codex_reasoning_items"]
+    assert messages[1]["codex_reasoning_items"]
+
+
+def test_non_codex_messages_untouched():
+    messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "plain"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "plain2"},
+    ]
+    assert _prune_stale_reasoning_replay(messages) == 0
+    assert messages == [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "plain"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "plain2"},
+    ]
+
+
+def test_prune_keys_contract():
+    """codex_message_items are replayed for prefix-cache continuity and must
+    NOT be in the prune set; the prune targets reasoning blobs only."""
+    assert "codex_reasoning_items" in _STALE_REPLAY_PRUNE_KEYS
+    assert "codex_message_items" not in _STALE_REPLAY_PRUNE_KEYS
+
+
+class TestInterimMergePreservesCheckpoints:
+    """Sibling site: the Codex incomplete-continuation dedup path must not
+    drop checkpoints when overwriting a visually-duplicate interim message."""
+
+    def test_prior_checkpoint_survives_overwrite(self):
+        from agent.native_compaction import merge_interim_reasoning_items
+
+        prior = [_compaction(), _reasoning("rs_old")]
+        newer = [_reasoning("rs_new")]
+        merged = merge_interim_reasoning_items(prior, newer)
+        assert _compaction() in merged
+        assert _reasoning("rs_new") in merged
+        assert _reasoning("rs_old") not in merged  # newer reasoning wins
+
+    def test_newer_checkpoint_wins_outright(self):
+        from agent.native_compaction import merge_interim_reasoning_items
+
+        prior = [{"type": "compaction", "encrypted_content": "old-ckpt"}]
+        newer = [{"type": "compaction", "encrypted_content": "new-ckpt"}, _reasoning("rs_new")]
+        merged = merge_interim_reasoning_items(prior, newer)
+        assert merged == newer
+
+    def test_no_prior_checkpoint_is_plain_overwrite(self):
+        from agent.native_compaction import merge_interim_reasoning_items
+
+        assert merge_interim_reasoning_items(
+            [_reasoning("rs_old")], [_reasoning("rs_new")]
+        ) == [_reasoning("rs_new")]
+
+    def test_non_list_inputs_are_safe(self):
+        from agent.native_compaction import merge_interim_reasoning_items
+
+        assert merge_interim_reasoning_items(None, None) == []
+        assert merge_interim_reasoning_items(None, [_reasoning("r")]) == [_reasoning("r")]
+        assert merge_interim_reasoning_items([_compaction()], None) == [_compaction()]
+

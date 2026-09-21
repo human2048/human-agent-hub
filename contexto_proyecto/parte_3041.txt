@@ -1,0 +1,299 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\relay\test_relay_roundtrip.py ===
+"""End-to-end relay round-trip against the in-memory stub connector.
+
+Proves the gateway side of the relay works with no real connector:
+  - connect() registers the inbound handler,
+  - a connector-delivered MessageEvent reaches the adapter's message path,
+  - SessionSource discriminators (scope_id) drive build_session_key isolation,
+  - an outbound send round-trips through the transport.
+
+These target the transport contract + session-key derivation (Task 1.2's gate),
+not the full agent turn — handle_message is patched to capture the event.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource, build_session_key
+from gateway.relay.adapter import RelayAdapter
+from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+
+from dataclasses import replace
+
+from tests.gateway.relay.stub_connector import StubConnector
+
+
+def _discord_descriptor() -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        contract_version=CONTRACT_VERSION,
+        platform="discord",
+        label="Discord",
+        max_message_length=2000,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=True,
+        markdown_dialect="discord",
+        len_unit="chars",
+        emoji="\U0001f47e",
+        platform_hint="You are on Discord.",
+        pii_safe=False,
+    )
+
+
+def _discord_event(scope_id: str, channel_id: str, user_id: str, text: str) -> MessageEvent:
+    """Synthetic inbound the connector would build from a discord.js message."""
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=channel_id,
+        chat_type="group",
+        user_id=user_id,
+        scope_id=scope_id,
+    )
+    return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+
+
+@pytest.fixture
+def wired():
+    stub = StubConnector(_discord_descriptor())
+    adapter = RelayAdapter(PlatformConfig(), _discord_descriptor(), transport=stub)
+    return adapter, stub
+
+
+@pytest.mark.asyncio
+async def test_connect_registers_inbound_handler(wired):
+    adapter, stub = wired
+    assert stub._inbound is None
+    ok = await adapter.connect()
+    assert ok is True
+    assert stub.connected is True
+    assert stub._inbound is not None
+
+
+@pytest.mark.asyncio
+async def test_inbound_event_reaches_adapter(wired, monkeypatch):
+    adapter, stub = wired
+    captured = []
+    monkeypatch.setattr(adapter, "handle_message", lambda ev: _async_capture(captured, ev))
+    await adapter.connect()
+    ev = _discord_event("guildA", "chan1", "userX", "hello")
+    await stub.push_inbound(ev)
+    assert len(captured) == 1
+    assert captured[0].text == "hello"
+    assert captured[0].source.scope_id == "guildA"
+
+
+async def _async_capture(sink, event):
+    sink.append(event)
+    return None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\relay\test_relay_roundtrip_telegram.py ===
+"""End-to-end relay round-trip for Telegram against the in-memory stub.
+
+Companion to ``test_relay_roundtrip.py`` (Discord). Proves the relay generalizes
+beyond Discord — the Phase 1 exit gate requires *both* Telegram and Discord
+descriptors to round-trip and their inbound ``MessageEvent``s to drive
+``build_session_key()`` correctly.
+
+Telegram's discriminator profile differs from Discord's, which is the point:
+  - No ``scope_id``; isolation between chats comes from ``chat_id`` alone.
+  - Forum topics live inside ONE ``chat_id`` and isolate by ``thread_id`` (the
+    Telegram analog of Discord's per-scope isolation).
+  - Forum/thread sessions are shared across participants by default
+    (``thread_sessions_per_user=False``) — user_id is NOT appended in a thread.
+  - ``len_unit="utf16"`` (Telegram counts UTF-16 code units) and
+    ``markdown_dialect="markdown_v2"`` — distinct from Discord's chars/discord.
+
+If the descriptor or session-keying only worked for Discord, these fail.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource, build_session_key
+from gateway.relay.adapter import RelayAdapter
+from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+
+from tests.gateway.relay.stub_connector import StubConnector
+
+
+def _telegram_descriptor() -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        contract_version=CONTRACT_VERSION,
+        platform="telegram",
+        label="Telegram",
+        max_message_length=4096,
+        supports_draft_streaming=True,  # Telegram DMs support sendMessageDraft
+        supported_ops=("send", "edit", "typing", "follow_up", "draft"),
+        supports_edit=True,
+        supports_threads=True,  # forum topics
+        markdown_dialect="markdown_v2",
+        len_unit="utf16",
+        emoji="\u2708\ufe0f",
+        platform_hint="You are on Telegram.",
+        pii_safe=False,
+    )
+
+
+def _tg_group_event(chat_id: str, user_id: str, text: str, thread_id: str | None = None) -> MessageEvent:
+    """Synthetic inbound the connector would build from a Telegram update.
+
+    A plain group message has no thread_id; a forum-topic message carries the
+    topic id as thread_id (no scope_id — Telegram has no scope concept).
+    """
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type="forum" if thread_id else "group",
+        user_id=user_id,
+        thread_id=thread_id,
+    )
+    return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+
+
+def _tg_dm_event(chat_id: str, user_id: str, text: str) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type="dm",
+        user_id=user_id,
+    )
+    return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+
+
+@pytest.fixture
+def wired():
+    desc = _telegram_descriptor()
+    stub = StubConnector(desc)
+    adapter = RelayAdapter(PlatformConfig(), desc, transport=stub)
+    return adapter, stub
+
+
+@pytest.mark.asyncio
+async def test_telegram_descriptor_round_trips_through_stub(wired):
+    """The connector's handshake descriptor for Telegram survives JSON + the
+    adapter configures itself from it (utf16 length unit, 4096 limit)."""
+    adapter, stub = wired
+    desc = _telegram_descriptor()
+    assert CapabilityDescriptor.from_json(desc.to_json()) == desc
+    # Adapter reflects the descriptor's capability profile.
+    assert adapter.MAX_MESSAGE_LENGTH == 4096
+    assert adapter.supports_draft_streaming() is True
+    # utf16 length unit selects a non-default len fn (Telegram counts UTF-16).
+    assert adapter.message_len_fn is not len
+
+
+@pytest.mark.asyncio
+async def test_inbound_telegram_event_reaches_adapter(wired, monkeypatch):
+    adapter, stub = wired
+    captured: list[MessageEvent] = []
+    monkeypatch.setattr(adapter, "handle_message", lambda ev: _async_capture(captured, ev))
+    await adapter.connect()
+    await stub.push_inbound(_tg_group_event("chat-100", "userX", "hello"))
+    assert len(captured) == 1
+    assert captured[0].text == "hello"
+    assert captured[0].source.platform == Platform.TELEGRAM
+    assert captured[0].source.scope_id is None  # Telegram has no scope
+
+
+async def _async_capture(sink, event):
+    sink.append(event)
+    return None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\relay\test_relay_seal_cancellation.py ===
+"""Regression: cancellation during the final seal must not orphan the
+remote stream (PR 85796 review round 2, finding 4).
+
+_seal_open_draft pops the open entry and writes the local tombstone
+BEFORE awaiting transport I/O. CancelledError bypasses the failure
+handling (it is not an Exception), so a cancel mid-seal left:
+
+    remote stream: OPEN (live indicator until connector eviction)
+    adapter._open_draft_by_chat: {}     <- abandon finds nothing
+    adapter._sealed_draft_by_chat: {key: id}  <- premature tombstone
+
+The seal now restores the open entry and drops its premature tombstone
+on CancelledError before re-raising, so the consumer's abandon pass can
+seal the stream in place.
+"""
+
+import asyncio
+
+import pytest
+
+from tests.gateway.relay.test_relay_live_cards import _connected_adapter
+
+
+class HangOnSealTransport:
+    def __init__(self):
+        self.ops = []
+        self.hang_seal = True
+
+    async def send_outbound(self, payload, platform=None):
+        final = bool(payload.get("final"))
+        self.ops.append((payload.get("op"), final, str(payload.get("content"))[:25]))
+        if payload.get("op") == "draft" and final and self.hang_seal:
+            await asyncio.sleep(30)
+        return {"success": True, "message_id": "ts.1"}
+
+
+class TestCancelDuringSeal:
+    @pytest.mark.asyncio
+    async def test_cancel_mid_seal_restores_open_state(self):
+        adapter, _ = _connected_adapter()
+        t = HangOnSealTransport()
+        adapter._transport = t
+        md = {"message_id": "m.1"}
+        await adapter.send_draft("C1", 11, "partial", metadata=md)
+        key = adapter._draft_key("C1", md)
+
+        task = asyncio.create_task(adapter.send("C1", "complete", metadata=dict(md)))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert adapter._open_draft_by_chat.get(key) == 11, (
+            "cancelled seal must restore the open entry so abandon can close it"
+        )
+        assert key not in adapter._sealed_draft_by_chat, (
+            "premature tombstone must not survive a cancelled seal"
+        )
+
+    @pytest.mark.asyncio
+    async def test_abandon_after_cancelled_seal_closes_remote_stream(self):
+        """End-to-end: cancel mid-seal, then the abandon pass (what the
+        consumer's CancelledError handler runs) seals the stream."""
+        adapter, _ = _connected_adapter()
+        t = HangOnSealTransport()
+        adapter._transport = t
+        md = {"message_id": "m.2"}
+        await adapter.send_draft("C1", 12, "partial on screen", metadata=md)
+
+        task = asyncio.create_task(adapter.send("C1", "complete", metadata=dict(md)))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        t.hang_seal = False  # transport recovers for the abandon pass
+        r = await adapter.abandon_open_draft(
+            "C1", "partial on screen", metadata=dict(md)
+        )
+        assert r.success
+        seals = [o for o in t.ops if o[0] == "draft" and o[1]]
+        # First seal attempt hung (cancelled); the abandon's seal landed.
+        assert seals[-1][2] == "partial on screen"
+        assert not adapter._open_draft_by_chat
+

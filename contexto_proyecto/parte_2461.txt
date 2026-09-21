@@ -1,0 +1,353 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_unreachable_retry.py ===
+"""Cowork-inspired bounded automatic re-runs for cron fires that never reached the model.
+
+Contract (cron/unreachable_retry.py): a recurring job whose run fails with a transient
+network/DNS error before ANY model call gets its ``next_run_at`` pulled earlier along a
+bounded ladder (5/15/30 min); a run that reaches the model resets the ladder, and the
+ladder never fires past its last rung.
+"""
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from cron import unreachable_retry as ur
+from cron.jobs import create_job, get_job, mark_job_run
+
+
+@pytest.fixture
+def tmp_cron_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(tmp_cron_home):
+    """Failed-unreachable runs re-fire on the 5/15/30-minute ladder instead of waiting a
+    full period, and the ladder stops after its last rung (falls back to the schedule)."""
+    # Interval, not a cron expression: the natural next fire is always a full day out. A
+    # fixed clock time ("0 3 * * *") makes the 30-minute rung land past the natural fire
+    # in the half hour before it, and plan_retry rightly yields to the schedule (CI red).
+    job = create_job("nightly report", "every 24h")
+    job_id = job["id"]
+
+    now = datetime.now(timezone.utc)
+    for i, delay in enumerate(ur.RETRY_DELAYS_SECONDS):
+        assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True)
+        j = get_job(job_id)
+        nxt = datetime.fromisoformat(j["next_run_at"])
+        # Pulled to roughly now + ladder delay, far before the daily occurrence.
+        assert timedelta(0) < nxt - now <= timedelta(seconds=delay + 120), (
+            f"attempt {i}: expected retry ~{delay}s out, got {nxt - now}")
+        assert j[ur.STATE_KEY]["attempt"] == i + 1
+
+    # Ladder exhausted: the next unreachable failure keeps the natural schedule.
+    assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True)
+    j = get_job(job_id)
+    assert j.get(ur.STATE_KEY) is None
+    assert datetime.fromisoformat(j["next_run_at"]) - now > timedelta(hours=1)
+
+
+def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home):
+    """Any run that reached the model clears retry state; one-shots (pre-claimed
+    dispatch, at-most-times #38758) never enter the ladder."""
+    job = create_job("hourly sync", "every 12h")
+    job_id = job["id"]
+    assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True)
+    assert get_job(job_id)[ur.STATE_KEY]["attempt"] == 1
+
+    # A normal failed run (model reached) resets the ladder and stays on schedule.
+    assert mark_job_run(job_id, False, "agent error")
+    j = get_job(job_id)
+    assert j.get(ur.STATE_KEY) is None
+    now = datetime.now(timezone.utc)
+    assert datetime.fromisoformat(j["next_run_at"]) - now > timedelta(hours=11)
+
+    # One-shot: flag is ignored, no retry state, no resurrection.
+    once = create_job("one shot", _iso(datetime.now(timezone.utc) + timedelta(minutes=1)))
+    assert mark_job_run(once["id"], False, "ConnectError: dns", model_unreachable=True)
+    remaining = get_job(once["id"])
+    assert remaining is None or remaining.get(ur.STATE_KEY) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_upgrade_module_skew.py ===
+"""Cron imports remain usable when a daemon spans an on-disk upgrade.
+
+A long-running scheduler already has ``hermes_cli.sqlite_util`` and ``cron.jobs`` cached from
+BEFORE the upgrade; the first lazy import of a cron store afterwards must not need names those
+stale modules lack (``scheduler_prompt._build_job_prompt`` imports ``cron.notepad`` unguarded, so
+an ``ImportError`` there fails every job tick until restart).
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+_SKEW_SCRIPT = """
+import sys, types
+import hermes_cli.sqlite_util as sqlite_util
+import cron.jobs as jobs
+
+# The pre-upgrade sqlite_util only had add_column_if_missing / write_txn.
+for name in ("open_db", "transaction"):
+    delattr(sqlite_util, name)
+sys.modules.pop("cron.{store}", None)
+
+import cron.{store}
+"""
+
+_OCCURRENCES_SKEW_SCRIPT = """
+from datetime import datetime, timedelta, timezone
+import cron.jobs as jobs
+
+# Model a daemon that loaded cron.jobs before these constants existed, then
+# lazy-loads the newer occurrences module from disk during a due scan.
+for name in ("FIRE_CLAIM_SKEW_SECONDS", "FIRE_CLAIM_TTL_SECONDS"):
+    delattr(jobs, name)
+
+from cron.occurrences import completed_occurrence, unclaimed_pending_slot
+
+assert not completed_occurrence({"id": "job"}, "2026-01-01T00:00:00+00:00")
+
+# A slot stamped by another owner whose lease has lapsed is restored: the TTL comparison runs.
+now = datetime.now(timezone.utc)
+stale = (now - timedelta(hours=1)).isoformat()
+job = {"id": "job", "schedule": {"kind": "interval"},
+       "pending_slot": {"scheduled_at": stale, "at": stale, "by": "other-machine"}}
+assert unclaimed_pending_slot(job, now) == stale
+"""
+
+
+@pytest.mark.parametrize("store", ["notepad", "incidents", "executions", "delivery_queue"])
+def test_lazy_cron_stores_import_against_pre_upgrade_sqlite_util(store):
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-c", _SKEW_SCRIPT.format(store=store)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_occurrences_resolve_fire_claim_constants_without_cached_jobs_exports():
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-c", _OCCURRENCES_SKEW_SCRIPT],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_usage_audit_logger.py ===
+"""Tests for the cron usage_audit.jsonl logger.
+
+Covers:
+- successful write produces a single valid JSONL line with full schema
+- missing token info still writes a line with null fields
+- writer exception is swallowed (json.dumps raises) — call must return cleanly
+- file path is created if parent dir is missing
+- timestamp format is RFC3339 UTC with millisecond precision and 'Z' suffix
+- path resolves through _get_hermes_home() (profile-safe)
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from cron import scheduler
+
+
+@pytest.fixture
+def tmp_hermes_home(tmp_path, monkeypatch):
+    """Redirect _get_hermes_home() so the audit logger writes under tmp_path."""
+    fake_home = tmp_path / "home" / ".hermes"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: fake_home)
+    return fake_home
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+class TestUsageAuditPath:
+    def test_resolves_through_get_hermes_home(self, tmp_hermes_home):
+        p = scheduler._usage_audit_path()
+        assert p == tmp_hermes_home / "cron" / "usage_audit.jsonl"
+
+    def test_does_not_use_path_home(self, tmp_hermes_home):
+        """Audit path must NOT hardcode Path.home() — it bypasses profile-aware resolution."""
+        with patch.object(Path, "home") as mock_home:
+            p = scheduler._usage_audit_path()
+            mock_home.assert_not_called()
+        assert p == tmp_hermes_home / "cron" / "usage_audit.jsonl"
+
+
+class TestUtcnowIsoMs:
+    def test_format_has_millisecond_precision_and_z(self):
+        ts = scheduler._utcnow_iso_ms()
+        # YYYY-MM-DDTHH:MM:SS.mmmZ
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$", ts), ts
+
+
+class TestWriteUsageAudit:
+    def test_successful_write_produces_valid_jsonl(self, tmp_hermes_home):
+        record = {
+            "ts": "2026-05-01T04:23:11.123Z",
+            "job_id": "bluenode-dispatch-recommend-sweep",
+            "fire_id": "deadbeefcafe",
+            "prompt_tokens": 11894,
+            "completion_tokens": 287,
+            "total_tokens": 12181,
+            "response_silent": False,
+            "deliver_target": None,
+            "model": "google/gemma-4-31b-it",
+            "duration_ms": 4231,
+            "error": None,
+        }
+        scheduler._write_usage_audit(record)
+
+        path = scheduler._usage_audit_path()
+        assert path.exists()
+        lines = _read_jsonl(path)
+        assert len(lines) == 1
+        assert lines[0] == record
+
+    def test_missing_token_info_writes_line_with_null_fields(self, tmp_hermes_home):
+        record = {
+            "ts": "2026-05-01T04:23:11.123Z",
+            "job_id": "j",
+            "fire_id": "f",
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "response_silent": True,
+            "deliver_target": "telegram",
+            "model": None,
+            "duration_ms": 12,
+            "error": "boom",
+        }
+        scheduler._write_usage_audit(record)
+        lines = _read_jsonl(scheduler._usage_audit_path())
+        assert len(lines) == 1
+        assert lines[0]["prompt_tokens"] is None
+        assert lines[0]["completion_tokens"] is None
+        assert lines[0]["total_tokens"] is None
+        assert lines[0]["error"] == "boom"
+
+    def test_writer_exception_swallowed(self, tmp_hermes_home, caplog):
+        # Force json.dumps to raise — writer must NOT propagate.
+        with patch("cron.scheduler.json.dumps", side_effect=RuntimeError("kaboom")):
+            scheduler._write_usage_audit({"job_id": "x"})
+
+        # File never created.
+        assert not scheduler._usage_audit_path().exists()
+        # Warning logged with our marker.
+        assert any("usage_audit write failed" in rec.message for rec in caplog.records)
+
+    def test_parent_dir_created_if_missing(self, tmp_hermes_home):
+        # Ensure the cron path does not exist yet.
+        target = tmp_hermes_home / "cron"
+        assert not target.exists()
+
+        scheduler._write_usage_audit({"k": "v"})
+
+        assert target.exists() and target.is_dir()
+        assert (target / "usage_audit.jsonl").exists()
+
+    def test_appends_multiple_records(self, tmp_hermes_home):
+        scheduler._write_usage_audit({"i": 1})
+        scheduler._write_usage_audit({"i": 2})
+        scheduler._write_usage_audit({"i": 3})
+        lines = _read_jsonl(scheduler._usage_audit_path())
+        assert [r["i"] for r in lines] == [1, 2, 3]
+
+    def test_unicode_preserved_not_escaped(self, tmp_hermes_home):
+        # ensure_ascii=False so non-ASCII model names / job names round-trip cleanly.
+        scheduler._write_usage_audit({"job_id": "한글", "model": "gemma"})
+        text = scheduler._usage_audit_path().read_text(encoding="utf-8")
+        assert "한글" in text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_warning_delivery_policy.py ===
+"""Failure classification survives durable delivery and drain-time policy changes."""
+from unittest.mock import patch
+
+import pytest
+
+from cron import delivery_queue, scheduler
+from cron.scheduler_delivery import _deliver_result
+
+
+@pytest.fixture(autouse=True)
+def configured_transport():
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    config = GatewayConfig()
+    config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
+    with patch("gateway.config.load_gateway_config", return_value=config):
+        yield
+
+
+@pytest.mark.parametrize("suppress", [False, True])
+def test_failure_queue_settles_without_claiming_a_suppressed_send(tmp_path, monkeypatch, suppress):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "queue.db")
+    (tmp_path / "config.yaml").write_text("display: {suppress_warning_notifications: false}\n")
+    job = {"id": "fixture", "name": "fixture", "deliver": "telegram:chat", "execution_id": "run"}
+    delivery_queue.enqueue("run", job, "arbitrary diagnostic", for_failure=True)
+    (tmp_path / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(suppress).lower()}}}\n")
+    with patch("cron.scheduler_delivery._deliver_standalone") as send:
+        assert scheduler.drain_delivery_queue({}, None) == 1
+    row = delivery_queue.get_status("run")
+    assert row["status"] == ("suppressed" if suppress else "delivered")
+    assert send.call_count == (0 if suppress else 1)
+    assert scheduler.drain_delivery_queue({}, None) == 0
+
+
+def test_success_content_and_explicit_destination_override_survive(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("display:\n  suppress_warning_notifications: true\n  platforms:\n    telegram:\n      suppress_warning_notifications: false\n")
+    job = {"id": "fixture", "deliver": "telegram:chat"}
+    with patch("cron.scheduler_delivery._deliver_standalone") as send:
+        assert _deliver_result(job, "warning quoted in requested result", for_failure=False) is None
+        assert _deliver_result(job, "diagnostic", for_failure=True) is None
+        assert send.call_count == 2
+
+
+def test_mixed_target_queue_is_not_reported_wholly_suppressed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "queue.db")
+    (tmp_path / "config.yaml").write_text("display:\n  suppress_warning_notifications: true\n  platforms:\n    telegram:\n      suppress_warning_notifications: false\n")
+    job = {"id": "fixture", "deliver": ["slack:muted", "telegram:allowed"]}
+    delivery_queue.enqueue("mixed", job, "diagnostic", for_failure=True)
+    with patch("cron.scheduler_delivery._deliver_standalone") as send:
+        assert scheduler.drain_delivery_queue({}, None) == 1
+    assert send.call_count == 1
+    assert delivery_queue.get_status("mixed")["status"] == "delivered"
+

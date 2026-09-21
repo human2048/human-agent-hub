@@ -1,0 +1,280 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_channel_directory_connected_only.py ===
+"""Session-based channel discovery must not resurrect disconnected platforms.
+
+Surgical reapply of the directory portion of PR #25959: historical session
+origins for platforms with no connected adapter must not become active
+send_message targets."""
+
+import asyncio
+from unittest.mock import patch
+
+from gateway.channel_directory import build_channel_directory
+from gateway.platforms.base import Platform
+
+
+def test_does_not_resurrect_disconnected_platforms_from_session_history(tmp_path, monkeypatch):
+    cache_file = tmp_path / "channel_directory.json"
+
+    calls = []
+
+    def fake_build_from_sessions(plat_name):
+        calls.append(plat_name)
+        return {"channels": [{"id": "1", "name": "old"}]}
+
+    with patch("gateway.channel_directory._build_from_sessions", side_effect=fake_build_from_sessions), \
+         patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+        # Only telegram is connected; no discord/slack/whatsapp adapters.
+        directory = asyncio.run(build_channel_directory({Platform.TELEGRAM: object()}))
+
+    plats = directory["platforms"]
+    assert "telegram" in plats
+    # Disconnected platforms must not appear via session discovery.
+    for stale in ("whatsapp", "signal", "matrix"):
+        assert stale not in plats, f"{stale} resurrected from session history"
+    assert set(calls) <= {"telegram"}
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_channel_overrides.py ===
+"""Tests for per-channel model and system prompt overrides (Fixes #1955)."""
+
+from unittest.mock import patch
+
+import pytest
+
+from gateway.config import (
+    ChannelOverride,
+    GatewayConfig,
+    Platform,
+    PlatformConfig,
+)
+from gateway.run import _get_channel_override, GatewayRunner
+from gateway.session import SessionSource
+
+
+class TestGetChannelOverride:
+
+
+    def test_no_override_when_channel_not_in_overrides(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "999": ChannelOverride(model="openrouter/healer-alpha"),
+                    },
+                ),
+            },
+        )
+        assert _get_channel_override(config, Platform.DISCORD, "123") is None
+
+    def test_returns_override_when_channel_matches(self):
+        ov = ChannelOverride(
+            model="openrouter/healer-alpha",
+            provider="openrouter",
+            system_prompt="You are a summarizer.",
+        )
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={"1234567890": ov},
+                ),
+            },
+        )
+        result = _get_channel_override(config, Platform.DISCORD, "1234567890")
+        assert result is not None
+        assert result.model == "openrouter/healer-alpha"
+        assert result.provider == "openrouter"
+        assert result.system_prompt == "You are a summarizer."
+
+
+    def test_thread_id_lookup_when_chat_id_misses(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "thread_99": ChannelOverride(model="topic-model"),
+                    },
+                ),
+            },
+        )
+        result = _get_channel_override(
+            config, Platform.DISCORD, "parent_chan", thread_id="thread_99"
+        )
+        assert result is not None
+        assert result.model == "topic-model"
+
+
+class TestResolveModelForChannel:
+    def test_uses_channel_override_when_present(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "chan_1": ChannelOverride(model="anthropic/claude-opus-4.6"),
+                    },
+                ),
+            },
+        )
+        runner = object.__new__(GatewayRunner)
+        runner.config = config
+        model = runner._resolve_model_for_channel(Platform.DISCORD, "chan_1")
+        assert model == "anthropic/claude-opus-4.6"
+
+
+class TestGetSystemPromptForChannel:
+    def test_uses_channel_override_when_present(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "chan_1": ChannelOverride(system_prompt="You are a coding assistant."),
+                    },
+                ),
+            },
+        )
+        runner = object.__new__(GatewayRunner)
+        runner.config = config
+        runner._ephemeral_system_prompt = "Global prompt"
+        prompt = runner._get_system_prompt_for_channel(Platform.DISCORD, "chan_1")
+        assert prompt == "You are a coding assistant."
+
+
+class TestResolveSessionAgentRuntimePriority:
+    """Model/runtime priority: session /model → channel_overrides → global."""
+
+    def test_channel_override_beats_global(self):
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "chan_1": ChannelOverride(
+                            model="channel/model",
+                            provider="openrouter",
+                        ),
+                    },
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan_1",
+            user_id="u1",
+        )
+        with patch("gateway.run._resolve_gateway_model", return_value="global/model"), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "anthropic",
+                 "api_key": "k",
+                 "base_url": "https://api.anthropic.com",
+                 "api_mode": "chat_completions",
+             }), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                 return_value={
+                     "provider": "openrouter",
+                     "api_key": "k2",
+                     "base_url": "https://openrouter.ai/api/v1",
+                     "api_mode": "chat_completions",
+                 },
+             ):
+            model, runtime = runner._resolve_session_agent_runtime(
+                source=source,
+                user_config={"model": {"default": "global/model"}},
+            )
+        assert model == "channel/model"
+        assert runtime["provider"] == "openrouter"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_checkpoint_config.py ===
+"""Runtime coverage for gateway filesystem-checkpoint configuration."""
+
+
+def test_gateway_checkpoint_config_reaches_real_agent(tmp_path, monkeypatch):
+    """Raw gateway YAML must configure the real agent checkpoint manager."""
+    from gateway import run as gateway_run
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        """checkpoints:
+  enabled: true
+  max_snapshots: 11
+  max_total_size_mb: 345
+  max_file_size_mb: 6
+""",
+        encoding="utf-8",
+    )
+
+    config = gateway_run._load_gateway_config()
+    agent = AIAgent(
+        model="anthropic/claude-sonnet-4",
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        provider="openrouter",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        enabled_toolsets=[],
+        **gateway_run._checkpoint_agent_kwargs(config),
+    )
+    try:
+        manager = agent._checkpoint_mgr
+        assert manager.enabled is True
+        assert manager.max_snapshots == 11
+        assert manager.max_total_size_mb == 345
+        assert manager.max_file_size_mb == 6
+    finally:
+        agent.close()
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_checkpoint_prune_housekeeping.py ===
+"""Checkpoint store pruning rides the gateway housekeeping tick, not the constructor.
+
+Its ``git gc`` repacks the whole store (tens of seconds on a GB store); run at construction it
+delayed the control socket, adapters and the code_sha stamp, so the first restart of the day (the
+``hermes update`` one) looked hung and failed fleet verification.
+"""
+
+import gateway.run as gateway_run
+
+
+class _OneTickStopEvent:
+    def __init__(self):
+        self.waited = False
+
+    def is_set(self):
+        return self.waited
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return True
+
+
+def test_gateway_housekeeping_runs_the_checkpoint_prune(monkeypatch):
+    import tools.checkpoint_manager as cm
+
+    calls = []
+    monkeypatch.setattr(cm, "auto_prune_from_config", lambda: calls.append(True) or {"skipped": False})
+
+    gateway_run._start_gateway_housekeeping(_OneTickStopEvent(), interval=0)
+
+    assert calls == [True]
+

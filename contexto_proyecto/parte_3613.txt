@@ -1,0 +1,407 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_cron_deadlock_guard.py ===
+"""Regression tests for #100179: cron-update three-way restart deadlock.
+
+When `hermes update` runs INSIDE the gateway's own process tree (the
+hermes-auto-update cron job), waiting for that gateway to exit is a
+circular wait:
+
+  gateway waits on all in-flight work units (#77184)
+    -> cron agent session waits on the `hermes update` process
+      -> `hermes update` waits on the gateway to exit  [back to A]
+
+The wedged-loop probe cannot break it: the cron session posts activity
+every ~180s (process-tool poll return), so it is never marked wedged and
+the gateway burns the full 1800s force-drain cap.
+
+The fix: when the target gateway PID is an ancestor of this process,
+fire-and-forget (SIGUSR1 + return) instead of drain-waiting.
+"""
+
+from unittest.mock import patch
+
+import pytest
+
+linux_only = pytest.mark.linux_only
+
+
+class TestAncestorDetectionGuard:
+    """_is_pid_ancestor_of_current_process is the deadlock discriminator."""
+
+    def test_own_pid_is_ancestor(self):
+        import os
+
+        from hermes_cli.gateway import _is_pid_ancestor_of_current_process
+
+        assert _is_pid_ancestor_of_current_process(os.getpid()) is True
+
+    def test_parent_pid_is_ancestor(self):
+        import os
+
+        from hermes_cli.gateway import _is_pid_ancestor_of_current_process
+
+        ppid = os.getppid()
+        if ppid <= 1:
+            pytest.skip("no meaningful parent in this environment")
+        assert _is_pid_ancestor_of_current_process(ppid) is True
+
+    def test_unrelated_pid_is_not_ancestor(self):
+        from hermes_cli.gateway import _is_pid_ancestor_of_current_process
+
+        # PID 0 / negative are never ancestors; a very high unlikely PID isn't
+        # either. Use the documented zero/negative contract for determinism.
+        assert _is_pid_ancestor_of_current_process(0) is False
+        assert _is_pid_ancestor_of_current_process(-5) is False
+
+
+@linux_only
+class TestSelfRestartFireAndForget:
+    """_request_gateway_self_restart signals without waiting for exit."""
+
+    def test_refuses_non_ancestor_pid(self):
+        from hermes_cli.gateway import _request_gateway_self_restart
+
+        # A non-ancestor must be refused — signalling an unrelated gateway
+        # and returning immediately would skip its drain entirely.
+        assert _request_gateway_self_restart(0) is False
+
+    def test_signals_ancestor_and_returns_immediately(self):
+        """The ancestor path sends SIGUSR1 and does NOT poll for exit."""
+        import os
+        import signal as _signal
+
+        from hermes_cli import gateway as gw
+
+        sent = []
+
+        def _fake_kill(pid, sig):
+            sent.append((pid, sig))
+
+        with patch.object(gw.os, "kill", side_effect=_fake_kill), patch.object(
+            gw, "_wait_for_pid_exit",
+            side_effect=AssertionError(
+                "fire-and-forget must NOT wait for the gateway to exit — "
+                "that wait is the #100179 deadlock"
+            ),
+        ):
+            ok = gw._request_gateway_self_restart(os.getpid())
+
+        assert ok is True
+        assert sent == [(os.getpid(), _signal.SIGUSR1)]
+
+    def test_graceful_restart_does_wait(self):
+        """Contrast: the non-ancestor path DOES drain-wait (unchanged)."""
+        import signal as _signal
+
+        from hermes_cli import gateway as gw
+
+        waited = []
+
+        with patch.object(gw.os, "kill"), patch.object(
+            gw, "_wait_for_pid_exit",
+            side_effect=lambda pid, t, **_: waited.append((pid, t)) or True,
+        ):
+            ok = gw._graceful_restart_via_sigusr1(4242, drain_timeout=7.0)
+
+        assert ok is True
+        assert waited == [(4242, 7.0)], "drain path must still wait for exit"
+
+
+class TestDrainOrSignalTriage:
+    """_drain_or_signal_gateway_for_update routes the three cases correctly."""
+
+    def _patched(self, monkeypatch, *, ancestor, wedged):
+        from hermes_cli import gateway as gw
+
+        calls = {"self_restart": [], "escalate": [], "drain": []}
+        monkeypatch.setattr(
+            gw, "_is_pid_ancestor_of_current_process", lambda pid: ancestor
+        )
+        monkeypatch.setattr(
+            gw,
+            "probe_gateway_loop_liveness",
+            lambda pid: gw.GATEWAY_LOOP_WEDGED if wedged else "alive",
+        )
+        monkeypatch.setattr(
+            gw,
+            "_request_gateway_self_restart",
+            lambda pid: calls["self_restart"].append(pid) or True,
+        )
+        monkeypatch.setattr(
+            gw, "_escalate_wedged_gateway", lambda pid: calls["escalate"].append(pid)
+        )
+        monkeypatch.setattr(
+            gw,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, drain_timeout, **_: calls["drain"].append((pid, drain_timeout))
+            or True,
+        )
+        return calls
+
+    def test_ancestor_gateway_is_signalled_fire_and_forget(self, monkeypatch):
+        """In-tree gateway (#100179): SIGUSR1 request, NO drain wait."""
+        from hermes_cli.update_cmd import _drain_or_signal_gateway_for_update
+
+        calls = self._patched(monkeypatch, ancestor=True, wedged=False)
+        assert _drain_or_signal_gateway_for_update(1234, 900.0, "svc") is True
+        assert calls["self_restart"] == [1234]
+        assert calls["drain"] == [], "drain-waiting on an ancestor IS the deadlock"
+        assert calls["escalate"] == []
+
+    def test_wedged_gateway_is_escalated(self, monkeypatch):
+        """Provably-dead loop (#81642): bounded escalation, no drain wait."""
+        from hermes_cli.update_cmd import _drain_or_signal_gateway_for_update
+
+        calls = self._patched(monkeypatch, ancestor=False, wedged=True)
+        assert _drain_or_signal_gateway_for_update(1234, 900.0, "svc") is True
+        assert calls["escalate"] == [1234]
+        assert calls["drain"] == []
+        assert calls["self_restart"] == []
+
+    def test_live_out_of_tree_gateway_still_drain_waits(self, monkeypatch):
+        """Normal out-of-tree update keeps the full graceful drain semantics."""
+        from hermes_cli.update_cmd import _drain_or_signal_gateway_for_update
+
+        calls = self._patched(monkeypatch, ancestor=False, wedged=False)
+        assert _drain_or_signal_gateway_for_update(1234, 900.0, "svc") is True
+        assert calls["drain"] == [(1234, 900.0)]
+        assert calls["self_restart"] == []
+        assert calls["escalate"] == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_current_node_repair.py ===
+"""The commit_count == 0 path must repair Node deps, not just Python (#77211).
+
+A previous ``hermes update`` whose npm install failed printed "Fix npm and
+re-run `hermes update`" — but re-running hit the "Already up to date!" early
+return before the Node refresh, so the advice could never work. The repair
+now runs through ``_repair_node_deps_on_current_checkout``, which delegates
+to ``_update_node_dependencies`` (self-gating on the lockfile hash, recorded
+only after a successful install, so healthy installs stay a cheap no-op).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+from hermes_cli import update_cmd
+
+
+def test_current_checkout_repairs_failed_node_deps(capsys):
+    """A recorded failure surfaces the fix-npm hint, not 'Already up to date!'."""
+    completion = MagicMock()
+    with patch.object(
+        update_cmd, "_update_node_dependencies", return_value=["ui-tui, web workspaces"]
+    ), patch.object(update_cmd, "_m") as m:
+        update_cmd._repair_node_deps_on_current_checkout(completion)
+
+    m.return_value._build_web_ui.assert_not_called()
+    completion.assert_called_once()
+    assert "could not be repaired" in completion.call_args[0][0]
+    out = capsys.readouterr().out
+    assert "Node.js refresh failed for: ui-tui, web workspaces" in out
+    assert "Fix npm and re-run `hermes update`." in out
+
+
+def test_current_checkout_healthy_node_deps_reports_up_to_date():
+    """A clean refresh (or lockfile-hash no-op) still says 'Already up to date!'."""
+    completion = MagicMock()
+    with patch.object(
+        update_cmd, "_update_node_dependencies", return_value=[]
+    ), patch.object(update_cmd, "_m") as m, patch.object(
+        update_cmd, "_rebuild_desktop_after_update", return_value=True
+    ):
+        update_cmd._repair_node_deps_on_current_checkout(completion)
+
+    # The refresh pairs with the web build like every other call site.
+    m.return_value._build_web_ui.assert_called_once()
+    completion.assert_called_once_with("✓ Already up to date!")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_desktop_stale_warning.py ===
+"""A failed Desktop pack must not look like a successful update.
+
+#88251: ``hermes update`` treated a failed desktop pack as non-fatal, printed
+an early warning, then still ended with ``✓ Update complete!``. The Python
+side moved on; the Electron app stayed on the previous build.
+
+``_rebuild_desktop_after_update`` returns False only when a rebuild was
+attempted and failed. The final banner then prints ``⚠ Update partially
+complete`` instead of the success line, and gateway mode writes ``1`` to
+``.update_exit_code``.
+"""
+
+import pytest
+
+from hermes_cli import update_cmd
+import hermes_cli.update_cmd_maint as update_cmd_maint
+from hermes_cli.update_cmd import (
+    _print_update_summary,
+    _rebuild_desktop_after_update,
+    _write_gateway_update_exit_code,
+)
+
+
+class _Result:
+    def __init__(self, returncode: int, stdout: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+@pytest.fixture()
+def desktop_env(tmp_path, monkeypatch):
+    """A desktop dir that looks installed and a faked CLI main module."""
+    desktop_dir = tmp_path / "apps" / "desktop"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
+
+    calls = {"builds": 0, "build_needed": True}
+
+    class _FakeMain:
+        PROJECT_ROOT = tmp_path
+
+        @staticmethod
+        def _resolve_node_runtime_npm():
+            return "/fake/npm"
+
+        @staticmethod
+        def _desktop_build_needed(*_a, **_kw):
+            return calls["build_needed"]
+
+        @staticmethod
+        def _run_logged_subprocess(cmd, cwd=None, env=None):
+            calls["builds"] += 1
+            return _Result(1, stdout="Error: [stage-native-deps] boom")
+
+        @staticmethod
+        def _install_rebuilt_desktop_app(_desktop_dir):
+            return [], []
+
+    monkeypatch.setattr(update_cmd, "_m", lambda: _FakeMain)
+    monkeypatch.setattr(
+        "hermes_constants.with_hermes_node_path", lambda: {}, raising=False
+    )
+    monkeypatch.setattr(
+        "hermes_constants.display_hermes_home", lambda: str(tmp_path), raising=False
+    )
+    return desktop_dir, calls
+
+
+def _run(desktop_dir):
+    return _rebuild_desktop_after_update(
+        desktop_dir, had_desktop_app_before_update=True
+    )
+
+
+def test_failed_rebuild_returns_false_and_keeps_the_retry_hint(desktop_env, capsys):
+    desktop_dir, calls = desktop_env
+    assert _run(desktop_dir) is False
+    assert calls["builds"] == 2
+    out = capsys.readouterr().out
+    assert "Desktop build failed" in out
+    assert "stage-native-deps" in out
+    assert "Update complete" not in out
+
+
+def test_successful_rebuild_returns_true(desktop_env, monkeypatch, capsys):
+    desktop_dir, _calls = desktop_env
+    builds = []
+    monkeypatch.setattr(
+        update_cmd._m(),
+        "_run_logged_subprocess",
+        staticmethod(lambda cmd, cwd=None, env=None: builds.append(cmd) or _Result(0)),
+    )
+    assert _run(desktop_dir) is True
+    assert len(builds) == 1
+    assert "Desktop app up to date" in capsys.readouterr().out
+
+
+def test_up_to_date_desktop_returns_true_without_spawning(desktop_env):
+    desktop_dir, calls = desktop_env
+    calls["build_needed"] = False
+    assert _run(desktop_dir) is True
+    assert calls["builds"] == 0
+
+
+def test_desktop_never_installed_returns_true(tmp_path, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_m",
+        lambda: type(
+            "_M",
+            (),
+            {
+                "PROJECT_ROOT": tmp_path,
+                "_resolve_node_runtime_npm": staticmethod(lambda: "/fake/npm"),
+                "_run_logged_subprocess": staticmethod(
+                    lambda *a, **k: spawned.append(1) or _Result(0)
+                ),
+            },
+        ),
+    )
+    missing = tmp_path / "apps" / "desktop"
+    missing.mkdir(parents=True)
+    assert _run(missing) is True
+    assert spawned == []
+
+
+def test_summary_omits_success_banner_when_desktop_rebuild_failed(capsys):
+    _print_update_summary(
+        node_failures=[],
+        desktop_build_ok=False,
+        pre_update_version="0.20.1",
+    )
+    out = capsys.readouterr().out
+    assert "Update complete" not in out
+    assert "partially complete" in out
+    assert "desktop app was not rebuilt" in out
+    assert "hermes desktop" in out
+
+
+def test_summary_keeps_success_banner_when_desktop_ok(capsys, monkeypatch):
+    monkeypatch.setattr(
+        update_cmd, "_update_complete_message", lambda _v: "✓ Update complete! (v0.20.2)"
+    )
+    monkeypatch.setattr(
+        update_cmd_maint, "_update_complete_message", lambda _v: "✓ Update complete! (v0.20.2)"
+    )
+    monkeypatch.setattr(update_cmd, "_branch_head_suffix", lambda *a, **k: "")
+    monkeypatch.setattr(
+        update_cmd, "_post_update_sqlite_runtime_status", lambda: (True, None)
+    )
+    monkeypatch.setattr(
+        update_cmd_maint, "_post_update_sqlite_runtime_status", lambda: (True, None)
+    )
+    _print_update_summary(
+        node_failures=[],
+        desktop_build_ok=True,
+        pre_update_version="0.20.1",
+    )
+    out = capsys.readouterr().out
+    assert "✓ Update complete!" in out
+    assert "partially complete" not in out
+
+
+def test_summary_combines_node_and_desktop_failures(capsys):
+    _print_update_summary(
+        node_failures=["dashboard"],
+        desktop_build_ok=False,
+        pre_update_version="0.20.1",
+    )
+    out = capsys.readouterr().out
+    assert "Update complete" not in out
+    assert "dashboard" in out
+    assert "desktop app was not rebuilt" in out
+
+
+def test_gateway_exit_code_file_tracks_desktop_rebuild(tmp_path, monkeypatch):
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path)
+    _write_gateway_update_exit_code(True)
+    assert (tmp_path / ".update_exit_code").read_text(encoding="utf-8") == "0"
+    _write_gateway_update_exit_code(False)
+    assert (tmp_path / ".update_exit_code").read_text(encoding="utf-8") == "1"
+

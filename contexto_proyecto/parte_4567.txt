@@ -1,0 +1,124 @@
+
+
+=== ARCHIVO: .\hermes-agent\tools\close_preview_tool.py ===
+"""Close the Hermes desktop GUI's preview pane, or one tab (``preview.close``).
+Registration lives in `desktop_preview`. The renderer drops the matching tab — or
+the whole pane when no url is given — only for the window that asked."""
+
+from tools import desktop_ui
+from tools.open_preview_tool import _normalize_target
+
+
+def close_preview_tool(url: str = "") -> str:
+    """Ask the desktop GUI to close the preview pane, or the tab for ``url``."""
+    target = _normalize_target(url or "")
+    return desktop_ui.emit_or_error(
+        "preview.close", {"url": target}, "Failed to close the preview pane: ",
+        "The preview pane is only available in the Hermes desktop app.", {"success": True, "url": target},
+    )
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import json  # noqa: F401,E402
+
+CLOSE_PREVIEW_SCHEMA = {
+    "name": "close_preview",
+    "description": (
+        "Close the preview pane beside the chat in the Hermes desktop app, or one "
+        "tab inside it. Use this when the user asks to close, hide, or dismiss the "
+        "preview — e.g. \"close the preview pane\", \"close cnn.com\", \"hide the "
+        "preview\". Omit url to close the whole pane (every tab). Pass a web URL, "
+        "localhost address, or file path to close only that tab. Counterpart of "
+        "open_preview."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": (
+                    "Optional. The tab to close: a web URL (https://… or a bare "
+                    "domain), a localhost URL, or a file path. Omit to close the "
+                    "whole preview pane."
+                ),
+            },
+        },
+    },
+}
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'registry': ('tools.registry', 'registry'),
+    'tool_error': ('tools.registry', 'tool_error'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\tools\close_terminal_tool.py ===
+"""Close a read-only agent terminal tab in the Hermes desktop GUI WITHOUT killing
+the mirrored ``terminal(background=true)`` process (output keeps buffering; the user
+can reopen it). Routes through the process registry's ``on_close`` sink, which the
+desktop gateway wires to a ``terminal.close`` event. ``desktop_ui`` toolset only."""
+
+import json
+
+from tools.process_registry import process_registry
+from tools.registry import registry, tool_error
+
+
+def close_terminal_tool(process_id: str) -> str:
+    """Ask the desktop GUI to close a background process's read-only tab."""
+    pid = (process_id or "").strip()
+    if not pid:
+        return tool_error("process_id is required (the background process whose tab to close).")
+    return json.dumps(process_registry.request_close_terminal(pid), ensure_ascii=False)
+
+
+CLOSE_TERMINAL_SCHEMA = {
+    "name": "close_terminal",
+    "description": (
+        "Hide a background process's terminal tab (process keeps running) in "
+        "the Hermes desktop GUI (the tabs mirroring terminal(background=true) runs). "
+        "This does NOT kill the process — it only drops the tab/view; the output "
+        "keeps buffering and the user can reopen it from the status stack. Use it "
+        "to tidy up when a background process's live terminal is no longer worth "
+        "showing. To actually stop the process, use process(action='kill') instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "process_id": {
+                "type": "string",
+                "description": (
+                    "The background process's session id (from terminal(background=true) "
+                    "output or process(action='list')) whose tab should be closed."
+                ),
+            },
+        },
+        "required": ["process_id"],
+    },
+}
+
+
+registry.register(
+    name="close_terminal",
+    toolset="desktop_ui",
+    schema=CLOSE_TERMINAL_SCHEMA,
+    handler=lambda args, **kw: close_terminal_tool(process_id=args.get("process_id", "")),
+    emoji="🖥️",
+)
+

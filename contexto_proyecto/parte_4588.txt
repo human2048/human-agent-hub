@@ -1,0 +1,202 @@
+
+
+=== ARCHIVO: .\hermes-agent\tools\delegation_output_schema.py ===
+"""Structured-output schema helpers for delegate_task.
+
+Optional per-task ``output_schema`` (a JSON Schema object): the child gets an
+OUTPUT CONTRACT block appended to its context, the parent validates the final
+answer with jsonschema, and on failure sends exactly ONE bounded retry turn
+carrying the validation errors verbatim (more retries make frontier models
+drop fields that were right the first time; the schema is never re-pasted).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+def coerce_output_schema(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """``(schema, None)`` when usable, ``(None, error)`` when not; ``None`` input
+    passes through as ``(None, None)`` (no schema requested)."""
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        # Models sometimes double-encode the schema as a JSON string.
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, "output_schema must be a JSON Schema object, got a non-JSON string."
+        if not isinstance(raw, dict):
+            return None, "output_schema must be a JSON Schema object."
+    if not isinstance(raw, dict):
+        return None, f"output_schema must be a JSON Schema object, got {type(raw).__name__}."
+    try:
+        from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+        validator_for(raw).check_schema(raw)
+    except ImportError:
+        # Degrade to accepting the dict as-is so delegation still works without jsonschema.
+        logger.debug("jsonschema unavailable; skipping output_schema meta-validation")
+    except Exception as exc:
+        return None, f"output_schema is not a valid JSON Schema: {exc}"
+    return raw, None
+
+
+def append_output_contract(context: Optional[str], schema: Dict[str, Any]) -> str:
+    """Append the explicit output contract block to a child's context."""
+    try:
+        schema_text = json.dumps(schema, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        schema_text = str(schema)
+    block = ("OUTPUT CONTRACT (machine-validated):\n"
+             "Your FINAL response must be ONLY the JSON value that validates against this JSON "
+             "Schema — no prose before or after it, no code fence, no explanation. Anything else "
+             "costs a correction turn and, if it fails again, is handed to the caller unvalidated.\n"
+             f"{schema_text}")
+    base = (context or "").rstrip()
+    return f"{base}\n\n{block}" if base else block
+
+
+def extract_json_candidate(text: str) -> str:
+    """Strip markdown fences and prose around the outermost ``{...}``/``[...]``."""
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        if raw.rstrip().endswith("```"):
+            raw = raw.rstrip()[: -3]
+        raw = raw.strip()
+        if raw.lower().startswith("json\n"):
+            raw = raw.split("\n", 1)[1]
+    # Try each bracket kind's outermost span, earliest opener first, and keep the first that parses:
+    # checking "{" before "[" unconditionally sliced a fenced array down to its first..last object and
+    # rejected every valid array answer.
+    spans = []
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start, end = raw.find(opener), raw.rfind(closer)
+        if start >= 0 and end > start:
+            spans.append((start, raw[start : end + 1]))
+    for _start, candidate in sorted(spans):
+        try:
+            json.loads(candidate)
+            return candidate
+        except ValueError:
+            continue
+    return spans[0][1] if spans else raw
+
+
+def validate_output(text: str, schema: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """``(True, [])`` or ``(False, errors)`` with strings suitable for the retry turn."""
+    candidate = extract_json_candidate(text or "")
+    if not candidate.strip():
+        return False, ["Response was empty — expected a JSON object matching the schema."]
+    try:
+        parsed = json.loads(candidate)
+    except (ValueError, TypeError) as exc:
+        return False, [f"Response is not valid JSON: {exc}"]
+    try:
+        from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+    except ImportError:
+        logger.debug("jsonschema unavailable; accepting parsed JSON without validation")
+        return True, []
+    validator = validator_for(schema)(schema)
+    errors = sorted(validator.iter_errors(parsed), key=lambda e: list(e.absolute_path))
+    rendered = [  # bound error volume for the retry prompt
+        "$" + "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in err.absolute_path) + f": {err.message}"
+        for err in errors[:10]]
+    return not rendered, rendered
+
+
+def build_retry_message(errors: List[str]) -> str:
+    """Single bounded retry turn: errors verbatim, schema deliberately NOT re-pasted."""
+    error_block = "\n".join(f"- {e}" for e in errors)
+    return ("Your previous final response was rejected by the output contract "
+            "validator. Validation errors:\n" f"{error_block}\n\n"
+            "Reply with ONLY the corrected JSON object matching the OUTPUT "
+            "CONTRACT schema from your task context. No prose, no explanations.")
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+MAX_SCHEMA_RETRIES = 1
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\tools\desktop_ui.py ===
+#!/usr/bin/env python3
+"""Bridge desktop-only tools to Hermes-desktop renderer events.
+
+The desktop ``tui_gateway`` installs an emitter via :func:`set_emitter`; elsewhere it
+stays ``None`` and tools report "desktop only". Routing keys off ``HERMES_UI_SESSION_ID``
+so the event lands on the window that owns the turn (the sink is lock-guarded).
+"""
+
+import json
+from typing import Callable, Optional
+
+from gateway.session_context import get_session_env
+from tools.registry import tool_error
+
+# (sid, event, payload) sink, installed by the desktop gateway.
+_emit: Optional[Callable[[str, str, dict], None]] = None
+
+
+def set_emitter(fn: Optional[Callable[[str, str, dict], None]]) -> None:
+    """Install (or clear) the renderer-event sink. Called by the desktop gateway."""
+    global _emit
+    _emit = fn
+
+
+def available() -> bool:
+    """True when running under the desktop app (an emitter is wired)."""
+    return _emit is not None
+
+
+def user_enabled(setting: str, default: bool) -> bool:
+    """Read a desktop Appearance switch from ``display.<setting>``. The renderer mirrors
+    these toggles onto the CONNECTED gateway's config, so this is the user's real answer
+    for local/SSH/URL/cloud gateways alike; ``check_fn``s use it to withdraw a tool from
+    the schema. Unreadable config -> ``default`` so a shipped-on feature does not vanish
+    on a transient read error."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        display = load_config_readonly().get("display")
+    except Exception:
+        return default
+    if not isinstance(display, dict) or setting not in display:
+        return default
+    return bool(display.get(setting))
+
+
+def emit(event: str, payload: dict) -> bool:
+    """Route ``event`` to the window owning the current turn; False when no emitter."""
+    if _emit is None:
+        return False
+    _emit(get_session_env("HERMES_UI_SESSION_ID", ""), event, payload)
+    return True
+
+
+def emit_or_error(event: str, payload: dict, fail_prefix: str, desktop_only: str, result: dict) -> str:
+    """Emit ``event``; ``tool_error`` text on failure (``fail_prefix`` + exception, or
+    ``desktop_only`` when no emitter), else ``result`` as JSON. Calls ``emit`` via the
+    module attribute so tests can patch it."""
+    try:
+        ok = emit(event, payload)
+    except Exception as exc:
+        return tool_error(f"{fail_prefix}{exc}")
+    return json.dumps(result, ensure_ascii=False) if ok else tool_error(desktop_only)
+
+
+def passthrough_json(raw) -> str:
+    """Desktop answers with a JSON object; pass it through, else wrap the raw text."""
+    try:
+        return json.dumps(json.loads(raw), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return json.dumps({"text": str(raw)}, ensure_ascii=False)
+

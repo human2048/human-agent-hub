@@ -1,0 +1,290 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\web-development\har-derived-api-client\scripts\har_capture_cdp.py ===
+#!/usr/bin/env python3
+"""Capture a HAR from a browser you connect to over CDP (not one you launch).
+
+Use this when the browser is owned by someone else and only reachable over the
+Chrome DevTools Protocol: Hermes cloud backends (Browserbase, Browser-Use,
+Firecrawl), a Camofox session exposing CDP, or anything wired via
+`/browser connect <url>` / BROWSER_CDP_URL / browser.cdp_url in config.
+
+Why this exists: Playwright's record_har_path only works on a context you
+launched locally. connect_over_cdp() attaches to an existing browser, so
+record_har is unavailable — we assemble the HAR from CDP Network.* events
+ourselves via page.on("request"/"response").
+
+Usage:
+  python3 har_capture_cdp.py <cdp_url> <output.har> [--wait S] \
+      [--goto URL] [--action "fill:SEL:TEXT"] [--action "click:SEL"] ...
+
+<cdp_url> is the ws:// or http:// CDP endpoint. For Hermes: run
+`/browser connect` to see the active endpoint, or read BROWSER_CDP_URL.
+"""
+import argparse
+import base64
+import json
+import sys
+import time
+
+from playwright.sync_api import sync_playwright
+
+
+def run_action(page, spec: str) -> None:
+    parts = spec.split(":", 2)
+    kind = parts[0]
+    if kind == "fill":
+        page.fill(parts[1], parts[2])
+    elif kind == "press":
+        page.press(parts[1], parts[2])
+    elif kind == "click":
+        page.click(parts[1])
+    elif kind == "goto":
+        page.goto(parts[1] + (":" + parts[2] if len(parts) > 2 else ""))
+    elif kind == "sleep":
+        time.sleep(float(parts[1]))
+    else:
+        raise ValueError(f"unknown action: {spec}")
+
+
+def _har_entry(req, resp):
+    """Build a minimal HAR entry from a Playwright request/response pair."""
+    body_text, encoding = "", ""
+    if resp is not None:
+        try:
+            raw = resp.body()
+            try:
+                body_text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                body_text = base64.b64encode(raw).decode("ascii")
+                encoding = "base64"
+        except Exception:
+            pass
+    post = req.post_data
+    return {
+        "_resourceType": req.resource_type,
+        "request": {
+            "method": req.method,
+            "url": req.url,
+            "headers": [{"name": k, "value": v} for k, v in req.headers.items()],
+            "queryString": [],  # har_to_client.py re-parses the URL, so leave empty
+            "postData": {"mimeType": req.headers.get("content-type", ""),
+                         "text": post} if post else {},
+        },
+        "response": {
+            "status": resp.status if resp else 0,
+            "headers": [{"name": k, "value": v} for k, v in (resp.headers.items() if resp else [])],
+            "content": {
+                "mimeType": (resp.headers.get("content-type", "") if resp else ""),
+                "text": body_text,
+                **({"encoding": encoding} if encoding else {}),
+            },
+        },
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cdp_url")
+    ap.add_argument("har_path")
+    ap.add_argument("--goto", default=None, help="URL to navigate to after attaching")
+    ap.add_argument("--wait", type=float, default=3.0)
+    ap.add_argument("--action", action="append", default=[])
+    args = ap.parse_args()
+
+    entries = []
+    pending = {}  # id(request) -> request
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(args.cdp_url)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.pages[0] if context.pages else context.new_page()
+
+        def on_request(req):
+            pending[id(req)] = req
+
+        def on_response(resp):
+            req = resp.request
+            pending.pop(id(req), None)
+            entries.append(_har_entry(req, resp))
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        if args.goto:
+            page.goto(args.goto, wait_until="domcontentloaded")
+        for spec in args.action:
+            run_action(page, spec)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+        time.sleep(args.wait)
+
+        page.remove_listener("request", on_request)
+        page.remove_listener("response", on_response)
+        # Do NOT close: we connected to someone else's browser.
+
+    har = {"log": {"version": "1.2",
+                   "creator": {"name": "har_capture_cdp", "version": "0.1"},
+                   "entries": entries}}
+    with open(args.har_path, "w", encoding="utf-8") as f:
+        json.dump(har, f)
+    print(f"HAR written: {args.har_path} ({len(entries)} entries)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\web-development\har-derived-api-client\scripts\har_to_client.py ===
+#!/usr/bin/env python3
+"""Distill a HAR file into an API summary an agent can turn into a client.
+
+Usage:
+  python3 har_to_client.py <input.har> [--include-static] [--host SUBSTRING] [--max-body 600]
+
+Filters to XHR/fetch/JSON traffic by default, groups by (method, host, path
+template), and prints per-endpoint: query params, interesting request headers,
+request body sample, response content-type/status, and a response body sample.
+Numeric/UUID-ish path segments are collapsed to {id} so repeated calls group.
+Also prints "### Replay hints": the browser User-Agent plus whether cookies or
+auth/token headers were present -- send those in the derived client or you may
+get a 403/401.
+"""
+import argparse
+import json
+import re
+import sys
+from collections import OrderedDict
+from urllib.parse import urlsplit
+
+BORING_HEADERS = {
+    "accept-encoding", "accept-language", "connection", "content-length",
+    "host", "origin", "referer", "sec-ch-ua", "sec-ch-ua-mobile",
+    "sec-ch-ua-platform", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+    "user-agent", "pragma", "cache-control", "priority", "te",
+    "upgrade-insecure-requests", "cookie",
+}
+ID_SEG = re.compile(r"^(\d+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,})$", re.I)
+STATIC_EXT = re.compile(r"\.(js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|mp4|map)$", re.I)
+
+
+def path_template(path: str) -> str:
+    segs = path.split("/")
+    return "/".join("{id}" if ID_SEG.match(s) else s for s in segs)
+
+
+def is_api_entry(entry: dict) -> bool:
+    req = entry["request"]
+    resp = entry.get("response", {})
+    rtype = (entry.get("_resourceType") or "").lower()
+    mime = (resp.get("content", {}).get("mimeType") or "").lower()
+    if rtype in ("xhr", "fetch"):
+        return True
+    if "json" in mime:
+        return True
+    if req["method"] not in ("GET", "HEAD") and not STATIC_EXT.search(urlsplit(req["url"]).path):
+        return True
+    return False
+
+
+def trunc(text, n: int) -> str:
+    text = text if isinstance(text, str) else str(text)
+    return text if len(text) <= n else text[:n] + f"... [{len(text)} chars total]"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("har")
+    ap.add_argument("--include-static", action="store_true")
+    ap.add_argument("--host", default=None, help="only endpoints whose host contains this")
+    ap.add_argument("--max-body", type=int, default=600)
+    args = ap.parse_args()
+
+    with open(args.har, encoding="utf-8") as f:
+        har = json.load(f)
+
+    groups = OrderedDict()
+    for entry in har["log"]["entries"]:
+        req = entry["request"]
+        url = urlsplit(req["url"])
+        if url.scheme not in ("http", "https"):
+            continue
+        if args.host and args.host not in url.netloc:
+            continue
+        if not args.include_static:
+            if STATIC_EXT.search(url.path) or not is_api_entry(entry):
+                continue
+        key = (req["method"], url.netloc, path_template(url.path))
+        g = groups.setdefault(key, {"count": 0, "queries": set(), "headers": {},
+                                    "req_body": None, "resp": None})
+        g["count"] += 1
+        for q in req.get("queryString", []):
+            g["queries"].add((q["name"], trunc(q["value"], 80)))
+        for h in req.get("headers", []):
+            name = h["name"].lower().lstrip(":")
+            if name in BORING_HEADERS or name in ("method", "path", "scheme", "authority"):
+                continue
+            g["headers"][name] = trunc(h["value"], 120)
+        post = req.get("postData", {})
+        if post.get("text") and g["req_body"] is None:
+            g["req_body"] = (post.get("mimeType", ""), trunc(post["text"], args.max_body))
+        resp = entry.get("response", {})
+        if g["resp"] is None and resp:
+            content = resp.get("content", {})
+            g["resp"] = (resp.get("status"), content.get("mimeType", ""),
+                         trunc(content.get("text") or "", args.max_body))
+
+    if not groups:
+        print("No API-looking entries found. Re-run with --include-static to see everything.")
+        return 1
+
+    # Surface the browser identity so the replay client can match it (many
+    # sites 403 a default library User-Agent).
+    ua = None
+    saw_cookie = saw_auth = False
+    for entry in har["log"]["entries"]:
+        for h in entry["request"].get("headers", []):
+            n = h["name"].lower()
+            if n == "user-agent" and ua is None:
+                ua = h["value"]
+            if n == "cookie":
+                saw_cookie = True
+            if n in ("authorization", "x-api-key") or "token" in n:
+                saw_auth = True
+    print("### Replay hints")
+    if ua:
+        print(f"  User-Agent (send this): {ua}")
+    if saw_cookie:
+        print("  Cookies present -> session may be auth-gated; capture & resend the Cookie header.")
+    if saw_auth:
+        print("  Authorization/token header present -> extract and resend it.")
+
+    for (method, host, path), g in groups.items():
+        print(f"\n=== {method} https://{host}{path}  (x{g['count']})")
+        if g["queries"]:
+            print("  query params:")
+            for name, val in sorted(g["queries"]):
+                print(f"    {name} = {val}")
+        if g["headers"]:
+            print("  request headers (non-boring):")
+            for name, val in sorted(g["headers"].items()):
+                print(f"    {name}: {val}")
+        if g["req_body"]:
+            print(f"  request body ({g['req_body'][0]}):")
+            print(f"    {g['req_body'][1]}")
+        if g["resp"]:
+            status, mime, body = g["resp"]
+            print(f"  response: {status} {mime}")
+            if body:
+                print(f"    {body}")
+    print(f"\n{len(groups)} distinct endpoints.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

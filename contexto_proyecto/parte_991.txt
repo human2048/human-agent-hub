@@ -1,0 +1,165 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\auteur\templates\CINEMA-QA.md ===
+# CINEMA-QA — <project>
+
+> Fill every row with PASS/FAIL + evidence (metric value or screenshot filename). Any FAIL loops back to its phase. Ship only on all-PASS.
+
+| # | Check | PASS/FAIL | Evidence |
+|---|-------|-----------|----------|
+| 1 | slopscan exit 0, all suppressions carry real reasons | | paste the `Summary:` line verbatim, from a run AFTER the last edit |
+| 2 | Screenshot journey reviewed frame-by-frame (390/768/1440) | | shots dir + frames flagged→fixed |
+| 3 | No text overflow / ugly wraps at any breakpoint | | e.g. "fixed S4 h1 at 390" |
+| 4 | No blank / half-fired scenes in any frame | | |
+| 5 | Adjacent scenes differ in layout & motion family | | frame pairs compared |
+| 6 | Exactly one peak (intensity ≥8) on the built page | | scene # |
+| 7 | Scrub replays cleanly scrolling UP | | manual pass |
+| 8 | Reduced-motion cut watchable end-to-end, nothing blank | | rm- frames |
+| 9 | Body contrast ≥4.5:1 (large ≥3:1, placeholders ≥4.5:1) | | measured pairs |
+| 10 | LCP <2.5s (throttled) | | value |
+| 11 | CLS <0.1 | | value |
+| 12 | INP <200ms | | value |
+| 13 | Hero video ≤2MB; poster ≤300KB; frames ≤150KB | | sizes |
+| 14 | Motion budget ≤3 families, matches commit-sheet | | list |
+| 15 | Keyboard: focus visible & designed, no traps, ESC works | | manual pass |
+| 16 | No-JS: content readable, nothing hidden behind reveals | | manual pass |
+| 17 | No console errors during full journey | | shoot.mjs summary |
+| 18 | Mobile: pinned scenes shortened/unpinned, assets 720p | | |
+| 19 | Sound (if any): off by default, gesture-gated, toggle visible | | or n/a |
+| 20 | Watched the film: one slow + one fast full scroll, no felt jank | | |
+| 21 | Perf measured at DPR 2 on the production build, not a dev server | | motionqa line, verbatim |
+| 22 | Reference diff done: own frame vs the recon reference, greyscaled too | | what it did better / what changed / what was left |
+| 23 | chromadiff vs the reference passes (no cheerful drift) | | paste the chromadiff line |
+| 24 | Background lightness within ±0.12 of commit-sheet §2 | | `--target-l` line |
+| 25 | The two house tells named in commit-sheet §7 are actually broken | | which two, and what replaced them |
+
+**Verdict:** SHIP / LOOP BACK TO PHASE …
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\auteur\templates\COMMIT-SHEET.md ===
+# COMMIT-SHEET — <project>
+
+> Seven decisions before the first line of code. A generic answer ("modern, clean") means the decision hasn't been made — stop and make it. Filled example answers below each field: ✗ is what slop looks like, ✓ is the bar.
+
+## 1. Peak / Signature
+<!-- direct: the ONE wow moment. build: the one element a visitor describes to a friend. -->
+…
+> ✗ "beautiful animations throughout"
+> ✓ "peak = scene 4: the espresso machine disassembles into 9 floating parts as you scroll (canvas sequence, 300vh pinned)"
+
+## 2. Color
+<!-- primary as OKLCH + tier (restrained / committed / full-palette / drenched) + why it's not lavender, not cream, not the category reflex
+     + the BACKGROUND LIGHTNESS as a number: target mean L, and one line on why the page lives at that level.
+     "Dark because it's premium" is not a reason — it is the single most common place this skill drifts. -->
+…
+> ✗ "purple gradient, feels techy" · "dark theme, feels premium"
+> ✓ "oklch(0.58 0.19 35) burnt terracotta, tier: committed (~40% of surface). Not the AI lavender; not wellness-beige — terracotta is pulled from the product's clay housing. Background L ≈ 0.55: the machine is photographed in a daylit workshop, and a black page would make the clay read as ceramic-shop-at-night"
+
+## 3. Type
+<!-- display + text pair on a contrast axis + why not Inter -->
+…
+> ✗ "Inter for everything, it's readable"
+> ✓ "display: Fraunces (soft wide serif, brand's warmth) / text: Söhne-class grotesque via 'Archivo'. Axis: high-contrast serif × neutral grotesque. Inter rejected as the 2024–26 default"
+
+## 4. Grid break
+<!-- the ONE concrete thing that breaks the symmetric grid -->
+…
+> ✗ "asymmetric layout"
+> ✓ "product photo in S2 crosses into S3 over the section boundary (−120px overlap), text wraps around it via shape-outside"
+
+## 5. Motion budget
+<!-- ≤3 scroll-pattern families, named -->
+…
+> ✓ "(1) scrub-pinned hero, (2) per-word text reveals on headings, (3) depth parallax in proof section. Nothing else scroll-triggered"
+
+## 6. Reflex check
+<!-- (a) what a generic AI does for this category; (b) what a generic AI avoiding (a) does; (c) our argued deviation from both.
+     If recon ran, (a) is evidence, not a guess — cite what design/refs/REFERENCES.md showed repeatedly. -->
+a) …
+b) …
+c) …
+> ✓ "a) coffee = warm beige + serif + steam photo; b) 'specialty' = black + neon + brutalist menu; c) ours = terracotta drench + technical cutaway drawings of the machine (the brand is engineering-led, not café-cozy)"
+
+## 7. House tells broken
+<!-- The two (minimum) items from taste.md §2.5 you are deliberately NOT doing this time, and what replaces each.
+     (a) and (b) above are reflexes of the CATEGORY; these are the reflexes of this SKILL, which recur across
+     projects that have nothing to do with each other. Naming them is the only thing that stops them. -->
+1. …
+2. …
+> ✓ "1. near-black background → daylit L 0.55 paper, the shadows do the drama instead; 2. mono service labels in the corners → no chrome at all, the only type on screen is the headline and one caption"
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\auteur\templates\DESIGN.md ===
+# DESIGN — <project>
+
+> The style contract. Written once after the build passes QA; read at the START of every subsequent edit. New work that contradicts this file is wrong even if it looks good in isolation — consistency IS the design. Update the file deliberately when the system itself evolves; never drift it silently.
+
+## Identity
+- **The one feeling:** <!-- from the storyboard -->
+- **Signature / peak:** <!-- what a visitor describes to a friend; do not dilute it with competing spectacles -->
+- **Register:** build | direct
+
+## Tokens (verbatim from the shipped CSS)
+```css
+:root {
+  /* colors (OKLCH) — bg, surface, ink, muted, accent, + roles */
+
+  /* type scale (clamp-based) */
+
+  /* spacing scale */
+
+  /* radii, shadows, z-scale */
+
+  /* easing custom properties */
+}
+```
+
+## Typography
+- **Display:** <family, weights, where used, letter-spacing rules>
+- **Text:** <family, sizes, line-heights, measure>
+- **Numerals/mono:** <if any>
+- Pairing axis and the reason (from COMMIT-SHEET). New text styles must come from this system — no new fonts.
+
+## Color rules
+- Commitment tier: <restrained/committed/full/drenched> — accent carries ~N% of surface.
+- What each role means semantically (e.g. "green = money-positive, never decorative").
+- Forbidden in this project: <e.g. gradients entirely; any warm neutral; ...>
+
+## Motion vocabulary
+- The ≤3 scroll families used, with their exact easing/duration/stagger values.
+- Hover/press/focus recipes (copy the shipped values).
+- New sections must reuse an existing family or consciously replace one (budget stays ≤3) — never add a fourth.
+
+## Layout patterns
+- Grid system + the named grid-break(s) in play.
+- Section-opening patterns used (list them; rotate among these, don't invent an eyebrow).
+- Component patterns that exist (cards? tables? ledger rows?) — reuse before inventing.
+
+## Copy voice
+- 2–3 adjectives + one example headline that nails it.
+- Button/label conventions. Banned words stay banned.
+
+## Project ban additions
+- auteur-allow suppressions in force (rule + reason).
+- Anything this project additionally forbids beyond SKILL.md's list.
+
+## Rejected — decisions that already have a history
+
+Everything below was tried and taken out, for a reason the finished page no longer shows. Without this list the next session — or the next model — sees an apparent mistake, confidently "corrects" it to the obvious answer, and reintroduces a problem that was already paid for once. The obvious answer is what got rejected; that is the whole point of the row. Write the row the moment you reject something, not at the end when the reason has evaporated.
+
+| What was tried | Why it lost | What is there instead |
+|---|---|---|
+| <e.g. subject lighter than its field> | <silhouette dissolved; no lighting fixed it> | <subject below the field in value, edges carry the light> |
+| <e.g. volumetric cones for the light shafts> | <read as cheap geometry; three rescue attempts, all worse> | <cut; the glow comes from the interior source alone> |
+
+The same discipline inside the code: a bare constant teaches nothing, so every tuned number says why it is that number and what breaks otherwise — `--scrub-smooth: 0.45; /* >0.6 and the scene visibly lags the cursor */`. Numbers that carry their reason survive being cleaned up by someone who does not know the history.
+
+## Editing protocol
+1. Read this file fully before touching anything.
+2. New section → pick an existing section-opening pattern + an existing motion family + existing tokens.
+3. After any edit: `node <skill>/scripts/slopscan.mjs <src>` and re-shoot the changed viewport(s); compare against neighboring sections for family consistency.
+4. If the edit genuinely needs a new pattern — update THIS file first (that's a design decision, not a patch).
+5. An edit that "fixes" something in the Rejected table is a regression, however reasonable it looks. Disagree in the file first — argue the row, change it, then edit the page.
+

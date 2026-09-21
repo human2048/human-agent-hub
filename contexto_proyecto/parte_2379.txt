@@ -1,0 +1,362 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cleanup_timeout.py ===
+"""Regression tests for bounded cron post-run cleanup.
+
+A cron worker must release its in-memory dispatch guard even when SQLite or an
+agent resource finalizer stops returning after the model turn has ended.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from concurrent.futures import Future
+from unittest.mock import MagicMock, patch
+
+from cron.scheduler import _teardown_cron_agent, run_job
+from cron.scheduler_detached_worker import defer_teardown_to_running_worker
+
+
+_RUNTIME = {
+    "api_key": "test-key",
+    "base_url": "https://example.invalid/v1",
+    "provider": "openrouter",
+    "api_mode": "chat_completions",
+}
+
+
+class HangingSessionDB:
+    def __init__(self, release: threading.Event):
+        self.release = release
+        self.entered = threading.Event()
+
+    def get_compression_tip(self, _session_id):
+        self.entered.set()
+        self.release.wait()
+        return None
+
+    def end_session(self, *_args, **_kwargs):
+        return None
+
+    def close(self):
+        return None
+
+
+class HangingAgent:
+    def __init__(self, release: threading.Event):
+        self.release = release
+        self.entered = threading.Event()
+
+    def close(self):
+        self.entered.set()
+        self.release.wait()
+
+
+def test_run_job_bounds_sessiondb_finalization(tmp_path):
+    release = threading.Event()
+    fake_db = HangingSessionDB(release)
+    job = {"id": "cleanup-sessiondb-hang", "name": "test", "prompt": "hello"}
+
+    try:
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.02):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            started = time.monotonic()
+            success, _output, final_response, error = run_job(job)
+            elapsed = time.monotonic() - started
+
+        assert fake_db.entered.wait(timeout=2.0)
+        assert elapsed < 5.0
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+    finally:
+        release.set()
+
+
+def test_agent_teardown_is_bounded():
+    release = threading.Event()
+    agent = HangingAgent(release)
+
+    try:
+        started = time.monotonic()
+        _teardown_cron_agent(agent, "cleanup-agent-hang", timeout_seconds=0.02)
+        elapsed = time.monotonic() - started
+
+        assert agent.entered.wait(timeout=2.0)
+        assert elapsed < 5.0
+    finally:
+        release.set()
+
+
+def test_detached_worker_teardown_waits_for_future():
+    """A timed-out worker keeps its agent and SessionDB until its Future completes."""
+    future = Future()
+    fake_db = MagicMock()
+    agent = MagicMock()
+
+    with patch("cron.scheduler._finalize_cron_session") as finalize, \
+         patch("cron.scheduler._teardown_cron_agent") as teardown_agent:
+        assert defer_teardown_to_running_worker(
+            future, fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker") is True
+        finalize.assert_not_called()
+        teardown_agent.assert_not_called()
+
+        future.set_result({"final_response": "late"})
+
+        finalize.assert_called_once_with(fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker")
+        teardown_agent.assert_called_once_with(agent, "detached-worker")
+    assert defer_teardown_to_running_worker(
+        future, fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker") is False
+
+
+def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
+    """A second scheduler tick can fire the same job after cleanup times out."""
+    import cron.scheduler as sched
+
+    release = threading.Event()
+    fake_db = HangingSessionDB(release)
+    job = {
+        "id": "cleanup-guard-hang",
+        "name": "cleanup-guard-hang",
+        "prompt": "hello",
+        "schedule": "every 5m",
+        "enabled": True,
+        "next_run_at": "2020-01-01T00:00:00",
+        "deliver": "local",
+    }
+    sched._parallel_pool = None
+    sched._parallel_pool_max_workers = None
+    sched._running_job_ids.clear()
+
+    try:
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.02), \
+             patch.object(sched, "get_due_jobs", return_value=[job]), \
+             patch.object(sched, "advance_next_runs"), \
+             patch.object(sched, "save_job_output", return_value="/tmp/out"), \
+             patch.object(sched, "mark_job_run"), \
+             patch.object(sched, "_deliver_result", return_value=None):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            assert sched.tick(verbose=False) == 1
+            assert "cleanup-guard-hang" not in sched.get_running_job_ids()
+            assert sched.tick(verbose=False) == 1
+    finally:
+        release.set()
+        sched._running_job_ids.discard("cleanup-guard-hang")
+        sched._shutdown_parallel_pool()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_codex_execution_paths.py ===
+import asyncio
+import sys
+import types
+from types import SimpleNamespace
+
+
+sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
+sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
+sys.modules.setdefault("fal_client", types.SimpleNamespace())
+
+import cron.scheduler as cron_scheduler
+import gateway.run as gateway_run
+import run_agent
+from gateway.config import Platform
+from gateway.session import SessionSource
+
+
+def _patch_agent_bootstrap(monkeypatch):
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **kwargs: [
+            {
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "description": "Run shell commands.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+
+
+def _codex_message_response(text: str):
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3, total_tokens=8),
+        status="completed",
+        model="gpt-5-codex",
+    )
+
+
+class _UnauthorizedError(RuntimeError):
+    def __init__(self):
+        super().__init__("Error code: 401 - unauthorized")
+        self.status_code = 401
+
+
+class _FakeOpenAI:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def close(self):
+        return None
+
+
+class _Codex401ThenSuccessAgent(run_agent.AIAgent):
+    refresh_attempts = 0
+    last_init = {}
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("skip_context_files", True)
+        kwargs.setdefault("skip_memory", True)
+        kwargs.setdefault("max_iterations", 4)
+        type(self).last_init = dict(kwargs)
+        super().__init__(*args, **kwargs)
+        self._cleanup_task_resources = lambda task_id: None
+        self._persist_session = lambda messages, history=None: None
+        self._save_trajectory = lambda messages, user_message, completed: None
+
+    def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
+        type(self).refresh_attempts += 1
+        return True
+
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        calls = {"api": 0}
+
+        def _fake_api_call(api_kwargs):
+            calls["api"] += 1
+            if calls["api"] == 1:
+                raise _UnauthorizedError()
+            return _codex_message_response("Recovered via refresh")
+
+        self._interruptible_api_call = _fake_api_call
+        return super().run_conversation(user_message, conversation_history=conversation_history, task_id=task_id)
+
+
+def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None, **kwargs: {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    _Codex401ThenSuccessAgent.refresh_attempts = 0
+    _Codex401ThenSuccessAgent.last_init = {}
+
+    success, output, final_response, error = cron_scheduler.run_job(
+        {"id": "job-1", "name": "Codex Refresh Test", "prompt": "ping", "model": "gpt-5.3-codex"}
+    )
+
+    assert success is True
+    assert error is None
+    assert final_response == "Recovered via refresh"
+    assert "Recovered via refresh" in output
+    assert _Codex401ThenSuccessAgent.refresh_attempts == 1
+    assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
+    assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+
+
+def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+        },
+    )
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+    monkeypatch.setenv("HERMES_MODEL", "gpt-5.3-codex")
+
+    _Codex401ThenSuccessAgent.refresh_attempts = 0
+    _Codex401ThenSuccessAgent.last_init = {}
+
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._running_agents = {}
+    from unittest.mock import MagicMock, AsyncMock
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.hooks.loaded_hooks = []
+    runner._session_db = None
+    # Ensure model resolution returns the codex model even if xdist
+    # leaked env vars cleared HERMES_MODEL.
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_resolve_turn_agent_config",
+        lambda self, msg, model, runtime: {
+            "model": model or "gpt-5.3-codex",
+            "runtime": runtime,
+        },
+    )
+
+    source = SessionSource(
+        platform=Platform.LOCAL,
+        chat_id="cli",
+        chat_name="CLI",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = asyncio.run(
+        runner._run_agent(
+            message="ping",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key="agent:main:local:dm",
+        )
+    )
+
+    assert result["final_response"] == "Recovered via refresh"
+    assert _Codex401ThenSuccessAgent.refresh_attempts == 1
+    assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
+    assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+

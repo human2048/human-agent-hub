@@ -1,0 +1,310 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_exit_cleanup_interrupt.py ===
+"""Tests for KeyboardInterrupt handling in exit cleanup paths.
+
+``except Exception`` does not catch ``KeyboardInterrupt`` (which inherits
+from ``BaseException``).  A second Ctrl+C during exit cleanup must not
+abort remaining cleanup steps.  These tests exercise the actual production
+code paths — not a copy of the try/except pattern.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _mock_runtime_provider(monkeypatch):
+    """run_job calls resolve_runtime_provider which can try real network
+    auto-detection (~4s of socket timeouts in hermetic CI). Mock it out
+    since these tests don't care about provider resolution — the agent
+    is mocked too."""
+    import hermes_cli.runtime_provider as rp
+    def _fake_resolve(*args, **kwargs):
+        return {
+            "provider": "openrouter",
+            "api_key": "test-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "model": "test/model",
+            "api_mode": "chat_completions",
+        }
+    monkeypatch.setattr(rp, "resolve_runtime_provider", _fake_resolve)
+
+
+class TestCronJobCleanup:
+    """cron/scheduler.py — end_session + close in the finally block."""
+
+    def test_keyboard_interrupt_in_end_session_does_not_skip_close(self):
+        """If end_session raises KeyboardInterrupt, close() must still run."""
+        mock_db = MagicMock()
+        mock_db.end_session.side_effect = KeyboardInterrupt
+
+        from cron import scheduler
+        from cron import scheduler_delivery as sched_delivery
+
+        job = {
+            "id": "test-job-1",
+            "name": "test cleanup",
+            "prompt": "hello",
+            "schedule": "0 9 * * *",
+            "model": "test/model",
+        }
+
+        with patch("hermes_state_registry.acquire", return_value=mock_db), \
+             patch.object(scheduler, "_build_job_prompt", return_value="hello"), \
+             patch.object(sched_delivery, "_resolve_origin", return_value=None), \
+             patch.object(scheduler, "_resolve_delivery_target", return_value=None), \
+             patch("dotenv.load_dotenv", return_value=None), \
+             patch("run_agent.AIAgent") as MockAgent:
+            # Make the agent raise immediately so we hit the finally block
+            MockAgent.return_value.run_conversation.side_effect = RuntimeError("boom")
+            scheduler.run_job(job)
+
+        mock_db.end_session.assert_called_once()
+        mock_db.close.assert_called_once()
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_export_current_turn_boundary.py ===
+"""The loop exports ``{turn_id, current_turn_user_idx}`` beside the exact ``messages`` it
+addresses, and only when that row is this turn's user message verbatim.
+
+Hosts that settle a transcript by index (hermes-webui) must not guess the current-turn
+row after the loop rewrote history (alternation repair, compaction, post-turn
+micro-compaction): with a repeated prompt a guessed index or a text match relabels the
+historical copy and claims its old answer. The producer therefore proves the coordinate on
+the final list; when it cannot, the keys are omitted and hosts fail closed.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agent.turn_context import export_current_turn_boundary
+
+
+class _Agent:
+    def __init__(self, turn_id="session:task:abcd1234"):
+        self._current_turn_id = turn_id
+        self._persist_user_message_idx = None
+
+
+@pytest.mark.parametrize("user_message, messages, expected_idx", [
+    # a repeated prompt resolves to the LAST verbatim row, never the historical copy
+    ("same question", [
+        {"role": "user", "content": "same question"}, {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "same question"}, {"role": "assistant", "content": "new answer"},
+    ], 2),
+    # multimodal content matches by structural equality
+    ([{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:x"}}],
+     [{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:x"}}]},
+      {"role": "assistant", "content": "ok"}], 0),
+    # a row the repair rewrote (merge-into-tail) is not a proven boundary: export nothing
+    ("same question", [{"role": "user", "content": "summary\n\nsame question"}, {"role": "assistant", "content": "answer"}], None),
+    # no current row at all: export nothing, persist override untouched
+    ("another question", [{"role": "user", "content": "same question"}, {"role": "assistant", "content": "old answer"}], None),
+])
+def test_boundary_is_exported_only_for_the_verbatim_current_row(user_message, messages, expected_idx):
+    agent = _Agent()
+    result = export_current_turn_boundary(agent, {"messages": messages}, user_message)
+    if expected_idx is None:
+        assert "current_turn_user_idx" not in result and "turn_id" not in result
+    else:
+        assert result["current_turn_user_idx"] == expected_idx
+        assert result["turn_id"] == agent._current_turn_id
+    # the persist funnel has already run by the time the envelope is stamped: never re-anchor it here
+    assert agent._persist_user_message_idx is None
+
+
+def test_preflight_timeout_envelope_exports_nothing():
+    """The preflight-timeout result carries the prior history without this turn's row (#7100);
+    a repeated prompt must not be resolved to its historical copy."""
+    agent = _Agent()
+    result = {"messages": [{"role": "user", "content": "continue"}, {"role": "assistant", "content": "old"}],
+              "turn_exit_reason": "context_compression_timeout"}
+    out = export_current_turn_boundary(agent, result, "continue")
+    assert "current_turn_user_idx" not in out and "turn_id" not in out
+
+
+@pytest.fixture()
+def loop_agent():
+    from run_agent import AIAgent
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        a = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        a.client = MagicMock()
+        a._cached_system_prompt = "You are helpful."
+        a._use_prompt_caching = False
+        a.compression_enabled = False
+        a.save_trajectories = False
+        return a
+
+
+def _stub(content, finish_reason="stop"):
+    from tests.agent.test_run_agent import _mock_assistant_msg
+
+    return SimpleNamespace(
+        id="chatcmpl-test",
+        model="test/model",
+        choices=[SimpleNamespace(index=0, message=_mock_assistant_msg(content=content), finish_reason=finish_reason)],
+        usage=None,
+    )
+
+
+def test_run_conversation_exports_the_pair_on_a_success_envelope(loop_agent):
+    loop_agent.client.chat.completions.create.side_effect = [_stub("new answer")]
+    history = [
+        {"role": "user", "content": "same question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    with (
+        patch.object(loop_agent, "_persist_session"),
+        patch.object(loop_agent, "_save_trajectory"),
+        patch.object(loop_agent, "_cleanup_task_resources"),
+    ):
+        result = loop_agent.run_conversation("same question", conversation_history=history)
+
+    assert result["completed"] is True
+    idx = result["current_turn_user_idx"]
+    assert result["messages"][idx]["role"] == "user"
+    assert result["messages"][idx]["content"] == "same question"
+    assert idx > 0  # the historical identical prompt at index 0 is never the export
+    assert result["turn_id"] == loop_agent._current_turn_id
+    assert result["messages"][-1]["content"] == "new answer"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_external_skills.py ===
+"""Tests for external skill directories (skills.external_dirs config)."""
+
+import json
+import os
+from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture
+def external_skills_dir(tmp_path):
+    """Create a temp dir with a sample external skill."""
+    ext_dir = tmp_path / "external-skills"
+    skill_dir = ext_dir / "my-external-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: my-external-skill\ndescription: A skill from an external directory\n---\n\n# My External Skill\n\nDo external things.\n"
+    )
+    return ext_dir
+
+
+@pytest.fixture
+def hermes_home(tmp_path):
+    """Create a minimal HERMES_HOME with config."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "skills").mkdir()
+    return home
+
+
+class TestGetExternalSkillsDirs:
+    def test_empty_config(self, hermes_home):
+        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            from agent.skill_utils import get_external_skills_dirs
+            result = get_external_skills_dirs()
+        assert result == []
+
+
+    def test_valid_dir_returned(self, hermes_home, external_skills_dir):
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            from agent.skill_utils import get_external_skills_dirs
+            result = get_external_skills_dirs()
+        assert len(result) == 1
+        assert result[0] == external_skills_dir.resolve()
+
+
+
+
+
+
+class TestGetAllSkillsDirs:
+    def test_local_always_first(self, hermes_home, external_skills_dir):
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            from agent.skill_utils import get_all_skills_dirs
+            result = get_all_skills_dirs()
+        assert result[0] == hermes_home / "skills"
+        assert result[1] == external_skills_dir.resolve()
+
+
+class TestExternalSkillsInFindAll:
+    def test_external_skills_found(self, hermes_home, external_skills_dir):
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        local_skills = hermes_home / "skills"
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import _find_all_skills
+            skills = _find_all_skills()
+        names = [s["name"] for s in skills]
+        assert "my-external-skill" in names
+
+    def test_local_takes_precedence(self, hermes_home, external_skills_dir):
+        """If the same skill name exists locally and externally, local wins."""
+        local_skills = hermes_home / "skills"
+        local_skill = local_skills / "my-external-skill"
+        local_skill.mkdir(parents=True)
+        (local_skill / "SKILL.md").write_text(
+            "---\nname: my-external-skill\ndescription: Local version\n---\n\nLocal.\n"
+        )
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import _find_all_skills
+            skills = _find_all_skills()
+        matching = [s for s in skills if s["name"] == "my-external-skill"]
+        assert len(matching) == 1
+        assert matching[0]["description"] == "Local version"
+
+
+class TestExternalSkillView:
+    def test_skill_view_finds_external(self, hermes_home, external_skills_dir):
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        local_skills = hermes_home / "skills"
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import skill_view
+            result = json.loads(skill_view("my-external-skill"))
+        assert result["success"] is True
+        assert "external things" in result["content"]
+

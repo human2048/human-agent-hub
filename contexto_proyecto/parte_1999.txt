@@ -1,0 +1,281 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_copilot_acp_deprecation.py ===
+"""Tests for gh-copilot CLI deprecation detection and GitHub Models Azure URL mapping."""
+
+import pytest
+
+from agent.copilot_acp_client import _is_gh_copilot_deprecation_message
+
+
+class TestDeprecationPatternDetection:
+    """Verify that stderr from the deprecated `gh copilot` extension is caught
+    without false-positiving on the new `@github/copilot` CLI."""
+
+    _REAL_DEPRECATION_STDERR = (
+        "The gh-copilot extension has been deprecated in favor of the newer "
+        "GitHub Copilot CLI.\nFor more information, visit:\n"
+        "- Copilot CLI: https://github.com/github/copilot-cli\n"
+        "- Deprecation announcement: https://github.blog/changelog/"
+        "2025-09-25-upcoming-deprecation-of-gh-copilot-cli-extension\n"
+        "No commands will be executed."
+    )
+
+    def test_real_deprecation_message_matches(self):
+        assert _is_gh_copilot_deprecation_message(self._REAL_DEPRECATION_STDERR)
+
+    @pytest.mark.parametrize(
+        "stderr_text",
+        [
+            # The deprecation banner uses both halves of the fingerprint.
+            "The gh-copilot extension has been deprecated.",
+            "gh-copilot: no commands will be executed.",
+            # Mixed casing — match is case-insensitive.
+            "The GH-Copilot Extension HAS BEEN DEPRECATED.",
+        ],
+    )
+    def test_genuine_deprecation_variants_match(self, stderr_text: str):
+        assert _is_gh_copilot_deprecation_message(stderr_text)
+
+    @pytest.mark.parametrize(
+        "stderr_text",
+        [
+            # Generic errors — no fingerprint at all.
+            "Error: connection refused",
+            "",
+            # The NEW @github/copilot CLI's repo is github.com/github/copilot-cli.
+            # Its stderr can legitimately mention "copilot-cli" or "deprecation"
+            # in unrelated contexts; neither alone should trip the detector.
+            "copilot-cli: failed to authenticate with the API",
+            "warning: the --foo flag is scheduled for deprecation in v3",
+            "See https://github.com/github/copilot-cli/issues for support",
+            # Half the fingerprint without the other half.
+            "gh-copilot: command not found",
+            "extension has been deprecated (some other extension)",
+        ],
+    )
+    def test_does_not_false_positive(self, stderr_text: str):
+        assert not _is_gh_copilot_deprecation_message(stderr_text)
+
+
+class TestGitHubModelsAzureUrl:
+    """Verify that the Azure GitHub Models URL is recognised."""
+
+    def test_url_to_provider_contains_azure_models(self):
+        from agent.model_metadata import _URL_TO_PROVIDER
+
+        # Maps to the canonical "copilot" provider (same convention as the
+        # other GitHub-family entries) — not the "github-models" alias.
+        assert _URL_TO_PROVIDER.get("models.inference.ai.azure.com") == "copilot"
+
+    def test_is_github_models_base_url_recognises_azure(self):
+        from hermes_cli.models import _is_github_models_base_url
+
+        assert _is_github_models_base_url("https://models.inference.ai.azure.com")
+        assert _is_github_models_base_url("https://models.inference.ai.azure.com/v1/chat")
+
+    def test_is_github_models_base_url_still_recognises_github_ai(self):
+        from hermes_cli.models import _is_github_models_base_url
+
+        assert _is_github_models_base_url("https://models.github.ai/inference")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_copilot_initiator.py ===
+"""Tests for per-turn Copilot x-initiator header injection (issue #3040).
+
+Copilot bills "premium requests" only when a request is marked as
+user-initiated via the ``x-initiator: user`` header. Hermes previously sent
+``x-initiator: agent`` on every request (client-level default headers), so
+user prompts never consumed premium requests and were throttled as agent
+traffic. The fix marks the FIRST API call of each user turn as "user" and
+lets tool-loop follow-ups keep the "agent" default.
+
+Salvaged from PR #4097 (@tjp2021); adapted to the post-refactor layout
+(conversation_loop.py owns the injection site, the codex transport now
+accepts extra_headers).
+"""
+
+import pytest
+
+from run_agent import AIAgent
+
+
+def _tool_defs(*names):
+    return [
+        {"type": "function", "function": {"name": n, "description": n, "parameters": {}}}
+        for n in names
+    ]
+
+
+class _FakeOpenAI:
+    def __init__(self, **kw):
+        self.api_key = kw.get("api_key", "test")
+        self.base_url = kw.get("base_url", "http://test")
+
+    def close(self):
+        pass
+
+
+def _make_agent(monkeypatch, base_url, api_mode="chat_completions"):
+    """Create an AIAgent pointing at the given base_url."""
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: _tool_defs("web_search"))
+    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
+    return AIAgent(
+        api_key="test-key",
+        base_url=base_url,
+        provider="copilot" if "githubcopilot" in base_url else "openrouter",
+        api_mode=api_mode,
+        max_iterations=4,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+
+def _inject(agent, api_kwargs):
+    """Mirror the injection block in agent/conversation_loop.py."""
+    if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
+        _xh = dict(api_kwargs.get("extra_headers") or {})
+        _xh["x-initiator"] = "user"
+        api_kwargs["extra_headers"] = _xh
+        agent._is_user_initiated_turn = False
+    return api_kwargs
+
+
+class TestIsCopilotUrl:
+    """_is_copilot_url() detects GitHub Copilot endpoints."""
+
+    def test_standard_copilot_url(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://api.githubcopilot.com")
+        assert agent._is_copilot_url() is True
+
+
+    def test_github_models_url(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://models.github.ai/inference")
+        assert agent._is_copilot_url() is True
+
+    def test_openrouter_url(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://openrouter.ai/api/v1")
+        assert agent._is_copilot_url() is False
+
+    def test_case_insensitive(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://API.GITHUBCOPILOT.COM")
+        assert agent._is_copilot_url() is True
+
+
+class TestUserInitiatedTurnFlag:
+    """_is_user_initiated_turn lifecycle."""
+
+    def test_default_is_false(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://api.githubcopilot.com")
+        assert agent._is_user_initiated_turn is False
+
+    def test_reset_session_clears_flag(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://api.githubcopilot.com")
+        agent._is_user_initiated_turn = True
+        agent.reset_session_state()
+        assert agent._is_user_initiated_turn is False
+
+
+class TestFlagFlipOnInjection:
+    """Flag flips immediately on injection so tool-loop calls use 'agent'."""
+
+    def test_first_call_injects_user_initiator(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://api.githubcopilot.com")
+        agent._is_user_initiated_turn = True
+        kwargs = _inject(agent, {})
+        assert kwargs["extra_headers"] == {"x-initiator": "user"}
+        assert agent._is_user_initiated_turn is False
+
+    def test_second_call_has_no_injection(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://api.githubcopilot.com")
+        agent._is_user_initiated_turn = True
+        kwargs1 = _inject(agent, {})
+        kwargs2 = _inject(agent, {})
+        assert "extra_headers" in kwargs1
+        assert "extra_headers" not in kwargs2
+
+
+    def test_non_copilot_flag_not_flipped(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "https://openrouter.ai/api/v1")
+        agent._is_user_initiated_turn = True
+        kwargs = _inject(agent, {})
+        assert "extra_headers" not in kwargs
+        # Flag unchanged — non-Copilot path doesn't touch it
+        assert agent._is_user_initiated_turn is True
+
+
+class TestHeaderValues:
+    """copilot_default_headers(is_agent_turn=...) sets x-initiator correctly."""
+
+    def test_default_is_agent(self):
+        from hermes_cli.models import copilot_default_headers
+        assert copilot_default_headers()["x-initiator"] == "agent"
+
+    def test_user_turn(self):
+        from hermes_cli.models import copilot_default_headers
+        assert copilot_default_headers(is_agent_turn=False)["x-initiator"] == "user"
+
+    def test_agent_turn_explicit(self):
+        from hermes_cli.models import copilot_default_headers
+        assert copilot_default_headers(is_agent_turn=True)["x-initiator"] == "agent"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_copilot_native_vision_headers.py ===
+from unittest.mock import MagicMock, patch
+
+from run_agent import AIAgent
+
+
+def _make_copilot_agent():
+    with patch("agent.process_bootstrap.OpenAI") as mock_openai:
+        mock_openai.return_value = MagicMock()
+        agent = AIAgent(
+            api_key="gh-token",
+            base_url="https://api.githubcopilot.com",
+            provider="copilot",
+            model="gpt-5.4",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    return agent
+
+
+def test_request_client_adds_copilot_vision_header_for_native_image_payload():
+    agent = _make_copilot_agent()
+    built_kwargs = []
+
+    def fake_create(kwargs, *, reason, shared):
+        built_kwargs.append(dict(kwargs))
+        return MagicMock()
+
+    api_kwargs = {
+        "model": "gpt-5.4",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }
+        ],
+    }
+
+    agent.client = object()
+    with patch.object(agent, "_is_openai_client_closed", return_value=False), patch.object(
+        agent, "_create_openai_client", side_effect=fake_create
+    ):
+        agent._create_request_openai_client(reason="test", api_kwargs=api_kwargs)
+
+    headers = built_kwargs[-1]["default_headers"]
+    assert headers["Copilot-Vision-Request"] == "true"
+
+
+
+
+

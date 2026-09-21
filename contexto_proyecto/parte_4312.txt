@@ -1,0 +1,390 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_stage2_hook_nous_routing_env.py ===
+"""Regression tests for the stage2 Nous routing-override sync.
+
+Hosted deploys carry ``HERMES_PORTAL_BASE_URL`` / ``NOUS_INFERENCE_BASE_URL`` only in the container
+environment. Under ``GATEWAY_MULTIPLEX_PROFILES`` both resolve through the profile secret scope
+(#108319 / #111809), built from ``<profile>/.env`` with no ``os.environ`` fallback, so stage2 must
+carry the container value into every served profile's ``.env`` — and take it out again when the
+platform stops setting it.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from agent.secret_scope import load_env_file
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+STAGE2_HOOK = REPO_ROOT / "docker" / "stage2-hook.sh"
+
+PORTAL = "https://portal.staging-nousresearch.com"
+INFERENCE = "https://stg-inference-api.nousresearch.com/v1"
+NAMES = ("HERMES_PORTAL_BASE_URL", "NOUS_PORTAL_BASE_URL", "NOUS_INFERENCE_BASE_URL")
+
+
+@pytest.fixture(scope="module")
+def stage2_text() -> str:
+    if not STAGE2_HOOK.exists():
+        pytest.skip("docker/stage2-hook.sh not present in this checkout")
+    return STAGE2_HOOK.read_text()
+
+
+def _sync_block(text: str) -> str:
+    start = text.index("# --- Sync deploy-injected Nous routing overrides")
+    end = text.index("# .env holds API keys and secrets", start)
+    return text[start:end]
+
+
+def _path_guard_functions(text: str) -> str:
+    start = text.index("path_has_symlink_component() {")
+    end = text.index("\n\nchown_hermes_tree() {", start)
+    return text[start:end]
+
+
+def _run_sync(stage2_text: str, home: Path, env: dict[str, str | None]) -> subprocess.CompletedProcess[str]:
+    if shutil.which("sh") is None:
+        pytest.skip("sh not available")
+    env = {name: env.get(name) for name in NAMES}
+    env_setup = "".join(f"unset {k}\n" if v is None else f"{k}='{v}'\n" for k, v in env.items())
+    script = (
+        "set -eu\n"  # production runs the hook under set -eu
+        f"{env_setup}"
+        f'HERMES_HOME="{home}"\n'
+        'as_hermes() { "$@"; }\n'
+        f"{_path_guard_functions(stage2_text)}\n"
+        f"{_sync_block(stage2_text)}\n"
+    )
+    return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+
+
+def _assignments(path: Path, name: str) -> list[str]:
+    return [ln for ln in path.read_text().splitlines() if ln.startswith(f"{name}=")]
+
+
+def test_container_values_reach_home_and_every_profile_env(stage2_text: str, tmp_path: Path) -> None:
+    """All three overrides land in $HERMES_HOME/.env and each profiles/*/.env (created 0600 when
+    missing), unrelated secrets survive, and the runtime tokenizer reads the marked line back."""
+    home = tmp_path / "home"
+    (home / "profiles" / "work").mkdir(parents=True)
+    (home / "profiles" / "ops").mkdir()
+    (home / ".env").write_text("API_SERVER_KEY=abc\n")
+    (home / "profiles" / "ops" / ".env").write_text("SLACK_BOT_TOKEN=xoxb-x\n")
+
+    result = _run_sync(stage2_text, home, {"HERMES_PORTAL_BASE_URL": PORTAL, "NOUS_PORTAL_BASE_URL": PORTAL,
+                                           "NOUS_INFERENCE_BASE_URL": INFERENCE})
+
+    assert result.returncode == 0, result.stderr
+    for env_file in (home / ".env", home / "profiles" / "work" / ".env", home / "profiles" / "ops" / ".env"):
+        parsed = load_env_file(env_file)
+        assert parsed["HERMES_PORTAL_BASE_URL"] == parsed["NOUS_PORTAL_BASE_URL"] == PORTAL, env_file
+        assert parsed["NOUS_INFERENCE_BASE_URL"] == INFERENCE, env_file
+        assert len(_assignments(env_file, "HERMES_PORTAL_BASE_URL")) == 1, env_file
+    assert load_env_file(home / ".env")["API_SERVER_KEY"] == "abc"
+    assert load_env_file(home / "profiles" / "ops" / ".env")["SLACK_BOT_TOKEN"] == "xoxb-x"
+    assert ((home / "profiles" / "work" / ".env").stat().st_mode & 0o777) == 0o600
+
+
+def test_container_wins_over_stale_line_then_idempotent_then_removed_when_unset(stage2_text: str, tmp_path: Path) -> None:
+    """Boot 1: a stale line is replaced (one assignment). Boot 2 (same value): the volume is not rewritten.
+    Boot 3 (variable gone): the stage2-written line is removed while hand-set lines stay. A read-only file
+    degrades to a warning; a symlinked .env is never written through."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env_file = home / ".env"
+    env_file.write_text("HERMES_PORTAL_BASE_URL=https://portal.nousresearch.com\nNOUS_INFERENCE_BASE_URL=https://by-hand/v1\nOTHER=1\n")
+
+    first = _run_sync(stage2_text, home, {"HERMES_PORTAL_BASE_URL": PORTAL})
+    assert first.returncode == 0, first.stderr
+    assert load_env_file(env_file)["HERMES_PORTAL_BASE_URL"] == PORTAL
+    assert len(_assignments(env_file, "HERMES_PORTAL_BASE_URL")) == 1
+    assert "Synced HERMES_PORTAL_BASE_URL" in first.stdout
+
+    before = env_file.stat().st_mtime_ns
+    os.utime(env_file, ns=(before - 5_000_000_000, before - 5_000_000_000))
+    stamped = env_file.stat().st_mtime_ns
+    second = _run_sync(stage2_text, home, {"HERMES_PORTAL_BASE_URL": PORTAL})
+    assert second.returncode == 0, second.stderr
+    assert env_file.stat().st_mtime_ns == stamped, "an already-correct line must not rewrite the volume"
+    assert "Synced" not in second.stdout
+
+    with env_file.open("a") as fh:
+        fh.write("HERMES_PORTAL_BASE_URL=https://by-hand\n")  # operator line beside the managed one
+    third = _run_sync(stage2_text, home, {})
+    assert third.returncode == 0, third.stderr
+    parsed = load_env_file(env_file)
+    assert _assignments(env_file, "HERMES_PORTAL_BASE_URL") == ["HERMES_PORTAL_BASE_URL=https://by-hand"], \
+        "only the stage2-written line goes when the platform unsets it"
+    assert parsed["NOUS_INFERENCE_BASE_URL"] == "https://by-hand/v1", "a hand-set line is never touched"
+    assert parsed["OTHER"] == "1"
+    assert "Removed HERMES_PORTAL_BASE_URL" in third.stdout
+
+    if os.geteuid() != 0:
+        env_file.chmod(0o444)
+        frozen = env_file.read_text()
+        readonly = _run_sync(stage2_text, home, {"HERMES_PORTAL_BASE_URL": PORTAL})
+        env_file.chmod(0o600)
+        assert readonly.returncode == 0, "a read-only volume degrades to a warning under set -e"
+        assert "could not write HERMES_PORTAL_BASE_URL" in readonly.stdout
+        assert env_file.read_text() == frozen
+
+    outside = tmp_path / "outside.env"
+    outside.write_text("KEEP=1\n")
+    env_file.unlink()
+    env_file.symlink_to(outside)
+    fourth = _run_sync(stage2_text, home, {"HERMES_PORTAL_BASE_URL": PORTAL})
+    assert fourth.returncode == 0, fourth.stderr
+    assert outside.read_text() == "KEEP=1\n"
+    assert "refusing sync through symlinked path" in fourth.stdout
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_stage2_hook_seed_one_symlinks.py ===
+"""Regression tests for symlink-safe Docker stage2 first-boot seeds."""
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+STAGE2_HOOK = REPO_ROOT / "docker" / "stage2-hook.sh"
+
+
+@pytest.fixture(scope="module")
+def stage2_text() -> str:
+    if not STAGE2_HOOK.exists():
+        pytest.skip("docker/stage2-hook.sh not present in this checkout")
+    return STAGE2_HOOK.read_text()
+
+
+def _seed_one_function(text: str) -> str:
+    m = re.search(
+        r"(seed_one\(\) \{\n(?:.*\n)*?\})\nseed_one",
+        text,
+    )
+    assert m, "stage2-hook.sh must define seed_one before first-boot seeds"
+    return m.group(1)
+
+
+def _path_guard_functions(text: str) -> str:
+    start = text.index("path_has_symlink_component() {")
+    end = text.index("\n\nchown_hermes_tree() {", start)
+    return text[start:end]
+
+
+def test_seed_one_refuses_symlinked_destinations(
+    stage2_text: str,
+    tmp_path: Path,
+) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available")
+
+    home = tmp_path / "home"
+    install_dir = tmp_path / "install"
+    home.mkdir()
+    install_dir.mkdir()
+    outside_env = tmp_path / "outside.env"
+    try:
+        (home / ".env").symlink_to(outside_env)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are not available on this platform")
+    (install_dir / ".env.example").write_text("SECRET=1\n")
+
+    script = (
+        "set -e\n"
+        f'HERMES_HOME="{home}"\n'
+        f'INSTALL_DIR="{install_dir}"\n'
+        "as_hermes() { \"$@\"; }\n"
+        f"{_path_guard_functions(stage2_text)}\n"
+        f"{_seed_one_function(stage2_text)}\n"
+        'seed_one ".env" ".env.example"\n'
+    )
+    script_path = tmp_path / "harness.sh"
+    script_path.write_text(script)
+
+    proc = subprocess.run([bash, str(script_path)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert not outside_env.exists()
+    assert (home / ".env").is_symlink()
+    assert "refusing seed through symlinked path" in proc.stdout
+
+
+def test_seed_one_is_quiet_for_existing_symlinked_files(
+    stage2_text: str,
+    tmp_path: Path,
+) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available")
+
+    home = tmp_path / "home"
+    install_dir = tmp_path / "install"
+    home.mkdir()
+    install_dir.mkdir()
+    outside_env = tmp_path / "outside.env"
+    outside_env.write_text("EXISTING=1\n")
+    try:
+        (home / ".env").symlink_to(outside_env)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are not available on this platform")
+    (install_dir / ".env.example").write_text("SECRET=1\n")
+
+    script = (
+        "set -e\n"
+        f'HERMES_HOME="{home}"\n'
+        f'INSTALL_DIR="{install_dir}"\n'
+        "as_hermes() { \"$@\"; }\n"
+        f"{_path_guard_functions(stage2_text)}\n"
+        f"{_seed_one_function(stage2_text)}\n"
+        'seed_one ".env" ".env.example"\n'
+    )
+    script_path = tmp_path / "harness.sh"
+    script_path.write_text(script)
+
+    proc = subprocess.run([bash, str(script_path)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert outside_env.read_text() == "EXISTING=1\n"
+    assert proc.stdout == ""
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_stage2_hook_symlink_chown.py ===
+"""Regression tests for symlink-safe Docker stage2 ownership repair."""
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+STAGE2_HOOK = REPO_ROOT / "docker" / "stage2-hook.sh"
+
+
+@pytest.fixture(scope="module")
+def stage2_text() -> str:
+    if not STAGE2_HOOK.exists():
+        pytest.skip("docker/stage2-hook.sh not present in this checkout")
+    return STAGE2_HOOK.read_text()
+
+
+def _chown_hermes_tree_function(text: str) -> str:
+    start = text.index("path_has_symlink_component() {")
+    end = text.index("\n\nneeds_chown=false", start)
+    return text[start:end]
+
+
+def _run_helper(
+    text: str,
+    target: Path,
+    log_path: Path,
+    *,
+    hermes_home: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("sh not available")
+    hermes_home = target if hermes_home is None else hermes_home
+    script = (
+        "set -eu\n"
+        f'HERMES_HOME="{hermes_home}"\n'
+        f"{_chown_hermes_tree_function(text)}\n"
+        f'chown() {{ printf "%s\\n" "$*" >> "{log_path}"; }}\n'
+        f'chown_hermes_tree "{target}"\n'
+    )
+    return subprocess.run([shell, "-c", script], capture_output=True, text=True)
+
+
+def test_chown_helper_repairs_real_directories(stage2_text: str, tmp_path: Path) -> None:
+    target = tmp_path / "home"
+    target.mkdir()
+    log_path = tmp_path / "chown.log"
+
+    proc = _run_helper(stage2_text, target, log_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert log_path.read_text().splitlines() == [
+        f"-R hermes:hermes {target}",
+    ]
+
+
+def test_chown_helper_refuses_symlinked_directories(stage2_text: str, tmp_path: Path) -> None:
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    symlinked_home = tmp_path / "hermes-home"
+    try:
+        symlinked_home.symlink_to(real_home, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are not available on this platform")
+    log_path = tmp_path / "chown.log"
+
+    proc = _run_helper(stage2_text, symlinked_home, log_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert not log_path.exists()
+    assert "refusing recursive chown through symlinked path" in proc.stdout
+
+
+def test_chown_helper_refuses_target_under_symlinked_home(
+    stage2_text: str,
+    tmp_path: Path,
+) -> None:
+    real_home = tmp_path / "real-home"
+    (real_home / "cron").mkdir(parents=True)
+    linked_home = tmp_path / "linked-home"
+    try:
+        linked_home.symlink_to(real_home, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are not available on this platform")
+    log_path = tmp_path / "chown.log"
+
+    proc = _run_helper(
+        stage2_text,
+        linked_home / "cron",
+        log_path,
+        hermes_home=linked_home,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not log_path.exists(), "must not chown through a symlinked HERMES_HOME"
+    assert "refusing recursive chown through symlinked path" in proc.stdout
+
+
+def test_stage2_uses_symlink_safe_helper_for_hermes_home_trees(stage2_text: str) -> None:
+    assert 'chown_hermes_tree "$HERMES_HOME/$sub"' in stage2_text
+    assert 'chown_hermes_tree "$HERMES_HOME/profiles"' in stage2_text
+    assert 'chown_hermes_tree "$HERMES_HOME/cron"' in stage2_text
+    assert 'chown -R hermes:hermes "$HERMES_HOME/$sub"' not in stage2_text
+    assert 'chown -R hermes:hermes "$HERMES_HOME/profiles"' not in stage2_text
+    assert 'chown -R hermes:hermes "$HERMES_HOME/cron"' not in stage2_text
+
+
+def test_stage2_skips_top_level_chown_for_symlinked_hermes_home(
+    stage2_text: str,
+) -> None:
+    assert 'refuse_symlinked_path "chown" "$HERMES_HOME"' in stage2_text
+
+
+def test_stage2_skips_recursive_repairs_when_tree_is_already_owned(
+    stage2_text: str,
+) -> None:
+    assert "tree_has_non_hermes_owner() {" in stage2_text
+    assert 'if [ -e "$HERMES_HOME/$sub" ] && tree_has_non_hermes_owner "$HERMES_HOME/$sub"; then' in stage2_text
+    assert 'if [ -d "$HERMES_HOME/profiles" ] && tree_has_non_hermes_owner "$HERMES_HOME/profiles"; then' in stage2_text
+    # Sibling every-boot chown blocks carry the same warm-boot gate.
+    assert 'if [ -d "$HERMES_HOME/cron" ] && tree_has_non_hermes_owner "$HERMES_HOME/cron"; then' in stage2_text
+    assert 'if [ -d "$HERMES_HOME/platforms/pairing" ] && tree_has_non_hermes_owner "$HERMES_HOME/platforms/pairing"; then' in stage2_text
+    assert 'if [ -d "$HERMES_HOME/pairing" ] && tree_has_non_hermes_owner "$HERMES_HOME/pairing"; then' in stage2_text
+

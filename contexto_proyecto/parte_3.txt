@@ -1,0 +1,421 @@
+
+
+=== ARCHIVO: .\backend\financial_agent.py ===
+import os
+import sys
+from typing import Dict, Any
+
+# Asegurar importación del directorio raíz
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+class FinancialAgent:
+    """
+    Financial Agent (backend/financial_agent.py)
+    Rol: Director Financiero (CFO) y Arquitecto de Métricas SaaS.
+    Dominio: Inteligencia contable basada en benchmarks globales de la industria SaaS (MRR, ARR, LTV, CAC, Churn, Payback).
+    """
+    def __init__(self):
+        pass
+
+    def execute(self, mrr_price: float = 29.0, active_subscribers: int = 1, acquisition_cost: float = 15.0) -> Dict[str, Any]:
+        """
+        Calcula y audita las finanzas del Micro-SaaS aplicando modelos de rentabilidad 
+        utilizados por fondos de inversión y startups de éxito en Silicon Valley.
+        """
+        try:
+            if mrr_price < 0 or active_subscribers < 0 or acquisition_cost < 0:
+                raise ValueError("Los parámetros financieros no pueden tener valores negativos.")
+
+            # Modelado financiero avanzado de nivel SaaS
+            mrr = float(mrr_price * active_subscribers)
+            arr = float(mrr * 12)
+            
+            # Estándar global SaaS: Asumiendo un Churn mensual saludable del 5% y LTV estimado a 12 meses
+            estimated_monthly_churn = 0.05
+            arpu = mrr_price  # Average Revenue Per User
+            ltv = float(arpu / estimated_monthly_churn) if estimated_monthly_churn > 0 else 0.0
+            
+            # Relación LTV / CAC (Un ratio superior a 3x indica un negocio altamente escalable)
+            cac_ratio = float(ltv / acquisition_cost) if acquisition_cost > 0 else 0.0
+            
+            # Diagnóstico de salud financiera basado en datos
+            if cac_ratio >= 3.0 and mrr > 0:
+                health_status = "SCALABLE_HIGH_GROWTH"
+                diagnostic = "El modelo financiero muestra una relación LTV/CAC óptima para inversión en escala."
+            elif mrr > 0:
+                health_status = "STABLE_EARLY_STAGE"
+                diagnostic = "Operación sostenible en fase inicial. Se recomienda optimizar el costo de adquisición."
+            else:
+                health_status = "PRE_REVENUE"
+                diagnostic = "Sin ingresos activos registrados en el periodo actual."
+
+            report = {
+                "agent": "FinancialAgent",
+                "status": health_status,
+                "mrr_usd": round(mrr, 2),
+                "arr_usd": round(arr, 2),
+                "estimated_ltv": round(ltv, 2),
+                "estimated_cac": round(acquisition_cost, 2),
+                "ltv_cac_ratio": round(cac_ratio, 2),
+                "churn_rate_benchmark": estimated_monthly_churn * 100,
+                "active_subscribers": active_subscribers,
+                "strategic_insight": diagnostic
+            }
+            
+            print(f"💰 [FinancialAgent CFO] Estado: {health_status} | MRR: ${mrr:,.2f} USD | ARR: ${arr:,.2f} USD | LTV/CAC: {cac_ratio:.1f}x")
+            return report
+
+        except Exception as e:
+            print(f"❌ [FinancialAgent] Error crítico en análisis financiero: {e}")
+            return {
+                "agent": "FinancialAgent",
+                "status": "ERROR",
+                "error_message": str(e)
+            }
+
+if __name__ == "__main__":
+    agent = FinancialAgent()
+    agent.execute(mrr_price=29.0, active_subscribers=10, acquisition_cost=10.0)
+
+
+=== ARCHIVO: .\backend\payment_sync.py ===
+import time
+import json
+import sqlite3
+from typing import Dict, Any, Optional
+
+# Importación de los agentes core de la colmena
+from database.db_agent import DatabaseAgent
+from backend.financial_agent import FinancialAgent
+
+class RealPaymentSyncService:
+    """
+    Servicio de Sincronización de Pasarela Real y Aprovisionamiento Multi-Tenant.
+    Jurisdicción: Manejo de Webhooks reales (ePayco/Wompi/Stripe),
+    aprovisionamiento automático de Tenants en BD y actualización de métricas MRR/Cashflow.
+    """
+
+    def __init__(self, db_path: str = "cyberniche.db"):
+        self.db = DatabaseAgent(db_path=db_path)
+        self.financial_agent = FinancialAgent(monthly_fee=29.00)
+        self._ensure_audit_schema()
+
+    def _ensure_audit_schema(self):
+        """Asegura que existan las tablas para registrar transacciones y cobros de Setup Fees."""
+        queries = [
+            """
+            CREATE TABLE IF NOT EXISTS payment_transactions (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                payment_provider TEXT NOT NULL,
+                transaction_type TEXT NOT NULL, -- 'SETUP_FEE' o 'RECURRING_SUBSCRIPTION'
+                amount REAL NOT NULL,
+                currency TEXT DEFAULT 'USD',
+                status TEXT NOT NULL,
+                raw_payload TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+            );
+            """
+        ]
+        for q in queries:
+            self.db.execute_transaction(q)
+
+    def process_webhook_payload(self, provider: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Punto de entrada universal para Webhooks de Pasarelas Reales (ePayco, Wompi, Stripe).
+        Normaliza los campos clave y desencadena la transacción ACID.
+        """
+        start_time = time.time()
+        
+        # 1. Normalización de datos según el proveedor
+        normalized_data = self._normalize_webhook(provider, payload)
+        
+        if not normalized_data["is_valid"] or normalized_data["status"] != "APPROVED":
+            return {
+                "status": "REJECTED_OR_FAILED",
+                "reason": normalized_data.get("reason", "Transacción no aprobada"),
+                "processed_in_ms": round((time.time() - start_time) * 1000, 2)
+            }
+
+        tenant_id = normalized_data["tenant_id"]
+        business_name = normalized_data["business_name"]
+        whatsapp_number = normalized_data["whatsapp_number"]
+        amount = normalized_data["amount"]
+        tx_type = normalized_data["transaction_type"]
+        tx_id = normalized_data["transaction_id"]
+
+        print(f"💳 [PaymentSync] Procesando Webhook verificado de {provider} | Tx: {tx_id} | Tenant: {tenant_id}")
+
+        # 2. Transacción Atómica en Base de Datos (Aprovisionamiento o Renovación)
+        try:
+            # Upsert en la tabla de Tenants
+            self.db.execute_transaction(
+                """
+                INSERT INTO tenants (id, slug, business_name, whatsapp_number, is_active)
+                VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(id) DO UPDATE SET 
+                    is_active = 1,
+                    updated_at = CURRENT_TIMESTAMP;
+                """,
+                (tenant_id, tenant_id, business_name, whatsapp_number)
+            )
+
+            # Actualización o creación de Suscripción
+            self.db.execute_transaction(
+                """
+                INSERT INTO subscriptions (tenant_id, status, mrr_amount)
+                VALUES (?, 'active', ?)
+                ON CONFLICT(tenant_id) DO UPDATE SET
+                    status = 'active',
+                    mrr_amount = ?,
+                    updated_at = CURRENT_TIMESTAMP;
+                """,
+                (tenant_id, 29.00, 29.00)
+            )
+
+            # Registro de auditoría financiera
+            self.db.execute_transaction(
+                """
+                INSERT INTO payment_transactions (id, tenant_id, payment_provider, transaction_type, amount, status, raw_payload)
+                VALUES (?, ?, ?, ?, ?, 'APPROVED', ?);
+                """,
+                (tx_id, tenant_id, provider, tx_type, amount, json.dumps(payload))
+            )
+
+        except Exception as e:
+            print(f"❌ [PaymentSync] Error en transacción de base de datos: {str(e)}")
+            return {"status": "DATABASE_ERROR", "error": str(e)}
+
+        # 3. Recálculo en tiempo real de Métricas SaaS
+        active_tenants_query = self.db.execute_query("SELECT COUNT(*) FROM tenants WHERE is_active = 1;")
+        active_count = active_tenants_query[0][0] if active_tenants_query else 0
+
+        saas_metrics = self.financial_agent.calculate_saas_metrics(
+            active_tenants=active_count,
+            canceled_tenants=0,
+            total_lead_cost=0.0
+        )
+
+        return {
+            "status": "PROCESSED_AND_SYNCED",
+            "tenant_id": tenant_id,
+            "provisioned": True,
+            "financial_summary": {
+                "current_mrr": saas_metrics["metrics"]["monthly_recurrent_revenue_mrr"],
+                "current_arr": saas_metrics["metrics"]["annual_recurrent_revenue_arr"],
+                "active_tenants": active_count
+            },
+            "processing_time_ms": round((time.time() - start_time) * 1000, 2)
+        }
+
+    def _normalize_webhook(self, provider: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalizador de eventos para ePayco, Wompi y Stripe."""
+        if provider == "epayco":
+            # Estructura ePayco
+            return {
+                "is_valid": True,
+                "transaction_id": payload.get("x_transaction_id", f"epayco_{int(time.time())}"),
+                "status": "APPROVED" if payload.get("x_cod_response") == 1 else "FAILED",
+                "tenant_id": payload.get("x_extra1", "default-tenant"),
+                "business_name": payload.get("x_extra2", "Comercio Local"),
+                "whatsapp_number": payload.get("x_extra3", "+573000000000"),
+                "amount": float(payload.get("x_amount", 0.0)),
+                "transaction_type": "SETUP_FEE" if payload.get("x_amount", 0) > 30 else "RECURRING_SUBSCRIPTION"
+            }
+        elif provider == "wompi":
+            # Estructura Wompi
+            data = payload.get("data", {}).get("transaction", {})
+            return {
+                "is_valid": True,
+                "transaction_id": data.get("id", f"wompi_{int(time.time())}"),
+                "status": "APPROVED" if data.get("status") == "APPROVED" else "FAILED",
+                "tenant_id": data.get("reference", "").split("_")[0],
+                "business_name": "Comercio Wompi",
+                "whatsapp_number": "+573000000000",
+                "amount": float(data.get("amount_in_cents", 0)) / 100,
+                "transaction_type": "SETUP_FEE"
+            }
+        elif provider == "stripe":
+            # Estructura Stripe
+            return {
+                "is_valid": True,
+                "transaction_id": payload.get("id", f"stripe_{int(time.time())}"),
+                "status": "APPROVED" if payload.get("status") == "succeeded" else "FAILED",
+                "tenant_id": payload.get("metadata", {}).get("tenant_id", "stripe-tenant"),
+                "business_name": payload.get("metadata", {}).get("business_name", "Comercio Stripe"),
+                "whatsapp_number": payload.get("metadata", {}).get("whatsapp", "+573000000000"),
+                "amount": float(payload.get("amount", 0)) / 100,
+                "transaction_type": "RECURRING_SUBSCRIPTION"
+            }
+        
+        return {"is_valid": False, "reason": f"Proveedor '{provider}' no soportado."}
+
+if __name__ == "__main__":
+    # Prueba de integración end-to-end con un Webhook simulación de ePayco (Setup Fee + Primer Mes)
+    service = RealPaymentSyncService()
+    
+    mock_epayco_payload = {
+        "x_transaction_id": "tx_epayco_99812",
+        "x_cod_response": 1,
+        "x_extra1": "pizzeria-don-luigi",
+        "x_extra2": "Pizzería Don Luigi",
+        "x_extra3": "+573158889900",
+        "x_amount": 79.00  # $50 Setup Fee + $29 Primer Mes
+    }
+
+    result = service.process_webhook_payload("epayco", mock_epayco_payload)
+    print("\n📊 Resultado de la Sincronización en Tiempo Real:")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+=== ARCHIVO: .\css\cyber-ui.css ===
+/* Variables y tema base */
+:root {
+  --bg-color: #0f172a;
+  --surface-color: #1e293b;
+  --accent-color: #10b981;
+  --accent-hover: #059669;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --border-color: #334155;
+  --font-family: system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  font-family: var(--font-family);
+  line-height: 1.5;
+  padding-bottom: 80px;
+}
+
+/* Encabezado y contenedor */
+.container {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.header-merchant {
+  text-align: center;
+  padding: 1.5rem 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.header-merchant h1 {
+  font-size: 1.5rem;
+  color: var(--accent-color);
+}
+
+.header-merchant p {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+/* Tarjeta de Producto */
+.product-card {
+  background-color: var(--surface-color);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  margin-top: 1rem;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.product-image {
+  width: 100%;
+  height: 180px;
+  object-fit: cover;
+}
+
+.product-info {
+  padding: 1rem;
+}
+
+.product-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.product-desc {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin: 0.5rem 0;
+}
+
+.product-action {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 0.75rem;
+}
+
+.product-price {
+  font-weight: bold;
+  color: var(--accent-color);
+}
+
+.btn-add {
+  background-color: var(--accent-color);
+  color: #ffffff;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.btn-add:hover {
+  background-color: var(--accent-hover);
+}
+
+/* Barra flotante de canasta */
+.basket-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background-color: var(--surface-color);
+  border-top: 1px solid var(--border-color);
+  padding: 1rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+
+=== ARCHIVO: .\data\menu-matrix.json ===
+{
+  "merchant": {
+    "name": "Sabor Cybernético",
+    "whatsapp_phone": "573000000000",
+    "currency": "COP",
+    "city": "Bogotá"
+  },
+  "categories": [
+    {
+      "id": "cat-1",
+      "name": "Hamburguesas Artesanales",
+      "products": [
+        {
+          "id": "prod-101",
+          "name": "Cyber Burger Doble",
+          "description": "Doble carne 150g, queso cheddar fundido, tocineta crocante y salsa de la casa.",
+          "price": 28000,
+          "image_url": "https://images.unsplash.com/photo-1568901346375-23c9450c58cd?w=500"
+        }
+      ]
+    }
+  ]
+}

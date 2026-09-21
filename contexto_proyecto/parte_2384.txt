@@ -1,0 +1,327 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cron_created_delivery.py ===
+"""Create-time delivery resolution for cron-context job creation.
+
+A cron-run agent (gate: cron.allow_agent_scheduling) creating a job must
+never produce a job whose deliver field points at the creating run itself:
+the run's session is ephemeral, so a stored literal 'origin' would resolve
+against a session that no longer exists by fire time. The cronjob tool
+therefore resolves 'origin' (or an omitted deliver) AT CREATE TIME to the
+creating job's own concrete persistent target, read from the
+HERMES_CRON_AUTO_DELIVER_* contextvars that run_job publishes per run.
+Non-cron sessions keep the literal 'origin' (live chat sessions have a real
+origin to resolve at fire time).
+"""
+
+import json
+
+import pytest
+
+from gateway.session_context import _VAR_MAP, clear_session_vars, set_session_vars
+
+
+@pytest.fixture
+def temp_cron_home(tmp_path, monkeypatch):
+    from cron import jobs as cron_jobs
+
+    with cron_jobs.use_cron_store(tmp_path):
+        cron_jobs.ensure_dirs()
+        yield tmp_path
+
+
+def _enter_cron_context(platform=None, chat_id=None, thread_id=None):
+    """Simulate the contextvar state run_job() establishes for a cron run."""
+    tokens = set_session_vars(
+        platform="",
+        chat_id="",
+        chat_name="",
+        cron_session="1",
+    )
+    extra = []
+    if platform is not None:
+        extra.append(
+            (_VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"],
+             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(platform))
+        )
+        extra.append(
+            (_VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"],
+             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(chat_id)))
+        )
+        if thread_id is not None:
+            extra.append(
+                (_VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"],
+                 _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(str(thread_id)))
+            )
+    return tokens, extra
+
+
+def _exit_cron_context(tokens, extra):
+    for var, token in reversed(extra):
+        var.reset(token)
+    clear_session_vars(tokens)
+
+
+def _create(deliver=None):
+    from tools.cronjob_tools import cronjob
+
+    return json.loads(
+        cronjob(
+            action="create",
+            schedule="every 4h",
+            prompt="check the thing",
+            deliver=deliver,
+        )
+    )
+
+
+class TestCronContextDeliveryResolution:
+    def test_omitted_deliver_resolves_to_creator_target(self, temp_cron_home):
+        tokens, extra = _enter_cron_context("telegram", "-100123456", "17")
+        try:
+            result = _create()
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["success"] is True
+        assert result["deliver"] == "telegram:-100123456:17"
+
+    def test_literal_origin_resolves_to_creator_target(self, temp_cron_home):
+        tokens, extra = _enter_cron_context("telegram", "-100123456", "17")
+        try:
+            result = _create(deliver="origin")
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["deliver"] == "telegram:-100123456:17"
+
+    def test_no_thread_id_omits_thread_segment(self, temp_cron_home):
+        tokens, extra = _enter_cron_context("slack", "C0ABC")
+        try:
+            result = _create(deliver="origin")
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["deliver"] == "slack:C0ABC"
+
+    def test_creator_without_delivery_target_falls_back_to_local(self, temp_cron_home):
+        # Creator job delivers nowhere concrete (deliver='local' run):
+        # AUTO_DELIVER vars unset. Child must store 'local', never 'origin'.
+        tokens, extra = _enter_cron_context()
+        try:
+            result = _create(deliver="origin")
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["deliver"] == "local"
+
+    def test_comma_list_resolves_only_origin_element(self, temp_cron_home):
+        tokens, extra = _enter_cron_context("telegram", "-100123456", "17")
+        try:
+            result = _create(deliver="origin,all")
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["deliver"] == "telegram:-100123456:17,all"
+
+    def test_explicit_target_passes_through_verbatim(self, temp_cron_home):
+        tokens, extra = _enter_cron_context("telegram", "-100999", "3")
+        try:
+            result = _create(deliver="discord:#engineering")
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["deliver"] == "discord:#engineering"
+
+    def test_local_passes_through(self, temp_cron_home):
+        tokens, extra = _enter_cron_context("telegram", "-100999")
+        try:
+            result = _create(deliver="local")
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["deliver"] == "local"
+
+    def test_stored_deliver_never_literal_origin_in_cron_context(self, temp_cron_home):
+        from cron.jobs import get_job
+
+        tokens, extra = _enter_cron_context("telegram", "-100123456")
+        try:
+            result = _create(deliver="origin")
+        finally:
+            _exit_cron_context(tokens, extra)
+        job = get_job(result["job_id"])
+        stored = str(job.get("deliver", ""))
+        assert "origin" not in [p.strip() for p in stored.split(",")]
+
+
+class TestCronContextUpdatePath:
+    def test_update_deliver_origin_resolves_in_cron_context(self, temp_cron_home):
+        """The update action must apply the same resolution as create — a
+        cron agent updating deliver='origin' would otherwise recreate the
+        dangling literal-origin shape on an origin-less job."""
+        from tools.cronjob_tools import cronjob
+        from cron.jobs import get_job
+
+        tokens, extra = _enter_cron_context("telegram", "-100123456", "17")
+        try:
+            created = _create(deliver="local")
+            result = json.loads(
+                cronjob(action="update", job_id=created["job_id"], deliver="origin")
+            )
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["success"] is True
+        job = get_job(created["job_id"])
+        stored = str(job.get("deliver", ""))
+        assert "origin" not in [p.strip() for p in stored.split(",")]
+        assert stored == "telegram:-100123456:17"
+
+    def test_update_deliver_outside_cron_context_unchanged(self, temp_cron_home):
+        from tools.cronjob_tools import cronjob
+        from cron.jobs import get_job
+
+        created = _create(deliver="local")
+        result = json.loads(
+            cronjob(action="update", job_id=created["job_id"], deliver="origin")
+        )
+        assert result["success"] is True
+        assert get_job(created["job_id"]).get("deliver") == "origin"
+
+
+class TestNonCronContextUnchanged:
+    def test_chat_session_create_keeps_literal_origin(self, temp_cron_home):
+        # No cron_session var — ordinary chat/CLI create. Existing semantics:
+        # 'origin' stays literal and resolves at fire time.
+        result = _create(deliver="origin")
+        assert result["deliver"] == "origin"
+
+    def test_chat_session_omitted_deliver_unchanged(self, temp_cron_home):
+        # Outside cron context the resolution helper must be a no-op so the
+        # ordinary chat/CLI create path is byte-identical to before.
+        from tools.cronjob_tools import _resolve_cron_context_deliver
+
+        assert _resolve_cron_context_deliver(None) is None
+        assert _resolve_cron_context_deliver("origin") == "origin"
+        assert _resolve_cron_context_deliver("origin,all") == "origin,all"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cron_delivery_redaction.py ===
+"""Cron output is secret-redacted on every outward lane, fail-closed.
+
+Shell-job stdout/stderr is redacted where it is captured, but an LLM cron job's response text
+reaches ``_deliver_result`` unscanned. Every egress lane — platform send, session mirror (payload
+and spliced job name), bot-chat turn — must apply ``redact_sensitive_text(force=True)``: the
+``security.redact_secrets`` preference governs the user's own logs, not egress, and a raising
+redactor must replace the payload rather than let it through.
+"""
+import importlib
+from contextlib import ExitStack
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+# Synthetic vendor-prefixed key, long enough to trip the redactor; never a real credential.
+FAKE_SECRET = "sk-" + "A" * 32
+BODY = "Job finished. 3 tasks done, 1 pending."
+
+
+def _telegram_cfg():
+    from gateway.config import Platform
+
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    cfg = MagicMock()
+    cfg.platforms = {Platform.TELEGRAM: pconfig}
+    return cfg
+
+
+def _job(name: str = "daily-report") -> dict:
+    return {"id": "report-job", "name": name, "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"}}
+
+
+def _flat(call) -> str:
+    return " ".join(str(a) for a in call.args) + " " + " ".join(str(v) for v in call.kwargs.values())
+
+
+def _deliver_platform_and_mirror(job: dict, content: str) -> tuple[str, str]:
+    """Drive ``_deliver_result`` with the mirror on; stub only the outermost sinks (the platform
+    send and the session write) so the real assembly — including the job-name splice — runs."""
+    from cron.scheduler_delivery import _deliver_result
+
+    send = AsyncMock(return_value={"success": True})
+    sink = MagicMock(return_value=True)
+    with patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()), \
+         patch("tools.send_message_tool._send_to_platform", new=send), \
+         patch("cron.scheduler_delivery._cron_mirror_delivery_enabled", return_value=True), \
+         patch("cron.scheduler_delivery._target_matches_origin", return_value=True), \
+         patch("gateway.mirror.mirror_to_session", new=sink), \
+         patch("sys.is_finalizing", return_value=False):
+        _deliver_result(job, content)
+    assert send.called and sink.called, "a sink did not run — assertions would be vacuous"
+    return _flat(send.call_args), _flat(sink.call_args)
+
+
+def _deliver_bot_chat(job: dict, content: str) -> str:
+    """Drive ``_deliver_to_bot_chat`` down to the CLI lane and capture the inbound turn."""
+    from cron.scheduler_delivery import _deliver_to_bot_chat
+
+    captured = {}
+
+    def _fake_run(argv, *args, **kwargs):
+        with open(argv[argv.index("--query-file") + 1], encoding="utf-8") as fh:
+            captured["message"] = fh.read()
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    # The CLI lane is seamed at whichever spawn helper the tree has: ``subprocess.run`` or the
+    # report-driven ``_run_bot_chat_turn(argv, env, report_path, timeout)`` (#113608); ``create``
+    # keeps the second patch a no-op where the helper does not exist, so no real child is spawned.
+    with patch("cron.scheduler_delivery.subprocess.run", side_effect=_fake_run), \
+            patch("cron.scheduler_delivery._run_bot_chat_turn", create=True, side_effect=_fake_run):
+        err = _deliver_to_bot_chat(job, content, "")
+    assert err is None, err
+    return captured["message"]
+
+
+@pytest.mark.parametrize("lane", ["platform_send", "session_mirror", "bot_chat"])
+def test_every_outward_lane_masks_secret_in_payload_and_job_name(lane):
+    """Secret in the body AND in the user-controlled job name is masked on every lane, while
+    ordinary text and the lane's own framing survive (no over-redaction, no empty payload)."""
+    job = _job(name=f"rotate {FAKE_SECRET} daily")
+    content = f"{BODY} Token was {FAKE_SECRET} (oops)."
+    if lane == "bot_chat":
+        out = _deliver_bot_chat(job, content)
+        assert "[Cronjob " in out
+    else:
+        sent, mirrored = _deliver_platform_and_mirror(job, content)
+        out = sent if lane == "platform_send" else mirrored
+        if lane == "session_mirror":
+            assert "[Cron delivery:" in out, "mirror prefix missing — assembly path not exercised"
+    assert "3 tasks done" in out, "payload mangled or empty — secret assertion would be vacuous"
+    assert FAKE_SECRET not in out, f"secret reached the {lane} lane"
+
+
+@pytest.mark.parametrize("mode", ["redact_secrets_off", "redactor_raises"])
+def test_delivery_redaction_is_forced_and_fails_closed(mode, monkeypatch):
+    """Egress redaction is independent of ``security.redact_secrets`` (force=True) and a raising
+    redactor replaces the payload instead of passing the unscanned text through."""
+    import agent.redact
+    from cron.scheduler_delivery import _deliver_result
+
+    send = AsyncMock(return_value={"success": True})
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()))
+            stack.enter_context(patch("tools.send_message_tool._send_to_platform", new=send))
+            stack.enter_context(patch("sys.is_finalizing", return_value=False))
+            if mode == "redact_secrets_off":
+                monkeypatch.setenv("HERMES_REDACT_SECRETS", "false")
+                importlib.reload(agent.redact)
+            else:
+                stack.enter_context(
+                    patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("boom")))
+            _deliver_result(_job(), f"Token was {FAKE_SECRET}")
+    finally:
+        monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
+        importlib.reload(agent.redact)
+
+    delivered = _flat(send.call_args)
+    assert FAKE_SECRET not in delivered, f"{mode}: secret reached the platform send"
+    if mode == "redactor_raises":
+        assert "REDACTED" in delivered
+

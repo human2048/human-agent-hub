@@ -1,0 +1,285 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_ollama_local_provider.py ===
+"""Explicit ``provider: ollama`` (and the sibling local-server aliases ``vllm`` / ``llamacpp``)
+must route through the ``custom`` branch in the auxiliary client, as it already does in
+``hermes_cli.auth``: a lane pointing at a local server with an empty ``api_key`` builds a
+client with the ``no-key-required`` placeholder instead of raising
+``Provider 'ollama' is set in config.yaml but no API key was found`` (issue #106010).
+
+Second half of the same report: these servers expose the OpenAI surface under ``/v1``, so
+a bare ``host:port`` base_url gains the tail — but only for the alias group; a literal
+``provider: custom`` base_url is used verbatim and an existing path is never doubled.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _keyless_environment(monkeypatch):
+    for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    # The key ladder inherits the main config's key on a host match; the placeholder
+    # assertions below need that rung empty.
+    with patch("agent.auxiliary_client._read_main_api_key_if_same_host", return_value=None):
+        yield
+
+
+def _client_attr(client, attr: str) -> str:
+    for chain in ((attr,), ("_real_client", attr), ("_client", attr)):
+        obj = client
+        try:
+            for name in chain:
+                obj = getattr(obj, name)
+            return str(obj)
+        except AttributeError:
+            continue
+    return ""
+
+
+@pytest.mark.parametrize(
+    "api_key, env_openai_key, expected_key",
+    [
+        ("", "", "no-key-required"),
+        ("test-key-123", "", "test-key-123"),
+        # SECURITY: a keyless local-server lane must not borrow OPENAI_API_KEY (or the main
+        # key on a host match) — that would send an OpenAI secret to the lane's base_url.
+        ("", "sk-USER-OPENAI-SECRET", "no-key-required"),
+    ],
+)
+def test_ollama_lane_with_bare_local_host_resolves_custom_client_under_v1(
+    monkeypatch, api_key, env_openai_key, expected_key,
+):
+    """The reporter's lane, through the real task-config path: keyless gets the placeholder,
+    an explicit key is sent verbatim, and both post to /v1."""
+    from agent import auxiliary_client as ac
+
+    if env_openai_key:
+        monkeypatch.setenv("OPENAI_API_KEY", env_openai_key)
+        monkeypatch.setattr(ac, "_read_main_api_key_if_same_host", lambda _base: "sk-MAIN-SECRET")
+    lane = {"provider": "ollama", "model": "qwen3.8:27b", "base_url": "http://127.0.0.1:11434", "api_key": api_key}
+    monkeypatch.setattr(ac, "_get_auxiliary_task_config", lambda task: dict(lane) if task == "title_generation" else {})
+    provider, model, base_url, key, _mode = ac._resolve_task_provider_model("title_generation")
+
+    client, _model = ac.resolve_provider_client(provider, model=model, explicit_base_url=base_url, explicit_api_key=key)
+    assert client is not None, "provider: ollama + local base_url must build a client via the custom branch"
+    assert _client_attr(client, "base_url").rstrip("/") == "http://127.0.0.1:11434/v1"
+    assert _client_attr(client, "api_key") == expected_key
+
+
+def test_v1_tail_applies_only_to_bare_alias_hosts_and_never_doubles():
+    from agent.auxiliary_client import resolve_provider_client
+
+    custom, _ = resolve_provider_client(
+        "custom", model="m", explicit_base_url="http://127.0.0.1:11434", explicit_api_key="test-key-123",
+    )
+    assert _client_attr(custom, "base_url").rstrip("/") == "http://127.0.0.1:11434"
+
+    with_path, _ = resolve_provider_client(
+        "vllm", model="m", explicit_base_url="http://127.0.0.1:8000/v1", explicit_api_key="test-key-123",
+    )
+    assert _client_attr(with_path, "base_url").rstrip("/") == "http://127.0.0.1:8000/v1"
+    assert _client_attr(with_path, "api_key") == "test-key-123"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_openrouter_max_tokens.py ===
+"""Test that _build_call_kwargs preserves max_tokens for OpenRouter endpoints.
+
+Regression test for #41035: OpenRouter free-tier credits exhausted when
+max_tokens was stripped, causing HTTP 402 and fallback to text-only model.
+"""
+
+import pytest
+
+from agent.auxiliary_client import _build_call_kwargs
+
+
+class TestOpenRouterMaxTokens:
+    """max_tokens must be included for OpenRouter to prevent free-tier 402."""
+
+    def test_openrouter_provider_includes_max_tokens(self):
+        """Direct openrouter provider keeps max_tokens."""
+        kwargs = _build_call_kwargs(
+            provider="openrouter",
+            model="openai/gpt-4o-mini",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=2000,
+        )
+        assert kwargs.get("max_tokens") == 2000 or kwargs.get("max_completion_tokens") == 2000
+
+    def test_openrouter_base_url_includes_max_tokens(self):
+        """Custom endpoint with openrouter.ai base_url keeps max_tokens."""
+        kwargs = _build_call_kwargs(
+            provider="openai",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=2000,
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert kwargs.get("max_tokens") == 2000 or kwargs.get("max_completion_tokens") == 2000
+
+    def test_generic_provider_omits_max_tokens(self):
+        """Generic OpenAI-compatible provider still omits max_tokens."""
+        kwargs = _build_call_kwargs(
+            provider="openai",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=2000,
+        )
+        assert "max_tokens" not in kwargs
+
+    def test_anthropic_compat_still_includes_max_tokens(self):
+        """Anthropic-compatible endpoints still include max_tokens."""
+        kwargs = _build_call_kwargs(
+            provider="minimax",
+            model="MiniMax-Text-01",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=4000,
+        )
+        assert kwargs["max_tokens"] == 4000
+
+    def test_none_max_tokens_never_included(self):
+        """max_tokens=None is never added regardless of provider."""
+        for provider, base_url in [
+            ("openrouter", None),
+            ("openai", "https://openrouter.ai/api/v1"),
+            ("minimax", None),
+        ]:
+            kwargs = _build_call_kwargs(
+                provider=provider,
+                model="test-model",
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=None,
+                base_url=base_url,
+            )
+            assert "max_tokens" not in kwargs, (
+                f"max_tokens should not be set when None for {provider}"
+            )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_parameter_rung_chaining.py ===
+"""Auxiliary parameter-rejection rungs chain in any order, on the primary AND the fallback path.
+
+Reasoning models reject several request fields at once (``temperature`` and ``max_tokens`` on
+gpt-5, #78273), a reasoning-strip retry can then 400 on ``temperature`` (#72351), and strict-schema
+gateways phrase an unknown ``reasoning`` field as "Extra inputs are not permitted" (#109774).
+Each rejected field must be stripped in whatever order the provider raises them, and a fallback
+candidate must get the same recovery as the primary request.
+"""
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from agent.auxiliary_client import (
+    _call_fallback_candidate_sync,
+    _drive_ladder,
+    _is_reasoning_field_rejection,
+    _ladder_parameter_rungs,
+    _LadderRoute,
+)
+
+
+class _Bad400(Exception):
+    status_code = 400
+
+
+def _ok(text="ok"):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text), finish_reason="stop")])
+
+
+def _rejecting_client(*rejected_fields):
+    """Fake OpenAI client that 400s while any of ``rejected_fields`` is still on the wire."""
+    client = MagicMock(base_url="https://api.example/v1")
+
+    def create(**kwargs):
+        body = dict(kwargs)
+        body.update(body.pop("extra_body", None) or {})
+        for field in rejected_fields:
+            if field in body:
+                phrase = {
+                    "reasoning": "Extra inputs are not permitted, field: 'reasoning'",
+                    "reasoning_effort": "Unsupported value: 'reasoning_effort' does not support 'none' with this model.",
+                    "temperature": "Unsupported value: 'temperature' does not support 0.3 with this model.",
+                    "max_tokens": "Unsupported parameter: 'max_tokens' is not supported with this model.",
+                }[field]
+                raise _Bad400(f"Error code: 400 - {phrase}")
+        return _ok()
+
+    client.chat.completions.create.side_effect = create
+    return client
+
+
+def test_primary_rungs_chain_in_provider_order_and_strip_each_field_once():
+    client = _rejecting_client("reasoning_effort", "temperature", "max_tokens")
+    kwargs = {"model": "m", "messages": [], "temperature": 0.3, "max_tokens": 64, "reasoning_effort": "none"}
+    route = _LadderRoute(**{**dict.fromkeys(_LadderRoute._fields), "client": client, "task": "title_generation",
+                            "tag": "", "async_mode": False, "base_info": "", "resolved_provider": ""})
+    first_err = _Bad400("Error code: 400 - Unsupported value: 'reasoning_effort' does not support 'none'")
+
+    def perform(step):
+        step_client, step_kwargs = step.args
+        return step_client.chat.completions.create(**step_kwargs)
+
+    resp, err, final_kwargs = _drive_ladder(_ladder_parameter_rungs(first_err, route, kwargs, 64), perform)
+
+    assert err is None and resp.choices[0].message.content == "ok"
+    assert not {"temperature", "max_tokens", "reasoning_effort"} & set(final_kwargs)
+    # One retry per rejected field: reasoning_effort → temperature → max_tokens, nothing re-sent unchanged.
+    assert client.chat.completions.create.call_count == 3
+    assert _is_reasoning_field_rejection(_Bad400("Extra inputs are not permitted, field: 'reasoning'"))
+
+
+def test_reasoning_effort_none_unsupported_reversed_wording():
+    """Relays that put the adjective last (``reasoning_effort 'none' unsupported; use ...``) fire the
+    strip-and-retry rung like the forward wordings do; route gating that merely names a thinking
+    model, or an adjective-only "unsupported" far from any reasoning field, does not."""
+    assert _is_reasoning_field_rejection(
+        _Bad400("Error code: 400 - reasoning_effort 'none' unsupported; use minimal|low|medium|high|xhigh")
+    )
+    assert not _is_reasoning_field_rejection(
+        _Bad400("The model kimi-k2-thinking is not supported when using this account")
+    )
+    assert not _is_reasoning_field_rejection(_Bad400("reasoning models: tool_choice 'required' is unsupported"))
+
+
+def test_fallback_candidate_recovers_from_rejected_temperature():
+    client = _rejecting_client("temperature")
+    resp = _call_fallback_candidate_sync(
+        client, "gpt-5-mini", "fallback_chain[0](openai)", task="title_generation",
+        messages=[{"role": "user", "content": "hi"}], temperature=0.3, max_tokens=16, tools=None,
+        effective_timeout=30.0, effective_extra_body={}, reasoning_config=None,
+    )
+    assert resp.choices[0].message.content == "ok"
+    sent = [c.kwargs for c in client.chat.completions.create.call_args_list]
+    assert [("temperature" in k) for k in sent] == [True, False]
+
+
+def test_rate_limit_after_parameter_strip_falls_through_to_later_rungs():
+    """A 429 on the stripped retry belongs to the credential/provider-fallback rungs; the
+    parameter rungs must hand it on with the stripped kwargs, not raise out of the ladder."""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://api.example/v1/chat/completions")
+    rate_limited = openai.RateLimitError(
+        "Error code: 429 - Rate limit exceeded", body=None,
+        response=httpx.Response(429, request=request, json={"error": {"message": "Rate limit exceeded"}}))
+    client = MagicMock(base_url="https://api.example/v1")
+    client.chat.completions.create.side_effect = rate_limited
+    route = _LadderRoute(**{**dict.fromkeys(_LadderRoute._fields), "client": client, "task": "title_generation",
+                            "tag": "", "async_mode": False, "base_info": "", "resolved_provider": ""})
+    kwargs = {"model": "m", "messages": [], "max_tokens": 64}
+    first_err = _Bad400("Error code: 400 - Unsupported parameter: 'max_tokens' is not supported with this model.")
+
+    resp, err, final_kwargs = _drive_ladder(
+        _ladder_parameter_rungs(first_err, route, kwargs, 64),
+        lambda step: step.args[0].chat.completions.create(**step.args[1]))
+
+    assert resp is None and err is rate_limited
+    assert "max_tokens" not in final_kwargs
+

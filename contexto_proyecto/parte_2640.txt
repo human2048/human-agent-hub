@@ -1,0 +1,353 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_feishu_profile_scope_hops.py ===
+"""Profile scope must survive the Feishu adapter's thread hops under a multiplexed gateway.
+
+The adapter is constructed and connected inside ``_profile_runtime_scope`` (HERMES_HOME override +
+secret scope as contextvars). Two hops used to start from an EMPTY context, so the work ran under
+the LAUNCH profile: the drive-comment agent turn (a full ``AIAgent`` on a bare default executor)
+and the lark WS client thread (every SDK callback, and its ``run_coroutine_threadsafe`` hop back
+onto the adapter loop, inherits the WS thread's context). The lark SDK is optional, so a fake
+client drives the REAL ``_connect_websocket`` / ``_run_official_feishu_ws_client``.
+"""
+
+import asyncio
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from agent.secret_scope import (
+    UnscopedSecretError,
+    get_secret,
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
+from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+
+def _observe(routed_home: Path) -> tuple:
+    try:
+        secret = get_secret("FEISHU_PROBE_TOKEN")
+    except UnscopedSecretError:
+        secret = "<unscoped>"
+    return ("routed" if Path(get_hermes_home()) == routed_home else "launch", secret)
+
+
+@pytest.fixture
+def routed_scope(tmp_path):
+    """Enter a secondary profile's scope the way gateway/run.py::_profile_runtime_scope does."""
+    routed_home = tmp_path / "profiles" / "b"
+    routed_home.mkdir(parents=True)
+    set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(routed_home))
+    secret_token = set_secret_scope({"FEISHU_PROBE_TOKEN": "routed-value"})
+    try:
+        yield routed_home
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+        set_multiplex_active(False)
+
+
+def test_drive_comment_agent_turn_runs_under_the_adapter_profile_scope(routed_scope):
+    """The comment agent thread must resolve model/credentials/home for the routed profile,
+    not the launch profile (bare run_in_executor drops the contextvar scope)."""
+    from plugins.platforms.feishu import feishu_comment as fc
+    from plugins.platforms.feishu import feishu_comment_rules as rules
+
+    seen = {}
+
+    def _fake_agent(prompt, client, session_key=""):
+        seen["turn"] = _observe(routed_scope)
+        return "NO_REPLY"
+
+    event = SimpleNamespace(event={
+        "comment_id": "c1", "reply_id": "", "is_mentioned": True, "timestamp": "1",
+        "notice_meta": {"file_token": "docx_t", "file_type": "docx", "notice_type": "add_reply",
+                        "from_user_id": {"open_id": "ou_user"}, "to_user_id": {"open_id": "ou_bot"}},
+    })
+    with patch.object(rules, "load_config", return_value=object()), \
+         patch.object(rules, "resolve_rule", return_value=rules.ResolvedCommentRule(True, "allowlist", frozenset(), "top")), \
+         patch.object(rules, "has_wiki_keys", return_value=False), \
+         patch.object(rules, "is_user_allowed", return_value=True), \
+         patch.object(fc, "query_document_meta", AsyncMock(return_value={"title": "T", "url": "u"})), \
+         patch.object(fc, "batch_query_comment", AsyncMock(return_value={"is_whole": False, "quote": ""})), \
+         patch.object(fc, "_local_comment_prompt", AsyncMock(return_value="prompt")), \
+         patch.object(fc, "_run_comment_agent", _fake_agent):
+        asyncio.run(fc.handle_drive_comment_event(object(), event, self_open_id="ou_bot"))
+
+    assert seen["turn"] == ("routed", "routed-value")
+
+
+def test_ws_client_thread_and_its_loop_callbacks_carry_the_adapter_profile_scope(routed_scope, monkeypatch):
+    """Lark SDK callbacks run on the WS thread and re-enter the adapter loop through
+    run_coroutine_threadsafe (which copies the caller's context): both must see the profile that
+    connected the adapter, so media caching / markers / env reads before handle_message stay in it."""
+    from plugins.platforms.feishu import adapter as fa
+
+    client_mod = types.ModuleType("lark_oapi.ws.client")
+    client_mod.loop = SimpleNamespace(name="sdk-default-loop")
+    client_mod.websockets = SimpleNamespace(connect=lambda *a, **k: None)
+    client_mod.Client = type("Client", (), {"_receive_message_loop": lambda self: None})
+    lark_ws = types.ModuleType("lark_oapi.ws")
+    lark_ws.client = client_mod
+    lark = types.ModuleType("lark_oapi")
+    lark.ws = lark_ws
+    for name, mod in (("lark_oapi", lark), ("lark_oapi.ws", lark_ws), ("lark_oapi.ws.client", client_mod)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setattr(fa, "_WS_ISOLATION_INSTALLED", False)
+    monkeypatch.setattr(fa, "FEISHU_WEBSOCKET_AVAILABLE", True)
+    monkeypatch.setattr(fa, "lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO=1)))
+
+    seen = {}
+
+    async def scenario():
+        adapter_loop = asyncio.get_running_loop()
+
+        async def _on_loop():
+            return _observe(routed_scope)
+
+        class FakeWSClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def start(self):  # the SDK-owned thread every lark callback fires on
+                seen["ws_thread"] = _observe(routed_scope)
+                seen["loop_callback"] = asyncio.run_coroutine_threadsafe(_on_loop(), adapter_loop).result(5)
+
+        monkeypatch.setattr(fa, "FeishuWSClient", FakeWSClient)
+        stub = SimpleNamespace(
+            _loop=adapter_loop, _app_id="cli_x", _app_secret="s", _domain_name="feishu", _event_handler=None,
+            _ws_thread_loop=None, _ws_reconnect_nonce=None, _ws_reconnect_interval=None,
+            _ws_ping_interval=None, _ws_ping_timeout=None, _ws_client=None, _ws_future=None,
+            _prepare_client=lambda: "feishu-domain", _hydrate_bot_identity=AsyncMock(),
+        )
+        # The WS thread runs on the adapter-owned pool, never the loop default executor.
+        stub._get_sdk_executor = fa.FeishuAdapter._get_sdk_executor.__get__(stub)
+        await fa.FeishuAdapter._connect_websocket(stub)
+        await stub._ws_future
+        stub._sdk_executor.shutdown(wait=True)
+
+    asyncio.run(scenario())
+    assert seen == {"ws_thread": ("routed", "routed-value"), "loop_callback": ("routed", "routed-value")}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_feishu_sdk_executor.py ===
+"""Regression tests for the Feishu adapter's owned SDK executor.
+
+Blocking Feishu SDK calls used to run on asyncio's shared default executor.
+When that executor was torn down (agent thread exit / loop cleanup), every
+subsequent send failed permanently with "Executor shutdown has been called"
+and the gateway became a zombie. The adapter now owns its own
+ThreadPoolExecutor and recreates it on demand if it has been shut down.
+
+Covers: #10849, #111020
+"""
+
+import asyncio
+import concurrent.futures
+import json
+
+import pytest
+
+from plugins.platforms.feishu.adapter import FeishuAdapter
+
+
+def _bare_adapter() -> FeishuAdapter:
+    """A FeishuAdapter with only the executor fields wired (no __init__)."""
+    adapter = object.__new__(FeishuAdapter)
+    import threading
+
+    adapter._sdk_executor_lock = threading.Lock()
+    adapter._sdk_executor = None
+    adapter._sdk_executor_closing = False
+    return adapter
+
+
+def test_get_executor_recreates_after_shutdown():
+    """A shut-down pool must be transparently replaced — the #10849 recovery."""
+    adapter = _bare_adapter()
+    first = adapter._get_sdk_executor()
+    first.shutdown(wait=True)
+    assert getattr(first, "_shutdown", False) is True
+
+    second = adapter._get_sdk_executor()
+    assert second is not first
+    assert getattr(second, "_shutdown", False) is False
+    adapter._shutdown_sdk_executor()
+
+
+@pytest.mark.asyncio
+async def test_run_blocking_executes_on_owned_pool():
+    adapter = _bare_adapter()
+    captured = {}
+
+    def _work(value):
+        import threading
+
+        captured["thread"] = threading.current_thread().name
+        return value * 2
+
+    result = await adapter._run_blocking(_work, 21)
+    assert result == 42
+    # Ran on the adapter-owned pool, not the default executor.
+    assert captured["thread"].startswith("hermes-feishu-sdk")
+    adapter._shutdown_sdk_executor()
+
+
+@pytest.mark.asyncio
+async def test_is_duplicate_flush_survives_default_executor_teardown(
+    tmp_path, monkeypatch
+):
+    """The inbound dedup flush must not ride the loop's default executor.
+
+    After the adapter's background event loop dies, its teardown shuts the
+    default executor down; every subsequent inbound message was then dropped
+    inside the dedup gate with a RuntimeError out of asyncio.to_thread
+    (#111020). The flush now runs on the adapter-owned pool, mirroring the
+    outbound SDK calls (#10849).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.config import PlatformConfig
+
+    adapter = FeishuAdapter(PlatformConfig())
+    loop = asyncio.get_running_loop()
+    # Save/restore via the private slot: set_default_executor() rejects None, but the
+    # pristine state is exactly "no default executor set yet" (lazy creation on first use).
+    original_executor = loop._default_executor
+    try:
+        torn_down = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(torn_down)
+        torn_down.shutdown(wait=True)
+
+        # Scenario premise: with the default executor torn down, to_thread fails.
+        with pytest.raises(RuntimeError):
+            await asyncio.to_thread(lambda: None)
+
+        # The dedup gate must still admit the message and flush it to disk.
+        assert await adapter._is_duplicate("om_after_executor_teardown") is False
+        state = json.loads(
+            (tmp_path / "feishu_seen_message_ids.json").read_text(encoding="utf-8")
+        )
+        assert "om_after_executor_teardown" in state["message_ids"]
+    finally:
+        loop._default_executor = original_executor
+        adapter._shutdown_sdk_executor()
+
+
+@pytest.mark.asyncio
+async def test_run_blocking_propagates_caller_contextvars(tmp_path, monkeypatch):
+    """Call sites moved off asyncio.to_thread must keep seeing the caller's context: a
+    multiplexed profile's HERMES_HOME override is a contextvar, and a worker that lost it
+    would flush dedup state / look up threads under the wrong profile."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.config import PlatformConfig
+    from hermes_constants import get_hermes_home_override, reset_hermes_home_override, set_hermes_home_override
+
+    adapter = FeishuAdapter(PlatformConfig())
+    token = set_hermes_home_override(str(tmp_path / "profiles" / "secondary"))
+    try:
+        assert await adapter._run_blocking(get_hermes_home_override) == str(tmp_path / "profiles" / "secondary")
+    finally:
+        reset_hermes_home_override(token)
+        adapter._shutdown_sdk_executor()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_feishu_table_markdown.py ===
+"""Tests for Feishu adapter outbound markdown payload construction.
+
+Reproduces the bug tracked in hermes-agent issue #52786:
+`_build_outbound_payload` was force-downgrading any message containing a
+markdown pipe table to ``msg_type=text``, so Feishu clients rendered the raw
+pipe-and-dash source instead of a table.  Empirically current Feishu clients
+render ``post``+``md`` tables natively, so the downgrade branch must be removed.
+
+These tests guard the fix.  They invoke the real adapter via the project's
+plugin-loader helper so that no ``sys.path`` / ``sys.modules`` games are
+needed.
+"""
+
+from __future__ import annotations
+
+import json
+
+from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+_adapter = load_plugin_adapter("feishu")
+
+
+def _call_build_outbound_payload(content: str) -> tuple[str, str]:
+    """Invoke ``_build_outbound_payload`` on a bare adapter instance.
+
+    ``_build_outbound_payload`` is a method that only uses module-level
+    helpers (``_MARKDOWN_TABLE_RE``, ``_MARKDOWN_HINT_RE``,
+    ``_build_markdown_post_payload``) and never touches ``self.*``, so a bare
+    object is sufficient.
+    """
+    inst = object.__new__(_adapter.FeishuAdapter)
+    return inst._build_outbound_payload(content)
+
+
+def _md_texts_from_post_payload(payload_str: str) -> list[str]:
+    """Pull every ``{tag:'md', text:'...'}`` element out of a Feishu post payload.
+
+    Real payload shape::
+
+        {"zh_cn": {"content": [[{"tag": "md", "text": "..."}], ...]}}
+
+    Helpers and tests need to introspect the ``md`` blocks regardless of
+    locale, so we walk the structure generically.
+    """
+    payload = json.loads(payload_str)
+    if not isinstance(payload, dict):
+        return []
+    texts: list[str] = []
+    for lang_val in payload.values():
+        if not isinstance(lang_val, dict):
+            continue
+        content = lang_val.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, list):
+                candidates = block
+            else:
+                candidates = [block]
+            for el in candidates:
+                if isinstance(el, dict) and el.get("tag") == "md":
+                    texts.append(el.get("text", ""))
+    return texts
+
+
+def test_markdown_table_uses_post_not_text():
+    """Regression test for issue #52786 (and its older sibling #23938).
+
+    A message whose only markdown is a table must take the ``post`` path,
+    not be downgraded to plain text.
+    """
+    content = (
+        "| col A | col B |\n"
+        "| ----- | ----- |\n"
+        "| 1     | 2     |"
+    )
+    msg_type, payload_str = _call_build_outbound_payload(content)
+    assert msg_type == "post", (
+        f"expected 'post' for a markdown table (issue #52786), got {msg_type!r}; "
+        "the table-downgrade branch in _build_outbound_payload has been re-introduced"
+    )
+    md_texts = _md_texts_from_post_payload(payload_str)
+    assert md_texts, f"post payload must include at least one md element; got {payload_str!r}"
+    joined = "".join(md_texts)
+    assert "col A" in joined and "|" in joined, (
+        "table text was lost or reformatted when switching from text to post"
+    )
+
+
+

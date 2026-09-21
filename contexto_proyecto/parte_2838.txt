@@ -1,0 +1,364 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_model_override_credential_pool.py ===
+"""Session /model overrides must attach credential_pool for 402 rotation."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from gateway.run import GatewayRunner, _credential_pool_for_provider
+
+
+def test_fast_session_override_includes_credential_pool(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {
+        "sess-1": {
+            "model": "kimi-k2.7",
+            "provider": "custom:hyper",
+            "api_key": "sk-test",
+            "base_url": "https://hyper.charm.land/v1",
+            "api_mode": "chat_completions",
+        },
+    }
+    fake_pool = object()
+
+    monkeypatch.setattr(
+        "gateway.run._resolve_gateway_model",
+        lambda _uc=None: "default-model",
+    )
+    monkeypatch.setattr(
+        "gateway.run._credential_pool_for_provider",
+        lambda provider: fake_pool if provider == "custom:hyper" else None,
+    )
+
+    model, runtime = runner._resolve_session_agent_runtime(session_key="sess-1")
+
+    assert model == "kimi-k2.7"
+    assert runtime.get("credential_pool") is fake_pool
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_model_override_persistence.py ===
+"""Per-session /model overrides must survive gateway restarts (#3659 salvage).
+
+``GatewayRunner._session_model_overrides`` is in-memory, so before persistence
+a gateway restart silently reverted every session to the global default model.
+The non-secret parts (model/provider/base_url) are now written through to the
+session store (``SessionEntry.model_override`` in sessions.json) and lazily
+rehydrated on first use after a restart, with credentials re-resolved through
+the normal runtime provider resolution.
+
+Covers:
+  - the override survives a simulated restart (a second SessionStore instance
+    reading the same sessions dir, and a fresh runner rehydrating from it)
+  - /new (SessionStore.reset_session) clears the persisted override so a
+    restart cannot resurrect it
+  - api_key is NEVER serialized to sessions.json
+"""
+import json
+from unittest.mock import patch
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    sanitize_model_override,
+)
+
+OVERRIDE = {
+    "model": "gpt-5o",
+    "provider": "openai",
+    "api_key": "sk-SUPER-SECRET-do-not-persist",
+    "base_url": "https://api.openai.example/v1",
+    "api_mode": "responses",
+}
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+@pytest.fixture
+def store_factory(tmp_path, monkeypatch):
+    """Build SessionStores over a shared sessions dir, without SQLite."""
+
+    def _raise():
+        raise RuntimeError("SQLite disabled in test")
+
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "SessionDB", _raise)
+
+    def _make() -> SessionStore:
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        assert store._db is None
+        return store
+
+    return _make
+
+
+def _sessions_json(tmp_path) -> str:
+    return (tmp_path / "sessions.json").read_text(encoding="utf-8")
+
+
+def test_override_persists_and_survives_restart(store_factory, tmp_path):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+
+    store.set_model_override(session_key, OVERRIDE)
+
+    # Simulated restart: a brand-new store instance reads the same dir.
+    store2 = store_factory()
+    persisted = store2.get_model_override(session_key)
+    assert persisted == {
+        "model": "gpt-5o",
+        "provider": "openai",
+        "base_url": "https://api.openai.example/v1",
+    }
+
+
+def _make_runner(store):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {}
+    runner.session_store = store
+    return runner
+
+
+def test_runner_rehydrates_override_after_restart(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    store.set_model_override(session_key, OVERRIDE)
+
+    # Simulated restart: fresh store + fresh runner with an empty in-memory
+    # override map, credentials re-resolved via runtime provider resolution.
+    runner = _make_runner(store_factory())
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "api_key": "sk-fresh-from-keychain",
+            "api_mode": "responses",
+            "base_url": "https://api.openai.example/v1",
+            "provider": "openai",
+            "requested_provider": "custom:chatgpt-tier",
+            "capabilities": {"openai_native_compaction": True},
+            "max_tokens": 32_768,
+        },
+    ):
+        runner._rehydrate_session_model_override(session_key)
+
+    override = runner._session_model_overrides[session_key]
+    assert override["model"] == "gpt-5o"
+    assert override["provider"] == "openai"
+    assert override["base_url"] == "https://api.openai.example/v1"
+    # Credentials come from live resolution, never from disk.
+    assert override["api_key"] == "sk-fresh-from-keychain"
+    assert override["api_mode"] == "responses"
+    assert override["requested_provider"] == "custom:chatgpt-tier"
+    assert override["capabilities"] == {"openai_native_compaction": True}
+    assert override["max_tokens"] == 32_768
+
+    model, runtime = runner._resolve_session_agent_runtime(
+        session_key=session_key,
+        user_config={"model": {"default": "global-model"}},
+    )
+    assert model == "gpt-5o"
+    assert runtime["requested_provider"] == "custom:chatgpt-tier"
+    assert runtime["capabilities"] == {"openai_native_compaction": True}
+    assert runtime["max_tokens"] == 32_768
+    route = runner._resolve_turn_agent_config("", model, runtime)
+    assert route["runtime"]["capabilities"] == {"openai_native_compaction": True}
+
+
+def test_rehydrate_llamacpp_override_follows_live_managed_port(store_factory):
+    """The managed llama.cpp supervisor may come back on an ephemeral port (18434 busy). The persisted
+    loopback URL is a snapshot of the previous boot, so rehydration must take the live endpoint."""
+    store = store_factory()
+    session_key = store.get_or_create_session(_make_source()).session_key
+    store.set_model_override(session_key, {
+        "model": "Local.Model-Q4_K_M", "provider": "llamacpp", "base_url": "http://127.0.0.1:51489/v1"})
+
+    runner = _make_runner(store_factory())
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={"api_key": "local-key", "base_url": "http://127.0.0.1:18434/v1",
+                      "provider": "custom", "requested_provider": "llamacpp"},
+    ):
+        runner._rehydrate_session_model_override(session_key)
+
+    override = runner._session_model_overrides[session_key]
+    assert override["base_url"] == "http://127.0.0.1:18434/v1"
+    assert override["api_key"] == "local-key"
+
+
+def test_sanitize_model_override():
+    assert sanitize_model_override(None) is None
+    assert sanitize_model_override({}) is None
+    assert sanitize_model_override({"api_key": "sk-x", "api_mode": "chat"}) is None
+    assert sanitize_model_override(OVERRIDE) == {
+        "model": "gpt-5o",
+        "provider": "openai",
+        "base_url": "https://api.openai.example/v1",
+    }
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_model_override_routing.py ===
+"""Regression tests for session-scoped model/provider overrides in gateway agents.
+
+These cover the bug where `/model ...` stored a session override, but fresh
+agent constructions still resolved model/provider from global config/runtime.
+That let helper agents (and cache-miss main agents) route GPT-5.4 to the wrong
+provider, e.g. Nous instead of OpenAI Codex.
+"""
+
+import asyncio
+import sys
+import threading
+import types
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+import gateway.run as gateway_run
+from gateway.config import Platform
+from gateway.session import SessionSource
+
+
+class _CapturingAgent:
+    """Fake agent that records init kwargs for assertions."""
+
+    last_init = None
+
+    def __init__(self, *args, **kwargs):
+        type(self).last_init = dict(kwargs)
+        self.tools = []
+
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        return {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+def _make_runner():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {}
+    runner.session_store = None
+    runner.config = None
+    runner._voice_mode = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._show_reasoning = False
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._service_tier = None
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._background_tasks = set()
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._pending_approvals = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.hooks.loaded_hooks = []
+    return runner
+
+
+def _codex_override():
+    return {
+        "model": "gpt-5.4",
+        "provider": "openai-codex",
+        "api_key": "***",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+    }
+
+
+def _explode_runtime_resolution():
+    raise AssertionError(
+        "global runtime resolution should not run when a complete session override exists"
+    )
+
+
+def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
+    """Regression: fallback provider must not inherit the primary model.
+
+    If primary openai-codex auth fails and fallback_providers selects
+    OpenRouter/minimax, the gateway must instantiate AIAgent with the fallback
+    model, not the primary config model (e.g. gpt-5.5). Otherwise OpenRouter
+    receives an unintended GPT request.
+    """
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+model:
+  default: gpt-5.5
+  provider: openai-codex
+fallback_providers:
+  - provider: openrouter
+    model: minimax/minimax-m2.7
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None,
+                                      target_model=None):
+        if requested in {None, "", "openai-codex"}:
+            from hermes_cli.auth import AuthError
+            raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
+        assert requested == "openrouter"
+        # The fallback rung is resolved against the model it will send, not the primary default.
+        assert target_model == "minimax/minimax-m2.7"
+        return {
+            "api_key": "sk-openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        }
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
+
+    runner = _make_runner()
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        session_key="agent:main:telegram:group:-1003715515980:63",
+        user_config={
+            "model": {"default": "gpt-5.5", "provider": "openai-codex"},
+            "fallback_providers": [{"provider": "openrouter", "model": "minimax/minimax-m2.7"}],
+        },
+    )
+
+    assert model == "minimax/minimax-m2.7"
+    assert runtime_kwargs["provider"] == "openrouter"
+    assert runtime_kwargs["api_key"] == "sk-openrouter"
+
+
+

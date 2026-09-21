@@ -1,0 +1,391 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_home_directory_diagnostics.py ===
+"""Home initialization must respect operator-owned links and diagnose storage."""
+import stat
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import config
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("subdir", (".", *config._HERMES_HOME_SUBDIRS))
+def test_unavailable_directory_links_are_diagnosed_without_creating_targets(tmp_path, monkeypatch, subdir):
+    home = tmp_path / "hermes"
+    link = home / subdir
+    link.parent.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "unmounted" / "external"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(config, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    config._HERMES_HOME_ENSURED.discard(str(home))
+
+    issues = config.validate_config_structure()
+
+    assert issues
+    text = " ".join(str(issue) for issue in issues)
+    assert str(link) in text and str(target) in text
+    assert "mount" in text.lower() and "setup" not in text.lower()
+    assert link.is_symlink() and link.readlink() == target
+    assert not target.parent.exists()
+    assert str(home) not in config._HERMES_HOME_ENSURED
+
+    target.mkdir(parents=True, mode=0o750)
+    config.ensure_hermes_home()
+    assert link.is_symlink() and target.stat().st_mode & 0o777 == 0o750
+    assert str(home) in config._HERMES_HOME_ENSURED
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("linked", ("plain", "logs", "home"))
+def test_initialization_preserves_external_directory_modes(tmp_path, monkeypatch, linked):
+    home = tmp_path / "hermes"
+    target = tmp_path / "shared"
+    target.mkdir(mode=0o750)
+    if linked == "home":
+        home.symlink_to(target, target_is_directory=True)
+    else:
+        home.mkdir()
+    curator = target / "curator"
+    curator.mkdir(mode=0o750)
+    if linked == "logs":
+        (home / "logs").symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(config, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    config._HERMES_HOME_ENSURED.discard(str(home))
+
+    config.ensure_hermes_home()
+    monkeypatch.setattr(config, "get_hermes_home", lambda: home.resolve())
+    config.ensure_hermes_home()
+
+    assert all((home / name).is_dir() for name in config._HERMES_HOME_SUBDIRS)
+    assert (home / "SOUL.md").is_file()
+    if linked != "plain":
+        assert (home if linked == "home" else home / "logs").is_symlink()
+        assert target.stat().st_mode & 0o777 == 0o750
+        assert curator.stat().st_mode & 0o777 == 0o750
+    else:
+        assert (home / "logs").stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("existing", (False, True))
+def test_symlinked_parent_above_home_is_not_an_operator_home_link(
+    tmp_path, monkeypatch, existing
+):
+    """A link above HERMES_HOME is not an operator-owned home link.
+
+    macOS aliases ``/tmp`` -> ``/private/tmp`` and ``/var`` -> ``/private/var``, so a home
+    under the default temp root arrives with a symlinked parent; the same happens for any
+    user whose own directory is aliased. The home and its subdirectories are still ours to
+    secure: they must end up 0o700, both when created fresh and when a previous run left them
+    at the 0o755 default.
+    """
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_root, target_is_directory=True)
+    home = alias / "hermes"
+    if existing:
+        home.mkdir(parents=True, mode=0o755)
+        for name in config._HERMES_HOME_SUBDIRS:
+            (home / name).mkdir(mode=0o755)
+        assert stat.S_IMODE(home.stat().st_mode) == 0o755
+
+    monkeypatch.setattr(config, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    config._HERMES_HOME_ENSURED.discard(str(home))
+    config._HERMES_HOME_ENSURED.discard(str(home.resolve()))
+
+    config.ensure_hermes_home()
+
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    for name in config._HERMES_HOME_SUBDIRS:
+        mode = stat.S_IMODE((home / name).stat().st_mode)
+        assert mode == 0o700, f"{name} should be 0700, got 0o{mode:o}"
+
+
+@pytest.mark.linux_only
+def test_aliased_parent_still_leaves_an_operator_home_link_alone(tmp_path, monkeypatch):
+    """An operator-owned link at the home boundary keeps owning the mode, aliased parent or not."""
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_root, target_is_directory=True)
+    shared = real_root / "shared"
+    shared.mkdir(mode=0o750)
+    (shared / "curator").mkdir(mode=0o750)
+    home = alias / "hermes"
+    home.symlink_to(shared, target_is_directory=True)
+
+    monkeypatch.setattr(config, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    config._HERMES_HOME_ENSURED.discard(str(home))
+    config._HERMES_HOME_ENSURED.discard(str(home.resolve()))
+
+    config.ensure_hermes_home()
+
+    assert home.is_symlink() and home.readlink() == shared
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o750
+    assert stat.S_IMODE((shared / "curator").stat().st_mode) == 0o750
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_home_init_soul_symlink.py ===
+"""Home initialization must survive a SOUL.md symlink the seed cannot write through.
+
+A cyclic ``SOUL.md -> SOUL.md`` link (ELOOP) or a link dangling into a missing directory
+(ENOENT) made the first-run seed raise OSError, which ``initialize_home`` turned into
+``HomeInitializationError`` on every gateway spawn (launchd exit-75 relaunch storm). The seed
+now replaces such a link with the default identity file; a link that resolves is operator
+wiring and stays a link.
+"""
+
+import pytest
+
+from hermes_cli.config import DEFAULT_SOUL_MD, _ensure_default_soul_md
+from hermes_cli.config_home import initialize_home
+
+_SUBDIRS = ("cron", "sessions", "logs", "memories")
+
+
+@pytest.mark.parametrize("target", ["SOUL.md", "missing-dir/SOUL.md"], ids=["cyclic", "dangling"])
+def test_initialize_home_replaces_unwritable_soul_symlink(tmp_path, target):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    soul = home / "SOUL.md"
+    soul.symlink_to(home / target)
+
+    initialize_home(home, _SUBDIRS, set())
+
+    assert not soul.is_symlink()
+    assert soul.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
+    assert not [p for p in home.iterdir() if p.name.startswith(".SOUL.md.")]
+
+
+def test_soul_symlink_to_customized_file_is_left_alone(tmp_path):
+    """Control: a resolving link survives and its content is untouched."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    target = tmp_path / "shared-identity.md"
+    target.write_text("custom identity\n", encoding="utf-8")
+    soul = home / "SOUL.md"
+    soul.symlink_to(target)
+
+    _ensure_default_soul_md(home)
+    initialize_home(home, _SUBDIRS, set())
+
+    assert soul.is_symlink()
+    assert soul.read_text(encoding="utf-8") == "custom identity\n"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_hooks_cli.py ===
+"""Tests for the ``hermes hooks`` CLI subcommand."""
+
+from __future__ import annotations
+
+import io
+import json
+from contextlib import redirect_stdout
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from agent import shell_hooks
+from hermes_cli import hooks as hooks_cli
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    shell_hooks.reset_for_tests()
+    yield
+    shell_hooks.reset_for_tests()
+
+
+def _hook_script(tmp_path: Path, body: str, name: str = "hook.sh") -> Path:
+    p = tmp_path / name
+    p.write_text(body)
+    p.chmod(0o755)
+    return p
+
+
+def _run(sub_args: SimpleNamespace) -> str:
+    """Capture stdout for a hooks_command invocation."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        hooks_cli.hooks_command(sub_args)
+    return buf.getvalue()
+
+
+# ── list ──────────────────────────────────────────────────────────────────
+
+
+class TestHooksList:
+    def test_empty_config(self, tmp_path):
+        with patch("hermes_cli.config.load_config", return_value={}):
+            out = _run(SimpleNamespace(hooks_action="list"))
+        assert "No shell hooks or outbound webhooks configured" in out
+
+    def test_shows_configured_and_consent_status(self, tmp_path):
+        script = _hook_script(
+            tmp_path, "#!/usr/bin/env bash\nprintf '{}\\n'\n",
+        )
+        cfg = {
+            "hooks": {
+                "pre_tool_call": [
+                    {"matcher": "terminal", "command": str(script), "timeout": 30},
+                ],
+                "on_session_start": [
+                    {"command": str(script)},
+                ],
+            }
+        }
+
+        # Approve one of the two so we can see both states in the output
+        shell_hooks._record_approval("pre_tool_call", str(script))
+
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="list"))
+
+        assert "[pre_tool_call]" in out
+        assert "[on_session_start]" in out
+        assert "✓ allowed" in out
+        assert "✗ not allowlisted" in out
+        assert str(script) in out
+
+
+# ── test ──────────────────────────────────────────────────────────────────
+
+
+class TestHooksTest:
+    def test_synthetic_payload_matches_production_shape(self, tmp_path):
+        """`hermes hooks test` must feed the script stdin in the same
+        shape invoke_hook() would at runtime.  Prior to this fix,
+        run_once bypassed _serialize_payload and the two paths diverged —
+        scripts tested with `hermes hooks test` saw different top-level
+        keys than at runtime, silently breaking in production."""
+        capture = tmp_path / "captured.json"
+        script = _hook_script(
+            tmp_path,
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+        )
+        cfg = {"hooks": {"subagent_stop": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            _run(SimpleNamespace(
+                hooks_action="test", event="subagent_stop",
+                for_tool=None, payload_file=None,
+            ))
+
+        seen = json.loads(capture.read_text())
+        # Same top-level keys _serialize_payload produces at runtime
+        assert set(seen.keys()) == {
+            "hook_event_name", "tool_name", "tool_input",
+            "session_id", "cwd", "extra", "profile",
+        }
+        # parent_session_id was routed to top-level session_id (matches runtime)
+        assert seen["session_id"] == "parent-sess"
+        assert "parent_session_id" not in seen["extra"]
+        # subagent_stop has no tool, so tool_name / tool_input are null
+        assert seen["tool_name"] is None
+        assert seen["tool_input"] is None
+
+    def test_fires_real_subprocess_and_parses_block(self, tmp_path):
+        block_script = _hook_script(
+            tmp_path,
+            "#!/usr/bin/env bash\n"
+            'printf \'{"decision": "block", "reason": "nope"}\\n\'\n',
+            name="block.sh",
+        )
+        cfg = {
+            "hooks": {
+                "pre_tool_call": [
+                    {"matcher": "terminal", "command": str(block_script)},
+                ],
+            },
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(
+                hooks_action="test", event="pre_tool_call",
+                for_tool="terminal", payload_file=None,
+            ))
+
+        # Parsed block appears in output
+        assert '"action": "block"' in out
+        assert '"message": "nope"' in out
+
+
+# ── revoke ────────────────────────────────────────────────────────────────
+
+
+class TestHooksRevoke:
+    def test_revoke_removes_entry(self, tmp_path):
+        script = _hook_script(tmp_path, "#!/usr/bin/env bash\n")
+        shell_hooks._record_approval("on_session_start", str(script))
+
+        out = _run(SimpleNamespace(hooks_action="revoke", command=str(script)))
+        assert "Removed 1" in out
+        assert shell_hooks.allowlist_entry_for(
+            "on_session_start", str(script),
+        ) is None
+
+
+# ── doctor ────────────────────────────────────────────────────────────────
+
+
+class TestHooksDoctor:
+
+
+    def test_flags_mtime_drift(self, tmp_path, monkeypatch):
+        """Allowlist with older mtime than current -> drift warning."""
+        script = _hook_script(tmp_path, "#!/usr/bin/env bash\nprintf '{}\\n'\n")
+
+        # Manually stash an allowlist entry with an old mtime
+        from agent.shell_hooks import allowlist_path
+        allowlist_path().parent.mkdir(parents=True, exist_ok=True)
+        allowlist_path().write_text(json.dumps({
+            "approvals": [
+                {
+                    "event": "on_session_start",
+                    "command": str(script),
+                    "approved_at": "2000-01-01T00:00:00Z",
+                    "script_mtime_at_approval": "2000-01-01T00:00:00Z",
+                }
+            ]
+        }))
+
+        cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+        assert "modified since approval" in out
+
+
+    def test_unallowlisted_script_is_not_executed(self, tmp_path):
+        """Regression for M4: `hermes hooks doctor` used to run every
+        listed script against a synthetic payload as part of its JSON
+        smoke test, which contradicted the documented workflow of
+        "spot newly-added hooks *before they register*".  An un-allowlisted
+        script must not be executed during `doctor`."""
+        sentinel = tmp_path / "executed"
+        # Script would touch the sentinel if executed; we assert it wasn't.
+        script = _hook_script(
+            tmp_path,
+            f"#!/usr/bin/env bash\ntouch {sentinel}\nprintf '{{}}\\n'\n",
+        )
+        cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+
+        assert not sentinel.exists(), (
+            "doctor executed an un-allowlisted script — "
+            "M4 gate regressed"
+        )
+        assert "not allowlisted" in out.lower()
+        assert "skipped JSON smoke test" in out
+

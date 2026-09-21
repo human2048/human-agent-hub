@@ -1,0 +1,305 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_send_reconnect_wait.py ===
+"""Telegram send() must wait for reconnect instead of dropping the final reply.
+
+A network blip can disconnect Telegram while the agent is sending its final
+response. send() used to return "Not connected" immediately (retryable=False),
+so the delivery ledger held the answer until the next gateway boot — hours
+later. QQBot already waits; these tests pin the same contract on Telegram,
+including the reconnect-watcher case that *replaces* the adapter object.
+"""
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+def _make_adapter() -> TelegramAdapter:
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._rich_send_disabled = True
+    adapter.send_typing = AsyncMock()
+    adapter._RECONNECT_WAIT_SECONDS = 0.6
+    adapter._RECONNECT_POLL_INTERVAL = 0.05
+    return adapter
+
+
+def _connected_bot() -> MagicMock:
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=42))
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_send_waits_and_succeeds_when_bot_returns():
+    adapter = _make_adapter()
+    adapter._bot = None
+
+    async def restore_bot() -> None:
+        await asyncio.sleep(0.12)
+        adapter._bot = _connected_bot()
+
+    asyncio.get_running_loop().create_task(restore_bot())
+    result = await adapter.send("123", "hello")
+
+    assert result.success is True
+    assert result.message_id == "42"
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_delegates_to_replacement_adapter_installed_mid_wait():
+    old = _make_adapter()
+    old._bot = None
+
+    live = _make_adapter()
+    live._bot = _connected_bot()
+    live._RECONNECT_WAIT_SECONDS = 0.01
+
+    runner = MagicMock()
+    runner.adapters = {}
+    old.gateway_runner = runner
+
+    async def install_replacement() -> None:
+        await asyncio.sleep(0.12)
+        runner.adapters[old.platform] = live
+
+    asyncio.get_running_loop().create_task(install_replacement())
+    result = await old.send("123", "hello")
+
+    assert result.success is True
+    assert result.message_id == "42"
+    live._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_delegates_immediately_when_replacement_already_live():
+    old = _make_adapter()
+    old._bot = None
+    live = _make_adapter()
+    live._bot = _connected_bot()
+    runner = MagicMock()
+    runner.adapters = {old.platform: live}
+    old.gateway_runner = runner
+    old._wait_for_reconnection = AsyncMock(
+        side_effect=AssertionError("must not wait when replacement is already live")
+    )
+
+    result = await old.send("123", "hello")
+
+    assert result.success is True
+    live._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_timeout_is_retryable_not_connected():
+    adapter = _make_adapter()
+    adapter._bot = None
+    adapter._RECONNECT_WAIT_SECONDS = 0.15
+    adapter._RECONNECT_POLL_INTERVAL = 0.05
+
+    result = await adapter.send("123", "hello")
+
+    assert result.success is False
+    assert result.error == "Not connected"
+    assert result.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_send_permanent_fatal_fails_immediately_without_wait():
+    adapter = _make_adapter()
+    adapter._bot = None
+    adapter._set_fatal_error("telegram_auth_error", "invalid token", retryable=False)
+    adapter._wait_for_reconnection = AsyncMock(
+        side_effect=AssertionError("must not wait on permanent fatal")
+    )
+
+    result = await adapter.send("123", "hello")
+
+    assert result.success is False
+    assert result.error == "Not connected"
+    assert result.retryable is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_slash_confirm.py ===
+"""Regression guard: send_slash_confirm must use format_message + MARKDOWN_V2."""
+
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+_repo = str(Path(__file__).resolve().parents[2])
+if _repo not in sys.path:
+    sys.path.insert(0, _repo)
+from plugins.platforms.telegram.adapter import TelegramAdapter
+from gateway.config import PlatformConfig
+
+
+def _make_adapter():
+    config = PlatformConfig(enabled=True, token="test-token", extra={})
+    adapter = TelegramAdapter(config)
+    adapter._bot = AsyncMock()
+    adapter._app = MagicMock()
+    return adapter
+
+
+class TestSendSlashConfirm:
+
+    @pytest.mark.asyncio
+    async def test_uses_markdown_v2_and_escapes_special_chars(self):
+        """send_slash_confirm must pass preview through format_message and use
+        MARKDOWN_V2 — so commands with underscores, dots, or brackets don't
+        raise BadRequest: Can't parse entities."""
+        adapter = _make_adapter()
+        sent = {}
+
+        async def mock_send(**kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(message_id=7)
+
+        adapter._bot.send_message = AsyncMock(side_effect=mock_send)
+
+        result = await adapter.send_slash_confirm(
+            chat_id="100",
+            title="Confirm",
+            message="/run script_name.sh --flag=value [option]",
+            session_key="sk",
+            confirm_id="cid1",
+        )
+
+        assert result.success is True
+        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        # Underscores and dots must be escaped by format_message
+        assert "script\\_name" in sent["text"]
+        assert "\\." in sent["text"]
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_split_send_flood.py ===
+"""Split Telegram replies under flood control: no duplicated head, no interleaving, no hammering.
+
+A reply past ``MAX_MESSAGE_LENGTH`` goes out as several ``sendMessage`` calls. When chunk 2 is refused
+(``RetryAfter`` past the inline cap) the adapter must report the partial delivery via the existing
+``partial_overflow`` contract and ``_send_with_retry`` must resume from the undelivered remainder — never
+re-send chunk 1 (the reporter saw a duplicated head), never drop the tail.
+"""
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+class _FloodError(Exception):
+    def __init__(self, seconds: float):
+        super().__init__(f"Flood control exceeded. Retry in {seconds} seconds")
+        self.retry_after = seconds
+
+
+def _adapter(send_message: AsyncMock) -> TelegramAdapter:
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._rich_send_disabled = True
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = send_message
+    return adapter
+
+
+def _three_chunk_text() -> str:
+    return "\n".join(" ".join(f"w{i * 20 + j}" for j in range(20)) for i in range(80))  # ~9.5k chars, 3 chunks
+
+
+@pytest.mark.asyncio
+async def test_split_send_resumes_from_undelivered_tail_without_resending_head(monkeypatch):
+    """Chunk 2 refused with a 7s RetryAfter (> the 5s adapter cap, < the 60s base cap): the retry
+    delivers chunks 2..3 only — every chunk exactly once, in order."""
+    sent: list = []
+    calls = {"n": 0}
+
+    async def fake_send_message(text: str, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _FloodError(7.0)
+        sent.append(text)
+        return MagicMock(message_id=1000 + calls["n"])
+
+    adapter = _adapter(AsyncMock(side_effect=fake_send_message))
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+
+    async def _penalty_elapses(_delay):  # the base retry sleep is mocked; model the window having passed
+        adapter._telegram_send_cooldown_until.clear()
+
+    monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", _penalty_elapses)
+    content = _three_chunk_text()
+    expected = adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH)
+    assert len(expected) >= 3
+
+    result = await adapter._send_with_retry(chat_id="4242", content=content)
+
+    assert result.success is True
+    assert [t.split()[0] for t in sent] == [c.split()[0] for c in expected]  # 1, 2, 3 — no duplicate head
+    assert result.raw_response["message_ids"] == ["1001"] + [str(1002 + i) for i in range(1, len(expected))]
+
+
+@pytest.mark.asyncio
+async def test_over_cap_flood_returns_partial_overflow_and_arms_cooldown(monkeypatch):
+    """A refusal past the base inline cap is returned typed (ledger owns the wait) but now carries the
+    partial_overflow contract; the next send to that chat fails closed locally, another chat is unaffected."""
+    calls = {"n": 0}
+
+    async def fake_send_message(text: str, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _FloodError(120.0)
+        return MagicMock(message_id=1000 + calls["n"])
+
+    adapter = _adapter(AsyncMock(side_effect=fake_send_message))
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+
+    content = _three_chunk_text()
+    total = len(adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH))
+    result = await adapter._send_with_retry(chat_id="4242", content=content)
+
+    assert result.success is False and result.error == "flood_control:120.0"
+    raw = result.raw_response
+    assert raw["partial_overflow"] is True and raw["delivered_chunks"] == 1 and raw["total_chunks"] == total >= 3
+    assert raw["last_message_id"] == "1001" and len(raw["undelivered_chunks"]) == total - 1
+    assert calls["n"] == 2
+    # Facet 3: a follow-up send inside the penalty window makes no API call; a different chat still sends.
+    again = await adapter.send("4242", "hello again")
+    assert again.success is False and again.error.startswith("flood_control:") and calls["n"] == 2
+    other = await adapter.send("999", "hello other")
+    assert other.success is True and calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_concurrent_split_sends_to_one_chat_do_not_interleave():
+    """Two 3-chunk sends racing on one chat arrive as A A A B B B, not A B A B A B."""
+    order: list = []
+
+    async def fake_send_message(text: str, **_kw):
+        await asyncio.sleep(0)  # yield like a real round-trip so an unlocked loop interleaves
+        order.append(text.split()[0])
+        return MagicMock(message_id=len(order))
+
+    adapter = _adapter(AsyncMock(side_effect=fake_send_message))
+    long = lambda tag: "\n".join(" ".join([tag] * 30) for _ in range(90))  # noqa: E731
+
+    await asyncio.gather(adapter.send("1", long("REPORT")), adapter.send("1", long("ALERT")))
+
+    assert len(order) >= 4
+    switches = sum(1 for a, b in zip(order, order[1:]) if a != b)
+    assert switches == 1, order
+

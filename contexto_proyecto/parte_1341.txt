@@ -1,0 +1,206 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\scripts\vectors.py ===
+"""Enumerate the search queries to run per broker, across ALL of a subject's identifiers.
+
+People-search sites index a person under every name, phone, email, and address they
+have. A subject with two names (maiden/married) and three past cities can have many
+distinct listings on one broker, each found via a different search. `search_vectors`
+expands the dossier into the concrete searches to run, filtered by what each broker
+supports (`broker.search.by`, default ["name"]).
+"""
+from __future__ import annotations
+
+import dossier as dossier_mod
+
+# What a broker can be searched by; default if a record doesn't declare it.
+DEFAULT_BY = ["name"]
+
+
+def supported_by(broker: dict) -> list[str]:
+    return list((broker.get("search") or {}).get("by") or DEFAULT_BY)
+
+
+def search_vectors(subject_dossier: dict, broker: dict) -> list[dict]:
+    """List of {by, query} searches to run for this subject on this broker."""
+    by = set(supported_by(broker))
+    ident = subject_dossier.get("identity", {})
+    vectors: list[dict] = []
+
+    if "name" in by:
+        names = dossier_mod.all_names(subject_dossier)
+        locations = dossier_mod.all_locations(subject_dossier)
+        if locations:
+            for name in names:
+                for loc in locations:
+                    vectors.append({"by": "name",
+                                    "query": {"full_name": name, "city": loc.get("city"), "state": loc.get("state")}})
+        else:
+            for name in names:
+                vectors.append({"by": "name", "query": {"full_name": name}})
+
+    if "phone" in by:
+        for phone in ident.get("phones") or []:
+            vectors.append({"by": "phone", "query": {"phone": phone}})
+
+    if "email" in by:
+        for email in ident.get("emails") or []:
+            vectors.append({"by": "email", "query": {"email": email}})
+
+    if "address" in by:
+        for a in dossier_mod.all_addresses(subject_dossier):
+            if a.get("line1"):
+                vectors.append({"by": "address",
+                                "query": {k: a.get(k) for k in ("line1", "city", "state", "postal")}})
+
+    return vectors
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\templates\consent\authorization.md ===
+# Authorization to act on my behalf (data removal)
+
+I, **{full_name}**, authorize the operator of this tool to act as my agent for the limited purpose of
+removing my personal information from data brokers and people-search websites, including submitting
+opt-out, deletion, and do-not-sell/share requests under applicable privacy laws (e.g. CCPA/CPRA,
+GDPR) on my behalf.
+
+This authorization is limited to data removal. It does not authorize any other use of my information.
+
+- Full name: {full_name}
+- Date: {date}
+- Signature: ______________________________
+
+Store the signed copy at the path recorded in the dossier `consent.authorization_artifact`. Required
+only when `consent.method` is `written_authorization` or `poa` (not for `self`).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\templates\emails\ccpa-authorized-agent.txt ===
+Subject: CCPA/CPRA request submitted by authorized agent (delete and opt out)
+
+To the {broker_name} privacy team,
+
+I am an authorized agent acting on behalf of the consumer named below, under Cal. Civ. Code
+1798.135 and the CCPA/CPRA. Written authorization is on file and available on request.
+
+On the consumer's behalf I request that you:
+
+  1. DELETE all personal information you hold about them, and
+  2. OPT them OUT of the sale and sharing of their personal information.
+
+Their information appears at:
+{listing_urls}
+
+Consumer:
+  Name:  {full_name}
+  Email for confirmation: {contact_email}
+
+Please confirm completion in writing to the email above. Do not request more sensitive information
+than necessary to verify and process this request.
+
+Sincerely,
+Authorized agent for {full_name}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\templates\emails\ccpa-deletion.txt ===
+Subject: CCPA/CPRA request to delete and opt out (do not sell or share)
+
+To the {broker_name} privacy team,
+
+Under the California Consumer Privacy Act as amended by the CPRA (Cal. Civ. Code 1798.105 and
+1798.120), I request that you:
+
+  1. DELETE all personal information you hold about me, and
+  2. OPT me OUT of the sale and sharing of my personal information.
+
+My information appears at:
+{listing_urls}
+
+Identifying details for this request:
+  Name:  {full_name}
+  Email: {contact_email}
+
+Please do not request more sensitive information than necessary to process this request. Confirm
+completion in writing to the email above within the statutory timeframe.
+
+Sincerely,
+{full_name}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\templates\emails\ccpa-indirect-deletion.txt ===
+Subject: Request to delete my personal information from third-party listings (CCPA/CPRA where applicable)
+
+To the {broker_name} privacy team,
+
+I am not the primary subject of the listings below, but each one currently exposes MY personal
+information as a secondary data point (my email address and/or my name shown as a relative or
+associated person). I am writing only about my own personal information, not about the individuals
+who are the primary subjects of these records, and I am not requesting any change to their data.
+
+Please delete and suppress the following personal information about me wherever it appears in your
+database and on Spokeo-operated sites, including Thatsthem.com:
+{my_identifiers}
+
+These items currently appear at:
+{listing_urls}
+
+To the extent the California Consumer Privacy Act as amended by the CPRA (Cal. Civ. Code 1798.105)
+applies to my personal information, please treat this as a request to delete it and to opt me out of
+its sale or sharing (1798.120). Where CCPA does not apply by residency, I ask that you honor this as a
+standard removal of my personal information consistent with the policy you apply to such requests.
+
+Please do not request more information than is necessary to locate and remove these items, and please
+do not add any new identifiers to my data in the course of processing this request. Confirm completion
+in writing to the email below.
+
+Name: {full_name}
+Contact email: {contact_email}
+
+Sincerely,
+{full_name}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\templates\emails\gdpr-erasure.txt ===
+Subject: Request for erasure under GDPR Article 17
+
+To the {broker_name} data protection officer,
+
+Under Article 17 of the EU General Data Protection Regulation (and/or the UK GDPR), I request the
+erasure of all personal data you hold about me, and under Article 21 I object to its processing.
+
+My personal data appears at:
+{listing_urls}
+
+Identifying details:
+  Name:  {full_name}
+  Email: {contact_email}
+
+Please confirm erasure in writing to the email above within one month, as required by Article 12(3).
+Do not request more personal data than necessary to action this request.
+
+Sincerely,
+{full_name}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\templates\emails\generic-optout.txt ===
+Subject: Opt-out and data removal request
+
+To the {broker_name} privacy team,
+
+I am writing to request the removal of my personal information from {broker_name} and any sites you
+operate or supply. My information currently appears at:
+{listing_urls}
+
+Please suppress and delete the record(s) associated with my name, {full_name}, and do not sell or
+share my personal information.
+
+Please confirm completion to this email address: {contact_email}
+
+Thank you,
+{full_name}
+

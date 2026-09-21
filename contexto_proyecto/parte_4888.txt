@@ -1,0 +1,183 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\developer-guide\cli-internals.md ===
+---
+sidebar_position: 15
+title: "CLI Internals"
+description: "How hermes_cli is shaped: slash dispatch, config loaders, the skin engine, the transactional update pipeline, and process-identity rules"
+---
+
+# CLI Internals
+
+Companion to `hermes_cli/AGENTS.md` (the rules) — this page holds the longer explanations.
+
+## Update pipeline
+
+The stage-by-stage contract (`plan → snapshot → apply → restart-per-kind → verify → report`) and the
+field failure each stage guards are documented in `hermes_cli/AGENTS.md`; user-facing behaviour
+(receipts, `--plan`, snapshot modes) is in [Updating](../getting-started/updating.md).
+
+The systemd blunt-restart fallback waits for the unit's `TimeoutStopUSec` plus
+`TimeoutStartUSec`, with 15 seconds of client-side slack. It reads the target unit
+in the same manager scope as the restart; both the initial attempt and retry use
+this budget, including the catch-up restart after an interrupted update.
+A start after a graceful drain uses only the start budget plus slack.
+A missing, unparseable, or infinite phase limit falls back to 90 seconds
+for that phase, keeping unattended updates bounded. Timing out the `systemctl`
+client does **not** cancel the manager's transaction. Custom multi-command stop
+chains or `EXTEND_TIMEOUT_USEC` can still outlast this estimate; a real timeout
+remains an incomplete restart, and successful commands still require the existing
+service-health and fleet-version verification. Raw numeric `*USec` values are
+microseconds, while formatted values use systemd's fixed units, including days,
+weeks, months and years. The combined timeout is capped below the native signed
+32-bit millisecond poll limit (with rounding headroom), so exceptionally long
+unit limits cannot overflow subprocess polling. Zero/unknown/infinite phase
+limits use the bounded fallback. This does not change active-turn drain settings.
+
+## Process identity: never infer it from argv substrings
+
+The bug class behind ~10 fleet-update issues (#90778, #87594, #78089, #76129, #91964, ...):
+classifying a process by `"serve" in cmdline` or similar. `kanban --preserve-cache` contains
+"serve"; a flag VALUE can equal a subcommand (`-m dashboard serve`); truncated cmdlines hide the real
+subcommand. Rules:
+
+- Use the canonical matchers: `gateway.status.looks_like_gateway_command_line` (gateway run),
+  `hermes_cli.update_cmd._hermes_holder_subcommand` (top-level subcommand of any Hermes argv). Never
+  hand-roll token scans.
+- Flag sets must be DERIVED from the parser (`_holder_value_flags()` introspects
+  `build_top_level_parser()`), never hand-written lists — they drift.
+- Never blanket-exclude ancestors from process scans: when `/update` runs as the gateway's child, a
+  gateway ancestor must stay visible to the pause machinery (#87594). Exclude interactive ancestry,
+  carve out gateway-shaped ancestors.
+- Match on FULL cmdlines; truncate only at display time (#78089).
+- Before adding any new scan heuristic, read #92091 — the gateway control socket replaces scans as
+  the primary coordination mechanism; scans are the fallback layer for old/crashed processes.
+
+## Skin engine — what skins customize
+
+| Element | Skin key | Used by |
+|---|---|---|
+| Banner panel border / title / section headers / dim / body | `colors.banner_border`, `banner_title`, `banner_accent`, `banner_dim`, `banner_text` | `banner.py` |
+| Response box border | `colors.response_border` | `cli.py` |
+| Spinner faces (waiting / thinking) | `spinner.waiting_faces`, `spinner.thinking_faces` | `display.py` |
+| Spinner verbs / wings (optional) | `spinner.thinking_verbs`, `spinner.wings` | `display.py` |
+| Tool output prefix / per-tool emojis | `tool_prefix`, `tool_emojis` | `display.py` → `get_tool_emoji()` |
+| Agent name / welcome / response label / prompt symbol | `branding.agent_name`, `welcome`, `response_label`, `prompt_symbol` | `banner.py`, `cli.py` |
+
+Built-in skins (`_BUILTIN_SKINS` in `hermes_cli/skin_engine.py`): `default` (classic gold/kawaii),
+`ares` (crimson/bronze with custom spinner wings), `mono` (grayscale), `slate` (cool blue). Add a
+built-in as a dict entry `{"name", "description", "colors", "spinner", "branding", "tool_prefix"}`.
+User skins are `~/.hermes/skins/<name>.yaml` with the same keys, activated with `/skin <name>` or
+`display.skin: <name>`; the full YAML template is in the
+[Skins & Themes](../user-guide/features/skins.md) user guide.
+
+## Profiles: multi-instance support
+
+Hermes supports profiles — fully isolated instances, each with its own `HERMES_HOME` (config, API
+keys, memory, sessions, skills, gateway). For single-profile commands (`hermes -p x <cmd>`),
+`_apply_profile_override()` in `hermes_cli/main.py` sets `HERMES_HOME` before any module imports, so
+every `get_hermes_home()` reference scopes to the active profile. The multiplex gateway and the
+Desktop/dashboard `serve` backend serve several profiles from one process instead: the active
+profile is a contextvar override bound per activity, `os.environ["HERMES_HOME"]` stays the launch
+profile's, and a module-level constant derived from the home freezes to that launch profile (see
+[Gateway Internals § Multiplexed profiles](./gateway-internals.md#multiplexed-profiles)). Profile
+operations are HOME-anchored (`_get_profiles_root()` returns
+`Path.home() / ".hermes" / "profiles"`, not `get_hermes_home() / "profiles"`) so
+`hermes -p coder profile list` sees all profiles regardless of which one is active — intentional.
+Profile-safe coding rules are in the root `AGENTS.md`; multiplex secret-scope rules in
+`gateway/AGENTS.md`.
+
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\developer-guide\codebase-ownership.md ===
+---
+title: "Codebase Ownership Map"
+description: "Which directories belong to which subsystem, and where the right docs entry point lives for each"
+---
+
+# Codebase Ownership Map
+
+Hermes is a large repository, and most contributions touch exactly one subsystem. This page maps each subsystem to its source directories and the documentation entry point you should read before changing it. Use it to find the right starting doc, the right place for a change, and the right test directory (tests mirror source: code in `tools/` is tested in `tests/tools/`, plugins in `tests/plugins/<type>/`, and so on).
+
+| Subsystem | Source directories | Docs entry point |
+|-----------|-------------------|------------------|
+| Agent core (loop, transports, compression) | `agent/`, `run_agent.py` | [Agent Loop](agent-loop.md), [Context Compression & Caching](context-compression-and-caching.md) |
+| Prompt assembly | `agent/prompt_builder.py`, `agent/system_prompt.py` | [Prompt Assembly](prompt-assembly.md) |
+| Model providers & transports | `agent/transports/`, `plugins/model-providers/`, `hermes_cli/models.py` | [Adding Providers](adding-providers.md), [Model Provider Plugins](model-provider-plugin.md), [Provider Runtime](provider-runtime.md) |
+| Built-in tools | `tools/` | [Adding Tools](adding-tools.md), [Tools Runtime](tools-runtime.md) |
+| Messaging gateway | `gateway/`, `plugins/platforms/` | [Gateway Internals](gateway-internals.md), [Adding Platform Adapters](adding-platform-adapters.md) |
+| CLI | `hermes_cli/` | [Extending the CLI](extending-the-cli.md) |
+| Plugins system | `plugins/` | [Build a Hermes Plugin](plugins/index.md) |
+| Skills (bundled & optional) | `skills/`, `optional-skills/` | [Creating Skills](creating-skills.md) |
+| Cron / scheduled jobs | `cron/` | [Cron Internals](cron-internals.md) |
+| Session storage | `hermes_state.py`, `hermes_state_*.py` | [Session Storage](session-storage.md) |
+| Browser stack | `tools/browser_tool.py`, `tools/browser_supervisor.py`, `tools/browser_cdp_tool.py` | [Browser Supervisor](browser-supervisor.md) |
+| Egress firewall | `agent/proxy_sources/iron_proxy.py` | [Egress Internals](egress-internals.md) |
+| ACP (IDE integration) | `acp_adapter/` | [ACP Internals](acp-internals.md) |
+| Desktop app | `apps/desktop/` | [Desktop Plugin SDK](desktop-plugin-sdk.md), [Worktree UI Development](worktree-ui-dev.md) |
+| TUI | `ui-tui/`, `tui_gateway/` | [Worktree UI Development](worktree-ui-dev.md) |
+| Docs site | `website/` | [Contributing](contributing.md) |
+| Tests | `tests/`, `tests-js/` | [Contributing → Before Submitting](contributing.md#before-submitting) |
+
+A few conventions that fall out of this map:
+
+- **Changes should stay inside their subsystem.** A plugin that needs to edit core files is a design smell — widen the generic plugin surface instead (see the contribution rubric in the repository's `AGENTS.md`).
+- **Run the mirror test directory for every source directory you touch.** A change to `plugins/platforms/telegram/` needs `tests/plugins/platforms/` green, not just the test file you happened to think of.
+- **When two subsystems are involved, the narrower one owns the change.** Prefer a fix in an adapter or plugin over a branch in the agent core; the core is a narrow waist, and every addition there is paid for on every API call.
+
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\developer-guide\completion-backlog-delivery.md ===
+---
+title: Background completion backlogs
+sidebar_label: Completion backlogs
+---
+
+# Background completion backlogs
+
+Interactive surfaces coalesce consecutive background-process completions that are
+already ready for one conversation into a single notification turn. This does not
+add a delay or promise to combine jobs that finish at different times. Failures and
+successful outputs remain in the batch; one completion keeps its original text.
+
+Process identity remains available until dispatch. Explicit `process_manage`
+wait/log/kill consumption can therefore suppress a CLI completion even after it
+has left the process registry and entered the input queue. An entirely consumed
+batch starts no turn. Watching output and async-delegation results remain separate
+notifications, in their original order; they are not folded into completion batches.
+
+## Consumers and ownership
+
+- **Classic CLI:** `hermes_cli/cli_process_notifications.py` owns the idle/post-turn
+  drain, compression-aware ownership and final input unwrapping.
+- **TUI and Desktop:** `tui_gateway/session_notifications.py` groups the poller's
+  ready snapshot after checking ownership. Each process still emits its own UI
+  status. Busy sessions requeue structured events, not rendered batch strings.
+- **Post-turn TUI safety net:** `tui_gateway/prompt_turn.py` uses the same routing
+  and rendering path. Desktop and dashboard chat clients share this backend.
+- **Messaging gateway:** `gateway/run_notifications.py` already uses its own
+  route-keyed short-window batching. This interactive-backlog change does not
+  replace that mechanism or alter adapter sends.
+- **Noninteractive/headless consumers:** this change does not create a new
+  autonomous notification loop for an API request, ACP client, or one-shot CLI.
+
+The shared renderer is `tools/process_registry_notifications.py::ProcessNotificationBatch`.
+Neither a batch nor its delivery status is persisted into the system prompt.
+Addressed events still require a provable owner; another live session cannot adopt
+them. Delegation delivery continues through its existing durable claim/complete
+ledger, once per delegation rather than once per process batch.
+
+## Local validation and its limits
+
+`evals/completion_backlog_probe.py REPO OUTPUT.json` starts real local shell children
+in temporary directories, reads their real completion events, and drives the
+production CLI, TUI poller and post-turn notification routes. A loopback HTTP turn
+sink replaces `chat` / `_run_prompt_submit`; it records actual dispatches but does
+**not** exercise model inference, native renderer interaction or a hosted platform.
+Synthetic watch and delegation envelopes are labeled fixtures; delegation claims
+use the real temporary SQLite ledger. The backlog case includes a nonzero exit.
+
+The probe checks a ready backlog, a single exact payload, explicitly consumed
+results, foreign ownership, and watches/delegations interleaved with completions.
+It measures turn admission at the notification boundary, not model token savings.
+

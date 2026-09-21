@@ -1,20 +1,18 @@
-import sys
-import os
+from pathlib import Path
 
-# Asegurar importación del directorio raíz
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "cyberniche.db"
 
 class MonitoringAgent:
     """
     Agente de Monitoreo (automation/monitoring_agent.py)
     Verifica el estado de los servicios del sistema, base de datos y servicios auxiliares.
     """
-    def __init__(self, db_path: str = "cyberniche.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
+        self.db_path = Path(db_path)
 
     def check_database_status(self) -> dict:
         """Verifica la conectividad y existencia de la base de datos."""
-        exists = os.path.exists(self.db_path)
+        exists = self.db_path.exists()
         return {
             "service": "Database",
             "status": "HEALTHY" if exists else "WARNING",

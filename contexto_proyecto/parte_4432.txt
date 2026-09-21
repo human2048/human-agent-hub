@@ -1,0 +1,287 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_config_profile_scope.py ===
+"""config.get / config.set must honor params.profile (issue #95760).
+
+A single dashboard backend in desktop app-global remote mode serves every
+profile. projects.* RPCs already bind params.profile via @_profile_scoped;
+config.get / config.set did not, so reads and persistent writes used the
+launch profile's config.yaml for every focused profile.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+import tui_gateway.server as server
+
+
+LAUNCH_CWD = "/workspace/default"
+WORKER_CWD = "/workspace/code"
+LAUNCH_ROOTS = ["/workspace/default"]
+WORKER_ROOTS = ["/workspace/code"]
+
+
+def _write_cfg(home: Path, cwd: str, roots: list[str]) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "terminal": {"cwd": cwd},
+                "desktop": {"repo_scan_roots": list(roots)},
+                "display": {"busy_input_mode": "queue"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _homes(tmp_path: Path) -> tuple[Path, Path]:
+    launch = tmp_path / "launch"
+    worker = tmp_path / "profiles" / "code"
+    _write_cfg(launch, LAUNCH_CWD, LAUNCH_ROOTS)
+    _write_cfg(worker, WORKER_CWD, WORKER_ROOTS)
+    return launch, worker
+
+
+def _reset_cfg_cache() -> None:
+    server._cfg_cache = None
+    server._cfg_sig = None
+    server._cfg_path = None
+
+
+def _bind_homes(monkeypatch, launch: Path, worker: Path) -> None:
+    monkeypatch.setattr(server, "_hermes_home", launch)
+    monkeypatch.setattr(
+        server,
+        "_profile_home",
+        lambda name: worker if (name or "").strip() == "code" else None,
+    )
+    _reset_cfg_cache()
+
+
+def _get(params: dict) -> dict:
+    return server._methods["config.get"]("rid-get", params)
+
+
+def _set(params: dict) -> dict:
+    return server._methods["config.set"]("rid-set", params)
+
+
+def _read_yaml(home: Path) -> dict:
+    return yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+
+
+def test_config_get_full_reads_params_profile_yaml_not_launch(tmp_path, monkeypatch):
+    launch, worker = _homes(tmp_path)
+    _bind_homes(monkeypatch, launch, worker)
+
+    launch_resp = _get({"key": "full"})
+    assert launch_resp["result"]["config"]["terminal"]["cwd"] == LAUNCH_CWD
+    assert launch_resp["result"]["config"]["desktop"]["repo_scan_roots"] == LAUNCH_ROOTS
+
+    _reset_cfg_cache()
+    worker_resp = _get({"key": "full", "profile": "code"})
+    assert worker_resp["result"]["config"]["terminal"]["cwd"] == WORKER_CWD
+    assert worker_resp["result"]["config"]["desktop"]["repo_scan_roots"] == WORKER_ROOTS
+
+    # Launch file must be untouched by the focused-profile read.
+    assert _read_yaml(launch)["terminal"]["cwd"] == LAUNCH_CWD
+
+
+def test_config_set_persistent_write_lands_on_params_profile_yaml(tmp_path, monkeypatch):
+    launch, worker = _homes(tmp_path)
+    _bind_homes(monkeypatch, launch, worker)
+
+    resp = _set({"key": "busy", "value": "steer", "profile": "code"})
+    assert resp["result"]["value"] == "steer"
+
+    worker_cfg = _read_yaml(worker)
+    launch_cfg = _read_yaml(launch)
+    assert worker_cfg["display"]["busy_input_mode"] == "steer"
+    assert launch_cfg["display"]["busy_input_mode"] == "queue"
+    assert launch_cfg["terminal"]["cwd"] == LAUNCH_CWD
+    assert worker_cfg["terminal"]["cwd"] == WORKER_CWD
+
+
+def test_config_set_without_profile_still_writes_launch_home(tmp_path, monkeypatch):
+    launch, worker = _homes(tmp_path)
+    _bind_homes(monkeypatch, launch, worker)
+
+    resp = _set({"key": "busy", "value": "interrupt"})
+    assert resp["result"]["value"] == "interrupt"
+    assert _read_yaml(launch)["display"]["busy_input_mode"] == "interrupt"
+    assert _read_yaml(worker)["display"]["busy_input_mode"] == "queue"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_config_set_display_toggles.py ===
+"""`config.set` has to accept the Appearance switches the desktop mirrors.
+
+The handler matches an explicit key list and answers 4002 for everything else,
+so a renderer mirroring an unlisted key writes nothing at all — and the
+renderer's `.catch()` swallows the refusal, which is how message reactions
+shipped with a toggle that never reached the backend gating the tool.
+"""
+
+import pytest
+import yaml
+
+from tui_gateway import server
+
+
+@pytest.fixture
+def config_home(tmp_path, monkeypatch):
+    """Point the server's config read/write at a temp file."""
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    server._cfg_cache = server._cfg_sig = server._cfg_path = None
+    yield tmp_path / "config.yaml"
+    server._cfg_cache = server._cfg_sig = server._cfg_path = None
+
+
+def _set(key, value):
+    return server._methods["config.set"](1, {"key": key, "value": value})
+
+
+@pytest.mark.parametrize("key", sorted(server._DISPLAY_TOGGLE_KEYS))
+def test_a_mirrored_switch_reaches_the_config_file(config_home, key):
+    """Both directions land on disk, where the tools' check_fn reads them."""
+    assert _set(key, "false")["result"] == {"key": key, "value": False}
+
+    section, name = key.split(".")
+    assert yaml.safe_load(config_home.read_text())[section][name] is False
+
+    assert _set(key, "true")["result"] == {"key": key, "value": True}
+    assert yaml.safe_load(config_home.read_text())[section][name] is True
+
+
+def test_a_non_boolean_is_refused_rather_than_written(config_home):
+    answer = _set("display.in_app_tips", "sometimes")
+
+    assert answer["error"]["code"] == 4002
+    assert not config_home.exists()
+
+
+def test_every_key_the_renderer_mirrors_is_listed():
+    """The list is the contract: a switch missing from it silently does nothing.
+
+    Kept as a relationship rather than a snapshot — it asserts that the tools
+    which gate on `display.<x>` all have `<x>` reachable through config.set,
+    not that the set has some particular size.
+    """
+    gated = {"display.message_reactions", "display.in_app_tips", "display.in_app_tours"}
+
+    assert gated <= server._DISPLAY_TOGGLE_KEYS
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_config_set_session_profile_scope.py ===
+"""``config.set`` bound by ``session_id`` alone persists into the session's profile (issue #85669).
+
+Desktop app-global remote mode and the Ink TUI send ``config.set`` with ``session_id`` and no
+``profile`` param. The session record carries ``profile_home``; a write that ignores it lands in
+the launch profile's config.yaml while the focused profile silently keeps its old value.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+import yaml
+
+import tui_gateway.server as server
+
+
+def _write_cfg(home: Path, busy: str, approvals: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"display": {"busy_input_mode": busy}, "approvals": {"mode": approvals}}),
+        encoding="utf-8",
+    )
+
+
+def _read(home: Path) -> dict:
+    return yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+
+
+@pytest.fixture
+def homes(tmp_path, monkeypatch):
+    launch, worker = tmp_path / "launch", tmp_path / "profiles" / "worker"
+    _write_cfg(launch, "queue", "manual")
+    _write_cfg(worker, "queue", "manual")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setattr(server, "_hermes_home", launch)
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    monkeypatch.setattr(server, "_cfg_sig", None)
+    monkeypatch.setattr(server, "_cfg_path", None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    return launch, worker
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "section", "field"),
+    [("busy", "steer", "display", "busy_input_mode"), ("approval_mode", "off", "approvals", "mode")],
+)
+def test_session_bound_config_set_writes_the_session_profile(homes, key, value, section, field):
+    launch, worker = homes
+    session = {"agent": None, "profile_home": str(worker), "session_key": "worker-session"}
+    with patch.dict(server._sessions, {"s-worker": session}, clear=False):
+        resp = server._methods["config.set"]("rid", {"session_id": "s-worker", "key": key, "value": value})
+    assert resp["result"]["value"] == value
+    assert _read(worker)[section][field] == value
+    assert _read(launch)[section][field] != value
+
+
+def test_unbound_config_set_still_writes_the_launch_profile(homes):
+    launch, worker = homes
+    resp = server._methods["config.set"]("rid", {"key": "busy", "value": "steer"})
+    assert resp["result"]["value"] == "steer"
+    assert _read(launch)["display"]["busy_input_mode"] == "steer"
+    assert _read(worker)["display"]["busy_input_mode"] == "queue"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_config_set_voice_chat_mode.py ===
+"""`config.set voice.voice_chat_mode` is how the composer's voice menu swaps engines.
+
+The renderer's radio row writes through this key and then re-reads the resolved status; if
+the key were unlisted the handler would answer 4002 and the menu would show a switch that
+never lands on disk.
+"""
+
+import pytest
+import yaml
+
+from tui_gateway import server
+
+
+@pytest.fixture
+def config_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    server._cfg_cache = server._cfg_sig = server._cfg_path = None
+    yield tmp_path / "config.yaml"
+    server._cfg_cache = server._cfg_sig = server._cfg_path = None
+
+
+def _set(value):
+    return server._methods["config.set"](1, {"key": "voice.voice_chat_mode", "value": value})
+
+
+def test_engine_choice_reaches_the_config_file_and_round_trips(config_home):
+    assert _set("gpt-live")["result"] == {"key": "voice.voice_chat_mode", "value": "gpt-live"}
+    assert yaml.safe_load(config_home.read_text())["voice"]["voice_chat_mode"] == "gpt-live"
+
+    assert _set("Chained ")["result"]["value"] == "chained"
+    assert yaml.safe_load(config_home.read_text())["voice"]["voice_chat_mode"] == "chained"
+
+
+def test_unknown_engine_is_refused_rather_than_written(config_home):
+    answer = _set("realtime")
+
+    assert answer["error"]["code"] == 4002
+    assert not config_home.exists()
+

@@ -1,0 +1,193 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_stream_read_timeout_floor.py ===
+"""Stream read timeout must never preempt the stale-stream detector.
+
+Reasoning models (e.g. Opus) routinely pause mid-stream for minutes during
+extended thinking.  The stale-stream detector is deliberately scaled up to
+tolerate this (180s base, raised to 240s/300s for large contexts).  The httpx
+socket read timeout, however, defaulted to a flat 120s for cloud providers and
+fired *first* — tearing down a healthy reasoning stream before the stale
+detector (which owns retry + diagnostics) could act.
+
+These tests pin the invariant: for a cloud provider on the default read
+timeout, the httpx socket read timeout is floored at the stale-stream timeout
+so it can never fire before the detector.  They mirror the inline logic in
+``agent/chat_completion_helpers.py`` (the real builder lives deep inside a
+worker thread, so — like ``test_local_stream_timeout.py`` — the resolution is
+reproduced here rather than driven end-to-end).
+"""
+
+import os
+
+import pytest
+
+from agent.model_metadata import is_local_endpoint
+
+
+def _resolve_stale_timeout(base_url, est_tokens, stale_base=180.0):
+    """Mirror of the stale-stream detector resolution."""
+    if stale_base == 180.0 and base_url and is_local_endpoint(base_url):
+        return float("inf")  # detector disabled for local providers
+    if est_tokens > 100_000:
+        return max(stale_base, 300.0)
+    if est_tokens > 50_000:
+        return max(stale_base, 240.0)
+    return stale_base
+
+
+def _resolve_read_timeout(base_url, stale_timeout, base_timeout=1800.0):
+    """Mirror of the httpx socket read-timeout builder (cloud branch)."""
+    read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+    if read_timeout == 120.0 and base_url and is_local_endpoint(base_url):
+        read_timeout = base_timeout
+    elif (
+        read_timeout == 120.0
+        and stale_timeout is not None
+        and stale_timeout != float("inf")
+        and stale_timeout > read_timeout
+    ):
+        read_timeout = stale_timeout
+    return read_timeout
+
+
+CLOUD_URLS = [
+    "https://api.githubcopilot.com",
+    "https://api.openai.com",
+    "https://openrouter.ai/api",
+    "https://api.anthropic.com",
+]
+
+
+class TestCloudReadTimeoutFloor:
+    @pytest.fixture(autouse=True)
+    def _clear_env(self):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+            yield
+
+    @pytest.mark.parametrize("base_url", CLOUD_URLS)
+    @pytest.mark.parametrize("est_tokens", [0, 10_000, 60_000, 150_000])
+    def test_read_timeout_never_below_stale(self, base_url, est_tokens):
+        """Core invariant: the socket read timeout >= the stale detector."""
+        stale = _resolve_stale_timeout(base_url, est_tokens)
+        read = _resolve_read_timeout(base_url, stale)
+        assert read >= stale
+
+
+
+    def test_user_override_is_respected(self):
+        """An explicit HERMES_STREAM_READ_TIMEOUT is never overridden by the floor."""
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("HERMES_STREAM_READ_TIMEOUT", "90")
+            stale = _resolve_stale_timeout("https://api.githubcopilot.com", est_tokens=0)
+            assert _resolve_read_timeout("https://api.githubcopilot.com", stale) == 90.0
+
+
+class TestLocalUnaffected:
+    @pytest.fixture(autouse=True)
+    def _clear_env(self):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+            yield
+
+    def test_local_still_raised_to_base(self):
+        """Local providers keep their existing behavior (raise to base timeout)."""
+        stale = _resolve_stale_timeout("http://localhost:11434", est_tokens=0)
+        assert stale == float("inf")  # detector disabled for local
+        read = _resolve_read_timeout("http://localhost:11434", stale)
+        assert read == 1800.0  # not clamped by inf
+
+    def test_stale_none_falls_back_to_default(self):
+        """If the stale value is unresolved, the read timeout keeps its default."""
+        assert _resolve_read_timeout("https://api.githubcopilot.com", None) == 120.0
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_stream_retry_route_switch.py ===
+"""A stream retry never replays a request built for a route the agent has since left.
+
+Regression for #112121: ``_StreamingCall`` captures ``api_kwargs`` once, but every stream
+(re)open builds its client from the LIVE agent. When ``/model`` (``switch_model``) re-pointed
+the agent while attempt 1 was stalled, attempt 2 sent the OLD model slug to the NEW provider's
+base_url (404, then a rate-limit hold). The streamer now hands the transient error back to the
+turn loop, which rebuilds the request for the current route on its own next attempt.
+"""
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+
+def _make_agent():
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="test-key", base_url="https://openrouter.ai/api/v1", model="deepseek/deepseek-v4-flash",
+        provider="openrouter", quiet_mode=True, skip_context_files=True, skip_memory=True,
+        enabled_toolsets=[], max_iterations=1,
+    )
+    agent.api_mode = "chat_completions"
+    return agent
+
+
+def _ok_stream(model):
+    chunks = [
+        SimpleNamespace(choices=[SimpleNamespace(index=0, delta=SimpleNamespace(
+            content="ok", tool_calls=None, reasoning_content=None, reasoning=None), finish_reason=None)],
+            model=model, usage=None),
+        SimpleNamespace(choices=[SimpleNamespace(index=0, delta=SimpleNamespace(
+            content=None, tool_calls=None, reasoning_content=None, reasoning=None), finish_reason="stop")],
+            model=model, usage=None),
+    ]
+    stream = MagicMock()
+    stream.__iter__ = MagicMock(return_value=iter(chunks))
+    stream.response = MagicMock(headers={})
+    return stream
+
+
+def _run(agent, on_create):
+    """Drive the streaming call with a request-local client whose ``create`` is ``on_create``."""
+    client = MagicMock()
+    client.chat.completions.create.side_effect = on_create
+    with patch("run_agent.AIAgent._create_request_openai_client", return_value=client), \
+            patch("run_agent.AIAgent._close_request_openai_client"):
+        return agent._interruptible_streaming_api_call(
+            {"model": "deepseek/deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]})
+
+
+def test_stream_retry_does_not_replay_stale_route_after_switch_model():
+    """After a mid-request switch_model the streamer sends nothing more and surfaces the
+    transient error (the turn loop rebuilds for the new route); on base it re-sent the
+    deepseek slug to the moonshot base_url."""
+    agent = _make_agent()
+    sent = []
+
+    def switch_then_drop(**kwargs):
+        sent.append((kwargs["model"], agent.base_url))
+        with patch("agent.model_metadata.get_model_context_length", return_value=128000):
+            agent.switch_model("kimi-k2.6", "kimi-coding", api_key="k",
+                               base_url="https://api.moonshot.ai/v1", api_mode="chat_completions")
+        raise httpx.ReadError("stale stream killed")
+
+    with pytest.raises(httpx.ReadError):
+        _run(agent, switch_then_drop)
+    assert sent == [("deepseek/deepseek-v4-flash", "https://openrouter.ai/api/v1")]
+
+
+def test_stream_retry_still_reconnects_in_place_when_route_unchanged():
+    """Control: without a switch the transient drop is retried inside the streamer."""
+    agent = _make_agent()
+    sent = []
+
+    def drop_once_then_succeed(**kwargs):
+        sent.append(kwargs["model"])
+        if len(sent) == 1:
+            raise httpx.ReadError("stale stream killed")
+        return _ok_stream(kwargs["model"])
+
+    response = _run(agent, drop_once_then_succeed)
+    assert response is not None
+    assert sent == ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash"]
+

@@ -1,0 +1,338 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_shim_fail_closed_windows_live.py ===
+"""LIVE Windows E2E for the fail-closed shim quarantine (#87331).
+
+Runs ONLY on a real Windows host (the on-demand ``windows-venv-e2e.yml``
+lane). Reproduces the REAL lock shape from the field report: a process
+holding ``hermes.exe`` open WITHOUT FILE_SHARE_DELETE, exactly like a
+running launcher — then proves the strict quarantine refuses before any
+installer runs, and that the non-contended path still installs.
+
+No mocks: real files, a real child process holding a real Windows handle,
+the real rename attempt hitting the real sharing violation.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+from hermes_cli import main_install_repair
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32", reason="live Windows shim-lock E2E"
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Child that opens a file with GENERIC_READ and NO FILE_SHARE_DELETE —
+# the exact sharing mode a running .exe image / desktop backend exhibits.
+_HOLDER_CODE = r"""
+import ctypes, sys, time
+GENERIC_READ = 0x80000000
+FILE_SHARE_READ = 0x1  # note: NO FILE_SHARE_DELETE
+OPEN_EXISTING = 3
+h = ctypes.windll.kernel32.CreateFileW(
+    sys.argv[1], GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, 0, None
+)
+if h == -1 or h == 0xFFFFFFFF:
+    print("OPEN_FAILED", flush=True)
+    sys.exit(1)
+print("HOLDING", flush=True)
+time.sleep(120)
+"""
+
+
+@pytest.fixture()
+def held_shim(tmp_path: Path):
+    scripts = tmp_path / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    shim = scripts / "hermes.exe"
+    shim.write_bytes(b"MZ fake shim")
+    (scripts / "hermes-gateway.exe").write_bytes(b"MZ fake shim")
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER_CODE, str(shim)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    line = holder.stdout.readline().strip()
+    if line != "HOLDING":
+        holder.kill()
+        pytest.fail(f"lock-holder child failed: {line!r}")
+    yield scripts, shim
+    holder.kill()
+    holder.wait()
+
+
+def test_locked_shim_really_cannot_be_renamed(held_shim):
+    """Premise check: the no-FILE_SHARE_DELETE handle blocks rename."""
+    _scripts, shim = held_shim
+    with pytest.raises(OSError):
+        os.rename(shim, shim.with_name("hermes.exe.old.premise"))
+
+
+def test_strict_quarantine_refuses_against_real_lock(held_shim, monkeypatch):
+    import hermes_cli.main as cli_main
+    import hermes_cli.main_install_repair as hermes_cli_main_install_repair
+
+    scripts, _shim = held_shim
+    install_ran: list = []
+    monkeypatch.setattr(
+        cli_main,
+        "_run_install_with_heartbeat",
+        lambda cmd, env=None: install_ran.append(cmd),
+    )
+    monkeypatch.setattr(
+        hermes_cli_main_install_repair,
+        "_run_install_with_heartbeat",
+        lambda cmd, env=None: install_ran.append(cmd),
+    )
+
+    with pytest.raises(main_install_repair.ShimQuarantineError) as exc_info:
+        main_install_repair._run_quarantined_install(
+            ["would-be", "uv", "pip", "install"],
+            scripts_dir=scripts,
+            strict_quarantine=True,
+        )
+
+    assert install_ran == [], "installer ran against a contended venv"
+    assert "hermes.exe" in exc_info.value.failed_shims
+    # The unlocked sibling's rename was rolled back — venv untouched.
+    assert (scripts / "hermes-gateway.exe").exists()
+    assert not list(scripts.glob("*.old.*"))
+
+
+def test_recovery_installer_refuses_against_real_lock(held_shim, monkeypatch):
+    import hermes_cli._install_repair as ir
+
+    scripts, _shim = held_shim
+    monkeypatch.setattr(ir, "_venv_scripts_dir", lambda root: scripts)
+    run_calls: list = []
+    monkeypatch.setattr(ir.subprocess, "run", lambda *a, **k: run_calls.append(a))
+
+    with pytest.raises(ir.ShimQuarantineError):
+        ir._run_install_cmd(["fake"], env=None, root=scripts.parent.parent)
+    assert run_calls == []
+
+
+def test_release_then_strict_quarantine_succeeds(tmp_path, monkeypatch):
+    """After the holder exits, the same strict path proceeds normally."""
+    import hermes_cli.main as cli_main
+    import hermes_cli.main_install_repair as hermes_cli_main_install_repair
+
+    scripts = tmp_path / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "hermes.exe").write_bytes(b"MZ fake shim")
+
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER_CODE, str(scripts / "hermes.exe")],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "HOLDING"
+    holder.kill()
+    holder.wait()
+    time.sleep(0.3)  # handle teardown
+
+    install_ran: list = []
+    monkeypatch.setattr(
+        cli_main,
+        "_run_install_with_heartbeat",
+        lambda cmd, env=None: install_ran.append(cmd),
+    )
+    monkeypatch.setattr(
+        hermes_cli_main_install_repair,
+        "_run_install_with_heartbeat",
+        lambda cmd, env=None: install_ran.append(cmd),
+    )
+    main_install_repair._run_quarantined_install(
+        ["fake"], scripts_dir=scripts, strict_quarantine=True
+    )
+    assert install_ran == [["fake"]]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_show_config_credential.py ===
+"""Regression test: /config must show the LIVE agent credential.
+
+HermesCLI.__init__ seeds ``self.api_key`` from OPENAI_API_KEY /
+OPENROUTER_API_KEY env vars before provider resolution runs. On any
+non-OpenAI provider (Nous, Anthropic, ...) the constructor value is a
+different vendor's key than the one actually used for requests, so
+``/config`` displayed e.g. an ``sk-proj-...`` OpenAI key next to a Nous
+base URL. ``show_config`` must prefer ``self.agent.api_key`` when an
+agent exists.
+"""
+
+from datetime import datetime
+from types import SimpleNamespace
+
+from cli import HermesCLI
+
+
+def _run_show_config(stand_in, capsys):
+    HermesCLI.show_config(stand_in)
+    return capsys.readouterr().out
+
+
+def _make_stand_in(cli_key, agent_key):
+    agent = SimpleNamespace(api_key=agent_key) if agent_key is not None else None
+    return SimpleNamespace(
+        api_key=cli_key,
+        agent=agent,
+        model="test/model",
+        base_url="https://example.invalid/v1",
+        enabled_toolsets=[],
+        max_turns=5,
+        verbose=False,
+        session_start=datetime(2026, 8, 19, 12, 0, 0),
+    )
+
+
+class TestShowConfigCredentialSource:
+    def test_prefers_live_agent_key(self, capsys):
+        out = _run_show_config(
+            _make_stand_in(cli_key="sk-proj-WRONGVENDORKEY1234", agent_key="nous-REALKEY-abcdef9876"),
+            capsys,
+        )
+        assert "nous-REA" in out
+        assert "sk-proj-" not in out
+
+    def test_falls_back_to_cli_key_without_agent(self, capsys):
+        out = _run_show_config(
+            _make_stand_in(cli_key="sk-proj-CONSTRUCTORKEY5678", agent_key=None),
+            capsys,
+        )
+        assert "sk-proj-" in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sibling_config_migration.py ===
+"""Fleet-wide config migration (#91277 Phase 2 — #20438/#54926/#79048 class).
+
+`hermes update` migrated only the active profile's config.yaml; sibling
+profiles silently drifted config versions until their gateway hit a config
+the new code couldn't read. `_migrate_sibling_profile_configs()` runs the
+same non-interactive safe migration for every sibling home, scoped via the
+context-local HERMES_HOME override.
+
+These tests use REAL config files on disk and the REAL migration pipeline —
+only the profile-root location is pointed at tmp_path.
+"""
+
+import yaml
+from pathlib import Path
+
+import hermes_cli.update_cmd as update_cmd
+import hermes_cli.update_cmd_config as update_cmd_config
+
+
+def _write_profile(root: Path, name: str, version: int) -> Path:
+    home = root / name
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"_config_version": version, "model": {"provider": "nous"}}),
+        encoding="utf-8",
+    )
+    return home
+
+
+def _latest_version() -> int:
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    return int(DEFAULT_CONFIG["_config_version"])
+
+
+def _setup(monkeypatch, tmp_path, active_home: Path):
+    import hermes_cli.profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: tmp_path / "profiles")
+    import hermes_constants
+
+    monkeypatch.setattr(
+        hermes_constants, "get_process_hermes_home", lambda: active_home
+    )
+
+
+def test_sibling_behind_is_migrated_on_disk(monkeypatch, tmp_path):
+    active = _write_profile(tmp_path / "profiles", "active", _latest_version())
+    sibling = _write_profile(tmp_path / "profiles", "research", 12)
+    _setup(monkeypatch, tmp_path, active)
+
+    migrated = update_cmd._migrate_sibling_profile_configs()
+
+    names = [m[0] for m in migrated]
+    assert "research" in names
+    entry = next(m for m in migrated if m[0] == "research")
+    assert entry[1] == 12 and entry[2] == _latest_version()
+    # REAL file on disk carries the new version
+    on_disk = yaml.safe_load((sibling / "config.yaml").read_text())
+    assert on_disk["_config_version"] == _latest_version()
+    # and user settings survived
+    assert on_disk["model"]["provider"] == "nous"
+
+
+def test_active_profile_is_skipped(monkeypatch, tmp_path):
+    active = _write_profile(tmp_path / "profiles", "active", 12)
+    _setup(monkeypatch, tmp_path, active)
+
+    migrated = update_cmd._migrate_sibling_profile_configs()
+
+    assert "active" not in [m[0] for m in migrated]
+    # active home untouched (the caller's own migration handles it)
+    on_disk = yaml.safe_load((active / "config.yaml").read_text())
+    assert on_disk["_config_version"] == 12
+
+
+def test_current_sibling_untouched(monkeypatch, tmp_path):
+    active = _write_profile(tmp_path / "profiles", "active", _latest_version())
+    sibling = _write_profile(tmp_path / "profiles", "work", _latest_version())
+    _setup(monkeypatch, tmp_path, active)
+    before = (sibling / "config.yaml").read_bytes()
+
+    migrated = update_cmd._migrate_sibling_profile_configs()
+
+    assert migrated == []
+    assert (sibling / "config.yaml").read_bytes() == before
+
+
+def test_unconfigured_profile_skipped(monkeypatch, tmp_path):
+    active = _write_profile(tmp_path / "profiles", "active", _latest_version())
+    bare = tmp_path / "profiles" / "empty"
+    bare.mkdir()
+    _setup(monkeypatch, tmp_path, active)
+
+    assert update_cmd._migrate_sibling_profile_configs() == []
+    assert not (bare / "config.yaml").exists()
+
+
+def test_one_broken_profile_does_not_block_others(monkeypatch, tmp_path):
+    active = _write_profile(tmp_path / "profiles", "active", _latest_version())
+    broken_home = tmp_path / "profiles" / "broken"
+    broken_home.mkdir()
+    (broken_home / "config.yaml").write_text(":\nnot yaml: [", encoding="utf-8")
+    _write_profile(tmp_path / "profiles", "healthy", 12)
+    _setup(monkeypatch, tmp_path, active)
+
+    migrated = update_cmd._migrate_sibling_profile_configs()
+
+    assert [m[0] for m in migrated] == ["healthy"]
+
+
+def test_override_is_reset_after_run(monkeypatch, tmp_path):
+    """The ContextVar override must not leak past the sweep."""
+    from hermes_constants import get_hermes_home_override
+
+    active = _write_profile(tmp_path / "profiles", "active", _latest_version())
+    _write_profile(tmp_path / "profiles", "research", 12)
+    _setup(monkeypatch, tmp_path, active)
+
+    before = get_hermes_home_override()
+    update_cmd._migrate_sibling_profile_configs()
+    assert get_hermes_home_override() == before
+

@@ -1,0 +1,616 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\mlops\training\trl-fine-tuning\references\online-rl.md ===
+# Online RL Methods
+
+Guide to online reinforcement learning with PPO, GRPO, RLOO, and OnlineDPO.
+
+## Overview
+
+Online RL generates completions during training and optimizes based on rewards.
+
+## PPO (Proximal Policy Optimization)
+
+Classic RL algorithm for LLM alignment.
+
+### Basic Usage
+
+```bash
+python -m trl.scripts.ppo \
+    --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --reward_model_path reward-model \
+    --dataset_name trl-internal-testing/descriptiveness-sentiment-trl-style \
+    --output_dir model-ppo \
+    --learning_rate 3e-6 \
+    --per_device_train_batch_size 64 \
+    --total_episodes 10000 \
+    --num_ppo_epochs 4 \
+    --kl_coef 0.05
+```
+
+### Key Parameters
+
+- `kl_coef`: KL penalty (0.05-0.2)
+- `num_ppo_epochs`: Epochs per batch (2-4)
+- `cliprange`: PPO clip (0.1-0.3)
+- `vf_coef`: Value function coef (0.1)
+
+## GRPO (Group Relative Policy Optimization)
+
+Memory-efficient online RL.
+
+### Basic Usage
+
+```python
+from trl import GRPOTrainer, GRPOConfig
+from datasets import load_dataset
+
+# Define reward function
+def reward_func(completions, **kwargs):
+    return [len(set(c.split())) for c in completions]
+
+config = GRPOConfig(
+    output_dir="model-grpo",
+    num_generations=4,  # Completions per prompt
+    max_new_tokens=128
+)
+
+trainer = GRPOTrainer(
+    model="Qwen/Qwen2-0.5B-Instruct",
+    reward_funcs=reward_func,
+    args=config,
+    train_dataset=load_dataset("trl-lib/tldr", split="train")
+)
+trainer.train()
+```
+
+### Key Parameters
+
+- `num_generations`: 2-8 completions
+- `max_new_tokens`: 64-256
+- Learning rate: 1e-5 to 1e-4
+
+## Memory Comparison
+
+| Method | Memory (7B) | Speed | Use Case |
+|--------|-------------|-------|----------|
+| PPO | 40GB | Medium | Maximum control |
+| GRPO | 24GB | Fast | **Memory-constrained** |
+| OnlineDPO | 28GB | Fast | No reward model |
+
+## References
+
+- PPO paper: https://arxiv.org/abs/1707.06347
+- GRPO paper: https://arxiv.org/abs/2402.03300
+- TRL docs: https://huggingface.co/docs/trl/
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\mlops\training\trl-fine-tuning\references\reward-modeling.md ===
+# Reward Modeling
+
+Guide to training reward models with TRL for RLHF pipelines.
+
+## Overview
+
+Reward models score completions based on human preferences. Used in:
+- PPO training (RL feedback)
+- GRPO online RL
+- Completion ranking
+
+## Basic Training
+
+```python
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from trl import RewardTrainer, RewardConfig
+from datasets import load_dataset
+
+# Load model (num_labels=1 for single reward score)
+model = AutoModelForSequenceClassification.from_pretrained(
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    num_labels=1
+)
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+
+# Load preference dataset (chosen/rejected pairs)
+dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
+
+# Configure
+config = RewardConfig(
+    output_dir="Qwen2.5-Reward",
+    per_device_train_batch_size=2,
+    num_train_epochs=1,
+    learning_rate=1e-5
+)
+
+# Train
+trainer = RewardTrainer(
+    model=model,
+    args=config,
+    processing_class=tokenizer,
+    train_dataset=dataset
+)
+trainer.train()
+```
+
+## Dataset Format
+
+Required fields:
+```json
+{
+  "prompt": "Question or instruction",
+  "chosen": "Better response",
+  "rejected": "Worse response"
+}
+```
+
+## Bradley-Terry Loss
+
+Default loss function:
+```
+loss = -log(sigmoid(reward_chosen - reward_rejected))
+```
+
+Learns to score chosen > rejected.
+
+## Using Reward Models
+
+### Inference
+
+```python
+from transformers import pipeline
+
+# Load trained reward model
+reward_pipe = pipeline("text-classification", model="Qwen2.5-Reward")
+
+# Score completions
+texts = ["Good answer", "Bad answer"]
+scores = reward_pipe(texts)
+print(scores)  # Higher score = better
+```
+
+### In PPO
+
+```python
+from trl import PPOTrainer, PPOConfig
+
+config = PPOConfig(
+    reward_model_path="Qwen2.5-Reward"  # Use trained reward model
+)
+
+trainer = PPOTrainer(
+    model=policy_model,
+    config=config,
+    # Reward model loaded automatically
+)
+```
+
+## Hyperparameters
+
+| Model Size | Learning Rate | Batch Size | Epochs |
+|------------|---------------|------------|--------|
+| <1B | 2e-5 | 4-8 | 1-2 |
+| 1-7B | 1e-5 | 2-4 | 1 |
+| 7-13B | 5e-6 | 1-2 | 1 |
+
+## Evaluation
+
+Check reward separation:
+```python
+# Chosen should score higher than rejected
+chosen_rewards = model(**chosen_inputs).logits
+rejected_rewards = model(**rejected_inputs).logits
+
+accuracy = (chosen_rewards > rejected_rewards).float().mean()
+print(f"Accuracy: {accuracy:.2%}")  # Target: >80%
+```
+
+## References
+
+- InstructGPT paper: https://arxiv.org/abs/2203.02155
+- TRL docs: https://huggingface.co/docs/trl/reward_trainer
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\mlops\training\trl-fine-tuning\references\sft-training.md ===
+# SFT Training Guide
+
+Complete guide to Supervised Fine-Tuning (SFT) with TRL for instruction tuning and task-specific fine-tuning.
+
+## Overview
+
+SFT trains models on input-output pairs to minimize cross-entropy loss. Use for:
+- Instruction following
+- Task-specific fine-tuning
+- Chatbot training
+- Domain adaptation
+
+## Dataset Formats
+
+### Format 1: Prompt-Completion
+
+```json
+[
+  {
+    "prompt": "What is the capital of France?",
+    "completion": "The capital of France is Paris."
+  }
+]
+```
+
+### Format 2: Conversational (ChatML)
+
+```json
+[
+  {
+    "messages": [
+      {"role": "user", "content": "What is Python?"},
+      {"role": "assistant", "content": "Python is a programming language."}
+    ]
+  }
+]
+```
+
+### Format 3: Text-only
+
+```json
+[
+  {"text": "User: Hello\nAssistant: Hi! How can I help?"}
+]
+```
+
+## Basic Training
+
+```python
+from trl import SFTTrainer, SFTConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+
+# Load model
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+
+# Load dataset
+dataset = load_dataset("trl-lib/Capybara", split="train")
+
+# Configure
+config = SFTConfig(
+    output_dir="Qwen2.5-SFT",
+    per_device_train_batch_size=4,
+    num_train_epochs=1,
+    learning_rate=2e-5,
+    save_strategy="epoch"
+)
+
+# Train
+trainer = SFTTrainer(
+    model=model,
+    args=config,
+    train_dataset=dataset,
+    tokenizer=tokenizer
+)
+trainer.train()
+```
+
+## Chat Templates
+
+Apply chat templates automatically:
+
+```python
+trainer = SFTTrainer(
+    model=model,
+    args=config,
+    train_dataset=dataset,  # Messages format
+    tokenizer=tokenizer
+    # Chat template applied automatically
+)
+```
+
+Or manually:
+```python
+def format_chat(example):
+    messages = example["messages"]
+    text = tokenizer.apply_chat_template(messages, tokenize=False)
+    return {"text": text}
+
+dataset = dataset.map(format_chat)
+```
+
+## Packing for Efficiency
+
+Pack multiple sequences into one to maximize GPU utilization:
+
+```python
+config = SFTConfig(
+    packing=True,  # Enable packing
+    max_seq_length=2048,
+    dataset_text_field="text"
+)
+```
+
+**Benefits**: 2-3× faster training
+**Trade-off**: Slightly more complex batching
+
+## Multi-GPU Training
+
+```bash
+accelerate launch --num_processes 4 train_sft.py
+```
+
+Or with config:
+```python
+config = SFTConfig(
+    output_dir="model-sft",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    num_train_epochs=1
+)
+```
+
+## LoRA Fine-Tuning
+
+```python
+from peft import LoraConfig
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules="all-linear",
+    lora_dropout=0.05,
+    task_type="CAUSAL_LM"
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=config,
+    train_dataset=dataset,
+    peft_config=lora_config  # Add LoRA
+)
+```
+
+## Hyperparameters
+
+| Model Size | Learning Rate | Batch Size | Epochs |
+|------------|---------------|------------|--------|
+| <1B | 5e-5 | 8-16 | 1-3 |
+| 1-7B | 2e-5 | 4-8 | 1-2 |
+| 7-13B | 1e-5 | 2-4 | 1 |
+| 13B+ | 5e-6 | 1-2 | 1 |
+
+## References
+
+- TRL docs: https://huggingface.co/docs/trl/sft_trainer
+- Examples: https://github.com/huggingface/trl/tree/main/examples/scripts
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\mlops\training\trl-fine-tuning\templates\basic_grpo_training.py ===
+"""
+Basic GRPO Training Template
+=============================
+
+A minimal, production-ready template for GRPO training with TRL.
+Adapt this for your specific task by modifying:
+1. Dataset loading (get_dataset function)
+2. Reward functions (reward_*_func)
+3. System prompt (SYSTEM_PROMPT)
+4. Hyperparameters (GRPOConfig)
+"""
+
+import torch
+import re
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig
+from trl import GRPOTrainer, GRPOConfig
+
+# ==================== CONFIGURATION ====================
+
+MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+OUTPUT_DIR = "outputs/grpo-model"
+MAX_PROMPT_LENGTH = 256
+MAX_COMPLETION_LENGTH = 512
+
+SYSTEM_PROMPT = """
+Respond in the following format:
+<reasoning>
+[Your step-by-step thinking]
+</reasoning>
+<answer>
+[Final answer]
+</answer>
+"""
+
+# ==================== DATASET ====================
+
+def get_dataset(split="train"):
+    """
+    Load and prepare your dataset.
+
+    Returns: Dataset with columns:
+    - 'prompt': List[Dict] with role/content
+    - 'answer': str (ground truth, optional)
+    """
+    # Example: GSM8K math dataset
+    data = load_dataset('openai/gsm8k', 'main')[split]
+
+    def process_example(x):
+        # Extract ground truth answer
+        answer = x['answer'].split('####')[1].strip() if '####' in x['answer'] else None
+
+        return {
+            'prompt': [
+                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': x['question']}
+            ],
+            'answer': answer
+        }
+
+    return data.map(process_example)
+
+# ==================== HELPER FUNCTIONS ====================
+
+def extract_xml_tag(text: str, tag: str) -> str:
+    """Extract content between XML tags."""
+    pattern = f'<{tag}>(.*?)</{tag}>'
+    match = re.search(pattern, text, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+def extract_answer(text: str) -> str:
+    """Extract the final answer from structured output."""
+    return extract_xml_tag(text, 'answer')
+
+# ==================== REWARD FUNCTIONS ====================
+
+def correctness_reward_func(prompts, completions, answer, **kwargs):
+    """
+    Reward correct answers.
+    Weight: 2.0 (highest priority)
+    """
+    responses = [comp[0]['content'] for comp in completions]
+    extracted = [extract_answer(r) for r in responses]
+    return [2.0 if ans == gt else 0.0 for ans, gt in zip(extracted, answer)]
+
+def format_reward_func(completions, **kwargs):
+    """
+    Reward proper XML format.
+    Weight: 0.5
+    """
+    pattern = r'<reasoning>.*?</reasoning>\s*<answer>.*?</answer>'
+    responses = [comp[0]['content'] for comp in completions]
+    return [0.5 if re.search(pattern, r, re.DOTALL) else 0.0 for r in responses]
+
+def incremental_format_reward_func(completions, **kwargs):
+    """
+    Incremental reward for partial format compliance.
+    Weight: up to 0.5
+    """
+    responses = [comp[0]['content'] for comp in completions]
+    rewards = []
+
+    for r in responses:
+        score = 0.0
+        if '<reasoning>' in r:
+            score += 0.125
+        if '</reasoning>' in r:
+            score += 0.125
+        if '<answer>' in r:
+            score += 0.125
+        if '</answer>' in r:
+            score += 0.125
+
+        # Penalize extra content after closing tag
+        if '</answer>' in r:
+            extra = r.split('</answer>')[-1].strip()
+            score -= len(extra) * 0.001
+
+        rewards.append(score)
+
+    return rewards
+
+# ==================== MODEL SETUP ====================
+
+def setup_model_and_tokenizer():
+    """Load model and tokenizer with optimizations."""
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        device_map="auto"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+def get_peft_config():
+    """LoRA configuration for parameter-efficient training."""
+    return LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ],
+        task_type="CAUSAL_LM",
+        lora_dropout=0.05,
+    )
+
+# ==================== TRAINING ====================
+
+def main():
+    """Main training function."""
+
+    # Load data
+    print("Loading dataset...")
+    dataset = get_dataset()
+    print(f"Dataset size: {len(dataset)}")
+
+    # Setup model
+    print("Loading model...")
+    model, tokenizer = setup_model_and_tokenizer()
+
+    # Training configuration
+    training_args = GRPOConfig(
+        output_dir=OUTPUT_DIR,
+        run_name="grpo-training",
+
+        # Learning rate
+        learning_rate=5e-6,
+        adam_beta1=0.9,
+        adam_beta2=0.99,
+        weight_decay=0.1,
+        warmup_ratio=0.1,
+        lr_scheduler_type='cosine',
+
+        # Batch settings
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+
+        # GRPO specific
+        num_generations=8,
+        max_prompt_length=MAX_PROMPT_LENGTH,
+        max_completion_length=MAX_COMPLETION_LENGTH,
+
+        # Training duration
+        num_train_epochs=1,
+
+        # Optimization
+        bf16=True,
+        optim="adamw_8bit",
+        max_grad_norm=0.1,
+
+        # Logging
+        logging_steps=1,
+        save_steps=100,
+        report_to="wandb",  # Change to "none" to disable logging
+    )
+
+    # Initialize trainer
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=[
+            incremental_format_reward_func,
+            format_reward_func,
+            correctness_reward_func,
+        ],
+        args=training_args,
+        train_dataset=dataset,
+        peft_config=get_peft_config(),
+    )
+
+    # Train
+    print("Starting training...")
+    trainer.train()
+
+    # Save final model
+    print(f"Saving model to {OUTPUT_DIR}/final")
+    trainer.save_model(f"{OUTPUT_DIR}/final")
+
+    print("Training complete!")
+
+if __name__ == "__main__":
+    main()
+

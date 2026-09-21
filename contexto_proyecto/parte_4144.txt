@@ -1,0 +1,269 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_gateway_cwd_contract.py ===
+"""Tool-surface cwd contract tests for gateway workspaces.
+
+These cover the platform-neutral part of #29265: once the gateway has resolved
+``TERMINAL_CWD``, the user-visible tool surfaces should agree on that workspace.
+
+Unlike the system-prompt readers fixed in the gateway-cwd-resolver cluster
+(agent/runtime_cwd.py), these tool sites already read ``TERMINAL_CWD``-first and
+were deliberately left out of scope. This file is a *characterization* guard: it
+pins the already-correct behavior so the supersession of PR #29365 is airtight
+and a future refactor of these sites can't silently regress the contract.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from tools import code_execution_tool, file_tools, terminal_tool
+
+
+def test_terminal_env_config_uses_terminal_cwd(monkeypatch, tmp_path):
+    """The terminal tool's default cwd should come from TERMINAL_CWD."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == str(workspace)
+
+
+def test_execute_code_project_mode_falls_back_when_terminal_cwd_missing(monkeypatch, tmp_path):
+    """Invalid TERMINAL_CWD should not break execute_code project mode startup."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "missing"))
+
+    resolved = code_execution_tool._resolve_child_cwd("project", str(staging))
+
+    assert Path(resolved).is_dir()
+    assert Path(resolved) != tmp_path / "missing"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_generation_source_confinement.py ===
+"""Tests for the generation-tool source-image confinement chokepoint.
+
+Under a non-local terminal backend, model-supplied local paths passed to
+image_generate / video_generate must resolve through the sandbox-aware media
+resolver (tools.image_source) and reach providers as data: URLs — the same
+boundary vision/video analysis enforce. URLs pass through untouched and the
+local backend is a no-op.
+"""
+
+import base64
+import json
+
+import pytest
+
+import tools.image_generation_tool as igt
+
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sandbox(monkeypatch):
+    import tools.terminal_tool as tt
+
+    monkeypatch.setattr(tt, "ensure_task_env", lambda *a, **k: None)
+
+
+class TestConfineSourceImages:
+    def test_local_backend_is_passthrough(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        url, refs, err = igt._confine_source_images(
+            "/some/host/pic.png", ["/other/ref.png"], "t1")
+        assert url == "/some/host/pic.png"
+        assert refs == ["/other/ref.png"]
+        assert err is None
+
+    def test_urls_pass_through_under_sandbox(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
+        url, refs, err = igt._confine_source_images(
+            "https://x/y.png", ["data:image/png;base64,AAAA"], "t1")
+        assert url == "https://x/y.png"
+        assert refs == ["data:image/png;base64,AAAA"]
+        assert err is None
+
+    def test_path_resolves_to_data_url_under_sandbox(self, monkeypatch, tmp_path):
+        """A path under docker resolves through the sandbox exec-read and
+        arrives as a data: URL carrying the CONTAINER's bytes."""
+        from types import SimpleNamespace
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
+
+        import tools.image_source as isrc
+
+        b64 = base64.b64encode(PNG).decode()
+        monkeypatch.setattr(
+            isrc, "_get_active_env",
+            lambda tid: SimpleNamespace(
+                execute=lambda cmd, **kw: {"returncode": 0, "output": b64}),
+        )
+
+        url, refs, err = igt._confine_source_images(
+            "/workspace/pic.png", None, "t1")
+        assert err is None
+        assert url.startswith("data:image/png;base64,")
+        assert base64.b64decode(url.split(",", 1)[1]) == PNG
+        assert refs is None
+
+    def test_unreadable_path_returns_error_payload(self, monkeypatch, tmp_path):
+        """No sandbox env + non-cache path -> structured error, not a host read."""
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
+
+        import tools.image_source as isrc
+
+        monkeypatch.setattr(isrc, "_get_active_env", lambda tid: None)
+
+        secret = tmp_path / "id_rsa"
+        secret.write_bytes(b"HOST-PRIVATE-KEY")
+        url, refs, err = igt._confine_source_images(str(secret), None, "t1")
+        assert err is not None
+        payload = json.loads(err)
+        assert payload["success"] is False
+        assert "Could not read source image" in payload["error"]
+        # The host secret's bytes never left the chokepoint.
+        assert "HOST-PRIVATE-KEY" not in err
+
+    def test_handler_rejects_before_provider_dispatch(self, monkeypatch, tmp_path):
+        """_handle_image_generate returns the confinement error without ever
+        reaching plugin/FAL dispatch."""
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
+
+        import tools.image_source as isrc
+
+        monkeypatch.setattr(isrc, "_get_active_env", lambda tid: None)
+
+        dispatched = []
+        monkeypatch.setattr(
+            igt, "_dispatch_to_plugin_provider",
+            lambda *a, **k: dispatched.append(1) or None)
+
+        out = igt._handle_image_generate(
+            {"prompt": "edit it", "image_url": str(tmp_path / "nope.png")},
+            task_id="t1",
+        )
+        payload = json.loads(out)
+        assert payload["success"] is False
+        assert dispatched == []
+
+    def test_video_generate_uses_same_chokepoint(self, monkeypatch, tmp_path):
+        """video_generate's handler routes its image sources through the
+        shared confinement helper too."""
+        import tools.video_generation_tool as vgt
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
+
+        import tools.image_source as isrc
+
+        monkeypatch.setattr(isrc, "_get_active_env", lambda tid: None)
+
+        out = vgt._handle_video_generate(
+            {"prompt": "animate", "image_url": str(tmp_path / "nope.png")},
+            task_id="t1",
+        )
+        payload = json.loads(out)
+        assert payload["success"] is False
+        assert "Could not read source image" in payload["error"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_gnu_long_option_abbreviation_bypass.py ===
+"""Tests for GNU long-option abbreviation bypass in DANGEROUS_PATTERNS.
+
+GNU tools accept unique long-option prefix abbreviations at runtime
+(e.g. ``chown --recur`` resolves to ``chown --recursive``). Two approval
+patterns matched only the full flag name and could be evaded by passing a
+valid abbreviation:
+
+  chown    --recursive  →  --recur[a-z]*
+  git push --force      →  --forc[a-z]*
+
+The other long-flag patterns (rm/chmod/sed) were already covered on every
+abbreviation by sibling short-flag / target patterns, so this file only
+asserts the two gaps that were genuinely open plus the relevant regression
+guards.
+"""
+
+import pytest
+
+from tools.approval import detect_dangerous_command
+
+
+class TestChownRecursiveLongOptionAbbreviation:
+    """chown --recur* abbreviations targeting root must be caught.
+
+    On main the bare ``--recur root`` form is caught only by an accidental
+    case-insensitive ``r`` → ``R`` overlap with the short-flag pattern; longer
+    abbreviations like ``--recurs``/``--recursi`` break that overlap and
+    slipped through before the prefix change.
+    """
+
+    def test_chown_recursive_full_still_detected(self):
+        dangerous, _, desc = detect_dangerous_command("chown --recursive root /etc")
+        assert dangerous is True
+        assert "chown" in desc.lower() or "root" in desc.lower()
+
+
+    def test_chown_recur_non_root_not_flagged(self):
+        """--recur* chown to a non-root user must not be flagged."""
+        dangerous, _, _ = detect_dangerous_command("chown --recur nobody /opt/app")
+        assert dangerous is False
+
+
+class TestGitPushForceLongOptionAbbreviation:
+    """git push --forc* abbreviations must be caught.
+
+    The short ``-f`` pattern does not catch ``--forc`` (the ``\\b`` after the
+    ``f`` does not match mid-word), so abbreviated long forms slipped through.
+    """
+
+    def test_git_push_force_full_still_detected(self):
+        dangerous, _, desc = detect_dangerous_command("git push --force origin main")
+        assert dangerous is True
+        assert "force" in desc.lower()
+
+
+    def test_git_push_short_f_still_detected(self):
+        """Existing -f pattern must not regress."""
+        dangerous, _, _ = detect_dangerous_command("git push -f origin main")
+        assert dangerous is True
+
+
+    def test_git_push_set_upstream_not_flagged(self):
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --set-upstream origin feature"
+        )
+        assert dangerous is False
+
+
+class TestFullFormRegressions:
+    """The two changed long-flag patterns must still detect their full form."""
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "chown --recursive root /etc",
+            "git push --force origin main",
+        ],
+    )
+    def test_full_form_still_detected(self, cmd):
+        dangerous, key, _ = detect_dangerous_command(cmd)
+        assert dangerous is True, f"Full-form long flag not detected in: {cmd!r}"
+        assert key is not None
+

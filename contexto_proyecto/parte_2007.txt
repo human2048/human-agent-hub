@@ -1,0 +1,364 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_lease_refresh_reselect.py ===
+"""acquire_lease must re-select after a deferred single-use-token refresh.
+
+Post-merge gate-sweep finding on the #71775 salvage (deferred refresh moved
+OUTSIDE the pool lock). ``select()`` re-selects once the refreshed entries
+are back in rotation (credential_pool.py, select() -> "if pending_refresh:
+re-select"); ``acquire_lease()`` did not, so a pool whose only entries all
+needed a refresh returned None even though the refresh had just succeeded —
+the caller saw "no credentials available" and failed a request that should
+have gone through.
+
+These tests stub ``_available_entries`` / ``_refresh_pending_entries`` at the
+same seam the production deferred-refresh contract uses: _available_entries
+returns ``(available, pending_refresh)`` and entries pending a refresh are
+NOT in ``available`` until the refresh has run.
+"""
+
+import threading
+
+from agent.credential_pool import CredentialPool, PooledCredential
+
+
+def _entry(entry_id: str) -> PooledCredential:
+    return PooledCredential(
+        id=entry_id,
+        provider="anthropic",
+        auth_type="oauth",
+        access_token="tok",
+        label=entry_id,
+        source="oauth",
+        priority=0,
+    )
+
+
+def _bare_pool(entries):
+    """Minimal pool shell — avoids disk/keyring I/O in __init__."""
+    pool = CredentialPool.__new__(CredentialPool)
+    pool._lock = threading.RLock()
+    pool._entries = list(entries)
+    pool._active_leases = {}
+    pool._current_id = None
+    pool._max_concurrent = 2
+    pool._unmatched_rotation_streak = 0
+    pool.provider = "anthropic"
+    return pool
+
+
+def _wire_deferred_refresh(pool, *, refresh_succeeds: bool = True):
+    """Model the deferred-refresh contract with an explicit state flag."""
+    state = {"needs_refresh": True, "refresh_calls": 0}
+
+    def fake_refresh(pending):
+        state["refresh_calls"] += 1
+        if refresh_succeeds:
+            state["needs_refresh"] = False
+
+    def fake_available(clear_expired=False, refresh=False):
+        if state["needs_refresh"]:
+            # Pending a refresh -> not yet available.
+            pending = [(e.id, "tok") for e in pool._entries] if refresh else []
+            return [], pending
+        return list(pool._entries), []
+
+    pool._refresh_pending_entries = fake_refresh
+    pool._available_entries = fake_available
+    return state
+
+
+def test_acquire_lease_reselects_after_deferred_refresh():
+    """The only entry needs a refresh; once refreshed it is available, so a
+    lease MUST be granted rather than reporting no credentials."""
+    pool = _bare_pool([_entry("e1")])
+    state = _wire_deferred_refresh(pool)
+
+    lease = pool.acquire_lease()
+
+    assert state["refresh_calls"] == 1, "the deferred refresh should run once"
+    assert state["needs_refresh"] is False, "entry is available post-refresh"
+    assert lease == "e1", (
+        "acquire_lease returned None despite a successfully refreshed, "
+        "available entry — the caller would fail an answerable request"
+    )
+    assert pool._active_leases.get("e1") == 1, "the lease must be recorded"
+
+
+def test_acquire_lease_without_pending_refresh_does_not_double_select():
+    """No pending refresh -> exactly one selection pass (no wasted work)."""
+    pool = _bare_pool([_entry("e1")])
+    state = _wire_deferred_refresh(pool)
+    state["needs_refresh"] = False  # already healthy
+
+    passes = {"n": 0}
+    original = pool._acquire_lease_under_lock
+
+    def counting(credential_id):
+        passes["n"] += 1
+        return original(credential_id)
+
+    pool._acquire_lease_under_lock = counting
+
+    lease = pool.acquire_lease()
+
+    assert lease == "e1"
+    assert passes["n"] == 1, "healthy pool must not trigger the retry path"
+    assert state["refresh_calls"] == 0
+
+
+def test_acquire_lease_still_none_when_refresh_does_not_help():
+    """If the refresh leaves nothing available, None is still the answer —
+    the retry must not loop or invent a credential."""
+    pool = _bare_pool([_entry("e1")])
+    state = _wire_deferred_refresh(pool, refresh_succeeds=False)
+
+    assert pool.acquire_lease() is None
+    assert state["refresh_calls"] == 1, "retry must not refresh repeatedly"
+    assert pool._active_leases == {}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_nous_refresh_stampede.py ===
+"""Concurrent Nous 401 recovery must not stampede the shared OAuth grant.
+
+Sep 2 2026 incident: ~120 subagent processes shared one Nous OAuth pool entry
+whose access token hit its hourly expiry. Every process got a 401, every
+process force-refreshed, and each rotation invalidated the token a sibling had
+just adopted — 81 refreshes and ~540 401s in eight minutes. Processes that
+lost the auth-store flock race had their only entry benched ("matched no nous
+entry ... pool size 0") and surfaced the 401 to the user as "out of funds".
+
+Two invariants pinned here:
+
+1. ``resolve_nous_runtime_credentials(force_refresh=True, stale_access_token=X)``
+   does NOT POST a refresh when the store already holds a usable token that
+   is not X — a peer already rotated; adopt it.
+2. A lock-timeout during a pool-level Nous refresh leaves the entry
+   untouched instead of marking it exhausted.
+"""
+
+import json
+import logging
+
+import hermes_cli.auth as auth_mod
+import hermes_cli.auth_nous as auth_nous
+from agent.credential_pool import CredentialPool, PooledCredential
+
+from tests.hermes_cli.test_auth_nous_provider import _invoke_jwt, _setup_nous_auth
+
+
+def test_forced_refresh_adopts_peer_rotation_instead_of_reposting(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    peer_token = _invoke_jwt(seconds=3600)
+    failed_token = _invoke_jwt(seconds=3000)  # what THIS process still holds
+    _setup_nous_auth(
+        hermes_home,
+        access_token=peer_token,
+        refresh_token="rt-after-peer-rotation",
+        scope=auth_mod.DEFAULT_NOUS_SCOPE,
+        expires_at=auth_mod.datetime.fromtimestamp(
+            auth_mod.time.time() + 3600, tz=auth_mod.timezone.utc
+        ).isoformat(),
+        expires_in=3600,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    posts = []
+
+    def _fake_refresh_access_token(*, client, portal_base_url, client_id, refresh_token):
+        posts.append(refresh_token)
+        return {
+            "access_token": _invoke_jwt(seconds=7200),
+            "refresh_token": "rt-should-not-happen",
+            "expires_in": 7200,
+            "token_type": "Bearer",
+            "scope": auth_mod.DEFAULT_NOUS_SCOPE,
+        }
+
+    monkeypatch.setattr(auth_mod, "_refresh_access_token", _fake_refresh_access_token)
+    monkeypatch.setattr(auth_nous, "_refresh_access_token", _fake_refresh_access_token)
+
+    creds = auth_mod.resolve_nous_runtime_credentials(
+        force_refresh=True, stale_access_token=failed_token
+    )
+
+    assert posts == [], "peer already rotated — must not consume the refresh token again"
+    assert creds["api_key"] == peer_token
+
+    # Same call WITHOUT the hint keeps the pre-existing force semantics.
+    auth_mod.resolve_nous_runtime_credentials(force_refresh=True)
+    assert posts == ["rt-after-peer-rotation"]
+
+
+def test_lock_timeout_during_nous_refresh_does_not_bench_entry(monkeypatch, caplog):
+    entry = PooledCredential(
+        id="267aed",
+        provider="nous",
+        auth_type="oauth",
+        access_token=_invoke_jwt(seconds=3600),
+        refresh_token="rt",
+        label="test@nous",
+        source="device_code",
+        priority=0,
+    )
+    pool = CredentialPool.__new__(CredentialPool)
+    pool._lock = __import__("threading").RLock()
+    pool._entries = [entry]
+    pool._active_leases = {}
+    pool._current_id = None
+    pool._max_concurrent = 2
+    pool._unmatched_rotation_streak = 0
+    pool.provider = "nous"
+
+    monkeypatch.setattr(pool, "_sync_nous_entry_from_auth_store", lambda e: e)
+    monkeypatch.setattr(pool, "_persist", lambda *a, **k: None)
+
+    def _busy(*a, **k):
+        raise TimeoutError("Timed out waiting for auth store lock")
+
+    monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials", _busy)
+    monkeypatch.setattr(auth_nous, "resolve_nous_runtime_credentials", _busy)
+
+    result = pool._refresh_entry_impl(entry, force=True)
+
+    assert result is entry
+    assert pool._entries[0].last_status is None, "lock contention is not a credential failure"
+
+
+def test_agent_401_refresh_passes_failed_bearer_as_stale_hint(monkeypatch):
+    """Every 401-recovery caller must hand the auth store the bearer that
+    failed — without it ``_already_rotated_by_peer`` can never fire and each
+    subagent rotates the shared grant again (the "no crash, N refreshes"
+    variant of the Sep 2 stampede).
+    """
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "nous"
+    agent.api_mode = "chat_completions"
+    agent.api_key = "jwt-that-just-401d"
+    agent.base_url = "https://inference-api.nousresearch.com/v1"
+    agent._client_kwargs = {}
+    monkeypatch.setattr(agent, "_replace_primary_openai_client", lambda **k: True)
+
+    seen = {}
+
+    def _fake_resolve(**kwargs):
+        seen.update(kwargs)
+        return {"api_key": "fresh", "base_url": agent.base_url}
+
+    monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials", _fake_resolve)
+    monkeypatch.setattr(auth_nous, "resolve_nous_runtime_credentials", _fake_resolve)
+
+    assert agent._try_refresh_nous_client_credentials(force=True) is True
+    assert seen["force_refresh"] is True
+    assert seen["stale_access_token"] == "jwt-that-just-401d"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_no_entries_log_throttle.py ===
+"""Regression: the credential-pool "no available entries" INFO line must be
+throttled so an empty/exhausted pool cannot storm the shared rotating log.
+
+Selection runs on a hot path (every model call plus auxiliary tasks). Before
+the throttle, an empty/exhausted pool logged this line on *every* select(),
+which on Windows storms concurrent-log-handler's cross-process lock
+("Cannot acquire lock after 20 attempts"), stalls the asyncio event loop, and
+fails the Desktop backend readiness handshake ("Timed out connecting to Hermes
+backend after 15000ms"). See #58265 for the same fix class on another message.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from agent.credential_pool import (
+    NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS,
+    CredentialPool,
+    PooledCredential,
+)
+
+_NO_ENTRIES_MSG = "credential pool: no available entries (all exhausted or empty)"
+
+
+class _FakeClock:
+    """Deterministic monotonic clock driven by the test."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _no_entries_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == _NO_ENTRIES_MSG]
+
+
+def _make_entry(entry_id: str) -> PooledCredential:
+    return PooledCredential(
+        provider="test",
+        id=entry_id,
+        label=entry_id,
+        auth_type="api_key",
+        source="manual",
+        access_token=f"tok-{entry_id}",
+        priority=0,
+    )
+
+
+def test_empty_pool_logs_once_within_throttle_window(monkeypatch, caplog):
+    clock = _FakeClock()
+    monkeypatch.setattr("agent.credential_pool.time.monotonic", clock)
+
+    pool = CredentialPool("test", [])
+
+    with caplog.at_level(logging.INFO, logger="agent.credential_pool"):
+        for _ in range(50):
+            clock.now += 0.1  # tighter than the throttle window
+            assert pool.select() is None
+
+    # 50 selections, well inside one window -> exactly one log line.
+    assert len(_no_entries_records(caplog)) == 1
+
+
+def test_logs_again_after_throttle_window_elapses(monkeypatch, caplog):
+    clock = _FakeClock()
+    monkeypatch.setattr("agent.credential_pool.time.monotonic", clock)
+
+    pool = CredentialPool("test", [])
+
+    with caplog.at_level(logging.INFO, logger="agent.credential_pool"):
+        assert pool.select() is None  # log #1
+        clock.now += NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS + 1
+        assert pool.select() is None  # window elapsed -> log #2
+
+    assert len(_no_entries_records(caplog)) == 2
+
+
+def test_successful_selection_rearms_throttle(monkeypatch, caplog):
+    """A recover -> re-exhaust transition must log immediately, even inside the
+    window opened by the previous empty stretch (observability of the flip)."""
+    clock = _FakeClock()
+    monkeypatch.setattr("agent.credential_pool.time.monotonic", clock)
+
+    pool = CredentialPool("test", [])
+
+    with caplog.at_level(logging.INFO, logger="agent.credential_pool"):
+        assert pool.select() is None  # log #1, throttle armed
+        clock.now += 1
+        assert pool.select() is None  # within window -> no log
+
+        # Pool recovers: a successful selection re-arms the throttle.
+        pool._entries = [_make_entry("a")]
+        clock.now += 1
+        assert pool.select() is not None
+
+        # Pool empties again shortly after (< throttle window since log #1).
+        pool._entries = []
+        clock.now += 1
+        assert pool.select() is None  # re-armed -> log #2 immediately
+
+    assert len(_no_entries_records(caplog)) == 2
+

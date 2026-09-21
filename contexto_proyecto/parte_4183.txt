@@ -1,0 +1,323 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_config_change_rebind.py ===
+"""A remote MCP server definition edited in config.yaml while the process runs must take effect on
+the next transport rebuild (#113907): ``run()`` used to keep its start-time dict forever, so a URL
+change (catalog migration, dashboard re-auth to a new endpoint) left the loop probing the old URL
+and its stale-URL OAuth provider evicted the fresh one built for the new URL."""
+
+import asyncio
+
+import pytest
+
+
+@pytest.mark.no_isolate
+def test_reconnect_adopts_changed_url_from_config_yaml(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool_config
+    from tools.mcp_tool import MCPServerTask
+
+    old = {"url": "https://mcp.example.test/sse", "auth": "oauth", "oauth": {"client_id": "a"}}
+    new = {"url": "https://mcp.example.test/mcp", "auth": "oauth", "oauth": {"client_id": "a"}}
+    disk = {"srv": dict(old)}
+    monkeypatch.setattr(mcp_tool_config, "_load_mcp_config", lambda: {k: dict(v) for k, v in disk.items()})
+    seen: list = []
+
+    class _Task(MCPServerTask):
+        async def _prepare_run(self, config):
+            self._config = config
+            self._auth_type = config["auth"]
+            return True
+
+        async def _run_http(self, config):
+            seen.append((config["url"], self._config["url"], self._auth_type))
+            self._ready.set()
+            self.session = object()
+            self._session_proven = True
+            if len(seen) == 1:
+                disk["srv"] = dict(new)  # the dashboard saved the migrated definition mid-run
+                return "reconnect"
+            self._shutdown_event.set()
+            return "shutdown"
+
+    async def _scenario():
+        task = _Task("srv")
+        await asyncio.wait_for(task.run(dict(old)), timeout=5)
+
+    asyncio.run(_scenario())
+    assert seen == [(old["url"], old["url"], "oauth"), (new["url"], new["url"], "oauth")]
+
+
+@pytest.mark.no_isolate
+def test_unchanged_or_missing_definition_keeps_the_running_config(monkeypatch, tmp_path):
+    """No rebuild churn when config.yaml agrees with the running dict (or no longer lists the
+    server): the start-time config stays bound byte-for-byte."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool_config
+    from tools.mcp_tool import MCPServerTask
+
+    cfg = {"url": "https://mcp.example.test/mcp", "headers": {"X": "1"}, "connect_timeout": 5}
+    task = MCPServerTask("srv")
+    task._config = cfg
+    monkeypatch.setattr(mcp_tool_config, "_load_mcp_config", lambda: {"srv": dict(cfg, connect_timeout=9)})
+    assert task._refresh_remote_config(cfg) is cfg  # non-endpoint keys do not trigger a rebind
+    monkeypatch.setattr(mcp_tool_config, "_load_mcp_config", lambda: {})
+    assert task._refresh_remote_config(cfg) is cfg
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_config_whitespace_warning.py ===
+"""Tests for MCP config hidden-whitespace warnings.
+
+Inspired by Claude Code v2.1.219: warn when MCP config values carry hidden
+leading/trailing whitespace (pasted tokens with trailing newlines, URLs with
+leading spaces), which otherwise surfaces as opaque auth/connect failures.
+"""
+
+import logging
+
+import pytest
+
+from tools import mcp_tool
+from tools import mcp_tool_config as _mcp_config
+from tools.mcp_tool_config import _warn_hidden_whitespace
+
+
+@pytest.fixture(autouse=True)
+def _reset_dedupe():
+    _mcp_config._whitespace_warned.clear()
+    yield
+    _mcp_config._whitespace_warned.clear()
+
+
+def test_clean_config_no_warnings(caplog):
+    config = {
+        "url": "https://example.com/mcp",
+        "headers": {"Authorization": "Bearer abc123"},
+        "args": ["--flag", "value"],
+    }
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        flagged = _warn_hidden_whitespace("clean", config)
+    assert flagged == []
+    assert not [r for r in caplog.records if "hidden" in r.getMessage()]
+
+
+def test_trailing_newline_in_header_flagged(caplog):
+    config = {"url": "https://example.com/mcp",
+              "headers": {"Authorization": "Bearer abc123\n"}}
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        flagged = _warn_hidden_whitespace("srv", config)
+    assert flagged == ["headers.Authorization"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("srv" in m and "headers.Authorization" in m for m in messages)
+    # The secret value itself must never appear in the log.
+    assert not any("abc123" in m for m in messages)
+
+
+def test_leading_space_in_url_flagged():
+    flagged = _warn_hidden_whitespace("srv", {"url": " https://example.com"})
+    assert flagged == ["url"]
+
+
+def test_whitespace_in_list_item_flagged_with_index():
+    flagged = _warn_hidden_whitespace(
+        "srv", {"command": "npx", "args": ["-y", "some-pkg "]}
+    )
+    assert flagged == ["args[1]"]
+
+
+def test_nested_env_dict_flagged():
+    flagged = _warn_hidden_whitespace(
+        "srv", {"command": "npx", "env": {"API_KEY": "secret\t"}}
+    )
+    assert flagged == ["env.API_KEY"]
+
+
+def test_multiple_flags_all_reported():
+    flagged = _warn_hidden_whitespace(
+        "srv", {"url": "https://x.com ", "headers": {"X-Key": " k"}}
+    )
+    assert set(flagged) == {"url", "headers.X-Key"}
+
+
+def test_non_string_values_ignored():
+    flagged = _warn_hidden_whitespace(
+        "srv", {"timeout": 30, "enabled": True, "retries": None}
+    )
+    assert flagged == []
+
+
+def test_values_never_mutated():
+    config = {"headers": {"Authorization": "Bearer tok\n"}}
+    _warn_hidden_whitespace("srv", config)
+    assert config["headers"]["Authorization"] == "Bearer tok\n"
+
+
+def test_warning_deduped_per_process(caplog):
+    config = {"url": "https://x.com "}
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        first = _warn_hidden_whitespace("srv", config)
+        second = _warn_hidden_whitespace("srv", config)
+    # Both calls still report the flagged path (return value is for callers)...
+    assert first == second == ["url"]
+    # ...but only one warning record is emitted.
+    warn_records = [r for r in caplog.records if "hidden" in r.getMessage()]
+    assert len(warn_records) == 1
+
+
+def test_distinct_servers_warned_separately(caplog):
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        _warn_hidden_whitespace("a", {"url": "https://x.com "})
+        _warn_hidden_whitespace("b", {"url": "https://x.com "})
+    warn_records = [r for r in caplog.records if "hidden" in r.getMessage()]
+    assert len(warn_records) == 2
+
+
+def test_load_mcp_config_emits_warning(tmp_path, monkeypatch, caplog):
+    """E2E through _load_mcp_config with a real config load path."""
+    from unittest.mock import patch as mock_patch
+
+    servers = {
+        "pasted": {
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer tok\n"},
+        }
+    }
+    with mock_patch("hermes_cli.config.load_config",
+                    return_value={"mcp_servers": servers}), \
+         caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        result = _mcp_config._load_mcp_config()
+
+    assert "pasted" in result
+    # Value passes through unmutated.
+    assert result["pasted"]["headers"]["Authorization"] == "Bearer tok\n"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("headers.Authorization" in m for m in messages)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_connect_secret_scope.py ===
+"""MCP connect resolves credentials under the connection owner's profile secret scope.
+
+Discovery at gateway startup runs outside any per-turn scope. Under multiplexing an unscoped
+``get_secret`` fails closed, so the stdio child-env build raised ``UnscopedSecretError`` and the
+server registered zero tools (#113746).
+"""
+import asyncio
+
+import pytest
+
+from agent.secret_scope import current_secret_scope, set_multiplex_active
+from hermes_cli import env_loader
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from tools import mcp_tool_discovery as discovery
+from tools.mcp_tool_config import _build_safe_env
+
+TOKEN_NAME, TOKEN_VALUE = "EXAMPLE_TOKEN", "profile-own-value"
+
+
+@pytest.fixture
+def profile_home(tmp_path, monkeypatch):
+    """A profile home whose ``.env`` holds the credential an external source tagged."""
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / ".env").write_text(f"{TOKEN_NAME}={TOKEN_VALUE}\n", encoding="utf-8")
+
+    # An external secret source (secrets.command / bitwarden / 1password) tags names
+    # process-wide; the VALUE must come from the active profile's scope.
+    monkeypatch.setitem(env_loader._SECRET_SOURCES, TOKEN_NAME, "command")
+
+    home_token = set_hermes_home_override(str(home))
+    set_multiplex_active(True)
+    try:
+        yield home
+    finally:
+        set_multiplex_active(False)
+        reset_hermes_home_override(home_token)
+
+
+@pytest.fixture
+def spawn_env(monkeypatch):
+    """Stub server task: ``start()`` builds the stdio child env the way the transport does."""
+    captured = {}
+
+    class _StubServerTask:
+        def __init__(self, name):
+            self.name = name
+
+        async def start(self, config):
+            captured["env"] = _build_safe_env(config.get("env"))
+
+        async def shutdown(self):
+            pass
+
+    # Origin state is read through _core; patch the origin module (see mcp_tool_discovery docstring).
+    monkeypatch.setattr("tools.mcp_tool.MCPServerTask", _StubServerTask)
+    return captured
+
+
+def test_connect_resolves_the_owning_profiles_secret(profile_home, spawn_env, monkeypatch):
+    """Red on base: UnscopedSecretError. The child env carries the OWNING profile's value — never
+    the launch process env's — and the binding is the run task's, not the caller's."""
+    monkeypatch.setenv(TOKEN_NAME, "launch-env-value")
+    assert current_secret_scope() is None  # discovery runs unscoped
+
+    asyncio.run(discovery._connect_server("demo", {"command": "true"}))
+
+    assert spawn_env["env"][TOKEN_NAME] == TOKEN_VALUE
+    assert current_secret_scope() is None
+
+
+def test_single_profile_process_binds_nothing(tmp_path, monkeypatch, spawn_env):
+    """No multiplexer, no home override (scope key None): unchanged, get_secret reads os.environ."""
+    monkeypatch.setitem(env_loader._SECRET_SOURCES, TOKEN_NAME, "command")
+    monkeypatch.setenv(TOKEN_NAME, "process-env-value")
+    set_multiplex_active(False)
+
+    asyncio.run(discovery._connect_server("demo", {"command": "true"}))
+
+    assert spawn_env["env"][TOKEN_NAME] == "process-env-value"
+    assert current_secret_scope() is None
+
+
+def test_unscoped_discover_interpolates_header_refs_under_the_owners_scope(profile_home, monkeypatch):
+    """Red on base: ``_load_mcp_config`` interpolates ``${VAR}`` refs BEFORE any connect and swallows
+    the UnscopedSecretError into {}, so discover for a routed profile registered ZERO servers
+    (stdio siblings included). The header carries the OWNING profile's value, never the launch env's."""
+    monkeypatch.setenv(TOKEN_NAME, "launch-env-value")
+    (profile_home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  httpsrv:\n    url: https://example.invalid/mcp\n"
+        f"    headers:\n      Authorization: 'Bearer ${{{TOKEN_NAME}}}'\n"
+        "  stdiosrv:\n    command: 'true'\n", encoding="utf-8")
+    handed_over = {}
+    monkeypatch.setattr(discovery, "register_mcp_servers", lambda servers: handed_over.update(servers) or [])
+    monkeypatch.setattr("tools.mcp_tool._ensure_mcp_sdk", lambda: True)
+    assert current_secret_scope() is None
+
+    discovery.discover_mcp_tools()
+
+    assert set(handed_over) == {"httpsrv", "stdiosrv"}
+    assert handed_over["httpsrv"]["headers"]["Authorization"] == f"Bearer {TOKEN_VALUE}"
+    assert current_secret_scope() is None
+
+
+def test_connect_scope_install_failure_releases_the_discovery_claim(monkeypatch, spawn_env):
+    """Red on base: the scope install sat between the claim ``set(None)`` and the try, so a raise from
+    hydration skipped ``_connect_server_claim.reset`` and the caller's claim stayed cleared."""
+    async def _boom():
+        raise RuntimeError("hydration failed")
+    monkeypatch.setattr(discovery, "_install_owner_secret_scope", _boom)
+    claim = lambda server: None  # noqa: E731
+
+    async def _run():
+        token = discovery._core._connect_server_claim.set(claim)
+        try:
+            with pytest.raises(RuntimeError, match="hydration failed"):
+                await discovery._connect_server("demo", {"command": "true"})
+            assert discovery._core._connect_server_claim.get() is claim
+        finally:
+            discovery._core._connect_server_claim.reset(token)
+
+    asyncio.run(_run())
+

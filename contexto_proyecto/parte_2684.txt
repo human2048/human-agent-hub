@@ -1,0 +1,403 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_kanban_auto_decompose_live.py ===
+"""Tests for live auto-decompose settings resolution (issue #49638).
+
+The gateway dispatcher used to capture ``kanban.auto_decompose`` once at boot,
+so a user who flipped it to ``false`` to STOP runaway auto-decompose (which had
+created and launched tasks they didn't intend) found the flag had no effect
+without a full gateway restart. ``_resolve_auto_decompose_settings`` is now
+called every tick, reading the current config.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gateway.kanban_watchers_common import _resolve_auto_decompose_settings
+
+
+def test_enabled_by_default_when_key_absent():
+    enabled, per_tick = _resolve_auto_decompose_settings(lambda: {"kanban": {}})
+    assert enabled is True
+    assert per_tick == 3
+
+
+def test_disabled_when_flag_false():
+    enabled, per_tick = _resolve_auto_decompose_settings(
+        lambda: {"kanban": {"auto_decompose": False}}
+    )
+    assert enabled is False
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_kanban_auto_decompose_secret_scope.py ===
+"""Auto-decompose tick under multiplex.
+
+Regression for #107955 / #57837: the tick runs off-turn in a fresh Context, so
+``get_secret`` fails closed unless the tick installs the launch profile's scope.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from types import SimpleNamespace
+
+from agent import secret_scope as ss
+from gateway import kanban_watchers_dispatcher as kwd
+from gateway.kanban_watchers_common import _to_thread_process_service
+
+
+def _dispatcher():
+    settings = kwd._DispatcherSettings(60.0, None, None, 2, 0, True, None, None)
+    return kwd._KanbanDispatcher(SimpleNamespace(DEFAULT_BOARD="default"), settings)
+
+
+def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkeypatch, tmp_path):
+    import hermes_cli
+
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=launch-profile-key\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(kwd, "_board_slugs", lambda kb: ["default"])
+
+    seen = {}
+
+    def fake_decompose(task_id, author=None):
+        seen["value"] = ss.get_secret("ANTHROPIC_API_KEY")
+        return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
+
+    fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
+    monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
+
+    ss.set_multiplex_active(True)
+    try:
+        # Same hop the gateway uses: fresh Context, no inherited per-turn scope.
+        decomposed = asyncio.run(_to_thread_process_service(_dispatcher().auto_decompose_tick, 5))
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert decomposed == 1
+    assert seen["value"] == "launch-profile-key"
+    assert ss.current_secret_scope() is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_kanban_changes_requested_notifier.py ===
+import asyncio
+
+from gateway.config import Platform
+from gateway.run import GatewayRunner
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
+
+
+class RecordingAdapter:
+    def __init__(self, *, fail_send=False):
+        self.sent = []
+        self.handled = []
+        self.fail_send = fail_send
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        if self.fail_send:
+            raise RuntimeError("transient send failure")
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+        event._gateway_accepted = True
+
+
+async def _run_one_tick(monkeypatch, runner):
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_notifier_watcher(interval=1)
+
+
+def _runner(adapter):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    return runner
+
+
+def _create_review_block(delivery_mode, *, reason="Tests need updates"):
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="existing implementation card",
+            assignee="implementer",
+            session_id="agent:main:telegram:thread:chat-1:topic-7",
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-7",
+            chat_type="thread",
+            delivery_mode=delivery_mode,
+            delivery_metadata={"thread_id": "topic-7", "chat_type": "thread"},
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            kind="changes_requested",
+            payload={
+                "reason": reason,
+                "reviewer": "claude-qa",
+                "implementer": "codex-cua",
+                "status": "ready",
+            },
+        )
+        return task_id
+    finally:
+        conn.close()
+
+
+def _unseen(task_id):
+    conn = kbc.connect()
+    try:
+        _, events = kbn.unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-7",
+            kinds=["changes_requested"],
+        )
+        return events
+    finally:
+        conn.close()
+
+
+def test_changes_requested_notify_wake_is_actionable_and_exactly_routed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-block.db"))
+    kb.init_db()
+    task_id = _create_review_block("notify+wake")
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert text.startswith(f"🛑 [default] Kanban {task_id} review requested changes/BLOCK: Tests need updates")
+    assert "reviewer @claude-qa → implementer @codex-cua" in text
+    assert adapter.sent[0]["metadata"]["thread_id"] == "topic-7"
+    assert len(adapter.handled) == 1
+    wake = adapter.handled[0]
+    assert wake.source.chat_id == "chat-1"
+    assert wake.source.chat_type == "thread"
+    assert wake.source.thread_id == "topic-7"
+    assert "implementation is not approved" in wake.text
+    assert "Inspect the existing card and its current review run" in wake.text
+    assert "do not create a duplicate task" in wake.text
+    assert wake.text.count("do not create a duplicate task") == 1
+    assert _unseen(task_id) == []
+
+    # A fresh watcher after restart cannot replay an event whose cursor advanced.
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+
+
+def test_changes_requested_notify_is_passive_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify.db"))
+    kb.init_db()
+    task_id = _create_review_block("notify")
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
+    assert _unseen(task_id) == []
+
+
+def test_changes_requested_wake_only_has_no_passive_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake.db"))
+    kb.init_db()
+    task_id = _create_review_block("wake")
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    assert _unseen(task_id) == []
+
+
+def test_changes_requested_send_failure_retries_without_event_loss(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "retry.db"))
+    kb.init_db()
+    task_id = _create_review_block("notify")
+    failing = RecordingAdapter(fail_send=True)
+
+    asyncio.run(_run_one_tick(monkeypatch, _runner(failing)))
+    assert len(failing.sent) == 1
+    assert len(_unseen(task_id)) == 1
+
+    healthy = RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(healthy)))
+    assert len(healthy.sent) == 1
+    assert _unseen(task_id) == []
+
+
+def test_changes_requested_reason_is_redacted_path_safe_and_truncated(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "redact.db"))
+    kb.init_db()
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    reason = f"See /Users/alice/private/review.log token={secret} " + ("x" * 300)
+    _create_review_block("notify", reason=reason)
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    text = adapter.sent[0]["text"]
+    assert "/Users/alice" not in text
+    assert "abcdefghijklmnopqrstuvwxyz" not in text
+    assert "[local path]" in text
+    assert "… — reviewer @claude-qa" in text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_kanban_multiplex_served_profile_parity.py ===
+"""Standalone-vs-served parity for the kanban dispatcher and notifier under
+``gateway.multiplex_profiles``: a worker spawned for served profile X gets the env a standalone
+``hermes -p X`` dispatcher would build, and X's notifications are rendered/filtered under X's
+config.
+"""
+
+import asyncio
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from agent.secret_scope import set_multiplex_active
+from gateway.config import Platform
+from gateway.run import GatewayRunner
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_notify as kbn
+from hermes_constants import get_hermes_home
+
+
+@pytest.fixture
+def served(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    alpha = root / "profiles" / "alpha"
+    alpha.mkdir(parents=True)
+    (root / ".env").write_text("HERMES_MODEL=default-model\nTERMINAL_ENV=docker\n")
+    (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\nterminal:\n  backend: docker\n")
+    (alpha / ".env").write_text("")
+    (alpha / "config.yaml").write_text("display:\n  language: zh\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_MODEL", "default-model")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    set_multiplex_active(True)
+    try:
+        yield SimpleNamespace(root=root, alpha=alpha)
+    finally:
+        set_multiplex_active(False)
+
+
+def test_worker_for_served_profile_gets_its_own_env_and_toolset_pin(served, monkeypatch):
+    """The dispatcher (root context) spawns alpha's worker: no launch-profile settings leak into the
+    child and the ``--toolsets`` pin (whose probes read credentials) is resolved under alpha's scope."""
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="alpha")
+        task = kb.get_task(conn, tid)
+    finally:
+        conn.close()
+
+    spawned = {}
+
+    def fake_popen(argv, **kwargs):
+        spawned["argv"], spawned["env"] = argv, kwargs["env"]
+        return SimpleNamespace(pid=4242)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(kbd, "_open_worker_log", lambda task, board: open("/dev/null", "w"))
+    monkeypatch.setattr(kbd, "_hermes_argv", lambda: ["hermes"], raising=False)
+    kbd._default_spawn(task, str(served.alpha), board=None)
+
+    env = spawned["env"]
+    assert env["HERMES_HOME"] == str(served.alpha)
+    assert "HERMES_MODEL" not in env and "TERMINAL_ENV" not in env
+    assert "--toolsets" in spawned["argv"]
+
+
+class RecordingAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, text, metadata=None):
+        from gateway.media_policy import media_delivery_strict
+        self.sent.append({"text": text, "home": str(get_hermes_home()), "strict": media_delivery_strict()})
+        return SimpleNamespace(success=True, error=None)
+
+    async def handle_message(self, event):
+        event._gateway_accepted = True
+
+
+def test_notifier_pings_run_under_the_subscribers_profile(served, monkeypatch):
+    """A subscription owned by served alpha is pinged with alpha's home active, so its media policy
+    and display language apply — alpha's own adapter was already selected before this fix."""
+    (served.alpha / "config.yaml").write_text("display:\n  language: zh\ngateway:\n  strict: true\n")
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="notify parity", assignee="alpha")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="1001", notifier_profile="alpha")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.config = SimpleNamespace(multiplex_profiles=True, profile_routes=[])
+    alpha_adapter = RecordingAdapter()
+    runner.adapters = {Platform.TELEGRAM: RecordingAdapter()}
+    runner._profile_adapters = {"alpha": {Platform.TELEGRAM: alpha_adapter}}
+    runner._primary_profile_name = "default"
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._profile_failed_platforms = {}
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert len(alpha_adapter.sent) == 1
+    assert alpha_adapter.sent[0]["home"] == str(served.alpha)
+    assert alpha_adapter.sent[0]["strict"] is True
+

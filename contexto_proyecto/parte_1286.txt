@@ -1,0 +1,413 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\scripts\timing_analysis.py ===
+#!/usr/bin/env python3
+"""Permutation test for donation/contract timing correlation (stdlib-only).
+
+For each (donor, vendor) pair, compute the mean number of days between each
+donation and the nearest contract award. Then shuffle contract award dates
+N times within the observation window and compute the same statistic. The
+one-tailed p-value is the fraction of permutations whose mean is <= the
+observed mean (smaller distance = tighter clustering).
+
+Adapted from ShinMegamiBoson/OpenPlanter (MIT). Differences:
+  - Pure stdlib (no pandas / numpy)
+  - Domain-agnostic (no snow-vendor / CRITICAL-politician filter)
+  - Configurable column names via flags
+  - Optional --seed for reproducibility
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import random
+import statistics
+from collections import defaultdict
+from pathlib import Path
+
+_DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d", "%m-%d-%Y", "%Y%m%d")
+
+
+def parse_date(raw: str) -> dt.date | None:
+    if not raw:
+        return None
+    raw = raw.strip()
+    for fmt in _DATE_FORMATS:
+        try:
+            return dt.datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _read(path: str) -> list[dict[str, str]]:
+    with open(path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _nearest_distance(donation_date: dt.date, awards: list[dt.date]) -> int:
+    """Absolute days to nearest award date."""
+    return min(abs((donation_date - a).days) for a in awards)
+
+
+def _permute(
+    awards_count: int,
+    donations: list[dt.date],
+    date_min: dt.date,
+    date_max: dt.date,
+    rng: random.Random,
+) -> float:
+    """One permutation: draw uniform random award dates, compute mean nearest-distance."""
+    span_days = (date_max - date_min).days or 1
+    rand_awards = [
+        date_min + dt.timedelta(days=rng.randint(0, span_days))
+        for _ in range(awards_count)
+    ]
+    distances = [_nearest_distance(d, rand_awards) for d in donations]
+    return statistics.mean(distances)
+
+
+def analyze(
+    donations_path: str,
+    donation_date_col: str,
+    donation_amount_col: str,
+    donation_donor_col: str,
+    donation_recipient_col: str,
+    contracts_path: str,
+    contract_date_col: str,
+    contract_vendor_col: str,
+    cross_links_path: str | None,
+    n_permutations: int = 1000,
+    min_donations: int = 3,
+    p_threshold: float = 0.05,
+    seed: int | None = None,
+    out_path: str = "timing.json",
+) -> dict:
+    rng = random.Random(seed)
+
+    donations = _read(donations_path)
+    contracts = _read(contracts_path)
+
+    # Allow optional join through cross_links — donor (left) ↔ vendor (right).
+    # When present, donor strings get mapped to matched vendor names so the
+    # vendor-date index lookup actually finds the contracts.
+    matched_pairs: set[tuple[str, str]] | None = None
+    donor_to_vendors: dict[str, set[str]] = defaultdict(set)
+    if cross_links_path:
+        matched_pairs = set()
+        for row in _read(cross_links_path):
+            left = row.get("left_name", "")
+            right = row.get("right_name", "")
+            matched_pairs.add((left, right))
+            donor_to_vendors[left].add(right)
+
+    # Index contract dates by vendor name.
+    vendor_to_award_dates: dict[str, list[dt.date]] = defaultdict(list)
+    all_award_dates: list[dt.date] = []
+    for row in contracts:
+        d = parse_date(row.get(contract_date_col, ""))
+        if not d:
+            continue
+        vendor_to_award_dates[row.get(contract_vendor_col, "").strip()].append(d)
+        all_award_dates.append(d)
+
+    if not all_award_dates:
+        raise SystemExit(f"No parseable dates in {contracts_path}/{contract_date_col}")
+    global_min = min(all_award_dates)
+    global_max = max(all_award_dates)
+
+    # Group donations by (donor, recipient).
+    grouped: dict[tuple[str, str], list[tuple[dt.date, float]]] = defaultdict(list)
+    for row in donations:
+        donor = row.get(donation_donor_col, "").strip()
+        recip = row.get(donation_recipient_col, "").strip()
+        d = parse_date(row.get(donation_date_col, ""))
+        try:
+            amt = float(row.get(donation_amount_col, "0") or 0)
+        except ValueError:
+            amt = 0.0
+        if not (donor and recip and d):
+            continue
+        grouped[(donor, recip)].append((d, amt))
+
+    results = []
+    skipped = 0
+    for (donor, recip), records in grouped.items():
+        if len(records) < min_donations:
+            skipped += 1
+            continue
+        # Only test if donor appears in cross-links (when provided). The
+        # (donor, candidate) tuple itself is NOT what's in matched_pairs —
+        # cross_links pairs are (donor, vendor). We use the cross-link to
+        # map donor → vendor name(s) so the vendor-date index resolves.
+        if matched_pairs is not None and donor not in donor_to_vendors:
+            skipped += 1
+            continue
+        # Try direct donor→awards first, then go through cross-link vendor names.
+        award_dates = list(vendor_to_award_dates.get(donor, []))
+        if not award_dates:
+            award_dates = list(vendor_to_award_dates.get(recip, []))
+        if not award_dates and donor_to_vendors.get(donor):
+            for vendor_name in donor_to_vendors[donor]:
+                award_dates.extend(vendor_to_award_dates.get(vendor_name, []))
+        if not award_dates:
+            skipped += 1
+            continue
+
+        donation_dates = [d for (d, _) in records]
+        observed = statistics.mean(
+            _nearest_distance(d, award_dates) for d in donation_dates
+        )
+
+        permuted_means = [
+            _permute(len(award_dates), donation_dates, global_min, global_max, rng)
+            for _ in range(n_permutations)
+        ]
+        p_value = sum(1 for m in permuted_means if m <= observed) / n_permutations
+        null_mean = statistics.mean(permuted_means)
+        null_std = statistics.pstdev(permuted_means) or 1.0
+        effect_size = (null_mean - observed) / null_std
+
+        results.append(
+            {
+                "donor": donor,
+                "recipient": recip,
+                "n_donations": len(records),
+                "n_award_dates": len(award_dates),
+                "observed_mean_days": round(observed, 2),
+                "null_mean_days": round(null_mean, 2),
+                "p_value": round(p_value, 4),
+                "effect_size_sd": round(effect_size, 2),
+                "significant": p_value < p_threshold,
+                "total_donation_amount": round(sum(a for (_, a) in records), 2),
+            }
+        )
+
+    results.sort(key=lambda r: r["p_value"])
+
+    payload = {
+        "metadata": {
+            "n_permutations": n_permutations,
+            "min_donations": min_donations,
+            "p_threshold": p_threshold,
+            "seed": seed,
+            "n_pairs_tested": len(results),
+            "n_pairs_skipped": skipped,
+            "n_significant": sum(1 for r in results if r["significant"]),
+            "observation_window": [global_min.isoformat(), global_max.isoformat()],
+        },
+        "results": results,
+    }
+
+    Path(out_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--donations", required=True)
+    p.add_argument("--donation-date-col", required=True)
+    p.add_argument("--donation-amount-col", required=True)
+    p.add_argument("--donation-donor-col", required=True)
+    p.add_argument("--donation-recipient-col", required=True)
+    p.add_argument("--contracts", required=True)
+    p.add_argument("--contract-date-col", required=True)
+    p.add_argument("--contract-vendor-col", required=True)
+    p.add_argument(
+        "--cross-links",
+        help="Optional cross_links.csv to restrict (donor, vendor) pairs",
+    )
+    p.add_argument("--permutations", type=int, default=1000)
+    p.add_argument("--min-donations", type=int, default=3)
+    p.add_argument("--p-threshold", type=float, default=0.05)
+    p.add_argument("--seed", type=int)
+    p.add_argument("--out", default="timing.json")
+    a = p.parse_args()
+
+    payload = analyze(
+        donations_path=a.donations,
+        donation_date_col=a.donation_date_col,
+        donation_amount_col=a.donation_amount_col,
+        donation_donor_col=a.donation_donor_col,
+        donation_recipient_col=a.donation_recipient_col,
+        contracts_path=a.contracts,
+        contract_date_col=a.contract_date_col,
+        contract_vendor_col=a.contract_vendor_col,
+        cross_links_path=a.cross_links,
+        n_permutations=a.permutations,
+        min_donations=a.min_donations,
+        p_threshold=a.p_threshold,
+        seed=a.seed,
+        out_path=a.out,
+    )
+    meta = payload["metadata"]
+    print(
+        f"Tested {meta['n_pairs_tested']} pairs ({meta['n_pairs_skipped']} skipped). "
+        f"Significant (p<{meta['p_threshold']}): {meta['n_significant']}. "
+        f"Wrote {a.out}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\scripts\_http.py ===
+"""Tiny stdlib HTTP helper used by fetch_*.py scripts.
+
+Provides polite retry + JSON convenience + User-Agent enforcement.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_UA = (
+    "hermes-osint-investigation/0.2 "
+    "(+https://github.com/NousResearch/hermes-agent; "
+    "set HERMES_OSINT_UA env var to identify yourself per "
+    "Wikimedia / SEC fair-use guidance)"
+)
+
+
+def get(
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    user_agent: str | None = None,
+    max_retries: int = 3,
+    backoff: float = 1.5,
+    timeout: float = 30.0,
+) -> bytes:
+    """GET with retry on 5xx and Retry-After honoring.
+
+    429 (rate-limit) is raised IMMEDIATELY with a clear message — retrying
+    when the upstream says "you're over quota" just wastes time. The caller
+    should slow down or supply real credentials.
+    """
+    if params:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{urllib.parse.urlencode(params)}"
+    h = {"User-Agent": user_agent or os.environ.get("HERMES_OSINT_UA", DEFAULT_UA)}
+    if headers:
+        h.update(headers)
+
+    last_err: Exception | None = None
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # Surface immediately. Read the body so the caller sees the
+                # provider's actual message ("OVER_RATE_LIMIT" etc.).
+                try:
+                    body = e.read(2048).decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    body = ""
+                raise RuntimeError(
+                    f"HTTP 429 rate-limited by {urllib.parse.urlsplit(url).netloc}. "
+                    f"Slow down or supply a real API key. Body: {body[:300]}"
+                ) from e
+            if e.code in {500, 502, 503, 504} and attempt < max_retries:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                wait = float(retry_after) if (retry_after and retry_after.isdigit()) else backoff ** (attempt + 1)
+                time.sleep(wait)
+                last_err = e
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < max_retries:
+                time.sleep(backoff ** (attempt + 1))
+                last_err = e
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("unreachable")
+
+
+def get_json(url: str, **kwargs) -> dict | list:
+    return json.loads(get(url, **kwargs).decode("utf-8"))
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\scripts\_normalize.py ===
+"""Shared entity-name normalization helpers (stdlib-only).
+
+Used by entity_resolution.py and timing_analysis.py.
+"""
+from __future__ import annotations
+
+import re
+
+# Legal suffixes / corporate boilerplate to strip during normalization.
+_SUFFIX_TOKENS = {
+    "INC", "INCORPORATED", "LLC", "LLP", "LP", "LTD", "LIMITED",
+    "CORP", "CORPORATION", "CO", "COMPANY",
+    "GROUP", "GRP", "HOLDINGS", "HOLDING",
+    "PARTNERS", "ASSOCIATES",
+    "INTERNATIONAL", "INTL",
+    "ENTERPRISES", "ENTERPRISE",
+    "SERVICES", "SERVICE", "SVCS",
+    "SOLUTIONS", "MANAGEMENT", "MGMT", "CONSULTING",
+    "TECHNOLOGY", "TECHNOLOGIES", "TECH",
+    "INDUSTRIES", "INDUSTRY",
+    "AMERICA", "AMERICAN",
+    "USA", "US",
+    "PLLC", "PC",
+    "TRUST", "FOUNDATION",
+}
+
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_name(name: str | None) -> str:
+    """Standard normalization: uppercase, strip suffixes, drop punctuation."""
+    if not name:
+        return ""
+    s = _PUNCT_RE.sub(" ", name.upper())
+    s = _WS_RE.sub(" ", s).strip()
+    tokens = [t for t in s.split() if t and t not in _SUFFIX_TOKENS]
+    return " ".join(tokens)
+
+
+def normalize_aggressive(name: str | None) -> str:
+    """Aggressive normalization: sorted unique tokens (word-bag)."""
+    base = normalize_name(name)
+    if not base:
+        return ""
+    return " ".join(sorted(set(base.split())))
+
+
+def name_tokens(name: str | None, min_len: int = 4) -> set[str]:
+    """Token set used for overlap matching."""
+    base = normalize_name(name)
+    if not base:
+        return set()
+    return {t for t in base.split() if len(t) >= min_len}
+
+
+def token_overlap_ratio(left: str | None, right: str | None) -> tuple[float, int]:
+    """Return (jaccard-like ratio, shared token count) over min-len tokens."""
+    a = name_tokens(left)
+    b = name_tokens(right)
+    if not a or not b:
+        return 0.0, 0
+    shared = a & b
+    if not shared:
+        return 0.0, 0
+    union = a | b
+    return len(shared) / len(union), len(shared)
+

@@ -1,0 +1,403 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_access_policy_mixin.py ===
+"""Every own-policy adapter must reach the same allow/deny verdict for the same policy inputs.
+
+The predicates used to be five hand-copied bodies (weixin, wecom, qqbot, whatsapp, yuanbao) that
+drifted on blank principals and scoped env reads; ``OwnAccessPolicyMixin`` is the single rule.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import itertools
+
+import pytest
+
+from agent.secret_scope import reset_secret_scope, set_secret_scope
+from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
+
+POLICIES = ("open", "allowlist", "disabled", "pairing", "typo")
+SENDERS = ("alice", "stranger", "", "   ", None)
+
+
+@contextlib.contextmanager
+def _scope(secrets):
+    token = set_secret_scope(secrets)
+    try:
+        yield
+    finally:
+        reset_secret_scope(token)
+
+
+def _hosts():
+    """One bare instance per own-policy class, attributes set exactly as the adapters do."""
+    from gateway.platforms.qqbot.adapter import QQAdapter
+    from gateway.platforms.weixin import WeixinAdapter
+    from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+    from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+    from gateway.platforms.yuanbao import AccessPolicy
+    from plugins.platforms.wecom.adapter import WeComAdapter
+
+    hosts = {
+        "weixin": object.__new__(WeixinAdapter),
+        "wecom": object.__new__(WeComAdapter),
+        "qqbot": object.__new__(QQAdapter),
+        "whatsapp": WhatsAppBehaviorMixin(),
+        "whatsapp_cloud": object.__new__(WhatsAppCloudAdapter),
+        "yuanbao": AccessPolicy("open", [], "open", []),
+    }
+    hosts["whatsapp"]._dm_allowlist_source = "config"
+    hosts["whatsapp_cloud"]._dm_allowlist_source = "config"
+    hosts["wecom"]._groups = {}
+    return hosts
+
+
+def _verdicts(host, name, dm_policy, group_policy):
+    host._dm_policy, host._group_policy = dm_policy, group_policy
+    host._allow_from, host._group_allow_from = ["alice"], ["room-1"]
+    out = {}
+    for sender in SENDERS:
+        out[("dm", sender)] = host._is_dm_allowed(sender or "")
+        out[("intake", sender)] = host._is_dm_intake_allowed(sender)
+    for group in ("room-1", "room-2"):
+        args = (group, "alice") if name in ("wecom", "qqbot") else (group,)
+        out[("group", group)] = host._is_group_allowed(*args)
+    return out
+
+
+# Per-host opt-in var (the one ``hermes gateway setup`` writes). Setting only GATEWAY_ALLOW_ALL_USERS
+# would pass with a host whose prefix is missing — that is exactly how WeCom regressed once.
+PLATFORM_OPT_IN = {"weixin": "WEIXIN_ALLOW_ALL_USERS", "wecom": "WECOM_ALLOW_ALL_USERS",
+                   "qqbot": "QQ_ALLOW_ALL_USERS", "whatsapp": "WHATSAPP_ALLOW_ALL_USERS",
+                   "whatsapp_cloud": "WHATSAPP_CLOUD_ALLOW_ALL_USERS", "yuanbao": "YUANBAO_ALLOW_ALL_USERS"}
+# Hosts whose allowlists document ``*`` (weixin/yuanbao match literally, as before).
+WILDCARD_HOSTS = ("wecom", "qqbot", "whatsapp", "whatsapp_cloud")
+
+
+def _all_agree(hosts, opt_in_for, label):
+    for dm_policy, group_policy in itertools.product(POLICIES, POLICIES):
+        table = {}
+        for name, host in hosts.items():
+            with _scope(opt_in_for(name)):
+                table[name] = _verdicts(host, name, dm_policy, group_policy)
+        for name, verdicts in table.items():
+            assert verdicts == table["weixin"], (name, dm_policy, group_policy, label)
+        expected_open = bool(opt_in_for("weixin")) and dm_policy == "open"
+        assert table["weixin"][("dm", "stranger")] is expected_open
+        assert table["weixin"][("intake", "   ")] is False  # blank principal never admitted
+        assert table["weixin"][("intake", "stranger")] is (dm_policy == "pairing" or expected_open)
+
+
+@pytest.mark.parametrize("mode", ["none", "gateway", "platform"])
+def test_all_own_policy_adapters_agree(monkeypatch, mode):
+    for var in ("GATEWAY_ALLOW_ALL_USERS", *PLATFORM_OPT_IN.values()):
+        monkeypatch.delenv(var, raising=False)
+    opt_in_for = {
+        "none": lambda name: {},
+        "gateway": lambda name: {"GATEWAY_ALLOW_ALL_USERS": "true"},
+        "platform": lambda name: {PLATFORM_OPT_IN[name]: "true"},
+    }[mode]
+    _all_agree(_hosts(), opt_in_for, mode)
+
+
+@pytest.mark.parametrize("name", WILDCARD_HOSTS)
+def test_wildcard_allowlist_admits_strangers_on_every_path(name):
+    """``*`` must open strict DM auth, DM intake AND group intake alike — whatsapp_cloud once
+    honoured it on intake only, then on neither."""
+    host = _hosts()[name]
+    host._dm_policy = host._group_policy = "allowlist"
+    host._allow_from, host._group_allow_from = ["*"], ["*"]
+    group_args = ("room-2", "stranger") if name in ("wecom", "qqbot") else ("room-2",)
+    assert host._is_dm_allowed("stranger") is True
+    assert host._is_dm_intake_allowed("stranger") is True
+    assert host._is_group_allowed(*group_args) is True
+    assert host._is_dm_intake_allowed("   ") is False
+
+
+def test_mixin_host_without_prefix_is_rejected_at_class_creation():
+    with pytest.raises(TypeError, match="ALLOW_ALL_ENV_PREFIX"):
+        class Host(OwnAccessPolicyMixin):  # noqa: F841
+            _dm_policy = "open"
+
+
+def test_platform_prefix_env_name_is_scoped_and_fail_closed(monkeypatch):
+    class Host(OwnAccessPolicyMixin):
+        ALLOW_ALL_ENV_PREFIX = "DEMO"
+        _dm_policy, _group_policy, _allow_from, _group_allow_from = "open", "open", [], []
+
+    monkeypatch.setattr("agent.secret_scope._MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("DEMO_ALLOW_ALL_USERS", "true")  # the DEFAULT profile's opt-in
+    assert Host()._allow_all_env_names() == ("GATEWAY_ALLOW_ALL_USERS", "DEMO_ALLOW_ALL_USERS")
+    with _scope({}):  # secondary profile: scope installed, key absent
+        assert Host()._is_dm_allowed("anyone") is False
+    with _scope({"DEMO_ALLOW_ALL_USERS": "yes"}):
+        assert Host()._is_dm_allowed("anyone") is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_active_session_text_merge.py ===
+"""Regression tests for active-session TEXT follow-up queueing.
+
+When the agent is actively running, rapid text follow-ups should survive as
+one next-turn pending message instead of clobbering each other. In
+``busy_text_mode=queue`` those active follow-ups first pass through a short
+debounce so bursty multi-message thoughts are merged before the active drain
+hands off the next turn.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import types
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+# Minimal telegram stub so importing gateway.platforms.base does not pull
+# in the real python-telegram-bot dependency.
+_tg = sys.modules.get("telegram") or types.ModuleType("telegram")
+_tg.constants = sys.modules.get("telegram.constants") or types.ModuleType("telegram.constants")
+_ct = MagicMock()
+_ct.PRIVATE = "private"
+_ct.GROUP = "group"
+_ct.SUPERGROUP = "supergroup"
+_tg.constants.ChatType = _ct
+sys.modules.setdefault("telegram", _tg)
+sys.modules.setdefault("telegram.constants", _tg.constants)
+sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    SendResult,
+)
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource, build_session_key
+
+
+def _make_event(
+    text: str,
+    chat_id: str = "12345",
+    *,
+    chat_type: str = "dm",
+    user_id: str = "u1",
+    user_name: str | None = None,
+    thread_id: str | None = None,
+) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=user_id,
+        user_name=user_name,
+        thread_id=thread_id,
+    )
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id=f"msg-{text[:8]}",
+    )
+
+
+class _DummyAdapter(BasePlatformAdapter):  # type: ignore[misc]
+    async def connect(self, *, is_reconnect: bool = False):
+        pass
+
+    async def disconnect(self):
+        pass
+
+    async def get_chat_info(self, chat_id):
+        return None
+
+    async def send(self, *args, **kwargs):
+        return SendResult(success=True, message_id="x")
+
+
+def _make_initialized_adapter() -> BasePlatformAdapter:
+    return _DummyAdapter(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+
+
+def _make_adapter() -> BasePlatformAdapter:
+    """Build a BasePlatformAdapter without running its heavy __init__."""
+    adapter = object.__new__(_DummyAdapter)
+    adapter.config = PlatformConfig(enabled=True, token="***")
+    adapter.platform = Platform.TELEGRAM
+    adapter._message_handler = AsyncMock(return_value=None)
+    adapter._busy_session_handler = None
+    adapter._active_sessions = {}
+    adapter._pending_messages = {}
+    adapter._session_tasks = {}
+    adapter._background_tasks = set()
+    adapter._post_delivery_callbacks = {}
+    adapter._expected_cancelled_tasks = set()
+    adapter._fatal_error_code = None
+    adapter._fatal_error_message = None
+    adapter._fatal_error_retryable = True
+    adapter._fatal_error_handler = None
+    adapter._running = True
+    adapter._busy_text_mode = "queue"
+    adapter._busy_text_debounce_seconds = 0.1
+    adapter._busy_text_hard_cap_seconds = 1.0
+    adapter._text_debounce = {}
+    adapter._auto_tts_default = False
+    adapter._auto_tts_enabled_chats = set()
+    adapter._auto_tts_disabled_chats = set()
+    adapter._typing_paused = set()
+    return adapter
+
+
+def _debounced_event(adapter: BasePlatformAdapter, session_key: str) -> MessageEvent:
+    return adapter._text_debounce[session_key].event
+
+
+@pytest.mark.asyncio
+async def test_non_dm_message_does_not_wait_for_topic_recovery_executor(monkeypatch):
+    """Group messages must not queue behind the shared thread pool.
+
+    Topic recovery only applies to Telegram DM topic mode. Offloading that
+    no-op check for every group message makes ingress wait behind unrelated
+    blocking jobs when the default executor is saturated.
+    """
+    adapter = _make_adapter()
+    recovery = MagicMock(return_value=None)
+    adapter.set_topic_recovery_fn(recovery)
+    executor_called = False
+    never_release = asyncio.Event()
+
+    async def _blocked_to_thread(*args, **kwargs):
+        nonlocal executor_called
+        executor_called = True
+        await never_release.wait()
+
+    monkeypatch.setattr(asyncio, "to_thread", _blocked_to_thread)
+
+    await asyncio.wait_for(
+        adapter.handle_message(_make_event("/status", chat_type="group")),
+        timeout=1.0,
+    )
+    await asyncio.sleep(0)
+
+    assert executor_called is False
+    recovery.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dm_topic_recovery_stays_offloaded(monkeypatch):
+    """Real Telegram DM topic recovery must still run outside the event loop."""
+    adapter = _make_adapter()
+    recovery = MagicMock(return_value="topic-222")
+    adapter.set_topic_recovery_fn(recovery)
+    offloaded = False
+
+    async def _inline_to_thread(func, *args, **kwargs):
+        nonlocal offloaded
+        offloaded = True
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
+    event = _make_event("hello", chat_type="dm", thread_id="1")
+    original_source = event.source
+
+    await adapter.handle_message(event)
+    await asyncio.sleep(0)
+
+    assert offloaded is True
+    assert recovery.call_count == 1
+    assert recovery.call_args.args[0] is original_source
+    assert event.source.thread_id == "topic-222"
+
+
+@pytest.mark.asyncio
+async def test_rapid_text_followups_accumulate_instead_of_replacing():
+    """Rapid TEXT follow-ups must all survive in the pending event."""
+    adapter = _make_adapter()
+    adapter._busy_text_mode = ""  # direct-merge behavior, no debounce
+    first = _make_event("part one")
+    session_key = build_session_key(first.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(_make_event("part two"))
+    await adapter.handle_message(_make_event("part three"))
+
+    pending = adapter._pending_messages[session_key]
+    assert pending.text == "part two\npart three"
+    assert not adapter._active_sessions[session_key].is_set()
+
+
+@pytest.mark.asyncio
+async def test_debounce_resets_timer_on_new_arrival():
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 0.1
+
+    first = _make_event("one")
+    session_key = build_session_key(first.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(first)
+    task1 = adapter._text_debounce[session_key].task
+    assert task1 is not None
+    assert not task1.done()
+
+    await adapter.handle_message(_make_event("two"))
+    task2 = adapter._text_debounce[session_key].task
+    assert task2 is not None
+    assert task2 is not task1
+    await asyncio.sleep(0)
+    assert task1.cancelled() or task1.done()
+    assert adapter._text_debounce[session_key].task is task2
+
+    await adapter.handle_message(_make_event("three"))
+    task3 = adapter._text_debounce[session_key].task
+    assert task3 is not None
+    assert task3 is not task2
+
+    await asyncio.sleep(0.2)
+    assert session_key not in adapter._text_debounce
+    assert adapter._pending_messages[session_key].text == "one\ntwo\nthree"
+
+
+@pytest.mark.asyncio
+async def test_control_and_clarify_messages_bypass_text_debounce():
+    adapter = _make_adapter()
+    started: list[str] = []
+
+    def _fake_start(event, session_key, *, interrupt_event=None):
+        started.append(event.text)
+        return True
+
+    adapter._start_session_processing = _fake_start  # type: ignore[method-assign]
+
+    await adapter.handle_message(_make_event("/status"))
+    assert started == ["/status"]
+    assert adapter._text_debounce == {}
+
+    answer = _make_event("clarify answer")
+    session_key = build_session_key(answer.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._message_handler = AsyncMock(return_value=None)
+
+    with patch("tools.clarify_gateway.get_pending_for_session", return_value=object()):
+        await adapter.handle_message(answer)
+
+    adapter._message_handler.assert_awaited_once_with(answer)
+    assert session_key not in adapter._text_debounce
+    assert session_key not in adapter._pending_messages
+
+
+def test_adapter_defaults_to_interrupt_mode(monkeypatch):
+    monkeypatch.delenv("HERMES_GATEWAY_BUSY_TEXT_MODE", raising=False)
+    adapter = _make_initialized_adapter()
+    assert adapter._busy_text_mode == "interrupt"
+    assert not adapter._is_queue_text_debounce_candidate(_make_event("hello"))
+
+
+def test_command_messages_bypass_debounce_even_in_queue_mode():
+    adapter = _make_adapter()
+    assert not adapter._is_queue_text_debounce_candidate(_make_event(""))
+    assert not adapter._is_queue_text_debounce_candidate(_make_event("/stop"))
+
+
+

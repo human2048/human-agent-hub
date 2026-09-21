@@ -1,0 +1,379 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_backend_heartbeat.py ===
+"""Tests for #94895: gateway-side heartbeat refresher wiring.
+
+The startup orphan sweep now consults ``gateway_heartbeats`` to tell
+"row owned by another live backend" from "row truly orphaned".  Each
+serve / TUI-gateway process registers a heartbeat row at startup and
+refreshes it periodically.  This file verifies:
+
+* The refresher registers a row on first call and is once-per-process.
+* ``entry.main`` and ``ws.handle_ws`` both call it (mirroring the
+  existing orphan-sweep wiring pattern).
+* Failure to start the refresher is swallowed so a malformed DB
+  never breaks gateway startup.
+* ``HERMES_GATEWAY_HEARTBEAT_REFRESH_S=0`` disables the refresher.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+
+import pytest
+
+from hermes_state import SessionDB
+from hermes_cli import model_switch_providers
+
+
+IDLE_S = 6 * 3600
+
+
+@pytest.fixture
+def db(tmp_path):
+    return SessionDB(tmp_path / "state.db")
+
+
+class TestBackendHeartbeatRefresher:
+    def test_first_call_registers_row_in_db(self, db, monkeypatch, tmp_path):
+        from tui_gateway import server
+
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_HEARTBEAT_REFRESH_S", 0.0)  # never re-enter
+        # Reset the once-per-process guard so the test runs cleanly.
+        monkeypatch.setattr(server, "_heartbeat_refresher_started", False)
+        # Use a stable backend id for assertion.
+        monkeypatch.setattr(
+            server, "_backend_id_for_this_process",
+            lambda: "test-backend-A",
+        )
+
+        server._start_backend_heartbeat_refresher()
+
+        rows = db.list_backend_heartbeats()
+        assert len(rows) == 1
+        assert rows[0]["backend_id"] == "test-backend-A"
+        assert rows[0]["last_heartbeat"] > 0
+
+    def test_repeat_calls_are_noops(self, db, monkeypatch):
+        from tui_gateway import server
+
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_HEARTBEAT_REFRESH_S", 0.0)
+        monkeypatch.setattr(server, "_heartbeat_refresher_started", False)
+        monkeypatch.setattr(
+            server, "_backend_id_for_this_process",
+            lambda: "test-backend-A",
+        )
+
+        server._start_backend_heartbeat_refresher()
+        server._start_backend_heartbeat_refresher()
+        server._start_backend_heartbeat_refresher()
+
+        rows = db.list_backend_heartbeats()
+        assert len(rows) == 1
+
+    def test_zero_refresh_disables_refresher(self, db, monkeypatch):
+        from tui_gateway import server
+
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_HEARTBEAT_REFRESH_S", 0.0)
+        monkeypatch.setattr(server, "_heartbeat_refresher_started", False)
+        monkeypatch.setattr(
+            server, "_backend_id_for_this_process",
+            lambda: "test-backend-A",
+        )
+
+        server._start_backend_heartbeat_refresher()
+        # Should have written the initial row exactly once, no thread started.
+        # (The default flow with _HEARTBEAT_REFRESH_S > 0 would spawn a
+        # thread; we asserted the helper is a no-op for repeat calls above.)
+
+    def test_refresher_failure_does_not_raise(self, monkeypatch):
+        """A malformed DB / write error must never break startup."""
+        from tui_gateway import server
+
+        def _boom():
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(server, "_refresh_backend_heartbeat", _boom)
+        monkeypatch.setattr(server, "_HEARTBEAT_REFRESH_S", 0.0)
+        monkeypatch.setattr(server, "_heartbeat_refresher_started", False)
+
+        # Must not raise.
+        server._start_backend_heartbeat_refresher()
+
+    def test_backend_id_is_stable_for_this_process(self):
+        """backend_id is per-process and includes a nonce for PID-reuse safety."""
+        from tui_gateway import server
+
+        a = server._backend_id_for_this_process()
+        b = server._backend_id_for_this_process()
+        assert a == b  # idempotent within a process
+        assert ":nonce" not in a  # we use a hex suffix
+        assert str(os.getpid()) in a
+
+
+class TestEntryAndWsWiring:
+    """The orphan-sweep wiring pattern (entry.main + handle_ws) extends
+    to the heartbeat refresher: both sites must call the start helper."""
+
+    def test_entry_main_starts_heartbeat_refresher(self, monkeypatch):
+        from tui_gateway import entry, server
+
+        started = {"n": 0}
+
+        def _start():
+            started["n"] += 1
+
+        monkeypatch.setattr(server, "_start_backend_heartbeat_refresher", _start)
+        monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+        monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
+        monkeypatch.setattr(entry, "resolve_skin", lambda: "default")
+        monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
+        monkeypatch.setattr(entry, "_log_exit", lambda reason: None)
+        monkeypatch.setattr(entry, "handle_spurious_eof", lambda *a: False)
+        monkeypatch.setattr(entry, "write_json", lambda _payload: True)
+        monkeypatch.setattr(entry.sys, "stdin", io.StringIO(""))
+
+        import hermes_cli.model_switch as ms
+        monkeypatch.setattr(model_switch_providers, "prewarm_picker_cache_async", lambda: None)
+
+        entry.main()
+        assert started["n"] == 1
+
+    def test_handle_ws_starts_heartbeat_refresher(self, monkeypatch):
+        import asyncio
+
+        from tui_gateway import server, ws as ws_mod
+
+        started = {"n": 0}
+        monkeypatch.setattr(
+            server, "_start_backend_heartbeat_refresher",
+            lambda: started.__setitem__("n", started["n"] + 1),
+        )
+        monkeypatch.setattr(server, "resolve_skin", lambda: "default")
+        monkeypatch.setattr(server, "_ensure_skin_watcher", lambda: None)
+        monkeypatch.setattr(server, "register_live_transport", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+
+        class FakeWS:
+            async def accept(self):
+                pass
+
+            async def send_text(self, line):
+                pass
+
+            async def receive_text(self):
+                raise ws_mod._WebSocketDisconnect()
+
+            async def close(self):
+                pass
+
+        asyncio.run(ws_mod.handle_ws(FakeWS()))
+        assert started["n"] == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_background_thread_profile_scope.py ===
+"""Background threads started from a profile-scoped turn carry that profile's scope.
+
+Under multiplex the HERMES_HOME override and secret scope are contextvars bound per turn; a bare
+``threading.Thread`` / ``Timer`` starts with an EMPTY context and resolves the LAUNCH profile's config
+and credentials (or fails closed on secrets). Two production spawn paths are exercised here through
+their real entry points: the auto-title thread and the ws-orphan reap Timer → session teardown.
+"""
+
+import threading
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from agent.secret_scope import (
+    UnscopedSecretError, build_profile_secret_scope, get_secret, reset_secret_scope, set_multiplex_active,
+    set_secret_scope,
+)
+from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+
+@pytest.fixture
+def served_home(tmp_path, monkeypatch):
+    a = tmp_path / ".hermes"
+    b = a / "profiles" / "b"
+    b.mkdir(parents=True)
+    (a / ".env").write_text("TITLE_KEY=a-key\n", encoding="utf-8")
+    (b / ".env").write_text("TITLE_KEY=b-key\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(a))
+    monkeypatch.setenv("TITLE_KEY", "a-key")
+    set_multiplex_active(True)
+    try:
+        yield a, b
+    finally:
+        set_multiplex_active(False)
+
+
+def _observe_scope(seen: dict, done: threading.Event) -> None:
+    seen["home"] = str(get_hermes_home())
+    try:
+        seen["key"] = get_secret("TITLE_KEY")
+    except UnscopedSecretError as exc:
+        seen["key"] = exc
+    done.set()
+
+
+def test_auto_title_thread_runs_in_the_turns_profile_scope(served_home, monkeypatch):
+    """``maybe_auto_title`` fires ``auto_title_session`` on a thread; it must see the turn's profile."""
+    import agent.title_generator as tg
+
+    a, b = served_home
+    seen, done = {}, threading.Event()
+    monkeypatch.setattr(tg, "auto_title_session", lambda *args, **kwargs: _observe_scope(seen, done))
+    monkeypatch.setattr(tg, "apply_instant_title", lambda *args, **kwargs: None)
+    db = MagicMock()
+    db.get_session_title.return_value = None
+    home_token = set_hermes_home_override(str(b))
+    secret_token = set_secret_scope(build_profile_secret_scope(b))
+    try:
+        tg.maybe_auto_title(db, "sess-1", "hello there", [{"role": "user", "content": "hello there"}])
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+    assert done.wait(timeout=10), "auto-title thread never ran"
+    assert seen == {"home": str(b), "key": "b-key"}
+
+
+def test_ws_orphan_reap_tears_down_under_the_sessions_profile(served_home, monkeypatch):
+    """The reap Timer (empty context) → ``_teardown_popped_session``: memory commit + ``agent.close`` run
+    under ``session['profile_home']``, so the provider reads B's config/credentials, not the launch's."""
+    import tui_gateway.server as server
+
+    a, b = served_home
+    seen_commit, seen_close = {}, {}
+    done = threading.Event()
+    agent = MagicMock()
+    agent._session_messages = None
+    agent.session_id = "sess-b"
+    agent.commit_memory_session = lambda history: _observe_scope(seen_commit, threading.Event())
+    agent.close = lambda: _observe_scope(seen_close, done)
+    sid = "ws-b"
+    session = {
+        "agent": agent, "history": [{"role": "user", "content": "x"}], "history_lock": threading.Lock(),
+        "session_key": "sess-b", "profile_home": str(b), "transport": server._detached_ws_transport,
+        "last_active": 0.0,
+    }
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_ws_session_is_orphaned", lambda s: s is session)
+    with server._sessions_lock:
+        server._sessions[sid] = session
+    try:
+        server._schedule_ws_orphan_reap(sid)
+        assert done.wait(timeout=10), "reap timer never tore the session down"
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+    assert seen_commit == {"home": str(b), "key": "b-key"}
+    assert seen_close == {"home": str(b), "key": "b-key"}
+    assert Path(get_hermes_home()) == a  # the test thread's own context is untouched
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_billing_rpc.py ===
+"""Tests for the Phase 2b billing JSON-RPC methods (tui_gateway/server.py).
+
+Verifies the structured envelope contract the Ink side branches on:
+- billing.state serializes BillingState (Decimals → strings) + fails open.
+- billing.charge / charge_status / auto_reload return typed error envelopes
+  (result.ok=false, result.error=<code>) instead of JSON-RPC errors.
+- billing.charge mints + echoes an idempotency_key for retry reuse.
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+
+import pytest
+
+import tui_gateway.server as srv
+import hermes_cli.nous_billing as nb
+import agent.billing_view as bv
+from agent.billing_view import BillingState, CardInfo, MonthlyCap, PaymentMethodInfo
+
+
+def _call(method: str, params: dict) -> dict:
+    """Invoke a registered RPC method and return its result dict."""
+    envelope = srv._methods[method](1, params)
+    return envelope["result"]
+
+
+# ---------------------------------------------------------------------------
+# billing.state
+# ---------------------------------------------------------------------------
+
+
+def test_billing_state_serializes_decimals_as_strings(monkeypatch):
+    state = BillingState(
+        logged_in=True,
+        org_name="Acme",
+        role="OWNER",
+        balance_usd=Decimal("142.5"),
+        cli_billing_enabled=True,
+        charge_presets=(Decimal("100"), Decimal("250")),
+        min_usd=Decimal("10"),
+        max_usd=Decimal("10000"),
+        card=CardInfo(brand="visa", last4="4242"),
+        payment_method=PaymentMethodInfo(
+            kind="link",
+            email="billing@example.com",
+            resolved_via="customerDefault",
+        ),
+        monthly_cap=MonthlyCap(
+            limit_usd=Decimal("1000"), spent_this_month_usd=Decimal("180"), is_default_ceiling=True
+        ),
+        portal_url="https://portal/billing?topup=open",
+    )
+    monkeypatch.setattr(bv, "build_billing_state", lambda *a, **kw: state)
+    res = _call("billing.state", {})
+    assert res["ok"] is True and res["logged_in"] is True
+    # Money on the wire is STRING, not float/number.
+    assert res["balance_usd"] == "142.5"
+    assert res["balance_display"] == "$142.50"
+    assert res["charge_presets"] == ["100", "250"]
+    assert res["card"] == {
+        "brand": "visa",
+        "last4": "4242",
+        "masked": "visa ····4242",
+        "display": "visa ····4242",
+        "resolved_via": None,
+    }
+    assert res["payment_method"] == {
+        "kind": "link",
+        "email": "billing@example.com",
+        "resolved_via": "customerDefault",
+    }
+    assert res["monthly_cap"]["is_default_ceiling"] is True
+    assert res["is_admin"] is True and res["can_charge"] is True
+
+
+# ---------------------------------------------------------------------------
+# billing.charge — typed error envelopes
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# billing.charge_status — the poll
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# billing.auto_reload
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# billing.step_up
+# ---------------------------------------------------------------------------
+
+
+

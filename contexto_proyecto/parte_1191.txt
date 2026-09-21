@@ -1,0 +1,513 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\mlops\llava\SKILL.md ===
+---
+name: llava
+description: "Vision-language chat: VQA, captioning, image dialogue."
+version: 1.0.0
+author: Orchestra Research
+license: MIT
+dependencies: [transformers, torch, pillow]
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [LLaVA, Vision-Language, Multimodal, Visual Question Answering, Image Chat, CLIP, Vicuna, Conversational AI, Instruction Tuning, VQA]
+
+---
+
+# LLaVA - Large Language and Vision Assistant
+
+Open-source vision-language model for conversational image understanding.
+
+## When to use LLaVA
+
+**Use when:**
+- Building vision-language chatbots
+- Visual question answering (VQA)
+- Image description and captioning
+- Multi-turn image conversations
+- Visual instruction following
+- Document understanding with images
+
+**Metrics**:
+- **23,000+ GitHub stars**
+- GPT-4V level capabilities (targeted)
+- Apache 2.0 License
+- Multiple model sizes (7B-34B params)
+
+**Use alternatives instead**:
+- **GPT-4V**: Highest quality, API-based
+- **CLIP**: Simple zero-shot classification
+- **BLIP-2**: Better for captioning only
+- **Flamingo**: Research, not open-source
+
+## Quick start
+
+### Installation
+
+```bash
+# Clone repository
+git clone https://github.com/haotian-liu/LLaVA
+cd LLaVA
+
+# Install
+pip install -e .
+```
+
+### Basic usage
+
+```python
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.conversation import conv_templates
+from PIL import Image
+import torch
+
+# Load model
+model_path = "liuhaotian/llava-v1.5-7b"
+tokenizer, model, image_processor, context_len = load_pretrained_model(
+    model_path=model_path,
+    model_base=None,
+    model_name=get_model_name_from_path(model_path)
+)
+
+# Load image
+image = Image.open("image.jpg")
+image_tensor = process_images([image], image_processor, model.config)
+image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+
+# Create conversation
+conv = conv_templates["llava_v1"].copy()
+conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\nWhat is in this image?")
+conv.append_message(conv.roles[1], None)
+prompt = conv.get_prompt()
+
+# Generate response
+input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
+
+with torch.inference_mode():
+    output_ids = model.generate(
+        input_ids,
+        images=image_tensor,
+        do_sample=True,
+        temperature=0.2,
+        max_new_tokens=512
+    )
+
+response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+print(response)
+```
+
+## Available models
+
+| Model | Parameters | VRAM | Quality |
+|-------|------------|------|---------|
+| LLaVA-v1.5-7B | 7B | ~14 GB | Good |
+| LLaVA-v1.5-13B | 13B | ~28 GB | Better |
+| LLaVA-v1.6-34B | 34B | ~70 GB | Best |
+
+```python
+# Load different models
+model_7b = "liuhaotian/llava-v1.5-7b"
+model_13b = "liuhaotian/llava-v1.5-13b"
+model_34b = "liuhaotian/llava-v1.6-34b"
+
+# 4-bit quantization for lower VRAM
+load_4bit = True  # Reduces VRAM by ~4×
+```
+
+## CLI usage
+
+```bash
+# Single image query
+python -m llava.serve.cli \
+    --model-path liuhaotian/llava-v1.5-7b \
+    --image-file image.jpg \
+    --query "What is in this image?"
+
+# Multi-turn conversation
+python -m llava.serve.cli \
+    --model-path liuhaotian/llava-v1.5-7b \
+    --image-file image.jpg
+# Then type questions interactively
+```
+
+## Web UI (Gradio)
+
+```bash
+# Launch Gradio interface
+python -m llava.serve.gradio_web_server \
+    --model-path liuhaotian/llava-v1.5-7b \
+    --load-4bit  # Optional: reduce VRAM
+
+# Access at http://localhost:7860
+```
+
+## Multi-turn conversations
+
+```python
+# Initialize conversation
+conv = conv_templates["llava_v1"].copy()
+
+# Turn 1
+conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\nWhat is in this image?")
+conv.append_message(conv.roles[1], None)
+response1 = generate(conv, model, image)  # "A dog playing in a park"
+
+# Turn 2
+conv.messages[-1][1] = response1  # Add previous response
+conv.append_message(conv.roles[0], "What breed is the dog?")
+conv.append_message(conv.roles[1], None)
+response2 = generate(conv, model, image)  # "Golden Retriever"
+
+# Turn 3
+conv.messages[-1][1] = response2
+conv.append_message(conv.roles[0], "What time of day is it?")
+conv.append_message(conv.roles[1], None)
+response3 = generate(conv, model, image)
+```
+
+## Common tasks
+
+### Image captioning
+
+```python
+question = "Describe this image in detail."
+response = ask(model, image, question)
+```
+
+### Visual question answering
+
+```python
+question = "How many people are in the image?"
+response = ask(model, image, question)
+```
+
+### Object detection (textual)
+
+```python
+question = "List all the objects you can see in this image."
+response = ask(model, image, question)
+```
+
+### Scene understanding
+
+```python
+question = "What is happening in this scene?"
+response = ask(model, image, question)
+```
+
+### Document understanding
+
+```python
+question = "What is the main topic of this document?"
+response = ask(model, document_image, question)
+```
+
+## Training custom model
+
+```bash
+# Stage 1: Feature alignment (558K image-caption pairs)
+bash scripts/v1_5/pretrain.sh
+
+# Stage 2: Visual instruction tuning (150K instruction data)
+bash scripts/v1_5/finetune.sh
+```
+
+## Quantization (reduce VRAM)
+
+```python
+# 4-bit quantization
+tokenizer, model, image_processor, context_len = load_pretrained_model(
+    model_path="liuhaotian/llava-v1.5-13b",
+    model_base=None,
+    model_name=get_model_name_from_path("liuhaotian/llava-v1.5-13b"),
+    load_4bit=True  # Reduces VRAM ~4×
+)
+
+# 8-bit quantization
+load_8bit=True  # Reduces VRAM ~2×
+```
+
+## Best practices
+
+1. **Start with 7B model** - Good quality, manageable VRAM
+2. **Use 4-bit quantization** - Reduces VRAM significantly
+3. **GPU required** - CPU inference extremely slow
+4. **Clear prompts** - Specific questions get better answers
+5. **Multi-turn conversations** - Maintain conversation context
+6. **Temperature 0.2-0.7** - Balance creativity/consistency
+7. **max_new_tokens 512-1024** - For detailed responses
+8. **Batch processing** - Process multiple images sequentially
+
+## Performance
+
+| Model | VRAM (FP16) | VRAM (4-bit) | Speed (tokens/s) |
+|-------|-------------|--------------|------------------|
+| 7B | ~14 GB | ~4 GB | ~20 |
+| 13B | ~28 GB | ~8 GB | ~12 |
+| 34B | ~70 GB | ~18 GB | ~5 |
+
+*On A100 GPU*
+
+## Benchmarks
+
+LLaVA achieves competitive scores on:
+- **VQAv2**: 78.5%
+- **GQA**: 62.0%
+- **MM-Vet**: 35.4%
+- **MMBench**: 64.3%
+
+## Limitations
+
+1. **Hallucinations** - May describe things not in image
+2. **Spatial reasoning** - Struggles with precise locations
+3. **Small text** - Difficulty reading fine print
+4. **Object counting** - Imprecise for many objects
+5. **VRAM requirements** - Need powerful GPU
+6. **Inference speed** - Slower than CLIP
+
+## Integration with frameworks
+
+### LangChain
+
+```python
+from langchain.llms.base import LLM
+
+class LLaVALLM(LLM):
+    def _call(self, prompt, stop=None):
+        # Custom LLaVA inference
+        return response
+
+llm = LLaVALLM()
+```
+
+### Gradio App
+
+```python
+import gradio as gr
+
+def chat(image, text, history):
+    response = ask_llava(model, image, text)
+    return response
+
+demo = gr.ChatInterface(
+    chat,
+    additional_inputs=[gr.Image(type="pil")],
+    title="LLaVA Chat"
+)
+demo.launch()
+```
+
+## Resources
+
+- **GitHub**: https://github.com/haotian-liu/LLaVA ⭐ 23,000+
+- **Paper**: https://arxiv.org/abs/2304.08485
+- **Demo**: https://llava.hliu.cc
+- **Models**: https://huggingface.co/liuhaotian
+- **License**: Apache 2.0
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\mlops\llava\references\training.md ===
+# LLaVA Training Guide
+
+Guide to training and fine-tuning LLaVA models.
+
+## Training stages
+
+### Stage 1: Feature alignment (Pretraining)
+
+**Purpose**: Align vision encoder with language model
+
+**Data**: 558K image-caption pairs (CC3M subset)
+
+```bash
+# Download pretrained projector or train from scratch
+bash scripts/v1_5/pretrain.sh
+```
+
+**Configuration:**
+- Base model: Vicuna-7B or LLaMA-2-7B
+- Vision encoder: CLIP ViT-L/14
+- Training time: ~20 hours on 8× A100
+
+### Stage 2: Visual instruction tuning
+
+**Purpose**: Teach model to follow visual instructions
+
+**Data**: 150K GPT-generated multimodal instruction data
+
+```bash
+# Fine-tune with instruction data
+bash scripts/v1_5/finetune.sh
+```
+
+**Configuration:**
+- Epochs: 1
+- Batch size: 128 (across 8 GPUs)
+- Learning rate: 2e-5
+- Training time: ~24 hours on 8× A100
+
+## Data format
+
+### Instruction data format
+
+```json
+[
+    {
+        "id": "001",
+        "image": "path/to/image.jpg",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "<image>\nWhat is in this image?"
+            },
+            {
+                "from": "gpt",
+                "value": "The image shows a dog playing in a park."
+            },
+            {
+                "from": "human",
+                "value": "What breed is the dog?"
+            },
+            {
+                "from": "gpt",
+                "value": "It appears to be a Golden Retriever."
+            }
+        ]
+    }
+]
+```
+
+## Fine-tuning on custom data
+
+### Prepare your data
+
+```python
+import json
+
+# Create instruction data
+data = []
+for image_path, qa_pairs in your_dataset:
+    conversations = []
+    for q, a in qa_pairs:
+        conversations.append({"from": "human", "value": f"<image>\n{q}"})
+        conversations.append({"from": "gpt", "value": a})
+
+    data.append({
+        "id": str(len(data)),
+        "image": image_path,
+        "conversations": conversations
+    })
+
+# Save
+with open("custom_data.json", "w") as f:
+    json.dump(data, f, indent=2)
+```
+
+### Fine-tune script
+
+```bash
+#!/bin/bash
+
+# Set paths
+DATA_PATH="custom_data.json"
+IMAGE_FOLDER="path/to/images"
+MODEL_PATH="liuhaotian/llava-v1.5-7b"
+OUTPUT_DIR="./checkpoints/llava-custom"
+
+# Fine-tune
+deepspeed llava/train/train_mem.py \
+    --deepspeed ./scripts/zero2.json \
+    --model_name_or_path $MODEL_PATH \
+    --version v1 \
+    --data_path $DATA_PATH \
+    --image_folder $IMAGE_FOLDER \
+    --vision_tower openai/clip-vit-large-patch14-336 \
+    --mm_projector_type mlp2x_gelu \
+    --mm_vision_select_layer -2 \
+    --mm_use_im_start_end False \
+    --mm_use_im_patch_token False \
+    --image_aspect_ratio pad \
+    --group_by_modality_length True \
+    --bf16 True \
+    --output_dir $OUTPUT_DIR \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 16 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 1 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 50000 \
+    --save_total_limit 1 \
+    --learning_rate 2e-5 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --tf32 True \
+    --model_max_length 2048 \
+    --gradient_checkpointing True \
+    --dataloader_num_workers 4 \
+    --lazy_preprocess True \
+    --report_to wandb
+```
+
+## LoRA fine-tuning (memory efficient)
+
+```python
+from peft import LoraConfig, get_peft_model
+
+# LoRA config
+lora_config = LoraConfig(
+    r=8,  # LoRA rank
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+# Apply LoRA
+model = get_peft_model(base_model, lora_config)
+
+# Train with much lower memory
+```
+
+## Hardware requirements
+
+### Full fine-tuning
+
+- **7B model**: 8× A100 (40GB)
+- **13B model**: 8× A100 (80GB)
+- **Training time**: 20-48 hours
+
+### LoRA fine-tuning
+
+- **7B model**: 1× A100 (40GB)
+- **13B model**: 2× A100 (40GB)
+- **Training time**: 10-24 hours
+
+## Best practices
+
+1. **Start with pretrained** - Don't train from scratch
+2. **Use LoRA for efficiency** - 10× less memory
+3. **Quality over quantity** - 1K high-quality > 10K low-quality
+4. **Multi-turn conversations** - More engaging than single Q&A
+5. **Diverse images** - Cover different scenarios
+6. **Clear instructions** - Specific questions get better answers
+7. **Monitor loss** - Should decrease smoothly
+8. **Save checkpoints** - Training can fail
+9. **Test regularly** - Validate on held-out set
+10. **Use DeepSpeed** - For multi-GPU training
+
+## Resources
+
+- **Training script**: https://github.com/haotian-liu/LLaVA/tree/main/scripts
+- **Data format**: https://github.com/haotian-liu/LLaVA/blob/main/docs/Data.md
+- **Paper**: https://arxiv.org/abs/2304.08485
+

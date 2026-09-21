@@ -1,0 +1,312 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_browser_console_ssrf.py ===
+"""Tests that browser_console blocks console messages and errors from eval-navigated private pages.
+
+browser_snapshot, browser_vision, _browser_eval, and browser_get_images all re-check
+the page URL before returning content. browser_console (in console output mode) must
+do the same to prevent leakage of console log messages and exception details.
+"""
+
+import json
+
+import pytest
+
+from tools import browser_tool
+from tools import browser_tool_eval_policy as bt_eval_policy
+from tools import browser_tool_session as bt_session
+
+PRIVATE_URL = "http://127.0.0.1:8080/internal"
+
+
+@pytest.fixture(autouse=True)
+def _patches(monkeypatch):
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_last_session_key", lambda key: key)
+
+
+def _mock_run_success(monkeypatch):
+    def _run(task_id, command, args=None, **kwargs):
+        if command == "console":
+            return {
+                "success": True,
+                "data": {
+                    "messages": [
+                        {"type": "log", "text": "secret internal message"}
+                    ]
+                }
+            }
+        elif command == "errors":
+            return {
+                "success": True,
+                "data": {
+                    "errors": [
+                        {"message": "internal exception info"}
+                    ]
+                }
+            }
+        return {"success": True, "data": {}}
+    monkeypatch.setattr(bt_session, "_run_browser_command", _run)
+
+
+def test_blocks_console_on_private_page(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: True)
+    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda tid: PRIVATE_URL)
+
+    result = json.loads(browser_tool.browser_console(task_id="test"))
+    assert result["success"] is False
+    assert "private or internal address" in result["error"]
+    assert PRIVATE_URL in result["error"]
+
+
+def test_allows_console_on_public_page(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: True)
+    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda tid: None)
+
+    result = json.loads(browser_tool.browser_console(task_id="test"))
+    assert result["success"] is True
+    assert result["total_messages"] == 1
+    assert result["console_messages"][0]["text"] == "secret internal message"
+
+
+def test_skips_guard_for_local_backend(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: False)
+
+    result = json.loads(browser_tool.browser_console(task_id="test"))
+    assert result["success"] is True
+    assert result["total_messages"] == 1
+
+
+def test_skips_guard_when_private_urls_allowed(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: False)
+
+    result = json.loads(browser_tool.browser_console(task_id="test"))
+    assert result["success"] is True
+    assert result["total_messages"] == 1
+
+
+def test_guard_does_not_block_on_failed_console_command(monkeypatch):
+    """If the console command itself fails, browser_console returns the error naturally."""
+    def _run(task_id, command, args=None, **kwargs):
+        return {"success": False, "error": "console fetch failed"}
+    monkeypatch.setattr(bt_session, "_run_browser_command", _run)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: True)
+    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda tid: PRIVATE_URL)
+
+    result = json.loads(browser_tool.browser_console(task_id="test"))
+    # When the page is private, the guard checks _current_page_private_url first.
+    # Because it checks _current_page_private_url BEFORE running the command, it should block it.
+    assert result["success"] is False
+    assert "private or internal address" in result["error"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_browser_content_none_guard.py ===
+"""Tests for None guard on browser_tool LLM response content.
+
+browser_tool.py's browser_vision accesses response.choices[0].message.content
+which can be None when reasoning-only models (DeepSeek-R1, QwQ) return
+content=None. These tests verify the site is guarded.
+
+The old _extract_relevant_content snapshot-summarization path was removed —
+oversized snapshots now always truncate-and-store (no auxiliary LLM), so its
+None-guard tests are gone with it.
+"""
+
+import types
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _make_response(content):
+    """Build a minimal OpenAI-compatible ChatCompletion response stub."""
+    message = types.SimpleNamespace(content=content)
+    choice = types.SimpleNamespace(message=message)
+    return types.SimpleNamespace(choices=[choice])
+
+
+# ── browser_vision ─────────────────────────────────────────────────────────
+
+class TestBrowserVisionNoneGuard:
+    """tools/browser_tool.py — browser_vision() analysis extraction"""
+
+    def test_none_content_produces_fallback_message(self):
+        """When LLM returns None content, analysis should have a fallback message."""
+        response = _make_response(None)
+        analysis = (response.choices[0].message.content or "").strip()
+        fallback = analysis or "Vision analysis returned no content."
+
+        assert fallback == "Vision analysis returned no content."
+
+    def test_normal_content_passes_through(self):
+        """Normal analysis content should pass through unchanged."""
+        response = _make_response("  The page shows a login form.  ")
+        analysis = (response.choices[0].message.content or "").strip()
+        fallback = analysis or "Vision analysis returned no content."
+
+        assert fallback == "The page shows a login form."
+
+
+# ── source line verification ──────────────────────────────────────────────
+
+class TestBrowserSourceLinesAreGuarded:
+    """Verify the actual source file has the fix applied."""
+
+    @staticmethod
+    def _read_file() -> str:
+        import os
+        base = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        with open(os.path.join(base, "tools", "browser_tool.py")) as f:
+            return f.read()
+
+    def test_browser_vision_guarded(self):
+        src = self._read_file()
+        assert "analysis = response.choices[0].message.content\n" not in src, (
+            "browser_tool.py browser_vision still has unguarded "
+            ".content assignment — apply None guard"
+        )
+
+    def test_snapshot_llm_summarization_removed(self):
+        """Snapshots must not route through an auxiliary LLM anymore."""
+        src = self._read_file()
+        assert "_extract_relevant_content" not in src
+        assert "_get_extraction_model" not in src
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_browser_env_loopback_no_proxy.py ===
+"""Loopback CDP dials must never go through a proxy (#110565).
+
+``websockets>=14`` connects with ``proxy=True`` and resolves the proxy via
+``urllib.request.getproxies()``, which on macOS reads the *system* proxy even with no
+``*_proxy`` env vars. The browser child env therefore carries loopback ``NO_PROXY`` entries
+(both casings, operator entries kept), and the in-process CDP dials pass ``proxy=None``
+for loopback URLs only.
+"""
+
+import pytest
+
+import tools.browser_tool as bt
+from agent.proxy_bypass import add_loopback_no_proxy, loopback_connect_kwargs, loopback_request_kwargs
+
+
+@pytest.fixture
+def stub_sanitized_env(monkeypatch):
+    """Replace the credential-scrub layer with a fixed dict so the test sees exactly what
+    ``_build_browser_env`` adds on top."""
+    import tools.environments.local as local
+    holder = {}
+    monkeypatch.setattr(local, "hermes_subprocess_env", lambda inherit_credentials=False: dict(holder))
+    return holder
+
+
+def test_browser_env_appends_loopback_to_operator_no_proxy(stub_sanitized_env):
+    stub_sanitized_env["NO_PROXY"] = "git.internal, 10.0.0.0/8"
+    env = bt._build_browser_env()
+    assert env["NO_PROXY"] == "git.internal,10.0.0.0/8,127.0.0.1,localhost,::1"
+    assert env["no_proxy"] == "127.0.0.1,localhost,::1"
+
+
+def test_operator_no_proxy_wildcard_is_left_alone():
+    # ``*,127.0.0.1,...`` is no longer the wildcard for urllib/requests: appending would flip a
+    # bypass-everything config into proxy-everything-but-loopback.
+    assert add_loopback_no_proxy({"NO_PROXY": "*"}) == {"NO_PROXY": "*"}
+
+
+NO_PROXIES = {"proxies": {"http": None, "https": None}}
+
+
+@pytest.mark.parametrize("url, expected, http_expected", [
+    ("ws://127.0.0.1:9222/devtools/browser/abc", {"proxy": None}, NO_PROXIES),
+    ("ws://localhost:9222/devtools/browser/abc", {"proxy": None}, NO_PROXIES),
+    ("ws://[::1]:9222/devtools/browser/abc", {"proxy": None}, NO_PROXIES),
+    ("http://127.0.0.2:9222", {"proxy": None}, NO_PROXIES),
+    ("http://[::ffff:127.0.0.1]:9222", {"proxy": None}, NO_PROXIES),
+    ("ws://localhost.evil.com:9222/devtools/browser/abc", {}, {}),
+    ("wss://connect.browserbase.com/cdp?apiKey=x", {}, {}),
+])
+def test_in_process_cdp_dial_disables_proxy_only_for_loopback(url, expected, http_expected):
+    assert loopback_connect_kwargs(url) == expected
+    assert loopback_request_kwargs(url) == http_expected
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_browser_eval_shim_args.py ===
+"""agent-browser CLI arguments must survive the Windows ``.cmd`` shim hop (#113838): cmd.exe
+re-parses the child command line, so a newline truncates an argument to its first line and
+``%VAR%`` expands. Host-specific bug — these are code-path invariants that run on every host."""
+
+from __future__ import annotations
+
+import base64
+import importlib
+import json
+import pkgutil
+
+import tools
+from tools import browser_tool_session as bt_session
+
+_SCRIPT = "JSON.stringify(\n  [...document.images].map(i => i.src)\n)"
+_TEXT = "line one\nline two %PATH% 100%"
+_SHIM = r"C:\Users\u\AppData\Roaming\npm\agent-browser.CMD"
+
+
+def _run_through_seam(monkeypatch, browser_cmd: str, command: str, args: list, stdout: str) -> tuple:
+    """Drive ``_run_browser_command`` up to the spawn with ``_spawn_and_collect`` captured; returns
+    ``(cmd_parts, stdin_payload, result)`` so the wiring — not just the helper — is under test."""
+    captured: dict = {}
+
+    def fake_spawn(task_id, session_info, cmd_parts, cmd, engine, timeout, stdin_payload=None):
+        captured.update(cmd_parts=cmd_parts, stdin=stdin_payload)
+        return bt_session._interpret_browser_command_output(cmd, stdout, "", 0)
+
+    monkeypatch.setattr(bt_session, "_browser_command_preflight", lambda: {"browser_cmd": browser_cmd})
+    monkeypatch.setattr(bt_session, "_get_session_info", lambda task_id: {"session_name": "s", "cdp_url": None})
+    monkeypatch.setattr(bt_session._cloud, "_get_browser_engine", lambda: "auto")
+    monkeypatch.setattr(bt_session._cloud, "_is_headed_mode", lambda: False)
+    monkeypatch.setattr(bt_session, "_spawn_and_collect", fake_spawn)
+    result = bt_session._run_browser_command("t", command, args, timeout=5)
+    return captured["cmd_parts"], captured["stdin"], result
+
+
+def test_cmd_shim_routes_eval_and_multiline_text_losslessly(monkeypatch):
+    """Through ``_run_browser_command``: a ``.cmd`` argv[0] sends ``eval`` as ``--base64 <script>``
+    and any other command whose argv carries a newline or ``%`` as ``batch`` with the command as
+    JSON on stdin (cmd.exe never parses the text), with the batch entry unwrapped to the usual
+    ``{success, data, error}`` shape; plain arguments and non-shim spawns keep the raw argv."""
+    parts, stdin, _ = _run_through_seam(monkeypatch, _SHIM, "eval", [_SCRIPT], '{"success":true,"data":{"result":1}}')
+    assert parts[-3:-1] == ["eval", "--base64"] and stdin is None
+    assert base64.b64decode(parts[-1]).decode("utf-8") == _SCRIPT  # byte-identical round trip
+
+    batch_out = json.dumps([{"command": ["fill", "@e3", _TEXT], "error": None,
+                             "result": {"filled": "@e3"}, "success": True}])
+    parts, stdin, result = _run_through_seam(monkeypatch, _SHIM, "fill", ["@e3", _TEXT], batch_out)
+    assert parts[-1] == "batch" and not any(("\n" in p or "%" in p) for p in parts)
+    assert json.loads(stdin) == [["fill", "@e3", _TEXT]]
+    assert result == {"success": True, "data": {"filled": "@e3"}, "error": None}
+
+    parts, stdin, _ = _run_through_seam(monkeypatch, _SHIM, "fill", ["@e3", "one line"], '{"success":true,"data":{}}')
+    assert parts[-3:] == ["fill", "@e3", "one line"] and stdin is None
+    for argv0 in (r"C:\tools\agent-browser.exe", "/home/u/.local/bin/agent-browser"):
+        parts, stdin, _ = _run_through_seam(monkeypatch, argv0, "fill", ["@e3", _TEXT], '{"success":true,"data":{}}')
+        assert parts[-3:] == ["fill", "@e3", _TEXT] and stdin is None
+
+
+def test_bundled_js_eval_payload_constants_are_single_line():
+    """Every ``*_JS`` string constant in ``tools/browser_*`` is one line — the fixed
+    ``_GET_IMAGES_JS`` and any future payload handed to the CLI ``eval`` as one argv element."""
+    seen = []
+    for mod_info in pkgutil.iter_modules(tools.__path__):
+        if not mod_info.name.startswith("browser_"):
+            continue
+        module = importlib.import_module(f"tools.{mod_info.name}")
+        for name, value in vars(module).items():
+            if name.endswith("_JS") and isinstance(value, str):
+                seen.append((mod_info.name, name))
+                assert "\n" not in value, f"tools/{mod_info.name}.py::{name} spans multiple lines"
+    assert ("browser_tool", "_GET_IMAGES_JS") in seen
+

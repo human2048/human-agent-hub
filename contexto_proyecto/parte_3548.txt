@@ -1,0 +1,247 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_setup_telemetry.py ===
+"""Tests for shared-metrics configuration discovery and setup."""
+
+from __future__ import annotations
+
+import argparse
+
+from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli.setup import setup_telemetry
+from hermes_cli.subcommands.setup import build_setup_parser
+
+
+def test_shared_metrics_are_registered_disabled_by_default():
+    assert DEFAULT_CONFIG["telemetry"]["shared_metrics"]["enabled"] is False
+
+
+def test_setup_telemetry_enables_shared_metrics(monkeypatch):
+    config = {}
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_yes_no",
+        lambda _question, default: not default,
+    )
+
+    setup_telemetry(config)
+
+    assert config["telemetry"]["shared_metrics"]["enabled"] is True
+
+
+def test_disabling_collection_closes_the_send_consent_window(monkeypatch, tmp_path):
+    """`hermes tools` -> disable shared metrics must withdraw send consent.
+
+    The not-enabled branch returned early without recording anything, so the
+    consent window stayed open and re-enabling later would release every
+    package collected in between.
+    """
+    from hermes_cli.observability.shared_metrics import SharedMetricsStore
+    from hermes_cli.observability.shared_metrics_sender import (
+        reconcile_send_consent,
+    )
+    from hermes_cli.sqlite_util import write_txn
+
+    store = SharedMetricsStore(
+        database_path=tmp_path / "m.db", outbox_directory=tmp_path / "o"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.observability.shared_metrics.SharedMetricsStore",
+        lambda *a, **k: store,
+    )
+
+    # The user had consented; now they turn collection off entirely.
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_yes_no", lambda _question, default: False
+    )
+    config = {"telemetry": {"shared_metrics": {"enabled": True, "send": True}}}
+    # Consent was granted earlier, so a window is open — that is precisely
+    # the state whose closure must be recorded.
+    with store._connection() as connection:
+        with write_txn(connection):
+            reconcile_send_consent(connection, True)
+
+    setup_telemetry(config)
+
+    assert config["telemetry"]["shared_metrics"]["enabled"] is False
+    assert config["telemetry"]["shared_metrics"]["send"] is False
+    with store._connection() as connection:
+        open_windows = connection.execute(
+            "SELECT COUNT(*) FROM send_consent_windows WHERE closed_at IS NULL"
+        ).fetchone()[0]
+    assert open_windows == 0, (
+        "disabling collection left the send consent window open"
+    )
+
+
+def test_setup_parser_accepts_telemetry_section():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    handler = object()
+    build_setup_parser(subparsers, cmd_setup=handler)
+
+    args = parser.parse_args(["setup", "telemetry"])
+
+    assert args.section == "telemetry"
+    assert args.func is handler
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_setup_terminal.py ===
+"""Tests for hermes_cli/setup_terminal.py backend wizards."""
+
+import pytest
+
+from hermes_cli.config import save_env_value, get_env_value
+from hermes_cli import setup as setup_mod
+from hermes_cli import setup_terminal
+
+
+@pytest.fixture
+def ssh_wizard(tmp_path, monkeypatch):
+    """Drive ``_setup_backend_ssh`` with scripted answers, SSH test declined."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("TERMINAL_SSH_PORT", raising=False)
+
+    def run(answers):
+        it = iter(answers)
+        monkeypatch.setattr(setup_mod, "prompt", lambda label, default="": next(it))
+        monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda label, default=True: False)
+        setup_terminal._setup_backend_ssh({})
+
+    return run
+
+
+def test_ssh_port_reset_to_22_removes_saved_port(ssh_wizard):
+    # A stored non-default port must be removable: answering "22" restores the
+    # default, it does not silently leave the old value in .env.
+    save_env_value("TERMINAL_SSH_PORT", "2222")
+    ssh_wizard(["host.example.com", "me", "22", "/tmp/key"])
+    assert get_env_value("TERMINAL_SSH_PORT") is None
+
+
+def test_ssh_port_non_default_still_saves(ssh_wizard):
+    # Control: the deliberate skip is only for the default; a real port persists.
+    ssh_wizard(["host.example.com", "me", "2222", "/tmp/key"])
+    assert get_env_value("TERMINAL_SSH_PORT") == "2222"
+
+
+def test_docker_wizard_reports_the_resolved_podman_runtime(monkeypatch, capsys):
+    """Podman satisfies the docker backend, so the wizard must name it instead of warning."""
+    monkeypatch.setattr(setup_terminal, "find_docker", lambda: "/usr/bin/podman")
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda label, default=True: False)
+
+    setup_terminal._setup_backend_docker({"terminal": {}})
+
+    out = capsys.readouterr().out
+    assert "Podman found: /usr/bin/podman" in out
+    assert "not found in PATH" not in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_setup_tts_xai_oauth.py ===
+"""Regression: TTS/setup xAI OAuth must not hijack the active chat provider."""
+
+import json
+
+import pytest
+
+import yaml
+
+
+def test_run_xai_oauth_login_from_setup_does_not_hijack_active_provider(
+    tmp_path, monkeypatch
+):
+    """TTS/setup OAuth must save tokens without switching chat inference routing.
+
+    Regression: `_run_xai_oauth_login_from_setup` used to call
+    `_update_config_for_provider("xai-oauth")` (and token save flipped
+    `active_provider`), so `hermes setup tts` OAuth login hijacked the main
+    chat provider.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "active_provider": "openrouter",
+                "providers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "anthropic/claude-sonnet-4",
+                    "base_url": "https://openrouter.ai/api/v1",
+                },
+                "tts": {"provider": "edge"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._xai_oauth_device_code_login",
+        lambda **kwargs: {
+            "tokens": {
+                "access_token": "tts-xai-access",
+                "refresh_token": "tts-xai-refresh",
+                "id_token": "",
+                "token_type": "Bearer",
+            },
+            "discovery": {"token_endpoint": "https://auth.x.ai/oauth2/token"},
+            "redirect_uri": "",
+            "base_url": "https://api.x.ai/v1",
+            "last_refresh": "2026-07-25T12:00:00Z",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.auth._is_remote_session", lambda: True)
+
+    from hermes_cli.auth import is_source_suppressed, suppress_credential_source
+    from hermes_cli.setup_tts import _run_xai_oauth_login_from_setup
+
+    suppress_credential_source("xai-oauth", "device_code")
+    assert is_source_suppressed("xai-oauth", "device_code") is True
+
+    assert _run_xai_oauth_login_from_setup() is True
+
+    assert is_source_suppressed("xai-oauth", "device_code") is False
+
+    auth = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert auth["active_provider"] == "openrouter"
+    xai_state = auth["providers"]["xai-oauth"]
+    assert xai_state["tokens"]["access_token"] == "tts-xai-access"
+    assert xai_state["tokens"]["refresh_token"] == "tts-xai-refresh"
+
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["model"]["provider"] == "openrouter"
+    assert config["model"]["base_url"] == "https://openrouter.ai/api/v1"
+    assert config["model"]["default"] == "anthropic/claude-sonnet-4"
+
+
+def test_tts_xai_step_prefers_existing_api_key_over_oauth(monkeypatch):
+    """Wizard copy must match runtime: an explicit XAI_API_KEY wins over stored OAuth
+    tokens (the subscription bearer 403s on metered /v1/tts — #87045, #113727)."""
+    import hermes_cli.setup_tts as setup_tts
+
+    messages = []
+    monkeypatch.setattr(setup_tts, "_xai_oauth_logged_in_for_setup", lambda: True)
+    monkeypatch.setattr(setup_tts._setup, "get_env_value", lambda key: "xai-key" if key == "XAI_API_KEY" else "")
+    monkeypatch.setattr(setup_tts._setup, "print_success", lambda msg: messages.append(msg))
+    monkeypatch.setattr(setup_tts._setup, "prompt", lambda *a, **k: "")
+    monkeypatch.setattr(setup_tts._setup, "prompt_choice", lambda *a, **k: pytest.fail("no prompt expected"))
+
+    config = {}
+    assert setup_tts._tts_xai_step(config) == "xai"
+    assert len(messages) == 1 and "XAI_API_KEY" in messages[0]
+    assert "OAuth credentials" not in messages[0]
+    assert "XAI_API_KEY" in setup_tts._tts_xai_step.__doc__.split(">")[0]
+

@@ -1,0 +1,348 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_exit_delete_session.py ===
+"""Tests for `/exit --delete` and `/quit --delete` session deletion.
+
+Ports the behavior from google-gemini/gemini-cli#19332: running `/exit` or
+`/quit` with the `--delete` flag arms a one-shot `_delete_session_on_exit`
+flag that the CLI shutdown path uses to remove the current session from
+SQLite + on-disk transcripts before exit.
+"""
+
+from unittest.mock import MagicMock
+
+
+def _make_cli():
+    """Bare HermesCLI suitable for process_command() tests.
+
+    Uses ``__new__`` to skip the heavy __init__; only sets the attributes
+    the /exit branch touches.
+    """
+    from cli import HermesCLI
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.config = {}
+    cli.console = MagicMock()
+    cli.agent = None
+    cli.conversation_history = []
+    cli.session_id = "test-session"
+    cli._delete_session_on_exit = False
+    return cli
+
+
+class TestExitDeleteFlag:
+
+
+    def test_exit_delete_arms_flag(self):
+        cli = _make_cli()
+        result = cli.process_command("/exit --delete")
+        assert result is False
+        assert cli._delete_session_on_exit is True
+
+    def test_quit_delete_arms_flag(self):
+        cli = _make_cli()
+        result = cli.process_command("/quit --delete")
+        assert result is False
+        assert cli._delete_session_on_exit is True
+
+    def test_exit_delete_short_form(self):
+        """`-d` is a convenience alias for `--delete`."""
+        cli = _make_cli()
+        result = cli.process_command("/exit -d")
+        assert result is False
+        assert cli._delete_session_on_exit is True
+
+
+
+    def test_delete_flag_trims_whitespace(self):
+        cli = _make_cli()
+        result = cli.process_command("/exit   --delete   ")
+        assert result is False
+        assert cli._delete_session_on_exit is True
+
+
+    def test_unknown_exit_argument_prints_help(self):
+        cli = _make_cli()
+        # _cprint goes through module-level print, so capture via console.
+        # We can't patch _cprint directly without import juggling; the
+        # previous assertion already proves the unknown-arg branch is
+        # reached (result True + flag False).
+        result = cli.process_command("/exit garbage")
+        assert result is True
+        assert cli._delete_session_on_exit is False
+
+
+class TestCommandRegistry:
+    def test_quit_command_advertises_delete_flag(self):
+        """The CommandDef args_hint should surface `--delete` in /help and
+        CLI autocomplete."""
+        from hermes_cli.commands import resolve_command
+        cmd = resolve_command("quit")
+        assert cmd is not None
+        assert cmd.args_hint == "[--delete]"
+
+    def test_exit_alias_resolves_to_quit_with_hint(self):
+        from hermes_cli.commands import resolve_command
+        cmd = resolve_command("exit")
+        assert cmd is not None
+        assert cmd.name == "quit"
+        assert cmd.args_hint == "[--delete]"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_exit_summary_resume_hint.py ===
+"""Tests for the CLI exit summary's resume hint, including profile-flag support."""
+
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+from cli import HermesCLI
+
+
+def _make_cli(session_id="20260524_000001_abc123"):
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj.session_id = session_id
+    # _print_exit_summary requires a populated conversation history (msg_count > 0)
+    # to print the resume hint at all. One synthetic user turn is enough.
+    cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
+    cli_obj.agent = None
+    cli_obj._session_db = None
+    cli_obj.session_start = datetime.now()
+    return cli_obj
+
+
+class TestExitSummaryResumeHint:
+    """The exit-line ``Resume this session with:`` hint must include the
+    active profile (`-p <name>`) so session IDs round-trip across
+    profile boundaries — sessions live under `~/.hermes-profiles/<profile>/`,
+    so a hint copied without `-p` from a non-default profile won't find
+    the session.
+    """
+
+    def test_resume_hint_no_profile_flag_on_default(self, capsys):
+        cli_obj = _make_cli()
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+            cli_obj._print_exit_summary()
+        out = capsys.readouterr().out
+        # No `-p` for the default profile.
+        assert "hermes --resume 20260524_000001_abc123" in out
+        assert " -p " not in out
+
+    def test_resume_hint_no_profile_flag_on_custom(self, capsys):
+        cli_obj = _make_cli()
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="custom"):
+            cli_obj._print_exit_summary()
+        out = capsys.readouterr().out
+        # "custom" is the standard HERMES_HOME indicator — no -p needed.
+        assert "hermes --resume 20260524_000001_abc123" in out
+        assert " -p " not in out
+
+    def test_resume_hint_includes_profile_flag_for_named_profile(self, capsys):
+        cli_obj = _make_cli()
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="dev"):
+            cli_obj._print_exit_summary()
+        out = capsys.readouterr().out
+        assert "hermes --resume 20260524_000001_abc123 -p dev" in out
+
+    def test_resume_hint_includes_profile_flag_on_title_hint_too(self, capsys, tmp_path):
+        """When a session title is available, the `hermes -c "title"` hint
+        must also include the `-p` flag for non-default profiles.
+        """
+        cli_obj = _make_cli()
+        fake_db = MagicMock()
+        fake_db.get_session_title.return_value = "My Cool Session"
+        cli_obj._session_db = fake_db
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="dev"):
+            cli_obj._print_exit_summary()
+        out = capsys.readouterr().out
+        assert 'hermes -c "My Cool Session" -p dev' in out
+        assert "hermes --resume 20260524_000001_abc123 -p dev" in out
+
+    def test_resume_hint_falls_back_when_profile_lookup_fails(self, capsys):
+        """If `get_active_profile_name` raises (e.g. profiles module
+        missing during ``hermes update`` mid-flight), fall back to no
+        flag rather than crashing the exit summary.
+        """
+        cli_obj = _make_cli()
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            side_effect=RuntimeError("profiles unavailable"),
+        ):
+            cli_obj._print_exit_summary()
+        out = capsys.readouterr().out
+        # Resume hint still printed without -p.
+        assert "hermes --resume 20260524_000001_abc123" in out
+        assert " -p " not in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_exit_watchdog_signal_arm.py ===
+"""Exit watchdog: arm on shutdown *intent* (signal), never at chat startup.
+
+Regression coverage for the #65998 class: a ``hermes --tui`` process whose
+main thread wedges before ``app.run()`` returns never executes the ``finally``
+that calls ``_run_cleanup`` — the only place the exit watchdog used to be
+armed — so a "dead" CLI lingered indefinitely (observed ~47 min at 4% CPU).
+
+The fix arms the backstop from the SIGTERM/SIGHUP handlers via
+``_arm_exit_watchdog_on_shutdown_signal()``. Arming at *startup* (the
+rejected #65998 approach) is specifically forbidden: the watchdog thread
+calls ``os._exit(0)`` unconditionally after its sleep, so a startup-armed
+timer hard-kills every session that outlives the timeout.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from unittest.mock import patch
+
+import pytest
+
+import cli
+
+
+@pytest.fixture(autouse=True)
+def _reset_arm_flag(monkeypatch):
+    """Each test starts with the idempotency flag clear."""
+    monkeypatch.setattr(cli, "_signal_watchdog_armed", False)
+
+
+class TestSignalArmLogic:
+    def test_arms_with_double_cleanup_timeout(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXIT_WATCHDOG_S", "7")
+        with patch.object(cli, "_arm_exit_watchdog") as arm:
+            cli._arm_exit_watchdog_on_shutdown_signal()
+        arm.assert_called_once_with(timeout_s=14.0, from_signal=True)
+
+
+
+    def test_bad_env_value_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXIT_WATCHDOG_S", "not-a-number")
+        with patch.object(cli, "_arm_exit_watchdog") as arm:
+            cli._arm_exit_watchdog_on_shutdown_signal()
+        arm.assert_called_once_with(timeout_s=60.0, from_signal=True)
+
+    def test_never_raises_even_if_arm_explodes(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXIT_WATCHDOG_S", "7")
+        with patch.object(cli, "_arm_exit_watchdog", side_effect=RuntimeError("boom")):
+            cli._arm_exit_watchdog_on_shutdown_signal()  # must not raise
+
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# A minimal stand-in for the wedged-CLI shape: signal handlers mirror the
+# production wiring (arm-on-signal, then a graceful unwind that wedges), and
+# the main thread parks the way a stuck app.run() does.
+_WEDGE_SRC = """
+import os, signal, sys, time
+sys.path.insert(0, {repo!r})
+import cli
+
+def _handler(signum, frame):
+    # Production wiring: arm the backstop the moment shutdown intent exists,
+    # then attempt a graceful unwind — which, in this repro, wedges (the
+    # KeyboardInterrupt lands in a frame that swallows it).
+    cli._arm_exit_watchdog_on_shutdown_signal()
+
+signal.signal(signal.SIGTERM, _handler)
+print("READY", flush=True)
+while True:  # the wedge: never observes any unwind
+    time.sleep(0.2)
+"""
+
+_CLEANUP_OVERLAP_SRC = """
+import os, signal, sys, threading, time
+sys.path.insert(0, {repo!r})
+import cli
+
+
+def _start_cleanup():
+    # Simulate a slow graceful-cleanup path that starts after signal intent.
+    time.sleep(1.0)
+    cli._cleanup_in_progress = True
+    cli._arm_exit_watchdog(timeout_s=1.5)
+    time.sleep(5.0)
+
+
+def _handler(signum, frame):
+    # Arm the broad signal watchdog, then trigger a cleanup window shortly after.
+    cli._arm_exit_watchdog_on_shutdown_signal()
+    threading.Thread(target=_start_cleanup, daemon=True).start()
+
+
+signal.signal(signal.SIGTERM, _handler)
+print("READY", flush=True)
+while True:
+    time.sleep(0.2)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_sigterm_on_wedged_process_forces_exit_within_leash():
+    """E2E: a wedged process armed via the signal path self-exits at ~2×
+    HERMES_EXIT_WATCHDOG_S; without the signal it would live forever."""
+    env = dict(os.environ, HERMES_EXIT_WATCHDOG_S="1", PYTHONPATH=_REPO_ROOT)
+    # _arm_exit_watchdog refuses to arm under pytest (it would kill the test
+    # worker); the subprocess must look like a real CLI.
+    env.pop("PYTEST_CURRENT_TEST", None)
+    src = _WEDGE_SRC.format(repo=_REPO_ROOT)
+    p = subprocess.Popen(
+        [sys.executable, "-c", src],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert p.stdout is not None
+        assert p.stdout.readline().strip() == "READY"
+        # Wedged, no signal yet: must still be alive well past the leash
+        # (proves we did NOT arm at startup — the #65998 regression).
+        time.sleep(3.0)
+        assert p.poll() is None, "watchdog fired without shutdown intent"
+
+        p.send_signal(signal.SIGTERM)
+        t0 = time.time()
+        rc = p.wait(timeout=10)
+        elapsed = time.time() - t0
+        assert rc == 0
+        # Leash is 2×1s; generous CI slack.
+        assert elapsed < 8.0, f"exit took {elapsed:.1f}s; leash should be ~2s"
+    finally:
+        if p.poll() is None:
+            p.kill()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_signal_watchdog_is_skipped_once_cleanup_starts():
+    """If cleanup starts after signal intent, the cleanup-owned watchdog should
+    govern shutdown and the signal watchdog should not hard-kill midway."""
+    env = dict(os.environ, HERMES_EXIT_WATCHDOG_S="1", PYTHONPATH=_REPO_ROOT)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    src = _CLEANUP_OVERLAP_SRC.format(repo=_REPO_ROOT)
+    p = subprocess.Popen(
+        [sys.executable, "-c", src],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert p.stdout is not None
+        assert p.stdout.readline().strip() == "READY"
+
+        p.send_signal(signal.SIGTERM)
+        t0 = time.time()
+        rc = p.wait(timeout=10)
+        elapsed = time.time() - t0
+        assert rc == 0
+        # Outer watchdog is at 2s, cleanup watchdog at 2.5s (1s delay + 1.5s
+        # timeout). Without the overlap fix this would likely exit earlier at 2s.
+        assert elapsed >= 2.2, f"elapsed={elapsed:.2f}s; expected cleanup watchdog to fire"
+        assert elapsed <= 5.0, f"elapsed={elapsed:.2f}s; expected bounded shutdown"
+    finally:
+        if p.poll() is None:
+            p.kill()
+

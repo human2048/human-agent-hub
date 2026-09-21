@@ -1,0 +1,392 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_long_form_chunking.py ===
+"""Tests for the long-form TTS chunking and delivery packing pipeline.
+
+Verifies that text exceeding a provider's per-request cap is split without
+content loss, that chunks are synthesized in order, and that the delivery
+packing respects platform upload limits.
+"""
+
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from tools.tts_tool import _build_audio_delivery_files, _split_text_for_tts
+from tools.tts_tool_delivery import (
+    AudioDeliveryProfile,
+    _concat_audio_files,
+    _pack_audio_files_for_delivery,
+    _split_oversized_sentence,
+)
+
+
+class TestSplitTextForTts:
+    def test_short_text_returns_single_chunk(self):
+        result = _split_text_for_tts("Hello world.", 4096)
+        assert result == ["Hello world."]
+
+    def test_empty_text_returns_empty_list(self):
+        assert _split_text_for_tts("", 4096) == []
+        assert _split_text_for_tts("   ", 4096) == []
+
+    def test_long_text_is_split_without_loss(self):
+        text = "A" * 5000
+        chunks = _split_text_for_tts(text, 4096)
+        assert len(chunks) == 2
+        assert chunks[0] == "A" * 4096
+        assert chunks[1] == "A" * 904
+        assert "".join(chunks) == text
+
+    def test_splits_on_sentence_boundaries(self):
+        text = "First sentence. Second sentence. Third sentence."
+        chunks = _split_text_for_tts(text, 30)
+        assert len(chunks) >= 2
+        # No content lost
+        assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
+
+    def test_handles_very_long_word(self):
+        text = "A" * 100
+        chunks = _split_text_for_tts(text, 30)
+        assert all(len(c) <= 30 for c in chunks)
+        assert "".join(chunks) == text
+
+
+class TestSplitOversizedSentence:
+    def test_short_sentence_returns_as_is(self):
+        assert _split_oversized_sentence("Hello world.", 100) == ["Hello world."]
+
+    def test_long_word_is_hard_split(self):
+        word = "A" * 100
+        chunks = _split_oversized_sentence(word, 30)
+        assert all(len(c) <= 30 for c in chunks)
+        assert "".join(chunks) == word
+
+    def test_word_boundary_split(self):
+        words = " ".join(["word"] * 50)
+        chunks = _split_oversized_sentence(words, 30)
+        assert all(len(c) <= 30 for c in chunks)
+
+
+class TestAudioDeliveryProfile:
+    def test_default_profile(self):
+        profile = AudioDeliveryProfile(platform="default", max_file_bytes=10 * 1024 * 1024)
+        assert profile.target_file_bytes > 0
+        assert profile.target_file_bytes < profile.max_file_bytes
+
+    def test_custom_safety_ratio(self):
+        profile = AudioDeliveryProfile(
+            platform="custom", max_file_bytes=1000, safety_ratio=0.5
+        )
+        assert profile.target_file_bytes == 500
+
+
+class TestPackAudioFilesForDelivery:
+    def test_single_file_returns_one_group(self, tmp_path):
+        f = tmp_path / "a.mp3"
+        f.write_bytes(b"x" * 100)
+        profile = AudioDeliveryProfile(platform="default", max_file_bytes=10000)
+        groups = _pack_audio_files_for_delivery([str(f)], profile)
+        assert len(groups) == 1
+        assert groups[0] == [str(f)]
+
+    def test_splits_on_size_limit(self, tmp_path):
+        files = []
+        for i in range(5):
+            f = tmp_path / f"chunk{i:02d}.mp3"
+            f.write_bytes(b"x" * 300)
+            files.append(str(f))
+        # Target is 500 bytes, each file is 300 → at most 1 file per group
+        profile = AudioDeliveryProfile(platform="default", max_file_bytes=1000, safety_ratio=0.5)
+        groups = _pack_audio_files_for_delivery(files, profile)
+        assert len(groups) == 5
+        for group in groups:
+            assert len(group) == 1
+
+    def test_splits_on_suffix_mismatch(self, tmp_path):
+        f1 = tmp_path / "a.mp3"
+        f1.write_bytes(b"x" * 100)
+        f2 = tmp_path / "b.ogg"
+        f2.write_bytes(b"x" * 100)
+        profile = AudioDeliveryProfile(platform="default", max_file_bytes=10000)
+        groups = _pack_audio_files_for_delivery([str(f1), str(f2)], profile)
+        assert len(groups) == 2
+
+
+class TestBuildAudioDeliveryFiles:
+    def test_single_file_passes_through(self, tmp_path):
+        f = tmp_path / "chunk.mp3"
+        f.write_bytes(b"x" * 100)
+        out = str(tmp_path / "output.mp3")
+        profile = AudioDeliveryProfile(platform="default", max_file_bytes=10000)
+        paths, combined = _build_audio_delivery_files([str(f)], out, profile)
+        assert len(paths) == 1
+        assert combined is False
+
+    def test_oversized_chunk_raises(self, tmp_path):
+        f = tmp_path / "chunk.mp3"
+        f.write_bytes(b"x" * 100)
+        out = str(tmp_path / "output.mp3")
+        profile = AudioDeliveryProfile(platform="default", max_file_bytes=50)
+        with pytest.raises(ValueError, match="exceeds"):
+            _build_audio_delivery_files([str(f)], out, profile)
+
+    def test_combines_multiple_files(self, tmp_path):
+        files = []
+        for i in range(3):
+            f = tmp_path / f"chunk{i:02d}.mp3"
+            f.write_bytes(b"\x00" * 100)
+            files.append(str(f))
+        out = str(tmp_path / "output.mp3")
+        profile = AudioDeliveryProfile(platform="default", max_file_bytes=10000)
+
+        with patch("tools.tts_tool_delivery._concat_audio_files") as mock_concat:
+            mock_concat.return_value = out
+            # Copy the first file to output so the size check passes
+            Path(out).write_bytes(b"\x00" * 300)
+            paths, combined = _build_audio_delivery_files(files, out, profile)
+            assert len(paths) == 1
+            assert combined is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_macos_output.py ===
+"""macOS output policy for streaming TTS.
+
+On macOS, stream_tts_to_speaker must NOT open a sounddevice OutputStream
+(PortAudio/CoreAudio init triggers a kTCCServiceMediaLibrary prompt). It
+should route audio through the tempfile/afplay fallback instead.
+See PR #62601 / #13291.
+"""
+
+import queue
+import threading
+
+import pytest
+
+
+class _FakeStreamer:
+    """Minimal chunked-streamer stand-in so the OutputStream setup path runs."""
+
+    sample_rate = 24000
+    channels = 1
+
+    def stream(self, text):
+        return iter([])
+
+
+def _run_stream(monkeypatch):
+    """Drive stream_tts_to_speaker once with a mock client on the real host.
+
+    Returns True if _import_sounddevice was called during the run.
+
+    No platform parameter: the two callers below are the macOS and non-macOS
+    arms of the same policy, and each now runs on a host that reaches its arm
+    by itself. Faking ``platform.system()`` here selected the branch without
+    reproducing anything underneath it — on Darwin the branch exists because
+    PortAudio init raises a TCC prompt, which no Linux runner can produce.
+    """
+    from tools.tts_tool_speaker import stream_tts_to_speaker
+
+    monkeypatch.setattr("hermes_cli.config.get_env_value",
+                        lambda name, default=None: "fake-key"
+                        if name == "ELEVENLABS_API_KEY" else default)
+    monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: {})
+
+    class _FakeTTS:
+        def __init__(self, *a, **k):
+            self.text_to_speech = self
+
+        def convert(self, *a, **k):
+            return iter([])  # no audio chunks needed for setup assertion
+
+    monkeypatch.setattr("tools.tts_tool._import_elevenlabs", lambda: _FakeTTS)
+    monkeypatch.setattr(
+        "tools.tts_streaming.resolve_streaming_provider",
+        lambda cfg, preferred=None: _FakeStreamer(),
+    )
+
+    sd_called = {"hit": False}
+
+    def _spy_import_sd():
+        sd_called["hit"] = True
+        # OSError, not AssertionError: the function's own guard handles it, so
+        # the off-macOS arm can record the call without the raise aborting the
+        # run. On macOS the call must never happen at all.
+        raise OSError("no audio device in test")
+
+    monkeypatch.setattr("tools.tts_tool._import_sounddevice", _spy_import_sd)
+
+    text_queue: queue.Queue = queue.Queue()
+    text_queue.put(None)  # end-of-text sentinel: no sentence spoken
+    stop_event = threading.Event()
+    done_event = threading.Event()
+
+    stream_tts_to_speaker(text_queue, stop_event, done_event)
+    assert done_event.is_set()
+    return sd_called["hit"]
+
+
+@pytest.mark.macos_only
+def test_streaming_tts_skips_sounddevice_on_macos(monkeypatch):
+    assert _run_stream(monkeypatch) is False
+
+
+@pytest.mark.linux_only
+def test_streaming_tts_uses_sounddevice_off_macos(monkeypatch):
+    # Off macOS the OutputStream setup runs; _import_sounddevice raising here
+    # is caught by the function's own guard, so the call itself is what we assert.
+    assert _run_stream(monkeypatch) is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_max_text_length.py ===
+"""Tests for per-provider TTS input-character limits.
+
+With long-form chunking, text exceeding the provider cap is split into
+ordered chunks instead of silently truncated. Each chunk is synthesized
+separately and the results are combined or delivered as multiple files.
+"""
+
+import json
+
+
+from tools.tts_tool import _resolve_max_text_length
+from tools.tts_tool_delivery import FALLBACK_MAX_TEXT_LENGTH, PROVIDER_MAX_TEXT_LENGTH
+
+
+class TestResolveMaxTextLength:
+    def test_edge_default(self):
+        assert _resolve_max_text_length("edge", {}) == PROVIDER_MAX_TEXT_LENGTH["edge"]
+
+    def test_openai_default_is_4096(self):
+        assert _resolve_max_text_length("openai", {}) == 4096
+
+    def test_xai_default_is_15000(self):
+        assert _resolve_max_text_length("xai", {}) == 15000
+
+    def test_minimax_default_is_10000(self):
+        assert _resolve_max_text_length("minimax", {}) == 10000
+
+    def test_mistral_default(self):
+        assert _resolve_max_text_length("mistral", {}) == PROVIDER_MAX_TEXT_LENGTH["mistral"]
+
+    def test_gemini_default(self):
+        assert _resolve_max_text_length("gemini", {}) == PROVIDER_MAX_TEXT_LENGTH["gemini"]
+
+    def test_unknown_provider_falls_back(self):
+        assert _resolve_max_text_length("does-not-exist", {}) == FALLBACK_MAX_TEXT_LENGTH
+
+    def test_empty_provider_falls_back(self):
+        assert _resolve_max_text_length("", {}) == FALLBACK_MAX_TEXT_LENGTH
+        assert _resolve_max_text_length(None, {}) == FALLBACK_MAX_TEXT_LENGTH
+
+
+    # --- Overrides ---
+
+
+    # --- ElevenLabs model-aware ---
+
+
+    # --- Sanity: the table covers every provider listed in the schema ---
+
+    def test_all_documented_providers_have_defaults(self):
+        expected = {"edge", "openai", "xai", "minimax", "mistral",
+                    "gemini", "elevenlabs", "neutts", "kittentts"}
+        assert expected.issubset(PROVIDER_MAX_TEXT_LENGTH.keys())
+
+
+class TestTextToSpeechToolChunking:
+    """End-to-end: verify the resolver drives text_to_speech_tool to split
+    per-request chunks rather than the old 4000-char global truncation."""
+
+    def test_openai_chunks_at_4096_without_dropping_text(self, tmp_path, monkeypatch):
+        # 5000 chars -- over OpenAI's 4096 limit but under xAI's 15k
+        text = "A" * 5000
+        captured_text = []
+
+        def fake_openai(t, out, cfg, **_kw):
+            captured_text.append(t)
+            with open(out, "wb") as f:
+                f.write(b"\x00")
+            return out
+
+        def fake_combine(paths, output_path, *, voice_compatible=False):
+            with open(output_path, "wb") as destination:
+                for path in paths:
+                    with open(path, "rb") as source:
+                        destination.write(source.read())
+            return output_path
+
+        monkeypatch.setattr("tools.tts_tool._generate_openai_tts", fake_openai)
+        monkeypatch.setattr("tools.tts_tool_delivery._concat_audio_files", fake_combine)
+        monkeypatch.setattr("tools.tts_tool._load_tts_config",
+                            lambda: {"provider": "openai"})
+
+        from tools.tts_tool import text_to_speech_tool
+        out = str(tmp_path / "out.mp3")
+        result = json.loads(text_to_speech_tool(text=text, output_path=out))
+
+        assert result["success"] is True
+        assert [len(chunk) for chunk in captured_text] == [4096, 904]
+        assert "".join(captured_text) == text
+        assert result["chunk_count"] == 2
+
+    def test_xai_accepts_much_longer_input(self, tmp_path, monkeypatch):
+        # 12000 chars -- over old global 4000, under xAI's 15000
+        text = "B" * 12000
+        captured_text = {}
+
+        def fake_xai(t, out, cfg):
+            captured_text["text"] = t
+            with open(out, "wb") as f:
+                f.write(b"\x00")
+            return out
+
+        monkeypatch.setattr("tools.tts_tool._generate_xai_tts", fake_xai)
+        monkeypatch.setattr("tools.tts_tool._load_tts_config",
+                            lambda: {"provider": "xai"})
+
+        from tools.tts_tool import text_to_speech_tool
+        out = str(tmp_path / "out.mp3")
+        result = json.loads(text_to_speech_tool(text=text, output_path=out))
+
+        assert result["success"] is True
+        # xAI should accept the full 12000 chars in a single chunk
+        assert len(captured_text["text"]) == 12000
+
+    def test_user_override_is_respected(self, tmp_path, monkeypatch):
+        # User says "cap openai at 100 chars" -- we must honor it
+        text = "C" * 500
+        captured_text = []
+
+        def fake_openai(t, out, cfg, **_kw):
+            captured_text.append(t)
+            with open(out, "wb") as f:
+                f.write(b"\x00")
+            return out
+
+        def fake_combine(paths, output_path, *, voice_compatible=False):
+            with open(output_path, "wb") as destination:
+                for path in paths:
+                    with open(path, "rb") as source:
+                        destination.write(source.read())
+            return output_path
+
+        monkeypatch.setattr("tools.tts_tool._generate_openai_tts", fake_openai)
+        monkeypatch.setattr("tools.tts_tool_delivery._concat_audio_files", fake_combine)
+        monkeypatch.setattr("tools.tts_tool._load_tts_config",
+                            lambda: {"provider": "openai",
+                                     "openai": {"max_text_length": 100}})
+
+        from tools.tts_tool import text_to_speech_tool
+        out = str(tmp_path / "out.mp3")
+        result = json.loads(text_to_speech_tool(text=text, output_path=out))
+
+        assert result["success"] is True
+        assert all(len(chunk) <= 100 for chunk in captured_text)
+        assert "".join(captured_text) == text
+

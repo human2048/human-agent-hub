@@ -1,0 +1,440 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_server_sessiondb_eventloop.py ===
+import ast
+import asyncio
+import threading
+from pathlib import Path
+
+from hermes_cli import web_server
+import hermes_cli.web_models as _web_models
+import hermes_cli.web_routers.sessions as _rt_sessions
+import hermes_cli.web_server_sessions as _web_server_sessions
+from hermes_cli import web_server_sessions
+from hermes_cli.web_routers import analytics as web_analytics
+from hermes_cli.web_routers import sessions as web_sessions
+
+
+TARGET_HANDLERS = {
+    "bulk_delete_sessions_endpoint",
+    "count_empty_sessions_endpoint",
+    "delete_empty_sessions_endpoint",
+    "get_session_latest_descendant",
+    "get_session_messages",
+    "delete_session_endpoint",
+    "export_session_endpoint",
+    "prune_sessions_endpoint",
+    "get_usage_analytics",
+    "get_models_analytics",
+}
+
+
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def test_sessiondb_handlers_open_connections_inside_executor_helpers():
+    # The session and analytics route handlers were extracted to
+    # web_routers/{sessions,analytics}.py; the executor helpers live in
+    # web_server_sessions.py (and any left in web_server.py) — scan all
+    # four modules' top-level bodies.
+    handlers: dict[str, ast.AsyncFunctionDef] = {}
+    top_level_helpers: dict[str, ast.FunctionDef] = {}
+    for mod in (web_server, web_server_sessions, web_sessions, web_analytics):
+        tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
+        for node in tree.body:
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in TARGET_HANDLERS:
+                handlers[node.name] = node
+            elif isinstance(node, ast.FunctionDef):
+                top_level_helpers[node.name] = node
+    assert handlers.keys() == TARGET_HANDLERS
+
+    for name, handler in handlers.items():
+        helpers = {
+            **top_level_helpers,
+            **{
+                node.name: node
+                for node in handler.body
+                if isinstance(node, ast.FunctionDef)
+            },
+        }
+        offloaded = {
+            arg.id
+            for node in ast.walk(handler)
+            if isinstance(node, ast.Call)
+            and _call_name(node) == "to_thread"
+            for arg in node.args[:1]
+            if isinstance(arg, ast.Name)
+        }
+        db_open_owners = {
+            helper_name
+            for helper_name, helper in helpers.items()
+            if helper_name in offloaded
+            and any(
+                isinstance(node, ast.Call)
+                and _call_name(node) == "_open_session_db_for_profile"
+                for node in ast.walk(helper)
+            )
+        }
+        assert db_open_owners, f"{name} does not offload SessionDB open + work"
+
+
+def test_sessiondb_opens_declare_access_mode():
+    for mod in (web_server_sessions, web_sessions):
+        tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and _call_name(node) == "_open_session_db_for_profile"
+        ]
+        assert calls
+        for call in calls:
+            assert any(keyword.arg == "read_only" for keyword in call.keywords)
+
+
+def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
+    loop_thread = threading.get_ident()
+    db_threads: list[int] = []
+    db_modes: list[bool] = []
+
+    class _DB:
+        def delete_sessions(self, ids):
+            db_threads.append(threading.get_ident())
+            assert ids == ["one", "two"]
+            return 2
+
+        def close(self):
+            db_threads.append(threading.get_ident())
+
+    def _open_db(profile=None, *, read_only):
+        assert profile is None
+        db_modes.append(read_only)
+        return _DB()
+
+    monkeypatch.setattr(_web_server_sessions, "_open_session_db_for_profile", _open_db)
+
+    result = asyncio.run(
+        _rt_sessions.bulk_delete_sessions_endpoint(
+            _web_models.BulkDeleteSessions(ids=["one", "two"])
+        )
+    )
+
+    assert result == {"ok": True, "deleted": 2}
+    assert db_modes == [False]
+    assert db_threads
+    assert all(thread_id != loop_thread for thread_id in db_threads)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_server_session_search.py ===
+import asyncio
+
+from hermes_cli import web_server
+import hermes_cli.web_routers.sessions as _rt_sessions
+
+
+class _FakeSessionDB:
+    """Fake backing the /api/sessions/search endpoint.
+
+    The endpoint surfaces direct session-id matches first, then FTS message
+    matches, deduping both by compression lineage root. This fake has no
+    compression chains (get_session returns no parent), so each session is its
+    own lineage root.
+    """
+
+    closed = False
+    opened_read_only = None
+    requested_fields = None
+
+    def __init__(self, *args, **kwargs):
+        type(self).opened_read_only = kwargs.get("read_only")
+
+    @staticmethod
+    def _source_allowed(row, source=None, sources=None, exclude_sources=None):
+        row_source = row.get("source")
+        if source and row_source != source:
+            return False
+        if sources and row_source not in sources:
+            return False
+        if exclude_sources and row_source in exclude_sources:
+            return False
+        return True
+
+    def search_sessions_by_id(
+        self,
+        query,
+        limit=20,
+        include_archived=True,
+        source=None,
+        sources=None,
+        exclude_sources=None,
+    ):
+        assert query == "20260603"
+        assert include_archived is True
+        rows = [
+            {
+                "id": "20260603_090200_exact",
+                "preview": "ID match preview",
+                "source": "cli",
+                "model": "claude",
+                "started_at": 100,
+            }
+        ]
+        return [
+            row
+            for row in rows
+            if self._source_allowed(
+                row, source=source, sources=sources, exclude_sources=exclude_sources
+            )
+        ][:limit]
+
+    def search_messages(
+        self,
+        query,
+        source_filter=None,
+        exclude_sources=None,
+        limit=20,
+        fields=None,
+    ):
+        assert query == "20260603*"
+        type(self).requested_fields = fields
+        rows = [
+            {
+                "session_id": "20260603_090200_exact",
+                "snippet": "duplicate content hit should not replace ID hit",
+                "role": "user",
+                "source": "cli",
+                "model": "claude",
+                "session_started": 100,
+            },
+            {
+                "session_id": "content_session",
+                "snippet": "content hit",
+                "role": "assistant",
+                "source": "desktop",
+                "model": "gpt",
+                "session_started": 200,
+            },
+        ]
+        return [
+            row
+            for row in rows
+            if self._source_allowed(
+                row, sources=source_filter, exclude_sources=exclude_sources
+            )
+        ][:limit]
+
+    def get_session(self, session_id):
+        # No compression chains in this fixture — every session is its own root.
+        return {"id": session_id, "parent_session_id": None}
+
+    def get_compression_tip(self, session_id):
+        return session_id
+
+    def close(self):
+        self.closed = True
+
+
+def test_desktop_session_search_merges_id_matches_before_content_matches(monkeypatch):
+    _FakeSessionDB.opened_read_only = None
+    _FakeSessionDB.requested_fields = None
+    monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
+
+    response = asyncio.run(_rt_sessions.search_sessions(q="20260603", limit=2))
+
+    assert _FakeSessionDB.requested_fields is not None
+    assert "context" not in _FakeSessionDB.requested_fields
+    # ID match surfaces first; the content hit on the SAME session is deduped
+    # by lineage root (not double-listed); the unrelated content hit follows.
+    assert response == {
+        "results": [
+            {
+                "id": "20260603_090200_exact",
+                "profile": "default",
+                "is_default_profile": True,
+                "session_id": "20260603_090200_exact",
+                "lineage_root": "20260603_090200_exact",
+                "snippet": "ID match preview",
+                "role": None,
+                "source": "cli",
+                "model": "claude",
+                "session_started": 100,
+            },
+            {
+                "id": "content_session",
+                "profile": "default",
+                "is_default_profile": True,
+                "session_id": "content_session",
+                "lineage_root": "content_session",
+                "snippet": "content hit",
+                "role": "assistant",
+                "source": "desktop",
+                "model": "gpt",
+                "session_started": 200,
+            },
+        ]
+    }
+    assert _FakeSessionDB.opened_read_only is True
+
+
+def test_desktop_session_search_stamps_the_requested_profile(monkeypatch):
+    monkeypatch.setattr(
+        _rt_sessions, "_cron_profile_home", lambda profile: (profile, None)
+    )
+    monkeypatch.setattr(
+        _rt_sessions,
+        "_open_session_db_for_profile",
+        lambda profile, *, read_only: _FakeSessionDB(read_only=read_only),
+    )
+
+    response = asyncio.run(
+        _rt_sessions.search_sessions(q="20260603", limit=2, profile="worker")
+    )
+
+    assert {
+        (row["profile"], row["is_default_profile"])
+        for row in response["results"]
+    } == {("worker", False)}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_server_skills_profiles.py ===
+"""Regression tests for dashboard profile-scoped skills/toolsets management.
+
+"Set as active" on the Profiles page only flips the sticky ``active_profile``
+file (future CLI/gateway runs) — it never retargets the running dashboard
+process. Before the ``profile`` parameter existed, toggling a skill after
+"activating" a profile silently wrote into the dashboard's own config.
+These tests pin the new behavior: reads and writes land in the REQUESTED
+profile's HERMES_HOME, and the dashboard's own profile stays untouched.
+"""
+import pytest
+import yaml
+import hermes_cli.web_server_gateway as _web_server_gateway
+import hermes_cli.web_server_profiles as _web_server_profiles
+
+
+def _write_skill(skills_dir, name, description="test skill"):
+    d = skills_dir / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def isolated_profiles(tmp_path, monkeypatch, _isolate_hermes_home):
+    """Isolated default home + one named profile, each with its own skills."""
+    from hermes_constants import get_hermes_home
+    from hermes_cli import profiles
+
+    default_home = get_hermes_home()
+    profiles_root = default_home / "profiles"
+    worker_home = profiles_root / "worker_alpha"
+    for home in (default_home, worker_home):
+        (home / "skills").mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    _write_skill(default_home / "skills", "dashboard-skill")
+    _write_skill(worker_home / "skills", "worker-skill")
+
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+    return {"default": default_home, "worker_alpha": worker_home}
+
+
+@pytest.fixture
+def client(monkeypatch, isolated_profiles):
+    try:
+        from starlette.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi/starlette not installed")
+
+    import hermes_state
+    from hermes_constants import get_hermes_home
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
+    c = TestClient(app)
+    c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    return c
+
+
+def _load_cfg(home):
+    return yaml.safe_load((home / "config.yaml").read_text()) or {}
+
+
+class TestProfileScopedSkills:
+
+
+    def test_toggle_writes_into_target_profile_only(self, client, isolated_profiles):
+        resp = client.put(
+            "/api/skills/toggle",
+            json={"name": "worker-skill", "enabled": False, "profile": "worker_alpha"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "name": "worker-skill", "enabled": False}
+
+        worker_cfg = _load_cfg(isolated_profiles["worker_alpha"])
+        assert "worker-skill" in worker_cfg.get("skills", {}).get("disabled", [])
+        # The dashboard's own config must stay untouched — this was the bug.
+        default_cfg = _load_cfg(isolated_profiles["default"])
+        assert "worker-skill" not in default_cfg.get("skills", {}).get("disabled", [])
+
+
+
+    def test_scope_restores_module_globals(self, client, isolated_profiles):
+        """The SKILLS_DIR swap is per-request; the module global must be
+        restored even after a scoped call (cron-style locked swap)."""
+        import tools.skills_tool as skills_tool
+
+        before = skills_tool.SKILLS_DIR
+        client.get("/api/skills", params={"profile": "worker_alpha"})
+        assert skills_tool.SKILLS_DIR == before
+
+
+class TestProfileScopedHubActions:
+    def test_hub_install_spawns_with_profile_flag(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        """Hub installs must go through a fresh ``hermes -p <profile>``
+        subprocess — the in-process scope can't reach skills_hub's
+        import-time SKILLS_DIR binding."""
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _FakeProc:
+            pid = 4242
+
+        def _fake_spawn(subcommand, name):
+            calls.append((list(subcommand), name))
+            return _FakeProc()
+
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", _fake_spawn)
+        resp = client.post(
+            "/api/skills/hub/install",
+            json={"identifier": "official/demo", "profile": "worker_alpha"},
+        )
+        assert resp.status_code == 200
+        assert calls == [
+            (
+                ["-p", "worker_alpha", "skills", "install", "official/demo", "--yes"],
+                _web_server_profiles._hub_action_name("install", "official/demo"),
+            )
+        ]
+
+
+    def test_hub_install_unknown_profile_404(self, client, isolated_profiles):
+        resp = client.post(
+            "/api/skills/hub/install",
+            json={"identifier": "official/demo", "profile": "ghost"},
+        )
+        assert resp.status_code == 404
+

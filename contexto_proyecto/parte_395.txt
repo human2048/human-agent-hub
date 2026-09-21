@@ -1,0 +1,207 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\review_probes\notice_delivery_probe.py ===
+"""#103549: interim notice must not claim/ack/dedup the batch's final result
+
+Independent-review probe (written by the /review subagent for tracking issue #103563, adapted here).
+It reproduced a defect in the first version of the PR; the fixed head must pass it. Paths are taken
+from the command line / environment, never hard-coded. Usage: see the argument parsing at the top of the file.
+"""
+import os, sys, tempfile, socket, json, time, threading, queue, asyncio
+from pathlib import Path
+from types import SimpleNamespace
+from collections import OrderedDict
+root=Path(sys.argv[1]).resolve(); sys.path.insert(0,str(root))
+for key in list(os.environ):
+    if key.startswith('HERMES_') or any(s in key for s in ('API_KEY','TOKEN','SECRET')):
+        os.environ.pop(key,None)
+os.environ['HERMES_HOME']=tempfile.mkdtemp(prefix='notice-review-')
+socket.socket.connect=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('network forbidden'))
+import tools.async_delegation as ad
+import tools.delegate_tool_dispatch as dd
+from tools.process_registry import process_registry as reg
+from tools.process_registry_notifications import format_process_notification
+from gateway.run_notifications import GatewayNotificationsMixin
+assert Path(ad.__file__).is_relative_to(root)
+assert Path(dd.__file__).is_relative_to(root)
+print('SOURCE',ad.__file__,dd.__file__,flush=True)
+class Sink(GatewayNotificationsMixin):
+    def __init__(self):
+        self._completion_delivery_lock=threading.Lock()
+        self._completion_deliveries_inflight=set()
+        self._completion_deliveries_delivered=OrderedDict()
+        self._completion_delivery_retention=100
+        self.received=[]
+    async def _classify_completion_target(self,sid): return 'deliver'
+    async def _inject_watch_notification(self,text,evt):
+        self.received.append(('notice' if evt.get('task_failure_notice') else 'final',evt.get('results')))
+        return True
+
+def batch_run(did, gates):
+    tasks=[{'goal':f'worker task {i}','group':'g'} for i in range(3)]  # grouped: one shared final, so the early notice matters
+    children=[(i,t,SimpleNamespace()) for i,t in enumerate(tasks)]
+    b=dd._Batch(tasks,children,SimpleNamespace(quiet_mode=True),{'model':'offline'},None,'leaf',3,did,[],[], '', '',None,None,time.monotonic())
+    # Since the per-group split on main, a detached unit carries its registry id; the notice keys on it.
+    if hasattr(b,'unit_id'): b.unit_id=did; b.group='g'
+    def child(i,t,c):
+        assert gates[i].wait(15)
+        return {'task_index':i,'status':'error' if i<2 else 'completed','error':'offline failure' if i<2 else None,'summary':None if i<2 else 'FINISHED_SUCCESS','duration_seconds':0.1}
+    b.run_child=child
+    results=[]
+    kwargs={'honor_parent_interrupt':False}
+    if 'detached' in __import__('inspect').signature(dd._run_children_parallel).parameters: kwargs['detached']=True
+    dd._run_children_parallel(b,results,**kwargs)
+    return {'results':results,'total_duration_seconds':1}
+
+def start(did):
+    gates=[threading.Event() for _ in range(3)]
+    h=ad.dispatch_async_delegation_batch(goals=['worker task 0','worker task 1','worker task 2'],context=None,toolsets=None,role='leaf',model='offline',session_key='owned',parent_session_id='parent',runner=lambda:batch_run(did,gates),delegation_id=did)
+    assert h['status']=='dispatched'
+    return gates
+
+def get(timeout=2): return reg.completion_queue.get(timeout=timeout)
+def deliver(sink,e): return asyncio.run(sink._deliver_completion_notification(format_process_notification(e),e))
+results={}
+if not hasattr(ad,'push_task_failure_notice'):
+    g=start('base-control');g[0].set()
+    try:get(.2);raise AssertionError('unexpected early event')
+    except queue.Empty:pass
+    g[1].set();g[2].set();e=get();sink=Sink();results['main_control']={'no_early_notice':True,'final_delivered':deliver(sink,e),'received':sink.received}
+else:
+    g=start('gateway-before-final');sink=Sink();g[0].set();first=get();assert first['task_failure_notice']
+    results['gateway']={'first_notice_accepted':deliver(sink,first),'after_notice':ad.get_durable_delegation('gateway-before-final')}
+    g[1].set();second=get();results['gateway']['second_notice_accepted']=deliver(sink,second)
+    g[2].set();final=get();assert not final.get('task_failure_notice')
+    results['gateway']['final_accepted']=deliver(sink,final)
+    results['gateway']['received']=sink.received
+    results['gateway']['after_final']=ad.get_durable_delegation('gateway-before-final')
+    print('GATEWAY_RECEIVED', [k for k,_ in sink.received])
+    assert [kind for kind,_ in sink.received]==['notice','notice','final'], 'fixed head must deliver both notices AND the final'
+    # Parent busy: the queued first notice gets accepted only after final persisted.
+    g=start('busy-parent');g[0].set();notice=get();g[1].set();second=get();g[2].set();final=get()
+    claim=ad.claim_event_delivery(notice,'tui-poller');assert claim=='', 'an interim notice must be NON-durable (empty claim token)'
+    ad.complete_event_delivery(notice,claim)
+    final_claim=ad.claim_event_delivery(final,'tui-poller')
+    results['busy_parent']={'notice_claimed':bool(claim),'final_claim':final_claim,'row':ad.get_durable_delegation('busy-parent')}
+    assert final_claim, 'the final result must still be claimable after a notice was consumed'
+    # Different TUI UI-dedup keys do not fix shared durable claim identity.
+    from tui_gateway.session_notifications import _notification_event_dedup_key
+    results['busy_parent']['ui_keys_differ']=_notification_event_dedup_key(notice)!=_notification_event_dedup_key(final)
+print(json.dumps(results,indent=2),flush=True)
+print('PROBE_COMPLETE',flush=True)
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\review_probes\rewrite_hint_probe.py ===
+"""#103551: remote backend, FIFO, and quadratic-time hazards of the rewrite hint
+
+Independent-review probe (written by the /review subagent for tracking issue #103563, adapted here).
+It reproduced a defect in the first version of the PR; the fixed head must pass it. Paths are taken
+from the command line / environment, never hard-coded. Usage: see the argument parsing at the top of the file.
+"""
+import sys, os, pathlib, tempfile, json, time, signal
+from unittest.mock import patch
+root=pathlib.Path(tempfile.mkdtemp(prefix='hint-probe-'))
+sys.path.insert(0, sys.argv[1] if len(sys.argv)>1 else os.getcwd())  # repo root under test
+os.environ['HERMES_HOME']=tempfile.mkdtemp(dir=root)
+os.environ['TERMINAL_ENV']='local'
+from tools import file_tools as f
+from tools.file_operations import WriteResult
+print('module',f.__file__)
+with tempfile.TemporaryDirectory(dir=root) as d:
+ p=pathlib.Path(d)/'file.txt'
+ for n in [1000,4000,10000,20000]:
+  old='same repetitive record\n'*n;p.write_text(old, encoding='utf-8');new=old+'end\n'
+  start=time.monotonic(); hint=f._whole_file_rewrite_hint('default',str(p),new)
+  print('repeat',n,len(old),round(time.monotonic()-start,3),bool(hint),flush=True)
+ old=''.join(f'{i} arbitrary unique data for test\n' for i in range(1500));p.write_text(old, encoding='utf-8')
+ new=old.replace('750 arbitrary','750 edited')
+ start=time.monotonic();r=json.loads(f.write_file_tool(str(p),new,task_id='review'))
+ print('live-write',round(time.monotonic()-start,3),r,p.read_text(encoding='utf-8')==new,flush=True)
+ class RemoteOps:
+  env=object()
+  def write_file(self,path,content):
+   self.written=(path,content)
+   return WriteResult(bytes_written=len(content),verified=True)
+ ops=RemoteOps()
+ p.write_text(old, encoding='utf-8')
+ with patch.object(f,'_get_file_ops',return_value=ops):
+  print('remote_backend_is_host',f._file_ops_uses_host_paths(ops))
+  r=json.loads(f.write_file_tool(str(p),new,task_id='remote-review'))
+ print('remote_empty_target_hint_from_host',r.get('hint'), 'host_unchanged',p.read_text(encoding='utf-8')==old,flush=True)
+ fifo=pathlib.Path(d)/'pipe.txt';os.mkfifo(fifo)
+ alarms=[]
+ def alarm(sig,frame):
+  alarms.append(time.monotonic())
+  raise TimeoutError('host FIFO read blocked')
+ signal.signal(signal.SIGALRM,alarm)  # windows-footgun: ok — POSIX-only FIFO hazard probe
+ with patch.object(f,'_get_file_ops',return_value=ops):
+  start=time.monotonic();signal.alarm(2)
+  try: print('remote_fifo',f.write_file_tool(str(fifo),'x'*20000,task_id='remote-fifo'), 'seconds',time.monotonic()-start,'read_alarm_fired',bool(alarms))
+  finally:signal.alarm(0)
+  with patch.object(f,'_whole_file_rewrite_hint',return_value=None):
+   start=time.monotonic();print('remote_fifo_base_no_hint',f.write_file_tool(str(fifo),'x'*20000,task_id='remote-fifo'), 'seconds',time.monotonic()-start)
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\review_probes\scanner_bypass_probe.py ===
+"""#103492: a hardline command hidden after a NEWLINE inside a double-quoted $(grep …) must stay blocked
+by the public guard with no approval callback; a grep with a backtick operand must stay allowed.
+
+Independent-review probe (written by the /review subagent for tracking issue #103563, adapted). It
+reproduced an approval bypass in the first version of the PR (approved, 0 callbacks). Runs the real
+public guard (check_dangerous_command) in a temp HERMES_HOME with approvals.mode=manual and executes a
+HARMLESS Bash witness (reboot shadowed by a function writing a marker) to prove reachability.
+
+Usage: python scanner_bypass_probe.py <repo_root> [<baseline_approval_detection.py>]
+"""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+ROOT=Path(sys.argv[1]).resolve()  # repo root under test
+sys.path.insert(0,str(ROOT))
+home=Path(tempfile.mkdtemp(prefix='review103492-confirm-'))
+os.environ['HERMES_HOME']=str(home)
+os.environ['HERMES_INTERACTIVE']='1'
+(home/'config.yaml').write_text('approvals:\n  mode: manual\n  timeout: 1\n', encoding='utf-8')
+from tools import approval_detection as d
+from tools import approval as a
+b=None
+if len(sys.argv)>2:  # optional: path to a baseline approval_detection.py (e.g. from main) to compare verdicts
+    spec=importlib.util.spec_from_file_location('baseline',sys.argv[2]); b=importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+r='re'+'boot'
+cmd='echo "$(grep -P \'safe\' /dev/null\n'+r+')"'
+print(json.dumps({'module':d.__file__,'approval_module':a.__file__,'case':'newline command','command':cmd,'baseline':(b.detect_hardline_command(cmd) if b else None),'head':d.detect_hardline_command(cmd),'variants':list(d._command_detection_variants(cmd))}))
+calls=[]
+def deny(*args,**kwargs):
+    calls.append([args,kwargs]);return 'deny'
+print(json.dumps({'pattern_guard':a.check_dangerous_command(cmd,'local',approval_callback=deny),'combined_guard':a.check_all_command_guards(cmd,'local',approval_callback=deny),'callback_calls':calls},default=str))
+# Shadow the dangerous command name with a harmless function; verify shell
+# execution and marker contents, never invoke a host shutdown binary.
+marker=home/'marker'
+prefix=r+'(){ printf executed > "$MARKER"; }; '
+p=subprocess.run(['/bin/bash','--noprofile','--norc','-c',prefix+cmd],env={'PATH':'/usr/bin:/bin','HOME':str(home),'MARKER':str(marker)},capture_output=True,text=True, encoding='utf-8', errors='replace',timeout=5)
+assert marker.read_text(encoding='utf-8')=='executed'
+print(json.dumps({'case':'newline safe execution','exit':p.returncode,'marker':marker.read_text(encoding='utf-8'),'stdout':p.stdout,'stderr':p.stderr}))
+# Prove the benign backtick argument really is well-formed and matches input.
+f=home/'f';f.write_text('needle\n', encoding='utf-8')
+cmd='grep -e `printf needle` '+str(f)
+p=subprocess.run(['/bin/bash','--noprofile','--norc','-c',cmd],env={'PATH':'/usr/bin:/bin','HOME':str(home)},capture_output=True,text=True, encoding='utf-8', errors='replace',timeout=5)
+assert p.returncode==0 and p.stdout=='needle\n'
+print(json.dumps({'case':'backtick argument','command':cmd,'baseline':(b.detect_hardline_command(cmd) if b else None),'head':d.detect_hardline_command(cmd),'tokens':d._shell_tokens_with_spans(cmd,0),'exit':p.returncode,'stdout':p.stdout}))
+# Reporter's exact spelling, fixture makes the sed address meaningful.
+with tempfile.TemporaryDirectory() as tmp:
+    Path(tmp,'f').write_text('X\ny\nz\nw\n', encoding='utf-8')
+    cmd='sed -n "$(grep -n X f | cut -d: -f1),+3p" f'
+    p=subprocess.run(['/bin/bash','--noprofile','--norc','-c',cmd],cwd=tmp,env={'PATH':'/usr/bin:/bin','HOME':str(home)},capture_output=True,text=True, encoding='utf-8', errors='replace',timeout=5)
+    assert p.returncode==0 and p.stdout=='X\ny\nz\nw\n'
+    print(json.dumps({'case':'reported real fixture','baseline':(b.detect_hardline_command(cmd) if b else None),'head':d.detect_hardline_command(cmd),'exit':p.returncode,'stdout':p.stdout}))
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\review_probes\__init__.py ===
+

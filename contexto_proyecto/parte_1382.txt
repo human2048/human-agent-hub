@@ -1,0 +1,299 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\browser\_common.py ===
+"""Shared base for the bundled cloud-browser plugins. Every vendor speaks the same REST shape
+(POST to create a session, one request to release it); :class:`CloudBrowserProvider` owns that
+lifecycle, subclasses supply attributes + hooks. Logs go to the subclass module's logger with the
+vendor label so emitted text matches the pre-refactor per-vendor modules."""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any, Dict, List, Optional
+
+import requests
+
+from agent.browser_provider import BrowserProvider
+
+_CLOSE_OK = {200, 201, 204}
+
+
+class CloudBrowserProvider(BrowserProvider):
+    """Subclasses set ``provider_id``/``label``, ``release_method``/``release_path`` (``{session_id}``
+    placeholder appended to ``config["base_url"]``), implement ``_get_config_or_none()`` and
+    ``_headers(config)``, and build ``create_session`` on ``_post_create``/``_check_created``."""
+
+    provider_id: str
+    label: str
+    release_method: str
+    release_path: str
+    missing_credentials_error: str = ""
+    setup_tag: Optional[str] = None  # ``None`` hides the provider from the setup picker
+    setup_env_vars: List[Dict[str, str]] = []
+    create_label_suffix: str = ""  # "Failed to create <label><suffix> session"; Firecrawl: " browser"
+    close_fail_fmt: Optional[str] = None  # Browserbase's close warning historically omits the vendor
+
+    @property
+    def name(self) -> str:
+        return self.provider_id
+
+    @property
+    def display_name(self) -> str:
+        return self.label
+
+    @property
+    def _log(self) -> logging.Logger:
+        return logging.getLogger(type(self).__module__)
+
+    def is_available(self) -> bool:
+        return self._get_config_or_none() is not None
+
+    def _get_config_or_none(self) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def _get_config(self) -> Dict[str, Any]:
+        config = self._get_config_or_none()
+        if config is None:
+            raise ValueError(self.missing_credentials_error)
+        return config
+
+    def _headers(self, config: Dict[str, Any]) -> Dict[str, str]:
+        raise NotImplementedError
+
+    def _release_headers(self, config: Dict[str, Any]) -> Dict[str, str]:
+        return self._headers(config)
+
+    def _release_body(self, config: Dict[str, Any]) -> Optional[Dict[str, object]]:
+        return None
+
+    def _release(self, config: Dict[str, Any], session_id: str, timeout: int) -> requests.Response:
+        kwargs: Dict[str, Any] = {"headers": self._release_headers(config), "timeout": timeout}
+        body = self._release_body(config)
+        if body is not None:
+            kwargs["json"] = body
+        url = f"{config['base_url']}{self.release_path.format(session_id=session_id)}"
+        return getattr(requests, self.release_method)(url, **kwargs)
+
+    @staticmethod
+    def _session_name(task_id: str) -> str:
+        return f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
+
+    def _post_create(
+        self, url: str, headers: Dict[str, str], payload: Dict[str, object], *, wrap_errors: bool = True
+    ) -> requests.Response:
+        """POST the create request; network failures → RuntimeError unless the managed gateway
+        caller needs the raw exception to retry."""
+        try:
+            return requests.post(url, headers=headers, json=payload, timeout=30)
+        except requests.RequestException as exc:
+            if not wrap_errors:
+                raise
+            raise RuntimeError(f"{self.label} API connection failed: {exc}") from exc
+
+    def _check_created(self, response: requests.Response) -> None:
+        if not response.ok:
+            raise RuntimeError(
+                f"Failed to create {self.label}{self.create_label_suffix} session: "
+                f"{response.status_code} {response.text}")
+
+    def close_session(self, session_id: str) -> bool:
+        try:
+            config = self._get_config()
+        except ValueError:
+            self._log.warning("Cannot close %s session %s — missing credentials", self.label, session_id)
+            return False
+        try:
+            response = self._release(config, session_id, timeout=10)
+            if response.status_code in _CLOSE_OK:
+                self._log.debug("Successfully closed %s session %s", self.label, session_id)
+                return True
+            self._log.warning(
+                self.close_fail_fmt or f"Failed to close {self.label} session %s: HTTP %s - %s",
+                session_id, response.status_code, response.text[:200])
+            return False
+        except Exception as e:
+            self._log.error("Exception closing %s session %s: %s", self.label, session_id, e)
+            return False
+
+    def emergency_cleanup(self, session_id: str) -> None:
+        config = self._get_config_or_none()
+        if config is None:
+            self._log.warning(
+                "Cannot emergency-cleanup %s session %s — missing credentials", self.label, session_id
+            )
+            return
+        try:
+            self._release(config, session_id, timeout=5)
+        except Exception as e:
+            self._log.debug("Emergency cleanup failed for %s session %s: %s", self.label, session_id, e)
+
+    def get_setup_schema(self) -> Optional[Dict[str, Any]]:
+        if self.setup_tag is None:
+            return None
+        return {
+            "name": self.label,
+            "badge": "paid",
+            "tag": self.setup_tag,
+            "env_vars": [dict(v) for v in self.setup_env_vars],
+            # Cloud-scoped hook: installs the agent-browser CLI only (the vendor hosts Chromium).
+            "post_setup": "browserbase",
+        }
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\browser\browserbase\provider.py ===
+"""Browserbase cloud browser provider: direct ``BROWSERBASE_API_KEY`` + ``BROWSERBASE_PROJECT_ID``
+only (the Nous subscription routes through Browser Use). Config ``browser.cloud_provider:
+"browserbase"``; knobs ``BROWSERBASE_BASE_URL``, ``BROWSERBASE_PROXIES`` (true),
+``BROWSERBASE_ADVANCED_STEALTH`` (false), ``BROWSERBASE_KEEP_ALIVE`` (true),
+``BROWSERBASE_SESSION_TIMEOUT`` (seconds, max 21600)."""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Dict, Optional
+
+from agent.secret_scope import get_secret
+from plugins.browser._common import CloudBrowserProvider
+
+logger = logging.getLogger(__name__)
+
+# 402 fallbacks, in retry order: (session_config key, warning logged when dropped).
+_PAID_FEATURE_FALLBACKS = (
+    ("keepAlive", "keepAlive may require paid plan (402), retrying without it. "
+                  "Sessions may timeout during long operations."),
+    ("proxies", "Proxies unavailable (402), retrying without proxies. "
+                "Bot detection may be less effective."))
+
+
+class BrowserbaseBrowserProvider(CloudBrowserProvider):
+    """Browserbase (https://browserbase.com) cloud browser backend."""
+
+    provider_id = "browserbase"
+    label = "Browserbase"
+    release_method = "post"
+    release_path = "/v1/sessions/{session_id}"
+    missing_credentials_error = (
+        "Browserbase requires BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID "
+        "environment variables.")
+    close_fail_fmt = "Failed to close session %s: HTTP %s - %s"
+    setup_tag = "Cloud browser with stealth and proxies"
+    setup_env_vars = [
+        {"key": "BROWSERBASE_API_KEY", "prompt": "Browserbase API key", "url": "https://browserbase.com"},
+        {"key": "BROWSERBASE_PROJECT_ID", "prompt": "Browserbase project ID"},
+    ]
+
+    def _get_config_or_none(self) -> Optional[Dict[str, Any]]:
+        api_key = get_secret("BROWSERBASE_API_KEY")
+        project_id = get_secret("BROWSERBASE_PROJECT_ID")
+        if not (api_key and project_id):
+            return None
+        return {
+            "api_key": api_key,
+            "project_id": project_id,
+            # Per-profile like the key: the scoped key must not be sent to the default profile's endpoint.
+            "base_url": (get_secret("BROWSERBASE_BASE_URL", "") or "https://api.browserbase.com").rstrip("/"),
+        }
+
+    def _headers(self, config: Dict[str, Any]) -> Dict[str, str]:
+        return {"Content-Type": "application/json", "X-BB-API-Key": config["api_key"]}
+
+    def _release_headers(self, config: Dict[str, Any]) -> Dict[str, str]:
+        return {"X-BB-API-Key": config["api_key"], "Content-Type": "application/json"}
+
+    def _release_body(self, config: Dict[str, Any]) -> Dict[str, object]:
+        return {"projectId": config["project_id"], "status": "REQUEST_RELEASE"}
+
+    def create_session(self, task_id: str) -> Dict[str, object]:
+        config = self._get_config()
+        enable_proxies = os.environ.get("BROWSERBASE_PROXIES", "true").lower() != "false"
+        enable_advanced_stealth = os.environ.get("BROWSERBASE_ADVANCED_STEALTH", "false").lower() == "true"
+        enable_keep_alive = os.environ.get("BROWSERBASE_KEEP_ALIVE", "true").lower() != "false"
+        custom_timeout_ms = os.environ.get("BROWSERBASE_SESSION_TIMEOUT")
+
+        session_config: Dict[str, object] = {"projectId": config["project_id"]}
+        if enable_keep_alive:
+            session_config["keepAlive"] = True
+        if custom_timeout_ms:
+            try:
+                timeout_val = int(custom_timeout_ms)
+                if timeout_val > 0:
+                    session_config["timeout"] = timeout_val
+            except ValueError:
+                logger.warning("Invalid BROWSERBASE_SESSION_TIMEOUT value: %s", custom_timeout_ms)
+        if enable_proxies:
+            session_config["proxies"] = True
+        if enable_advanced_stealth:
+            session_config["browserSettings"] = {"advancedStealth": True}
+
+        url = f"{config['base_url']}/v1/sessions"
+        headers = self._headers(config)
+        response = self._post_create(url, headers, session_config)
+
+        # 402 — paid features unavailable: drop keepAlive, then proxies, and retry.
+        dropped = set()
+        for key, warning in _PAID_FEATURE_FALLBACKS:
+            if response.status_code == 402 and key in session_config:
+                dropped.add(key)
+                logger.warning(warning)
+                session_config.pop(key)
+                response = self._post_create(url, headers, session_config)
+        self._check_created(response)
+
+        session_data = response.json()
+        session_name = self._session_name(task_id)
+        features_enabled = {
+            "basic_stealth": True,
+            "proxies": enable_proxies and "proxies" not in dropped,
+            "advanced_stealth": enable_advanced_stealth,
+            "keep_alive": enable_keep_alive and "keepAlive" not in dropped,
+            "custom_timeout": bool(custom_timeout_ms) and "timeout" in session_config,
+        }
+        feature_str = ", ".join(k for k, v in features_enabled.items() if v)
+        logger.info("Created Browserbase session %s with features: %s", session_name, feature_str)
+        return {
+            "session_name": session_name,
+            "bb_session_id": session_data["id"],
+            "cdp_url": session_data["connectUrl"],
+            "features": features_enabled,
+        }
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import requests  # noqa: F401,E402
+import uuid  # noqa: F401,E402
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'BrowserProvider': ('agent.browser_provider', 'BrowserProvider'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\browser\browserbase\__init__.py ===
+"""Browserbase cloud browser plugin — bundled, auto-loaded."""
+
+from __future__ import annotations
+
+from plugins.browser.browserbase.provider import BrowserbaseBrowserProvider
+
+
+def register(ctx) -> None:
+    ctx.register_browser_provider(BrowserbaseBrowserProvider())
+

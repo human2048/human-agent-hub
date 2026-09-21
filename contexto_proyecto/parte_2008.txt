@@ -1,0 +1,360 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_oat_authtype.py ===
+"""Regression tests for #63737: sk-ant-oat pool entries are OAuth."""
+
+import json
+from pathlib import Path
+
+from agent.credential_pool import (
+    AUTH_TYPE_API_KEY,
+    AUTH_TYPE_OAUTH,
+    CredentialPool,
+    PooledCredential,
+)
+
+
+
+
+def test_anthropic_real_api_key_unchanged():
+    entry = PooledCredential.from_dict(
+        "anthropic",
+        {"auth_type": "api_key", "access_token": "sk-ant-api-EXAMPLE"},
+    )
+    assert entry.auth_type == AUTH_TYPE_API_KEY
+
+
+
+
+
+
+
+
+def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.read_claude_code_credentials",
+        lambda: None,
+    )
+    token = "sk-ant-oat-legacy-manual"
+    auth_file = hermes_home / "auth.json"
+    auth_file.write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "anthropic": [{
+                "id": "legacy-oat",
+                "label": "Legacy setup token",
+                "auth_type": AUTH_TYPE_API_KEY,
+                "priority": 0,
+                "source": "manual",
+                "access_token": token,
+            }],
+        },
+    }))
+
+    from agent.anthropic_credentials import resolve_anthropic_token
+    from agent.credential_pool import load_pool
+
+    entry = load_pool("anthropic").entries()[0]
+    persisted = json.loads(auth_file.read_text())
+    assert entry.auth_type == AUTH_TYPE_OAUTH
+    assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_OAUTH
+    assert resolve_anthropic_token() == token
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_oauth_writethrough.py ===
+"""Credential-pool OAuth refresh persistence.
+
+Single-use refresh tokens (Codex, xAI, Anthropic PKCE) must be POSTed under the cross-process
+auth lock and the rotated pair committed back to the store/singleton that seeds the pool, or the
+next ``load_pool()`` re-seeds the consumed pair over the rotated one. Real on-disk stores under
+``tmp_path``; only the token endpoint is faked.
+"""
+
+import json
+import time
+
+from agent import credential_pool as CP
+from agent.credential_pool import (
+    AUTH_TYPE_OAUTH,
+    CredentialPool,
+    PooledCredential,
+    load_pool,
+)
+from hermes_cli import auth as A
+import hermes_cli.auth_codex as auth_codex
+
+
+def _write_store(path, store):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(store), encoding="utf-8")
+
+
+def _entry(provider: str, *, id: str, access_token: str, refresh_token: str):
+    return PooledCredential(
+        provider=provider,
+        id=id,
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="device_code",
+        access_token=access_token,
+        refresh_token=refresh_token,
+    )
+
+
+def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_path):
+    """The Codex OAuth pool refresh must POST under the cross-process auth lock.
+
+    Codex refresh tokens are single-use. If two Hermes processes both read the
+    same on-disk token and both POST it, the loser gets ``refresh_token_reused``.
+    Serializing the sync -> refresh POST -> write-back sequence through the
+    shared ``_auth_store_lock`` closes that window: a second process blocks on
+    the flock and, once inside, adopts the rotated token instead of re-POSTing.
+
+    This asserts the invariant directly — that ``refresh_codex_oauth_pure`` is
+    only ever called while the auth-store lock is held — rather than snapshotting
+    any token value.
+    """
+    provider = "openai-codex"
+    profile_path = tmp_path / "auth.json"
+    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+
+    lock_held: dict = {"during_post": None}
+    real_lock = A._auth_store_lock
+
+    depth = {"n": 0}
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def tracking_lock(*args, **kwargs):
+        depth["n"] += 1
+        try:
+            with real_lock(*args, **kwargs):
+                yield
+        finally:
+            depth["n"] -= 1
+
+    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
+    # credential_pool imported _auth_store_lock by name; patch that binding too.
+    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
+
+    def fake_refresh(access_token, refresh_token, **kwargs):
+        # The POST to the token endpoint must happen with the lock held.
+        lock_held["during_post"] = depth["n"] > 0
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2020-01-02T00:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", fake_refresh)
+
+    entry = _entry(
+        provider,
+        id="codex-1",
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+    )
+    pool = CredentialPool(provider, [entry])
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.access_token == "rotated-access"
+    assert refreshed.refresh_token == "rotated-refresh"
+    # The invariant: the single-use token POST ran inside the auth-store lock.
+    assert lock_held["during_post"] is True
+
+
+def test_hermes_pkce_refresh_writes_back_to_singleton(tmp_path, monkeypatch):
+    """A successful hermes_pkce refresh must update
+    ~/.hermes/.anthropic_oauth.json, or ``_seed_from_singletons()`` on the
+    next ``load_pool()`` re-seeds the pre-refresh (already-consumed,
+    single-use) token pair over the freshly rotated one.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+
+    oauth_file = hermes_home / ".anthropic_oauth.json"
+    oauth_file.write_text(
+        json.dumps({"accessToken": "sk-ant-oat-rt0", "refreshToken": "rt0", "expiresAt": 0}),
+        encoding="utf-8",
+    )
+    _write_store(hermes_home / "auth.json", {"version": 1, "providers": {}})
+
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "sk-ant-oat-rt1",
+            "refresh_token": "rt1",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="pool-entry",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="hermes_pkce",
+        access_token="sk-ant-oat-rt0",
+        refresh_token="rt0",
+    )
+    pool = CredentialPool("anthropic", [entry])
+    updated = pool._refresh_entry(entry, force=True)
+    assert updated is not None
+    assert updated.refresh_token == "rt1"
+
+    on_disk = json.loads(oauth_file.read_text(encoding="utf-8"))
+    assert on_disk["refreshToken"] == "rt1", (
+        "successful hermes_pkce refresh must write back to "
+        "~/.hermes/.anthropic_oauth.json, or _seed_from_singletons() will "
+        "revert the pool entry to the pre-refresh (spent) token on next load"
+    )
+
+    reloaded = load_pool("anthropic")
+    reloaded_entries = [e for e in reloaded.entries() if e.source.endswith("hermes_pkce")]
+    assert reloaded_entries, "hermes_pkce entry should still be present after reload"
+    assert reloaded_entries[0].refresh_token == "rt1", (
+        "regression: fresh load_pool() re-seeded the pre-refresh refresh "
+        "token from the stale singleton file, reverting a successful "
+        "rotation and orphaning the already-consumed rt0"
+    )
+
+
+def test_manual_hermes_pkce_refresh_does_not_create_duplicate_singleton(
+    tmp_path, monkeypatch
+):
+    """A pool-owned manual:hermes_pkce entry must not create a second source."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "manual-at-1",
+            "refresh_token": "manual-rt-1",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+    _write_store(hermes_home / "auth.json", {"version": 1, "providers": {}})
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="manual-entry",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:hermes_pkce",
+        access_token="manual-at-0",
+        refresh_token="manual-rt-0",
+        expires_at_ms=0,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "manual-rt-1"
+    oauth_file = hermes_home / ".anthropic_oauth.json"
+    assert not oauth_file.exists(), (
+        "manual:hermes_pkce is already pool-owned; refreshing it must not "
+        "create a second hermes_pkce singleton source"
+    )
+
+    reloaded = load_pool("anthropic")
+    matching = [e for e in reloaded.entries() if e.id == "manual-entry"]
+    assert len(matching) == 1
+    assert matching[0].source == "manual:hermes_pkce"
+    assert matching[0].refresh_token == "manual-rt-1"
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_operations.py ===
+"""Durable pool administration and selection invariants."""
+import time
+from dataclasses import replace
+
+import pytest
+
+from agent.credential_pool import CredentialPool, PooledCredential
+from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+
+def _pool(provider="openrouter", *, exhausted=False):
+    rows = [PooledCredential(
+        provider=provider, id=f"row{i}", label=f"account{i}", source="manual",
+        auth_type="api_key", access_token=f"fixture-{i}", priority=i,
+        last_status="exhausted" if exhausted else None,
+        last_status_at=time.time() if exhausted else None,
+        last_error_code=429 if exhausted else None,
+        last_error_reset_at=time.time() + 3600 if exhausted else None,
+    ) for i in range(2)]
+    write_credential_pool(provider, [e.to_dict() for e in rows])
+    return CredentialPool(provider, rows)
+
+
+def test_target_reset_preserves_sibling_cooldown():
+    pool = _pool(exhausted=True)
+    before = read_credential_pool(pool.provider)
+    assert pool.reset_status("missing") is None
+    assert read_credential_pool(pool.provider) == before
+    assert pool.reset_status("row1").last_status is None
+    after = {e["id"]: e for e in read_credential_pool(pool.provider)}
+    assert after["row0"] == before[0]
+    assert after["row1"].get("last_error_reset_at") is None
+    assert pool.reset_statuses() == 1
+    assert all(e.get("last_status") is None for e in read_credential_pool(pool.provider))
+
+
+@pytest.mark.parametrize("strategy", ["fill_first", "round_robin", "random", "least_used"])
+def test_selection_counts_only_returned_selections(strategy):
+    pool = _pool()
+    pool._strategy = strategy
+    selected = [pool.select().id for _ in range(2)]
+    assert {e.id: e.request_count for e in pool.entries()} == {
+        e.id: selected.count(e.id) for e in pool.entries()}
+    pool.reset_status("row0")  # existing persistence boundary, not a selection
+    assert sum(e.get("request_count", 0) for e in read_credential_pool(pool.provider)) == 2
+    pool._current_id = None
+    pool.try_refresh_matching()  # API key is not refreshable; lookup must not count
+    assert sum(e.request_count for e in pool.entries()) == 2
+    assert pool.peek() is not None
+    assert sum(e.request_count for e in pool.entries()) == 2
+
+
+def test_priority_persists_contiguous_order_without_clearing_cooldown():
+    pool = _pool(exhausted=True)
+    before = {e.id: e.last_error_reset_at for e in pool.entries()}
+    assert pool.move_entry("row1", -5).priority == 0
+    assert [e["id"] for e in read_credential_pool(pool.provider)] == ["row1", "row0"]
+    assert pool.move_entry("row1", 99).priority == 1
+    assert [(e.id, e.priority) for e in pool.entries()] == [("row0", 0), ("row1", 1)]
+    assert {e.id: e.last_error_reset_at for e in pool.entries()} == before
+    snapshot = read_credential_pool(pool.provider)
+    assert pool.move_entry("missing", 0) is None
+    assert read_credential_pool(pool.provider) == snapshot
+
+
+def test_priority_honors_anthropic_manual_first():
+    pool = _pool("anthropic")
+    pool._entries[1] = replace(pool._entries[1], source="env:ANTHROPIC_API_KEY")
+    assert pool.move_entry("row1", 0).priority == 1
+    assert [e.id for e in pool.entries()] == ["row0", "row1"]
+

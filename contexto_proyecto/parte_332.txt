@@ -1,0 +1,260 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\api_delegation_http_probe.py ===
+"""Loopback HTTP + real API executor/session bindings, with inference replaced.
+
+No paid model calls. Captures what the runtime hands the model, not provider behavior.
+"""
+import asyncio
+import inspect
+import json
+import os
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+
+async def probe():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import get_session_env
+    from gateway.wake import persist_delegation_delivery
+    from hermes_state import SessionDB
+    from tools.delegate_tool_dispatch import _resolve_async_wake_sid
+    import gateway.session_context as sc
+
+    db = SessionDB(db_path=Path(os.environ["HERMES_HOME"]) / "state.db")
+    db.create_session("parent", source="api_server")
+    db.append_message("parent", "user", "request")
+    db.append_message("parent", "assistant", "acknowledged")
+    db.end_session("parent", "compression")
+    db.create_session("child", source="api_server", parent_session_id="parent")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "fixture-api-key"}))
+    adapter._session_db = db
+    captured = []
+
+    def create_agent(**kwargs):
+        agent = MagicMock()
+        agent.session_id = kwargs.get("session_id")
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        def run(**turn):
+            sid = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            args = [sid]
+            if len(inspect.signature(_resolve_async_wake_sid).parameters) > 1:
+                args.append(sc.session_history_delivery_supported())
+            captured.append({"session_id": sid, "target": _resolve_async_wake_sid(*args), "history": turn.get("conversation_history")})
+            callback = kwargs.get("stream_delta_callback")
+            if callback:
+                callback("fixture reply")
+            return {"final_response": "fixture reply", "session_id": sid, "messages": [], "api_calls": 1}
+        agent.run_conversation.side_effect = run
+        return agent
+    adapter._create_agent = create_agent
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    records = []
+    runs = []
+    async with TestClient(TestServer(app)) as client:
+        for stream in (False, True):
+            for explicit in (False, True):
+                headers = {"Authorization": "Bearer fixture-api-key"}
+                if explicit:
+                    headers["X-Hermes-Session-Id"] = "parent"
+                response = await client.post("/v1/chat/completions", headers=headers, json={"messages": [{"role": "user", "content": "continue"}], "stream": stream})
+                body = await response.text()
+                records.append({"stream": stream, "explicit": explicit, "status": response.status, "header": response.headers.get("X-Hermes-Session-Id"), "runtime": captured[-1] if captured else None, "body": body[:120]})
+        calls_before = len(captured)
+        evt = {"type": "async_delegation", "delegation_id": "unit-http"}
+        delivery_error = None
+        try:
+            await asyncio.gather(*(persist_delegation_delivery(adapter, text="DELIVERY_RESULT", session_id="parent", evt=evt) for _ in range(2)))
+        except Exception as exc:
+            delivery_error = type(exc).__name__
+        calls_after = len(captured)
+        response = await client.post("/v1/chat/completions", headers={"Authorization": "Bearer fixture-api-key", "X-Hermes-Session-Id": "parent"}, json={"messages": [{"role": "user", "content": "read result"}]})
+        await response.read()
+        resumed_history = captured[-1]["history"]
+        snapshot = [{"role": "user", "content": "caller snapshot"}]
+        adapter._response_store.put("resp-seed", {"conversation_history": snapshot, "session_id": "parent"})
+        db.create_session("declared", source="api_server", session_key="fixture-key")
+        db.append_message("declared", "assistant", "DECLARED_HISTORY")
+        for name, body, extra_headers in (
+            ("session", {"session_id": "parent"}, {}),
+            ("caller_history", {"session_id": "parent", "conversation_history": snapshot}, {}),
+            ("response_chain", {"previous_response_id": "resp-seed"}, {}),
+            ("declared_key", {}, {"X-Hermes-Session-Key": "fixture-key"}),
+        ):
+            count = len(captured)
+            response = await client.post("/v1/runs", headers={"Authorization": "Bearer fixture-api-key", **extra_headers}, json={"input": "continue", **body})
+            await response.read()
+            async def wait_for_run():
+                while len(captured) == count:
+                    await asyncio.sleep(0.01)
+            if response.status == 202:
+                await asyncio.wait_for(wait_for_run(), 10)
+            runs.append({"name": name, "status": response.status, "runtime": captured[-1] if len(captured) > count else None})
+    result = {"requests": records, "runs": runs, "delivery_error": delivery_error, "unsolicited_calls": calls_after-calls_before, "resumed_history": resumed_history, "durable_child_rows": len(db.get_messages("child"))}
+    db.close()
+    return result
+
+
+if __name__ == "__main__":
+    print(json.dumps(asyncio.run(probe()), indent=2, default=str))
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\api_delegation_sync_probe.py ===
+"""Model-free API delegation delivery probe; run in an isolated HERMES_HOME.
+
+Uses real request-context binding, dispatch policy and SQLite persistence. This
+is local mechanism evidence, not provider inference or native Windows evidence.
+"""
+import asyncio
+import inspect
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+
+async def probe():
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import clear_session_vars
+    from gateway.wake import persist_delegation_delivery
+    from hermes_state import SessionDB
+    from tools.delegate_tool_dispatch import _resolve_async_wake_sid
+
+    decisions = {}
+    for name, capable in (("headerless", ""), ("explicit", "1")):
+        kw = dict(chat_id="api-parent", session_id="api-parent")
+        if "session_history_delivery" in inspect.signature(APIServerAdapter._bind_api_server_session).parameters:
+            kw["session_history_delivery"] = capable
+        tokens = APIServerAdapter._bind_api_server_session(**kw)
+        try:
+            args = ["api-parent"]
+            if len(inspect.signature(_resolve_async_wake_sid).parameters) > 1:
+                args.append(capable == "1")
+            decisions[name] = _resolve_async_wake_sid(*args)
+        finally:
+            clear_session_vars(tokens)
+    db = SessionDB(db_path=Path(os.environ["HERMES_HOME"]) / "state.db")
+    db.create_session("api-parent", source="api_server")
+    db.create_session("stranger", source="api_server")
+    adapter = SimpleNamespace(_ensure_session_db=lambda: db)
+    evt = {"type": "async_delegation", "delegation_id": "probe-unit-1"}
+    await asyncio.gather(*(persist_delegation_delivery(adapter, text="OWNER_RESULT", session_id="api-parent", evt=evt) for _ in range(2)))
+    decisions["replayed_rows"] = len(db.get_messages("api-parent"))
+    db.end_session("api-parent", "compression")
+    db.create_session("api-child", source="api_server", parent_session_id="api-parent")
+    try:
+        await persist_delegation_delivery(adapter, text="LATE_RESULT", session_id="api-parent", evt={**evt, "delegation_id": "probe-unit-2"})
+        decisions["rotation"] = "persisted"
+    except Exception as exc:
+        decisions["rotation"] = type(exc).__name__
+    decisions["child_rows"] = len(db.get_messages("api-child"))
+    db.acquire_session_turn_lease("api-child", "fixture-client-turn", wait_seconds=0)
+    busy_evt = {**evt, "delegation_id": "busy-unit"}
+    try:
+        await persist_delegation_delivery(adapter, text="BUSY_RESULT", session_id="api-child", evt=busy_evt)
+        decisions["busy_delivery"] = "inserted"
+    except Exception as exc:
+        decisions["busy_delivery"] = type(exc).__name__
+    finally:
+        db.release_session_turn_lease("api-child", "fixture-client-turn")
+    await persist_delegation_delivery(adapter, text="BUSY_RESULT", session_id="api-child", evt=busy_evt)
+    decisions["after_release_rows"] = len(db.get_messages("api-child"))
+    decisions["stranger_rows"] = len(db.get_messages("stranger"))
+    db.close()
+    return decisions
+
+
+if __name__ == "__main__":
+    print(json.dumps(asyncio.run(probe()), indent=2))
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\approval_deny_dispatch.py ===
+"""Offline production-dispatch receipt; never invokes a privileged binary.
+
+Run with the shared Python environment and a source tree argument to compare
+base/head. The executable named sudo is an owned temporary marker script.
+"""
+import json
+import os
+from pathlib import Path
+import shlex
+import sys
+import tempfile
+
+source = Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix="hermes-deny-dispatch-") as directory:
+    home = Path(directory)
+    os.environ.clear()
+    # The terminal's own NOPASSWD probe must also resolve to our inert fixture.
+    os.environ.update(PATH=directory + ":/usr/bin:/bin", HOME=directory, HERMES_HOME=directory,
+                      HERMES_INTERACTIVE="1", TERMINAL_ENV="local")
+    (home / "config.yaml").write_text(
+        'approvals:\n  mode: "off"\n  deny: ["sudo *", "printf SAFE", "git status"]\n'
+        'security:\n  tirith_enabled: false\n', encoding="utf-8")
+    executable = home / "sudo"
+    executable.write_text('#!/bin/sh\nprintf "OWNED_EXECUTABLE_REACHED\\n"\n', encoding="utf-8")
+    executable.chmod(0o700)
+    # Prefer GNU env when the host's default env implements different -S syntax.
+    if Path("/usr/bin/gnuenv").exists():
+        (home / "env").symlink_to("/usr/bin/gnuenv")
+    sys.path.insert(0, str(source))
+    from tools import terminal_tool  # noqa: F401
+    from tools.registry import registry
+    from tools import approval_context
+
+    binary = shlex.quote(str(executable))
+    cases = [binary + " -n id -u", "env -i " + binary + " -n id -u",
+             "command " + binary + " -n id -u",
+             "true && " + binary + " -n id -u",
+             "bash -c " + shlex.quote(binary + " -n id -u"),
+             "printf '%s\\n' 'sudo -n id -u'",
+             "env -S 'printf %s; sudo -n id'", "env -S printf SAFE",
+             "env -S git status", "echo ok # ; bash -c " + shlex.quote(binary + " -n id"),
+             "env -S 'printf %s' 'sudo -n id'", "env -S printf BENIGN",
+             "env -S " + shlex.quote("bash -c " + shlex.quote(binary + " -n id")),
+             "echo ok # ignored\n bash -c " + shlex.quote(binary + " -n id")]
+    cases += [
+        r"env -S 'printf\_SAFE'", r"env -S 'printf\_SAFE\c ignored'",
+        "env -S 'printf SAFE # ignored'", "env -S 'printf # ignored' SAFE",
+        "env -a marker printf SAFE", "env --argv0 marker printf SAFE",
+        "env --argv0=marker printf SAFE", "env -amarker printf SAFE",
+        r"env -a marker -S 'printf\_SAFE'",
+        "env -S '\"printf\"\\_SAFE'", "env -S \"'printf' SAFE\"",
+        r"env -S 'printf\_\_SAFE'", r"env -S 'printf\c ignored' SAFE",
+        "env -a sudo printf BENIGN", "env --argv0 sudo printf BENIGN",
+        "env -S 'printf %s \"sudo\\_-n\\_id\"'",
+        r"env -S 'printf BENIGN\c bash -c sudo'",
+        "env -S 'printf BENIGN # bash -c sudo'",
+        r"env -S 'printf %s \${IGNORED}'",
+    ]
+    rows = []
+    for command in cases:
+        result = registry.dispatch("terminal", {"command": command, "workdir": directory, "timeout": 10})
+        if isinstance(result, str):
+            result = json.loads(result)
+        rows.append({"command": command, "result": result})
+    # Optional assertions keep the same harness usable for before/after receipts.
+    expected_outputs = {5: 'sudo -n id -u', 6: 'sudo;-n;id;', 9: 'ok',
+                        10: 'sudo -n id', 11: 'BENIGN', 27: 'BENIGN', 28: 'BENIGN',
+                        29: 'sudo -n id', 30: 'BENIGN', 31: 'BENIGN', 32: '${IGNORED}'}
+    if '--verify' in sys.argv:
+        for index, row in enumerate(rows):
+            result = row['result']
+            if index in expected_outputs:
+                assert result.get('exit_code') == 0, row
+                assert result.get('output', '').strip() == expected_outputs[index], row
+            else:
+                assert result.get('status') == 'blocked', row
+                assert 'user-defined deny rule' in result.get('error', ''), row
+                assert not result.get('output'), row
+    print(json.dumps({"source": str(source), "config": approval_context._get_approval_config(),
+                      "rows": rows}, indent=2))
+

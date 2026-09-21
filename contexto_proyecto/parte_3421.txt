@@ -1,0 +1,231 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_oauth_status_pool_observation.py ===
+"""A status snapshot observes the credential pool; it never leases (refreshes / rotates) an entry.
+
+``get_codex_auth_status`` / ``get_xai_oauth_auth_status`` back every credential-gated listing
+(``/model`` picker, ``hermes doctor``, dashboard cards). When that read ran ``pool.select()`` it
+refreshed an expiring single-use token, and a *transient* failure of that speculative POST benched
+the entry with a persisted cooldown — the picker then rendered the provider as unconfigured
+("needs setup" / "0 models") while the runtime resolver kept serving the same credential.
+
+Fixtures adapted from #114379 by @Finn763.
+"""
+
+import base64
+import json
+import time
+
+from agent import credential_pool
+from agent.credential_pool import load_pool
+from hermes_cli.auth import AuthError, DEFAULT_CODEX_BASE_URL, get_codex_auth_status
+
+
+def _jwt_with_exp(offset_seconds: int) -> str:
+    def _b64(payload: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).rstrip(b"=").decode("utf-8")
+
+    return f"{_b64({'alg': 'none'})}.{_b64({'exp': int(time.time()) + offset_seconds})}.sig"
+
+
+def _pool_only_codex_home(tmp_path, monkeypatch, *, access_tokens: list):
+    """HERMES_HOME whose only Codex credentials live in ``credential_pool.openai-codex``; the token
+    endpoint is a transient failure (the credential itself is still good)."""
+    import hermes_cli.auth as auth
+    import hermes_cli.codex_models as codex_models
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    entries = [
+        {"id": f"codex-pool-entry-{i}", "label": f"device_code-{i}", "auth_type": "oauth", "source": "device_code",
+         "priority": i, "request_count": 0, "access_token": token, "refresh_token": f"codex-refresh-token-{i}",
+         "base_url": DEFAULT_CODEX_BASE_URL}
+        for i, token in enumerate(access_tokens)
+    ]
+    (home / "auth.json").write_text(
+        json.dumps({"version": 1, "credential_pool": {"openai-codex": entries}}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-cli"))
+    monkeypatch.setattr(codex_models, "_fetch_models_from_api", lambda access_token: [])
+    refresh_calls: list = []
+
+    def _transient_failure(access_token, refresh_token, *args, **kwargs):
+        refresh_calls.append(refresh_token)
+        raise AuthError("Codex token refresh failed with status 503.", provider="openai-codex",
+                        code="codex_refresh_failed")
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _transient_failure)
+    return home, refresh_calls
+
+
+def _persisted_pool(home) -> list:
+    return json.loads((home / "auth.json").read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+
+
+def test_status_snapshot_does_not_refresh_or_bench_an_expiring_pool_entry(tmp_path, monkeypatch):
+    home, refresh_calls = _pool_only_codex_home(tmp_path, monkeypatch, access_tokens=[_jwt_with_exp(-3600)])
+
+    status = get_codex_auth_status()
+
+    assert refresh_calls == [], "a status read spent the single-use pool refresh token"
+    assert status["logged_in"] is True, status
+    assert [e.get("last_status") for e in _persisted_pool(home)] == [None]
+    assert load_pool("openai-codex").has_available() is True
+
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    rows = [r for r in list_authenticated_providers(current_provider="openai-codex", current_model="gpt-5.6-sol")
+            if r["slug"] == "openai-codex"]
+    assert rows and rows[0]["total_models"] > 0, rows
+
+    # Control: the runtime lease still refreshes the same entry.
+    load_pool("openai-codex").select()
+    assert refresh_calls == ["codex-refresh-token-0"]
+
+
+def test_status_snapshot_leaves_round_robin_order_and_counts_untouched(tmp_path, monkeypatch):
+    home, _ = _pool_only_codex_home(
+        tmp_path, monkeypatch, access_tokens=[_jwt_with_exp(3600), _jwt_with_exp(3600)])
+    monkeypatch.setattr(credential_pool, "get_pool_strategy", lambda provider: credential_pool.STRATEGY_ROUND_ROBIN)
+    before = _persisted_pool(home)
+
+    assert get_codex_auth_status()["logged_in"] is True
+    assert _persisted_pool(home) == before, "a status read rotated or re-counted the persisted pool"
+
+    # Control: a runtime selection still rotates and persists the new order.
+    load_pool("openai-codex").select()
+    assert _persisted_pool(home) != before
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_observational_sessiondb_modes.py ===
+"""Regression coverage for #110173: observational `hermes sessions` readers stay read-only."""
+
+from argparse import Namespace
+from unittest.mock import MagicMock
+
+import pytest
+
+import hermes_cli.sessions_cmd as sessions_cmd
+
+
+@pytest.mark.parametrize("action", ["list", "stats", "pinned"])
+def test_observational_sessions_actions_open_a_read_only_store(monkeypatch, action):
+    factory = MagicMock()
+    monkeypatch.setattr("hermes_state.SessionDB", factory)
+    monkeypatch.setitem(sessions_cmd._DB_HANDLERS, action, lambda _db, _args: None)
+
+    sessions_cmd.cmd_sessions(Namespace(sessions_action=action))
+
+    factory.assert_called_once_with(read_only=True)
+
+
+def test_sessions_observational_commands_on_missing_store_stay_empty(monkeypatch, tmp_path, capsys):
+    """Fresh profile: list/stats/pinned report empty without creating a writable store."""
+    import hermes_state
+
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(hermes_state, "_default_db_path", lambda: db_path)
+
+    list_args = Namespace(sessions_action="list", source=None, limit=20, workspace=None)
+    assert sessions_cmd.cmd_sessions(list_args) is None
+    assert "No sessions found." in capsys.readouterr().out
+
+    assert sessions_cmd.cmd_sessions(Namespace(sessions_action="stats")) is None
+    stats_out = capsys.readouterr().out
+    assert "Total sessions: 0" in stats_out
+    assert "Total messages: 0" in stats_out
+
+    pinned_args = Namespace(sessions_action="pinned", source=None, json=False)
+    assert sessions_cmd.cmd_sessions(pinned_args) is None
+    assert "No pinned sessions" in capsys.readouterr().out
+    assert not db_path.exists()
+
+
+def test_doctor_write_probe_never_touches_a_store_a_live_writer_holds(monkeypatch, tmp_path):
+    """The write probe runs against a read-only snapshot when a gateway holds state.db, in place otherwise."""
+    import sqlite3
+
+    import hermes_state_holders
+    import hermes_state_repair
+    from hermes_cli import doctor_state
+
+    state_db = tmp_path / "state.db"
+    sqlite3.connect(state_db).execute("CREATE TABLE sessions (id TEXT)").connection.close()
+    probed: list = []
+    monkeypatch.setattr(hermes_state_repair, "_db_opens_cleanly", lambda path: probed.append(path))
+
+    monkeypatch.setattr(hermes_state_holders, "live_writer_holds_db", lambda *_a, **_k: True)
+    assert doctor_state._write_health_reason(state_db, should_fix=False) is None
+    monkeypatch.setattr(hermes_state_holders, "live_writer_holds_db", lambda *_a, **_k: False)
+    assert doctor_state._write_health_reason(state_db, should_fix=False) is None
+
+    assert probed[0] != state_db and probed[0].name == "state.db"
+    assert probed[1] == state_db
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_official_openai_host.py ===
+"""Security + parity contract for ``is_official_openai_host``.
+
+One predicate decides "is this endpoint OpenAI's official API surface?"
+for every lane that branches on it: transport mandates
+(``host_mandated_api_mode``), URL auto-detection in the runtime resolver,
+model-catalog filtering, and live-listing authority. OpenAI's documented
+data-residency hosts (``us.api.openai.com``, ``eu.api.openai.com``, and any
+future ``<region>.api.openai.com``) are the same API surface as the
+canonical host and must match; lookalike/spoof hosts must not (#32243).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_cli.providers import is_official_openai_host
+
+
+class TestOfficialHosts:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.openai.com/v1",
+            "https://api.openai.com",
+            "https://us.api.openai.com/v1",
+            "https://eu.api.openai.com/v1",
+            "https://US.api.OpenAI.com/v1",  # case-insensitive hostname
+            "https://in.api.openai.com/v1",  # future regional variants
+            "https://api.openai.com:443/v1",  # port stripped by hostname parse
+            "https://api.openai.com./v1",  # trailing dot normalized
+            "https://attacker.test@us.api.openai.com/v1",  # userinfo stripped; real host wins
+        ],
+    )
+    def test_official_hosts_match(self, url):
+        assert is_official_openai_host(url) is True
+
+
+class TestSpoofRejection:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Lookalike host suffix: registrable domain is attacker.test.
+            "https://api.openai.com.attacker.test/v1",
+            "https://us.api.openai.com.attacker.test/v1",
+            # Path-segment spoofing: host is proxy.test.
+            "https://proxy.test/api.openai.com/v1",
+            "https://proxy.test/us.api.openai.com/v1",
+            # Prefix tricks that are NOT dot-separated subdomains of
+            # api.openai.com (fooapi.openai.com is an openai.com host but
+            # not the official API host family this predicate is scoped to).
+            "https://evilapi.openai.com.attacker.test/v1",
+            "https://fooapi.openai.com/v1",
+            # Unrelated hosts.
+            "https://openrouter.ai/api/v1",
+            "https://api.anthropic.com/v1",
+            # IPv6 literal and empty input.
+            "https://[::1]:8080/v1",
+            "",
+        ],
+    )
+    def test_spoof_and_unrelated_hosts_rejected(self, url):
+        assert is_official_openai_host(url) is False
+

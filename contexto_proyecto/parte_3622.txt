@@ -1,0 +1,396 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_hangup_protection.py ===
+"""Tests for SIGHUP protection and stdout mirroring in ``hermes update``.
+
+Covers ``_UpdateOutputStream``, ``_install_hangup_protection``, and
+``_finalize_update_output`` in ``hermes_cli/main.py``.  These exist so
+that ``hermes update`` survives a terminal disconnect mid-install
+(SSH drop, shell close) without leaving the venv half-installed.
+"""
+
+from __future__ import annotations
+
+import io
+import signal
+import sys
+
+import pytest
+
+from hermes_cli.main_dashboard import _UpdateOutputStream, _finalize_update_output, _install_hangup_protection
+from hermes_cli.update_cmd import _log_only_write, _print_update_completion, _run_logged_subprocess
+
+
+def test_update_completion_includes_bounded_action_identity(monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_ACTION_ID", "a" * 32)
+    # These tests pin the action-identity receipt contract, not the branch
+    # display — neutralize the branch+HEAD suffix added for the 2026-08-17
+    # parked-branch incident (covered by test_update_parked_branch_guard.py).
+    monkeypatch.setattr("hermes_cli.update_cmd._branch_head_suffix", lambda: "")
+
+    _print_update_completion("✓ Update complete!")
+
+    assert capsys.readouterr().out.splitlines() == [
+        "✓ Update complete!",
+        f"=== hermes-update completed {'a' * 32} ===",
+    ]
+
+
+def test_update_completion_rejects_untrusted_action_identity(monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_ACTION_ID", "not-safe\nforged")
+    monkeypatch.setattr("hermes_cli.update_cmd._branch_head_suffix", lambda: "")
+
+    _print_update_completion("✓ Update complete!")
+
+    assert capsys.readouterr().out == "✓ Update complete!\n"
+
+
+# -----------------------------------------------------------------------------
+# _UpdateOutputStream
+# -----------------------------------------------------------------------------
+
+
+class TestUpdateOutputStream:
+
+    def test_write_continues_after_broken_original(self):
+        """When the terminal disconnects, original.write raises BrokenPipeError.
+
+        The wrapper must catch it, flip the broken flag, and keep writing to
+        the log from then on.
+        """
+        log = io.StringIO()
+
+        class _BrokenStream:
+            def write(self, data):
+                raise BrokenPipeError("terminal gone")
+
+            def flush(self):
+                raise BrokenPipeError("terminal gone")
+
+        stream = _UpdateOutputStream(_BrokenStream(), log)
+
+        # First write triggers the broken-pipe path.
+        stream.write("first line\n")
+        # Subsequent writes take the fast broken path (no exception).
+        stream.write("second line\n")
+
+        assert log.getvalue() == "first line\nsecond line\n"
+        assert stream._original_broken is True
+
+
+
+
+    def test_isatty_delegates_to_original(self):
+        class _TtyStream:
+            def isatty(self):
+                return True
+
+            def write(self, data):
+                return len(data)
+
+            def flush(self):
+                return None
+
+        stream = _UpdateOutputStream(_TtyStream(), io.StringIO())
+        assert stream.isatty() is True
+
+
+# -----------------------------------------------------------------------------
+# _install_hangup_protection
+# -----------------------------------------------------------------------------
+
+
+class TestInstallHangupProtection:
+
+
+    def test_wraps_stdout_and_stderr_with_mirror(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Nuke any cached home path
+        import hermes_cli.config as _cfg
+        if hasattr(_cfg, "_HERMES_HOME_CACHE"):
+            _cfg._HERMES_HOME_CACHE = None  # type: ignore[attr-defined]
+
+        prev_out, prev_err = sys.stdout, sys.stderr
+        state = _install_hangup_protection(gateway_mode=False)
+
+        try:
+            # On Windows (no SIGHUP) we still wrap stdio and create the log.
+            assert state["installed"] is True
+            assert isinstance(sys.stdout, _UpdateOutputStream)
+            assert isinstance(sys.stderr, _UpdateOutputStream)
+            assert state["log_file"] is not None
+
+            sys.stdout.write("checking mirror\n")
+            sys.stdout.flush()
+
+            log_path = tmp_path / "logs" / "update.log"
+            assert log_path.exists()
+            contents = log_path.read_text(encoding="utf-8")
+            assert "checking mirror" in contents
+            assert "hermes update started" in contents
+        finally:
+            _finalize_update_output(state)
+            # Sanity-check restoration
+            assert sys.stdout is prev_out
+            assert sys.stderr is prev_err
+
+
+    def test_non_fatal_if_log_setup_fails(self, monkeypatch):
+        """If get_hermes_home() raises, stdio must be left untouched but SIGHUP still handled."""
+        prev_out, prev_err = sys.stdout, sys.stderr
+
+        def _boom():
+            raise RuntimeError("no home for you")
+
+        # Patch the import inside _install_hangup_protection.
+        monkeypatch.setattr(
+            "hermes_cli.config.get_hermes_home", _boom, raising=True
+        )
+
+        original_handler = (
+            signal.getsignal(signal.SIGHUP) if hasattr(signal, "SIGHUP") else None
+        )
+
+        state = _install_hangup_protection(gateway_mode=False)
+
+        try:
+            assert sys.stdout is prev_out
+            assert sys.stderr is prev_err
+            assert state["installed"] is False
+            # SIGHUP must still be installed even when log setup fails.
+            if hasattr(signal, "SIGHUP"):
+                assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+        finally:
+            _finalize_update_output(state)
+            if hasattr(signal, "SIGHUP") and original_handler is not None:
+                signal.signal(signal.SIGHUP, original_handler)
+
+
+# -----------------------------------------------------------------------------
+# _finalize_update_output
+# -----------------------------------------------------------------------------
+
+
+class TestFinalizeUpdateOutput:
+    def test_none_state_is_noop(self):
+        _finalize_update_output(None)  # must not raise
+
+
+    def test_skipped_install_leaves_stdio_alone(self):
+        """When install failed (state['installed']=False) finalize should not
+        touch sys.stdout / sys.stderr (they were never wrapped)."""
+        # Build a synthetic state that mimics a failed install.
+        sentinel_out = object()
+        state = {
+            "prev_stdout": sentinel_out,
+            "prev_stderr": sentinel_out,
+            "log_file": None,
+            "installed": False,
+        }
+        before_out, before_err = sys.stdout, sys.stderr
+
+        _finalize_update_output(state)
+
+        assert sys.stdout is before_out
+        assert sys.stderr is before_err
+
+
+# -----------------------------------------------------------------------------
+# _log_only_write / _run_logged_subprocess (spam suppression)
+# -----------------------------------------------------------------------------
+
+
+class TestLogOnlyWrite:
+
+    def test_plain_stdout_keeps_build_output_off_screen(self, monkeypatch):
+        """An unwrapped stdout must not receive log-only build output."""
+        plain = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", plain)
+        _log_only_write("something")  # should not raise
+        assert plain.getvalue() == ""
+
+    def test_empty_text_is_noop(self, monkeypatch):
+        terminal = io.StringIO()
+        log = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", _UpdateOutputStream(terminal, log))
+        _log_only_write("")
+        assert log.getvalue() == ""
+
+
+class TestRunLoggedSubprocess:
+    def test_captures_output_to_log_only(self, monkeypatch):
+        terminal = io.StringIO()
+        log = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", _UpdateOutputStream(terminal, log))
+
+        result = _run_logged_subprocess(
+            [sys.executable, "-c", "print('LOUD BUILD OUTPUT')"]
+        )
+
+        assert result.returncode == 0
+        assert "LOUD BUILD OUTPUT" in (result.stdout or "")
+        assert terminal.getvalue() == ""  # not echoed to terminal
+        assert "LOUD BUILD OUTPUT" in log.getvalue()  # but kept in the log
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_head_moved_gate.py ===
+"""Tests for the post-pull HEAD-movement gate in ``hermes update``.
+
+Issue #79678: a detached/pinned checkout can report "N new commit(s)"
+against origin, run the ff-only merge successfully, and still sit on the
+old commit afterward (the branch-switch step re-detaches to the raw SHA).
+Before this guard ``hermes update`` printed "✓ Code updated!" and
+reinstalled deps + rebuilt the desktop app against the stale tree — no
+error, no warning. The gate compares the pre-pull and post-pull HEAD SHA
+and fails loudly when the update was a no-op.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_cli import main as hermes_main
+import hermes_cli.main_web_build as main_web_build
+import hermes_cli.main_install_repair as main_install_repair
+from hermes_cli import update_cmd
+
+
+def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
+    """Simulate git commands where HEAD advances from pre_sha to post_sha."""
+    calls = {"n": 0}
+
+    def side_effect(cmd, **kwargs):
+        joined = " ".join(str(c) for c in cmd)
+
+        # git rev-parse --abbrev-ref HEAD  (get current branch)
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+
+        # git rev-list HEAD..origin/main --count  (behind count)
+        if "rev-list" in joined:
+            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+
+        # git rev-parse HEAD  — first call (pre-pull) returns pre_sha,
+        # subsequent calls (post-pull) return post_sha.
+        if joined.endswith("rev-parse HEAD"):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                return SimpleNamespace(returncode=0, stdout=f"{pre_sha}\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+
+        # Everything else (merge, checkout, etc.) succeeds quietly.
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return side_effect
+
+
+def _make_head_pinned_side_effect(sha="abc123"):
+    """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
+
+    def side_effect(cmd, **kwargs):
+        joined = " ".join(str(c) for c in cmd)
+
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
+
+        if "rev-list" in joined:
+            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+
+        if joined.endswith("rev-parse HEAD"):
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
+
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return side_effect
+
+
+def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
+    """Patch the hermes_cli.main helpers ``_cmd_update_impl`` touches.
+
+    ``_m()`` in update_cmd.py lazily returns hermes_cli.main, so patching
+    attributes on that module is the canonical test surface (matches
+    tests/hermes_cli/test_cmd_update.py).
+    """
+    monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
+    monkeypatch.setattr(
+        hermes_main, "_resolve_update_branch", lambda args: "main"
+    )
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+    monkeypatch.setattr(main_install_repair, "_is_windows", lambda: False)
+    monkeypatch.setattr(
+        hermes_main, "_get_origin_url",
+        lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
+    )
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: False)
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **k: None
+    )
+    monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        main_web_build, "_record_bytecode_fingerprint", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_run_pre_update_backup", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_pause_windows_gateways_for_update", lambda: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
+    )
+    # Short-circuit the long tail: dependency install + desktop build.
+    monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(main_install_repair, "_clear_update_incomplete_marker", lambda: None)
+    # Gateway restart path (called after a successful update).
+    monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **k: None)
+    # Keep the (now surfaced — #78574) gateway auto-restart phase away from
+    # this machine's real gateways: discovery returns nothing, systemd is
+    # unsupported, so the phase is a clean no-op for both snapshots.
+    import hermes_cli.gateway as hermes_gateway
+
+    monkeypatch.setattr(
+        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "supports_systemd_services", lambda: False
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
+    )
+
+
+def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
+    """When the pull advances HEAD, the update proceeds normally."""
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+
+    hermes_main.cmd_update(args)  # completes normally (no SystemExit)
+
+    out = capsys.readouterr().out
+    assert "✓ Code updated!" in out
+    assert "Code did not move" not in out
+
+
+def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
+    """A detached/pinned HEAD that never moves must fail loudly, not print
+    '✓ Code updated!' against the stale tree."""
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    _patch_update_deps(monkeypatch, tmp_path, _make_head_pinned_side_effect())
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "Code did not move" in out
+    assert "✓ Code updated!" not in out
+    assert "checkout main" in out
+

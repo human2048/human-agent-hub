@@ -1,0 +1,191 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_model_switch_marker_role.py ===
+"""Tests for _append_model_switch_marker role fix (issue #48338).
+
+The model switch marker must NOT use role="system" because strict providers
+(vLLM, Qwen) reject system messages that appear mid-conversation. Using
+role="user" is safe — the system prompt is prepended to the API message list,
+so a user-role marker can appear at any later position, and the gateway's
+sanitize/merge pass already coalesces consecutive user messages.
+"""
+
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from tui_gateway.server import _append_model_switch_marker
+
+
+class TestAppendModelSwitchMarkerRole:
+    """Verify the marker uses role='user', not role='system'."""
+
+    def test_marker_uses_user_role(self) -> None:
+        """The history entry must be role='user', not role='system'."""
+        session: dict = {"session_key": "test-session", "history": []}
+        _append_model_switch_marker(session, model="gpt-4o", provider="openai")
+        assert len(session["history"]) == 1
+        entry = session["history"][0]
+        assert entry["role"] == "user", (
+            f"Expected role='user' but got role='{entry['role']}'. "
+            "Strict providers (vLLM, Qwen) reject mid-conversation system messages."
+        )
+
+
+    def test_no_marker_for_none_session(self) -> None:
+        """None session should be a no-op."""
+        _append_model_switch_marker(None, model="gpt-4o", provider="openai")
+
+
+class TestModelSwitchMarkerDedup:
+    """#65891: only the newest marker is meaningful; older ones must not
+    accumulate in the live history and burn context tokens every turn."""
+
+    @staticmethod
+    def _markers(session: dict) -> list:
+        from tui_gateway.server import _is_model_switch_marker
+
+        return [h for h in session["history"] if _is_model_switch_marker(h)]
+
+    def test_second_switch_replaces_first_marker(self) -> None:
+        session: dict = {"session_key": "s", "history": []}
+        _append_model_switch_marker(session, model="model-a", provider="p")
+        _append_model_switch_marker(session, model="model-b", provider="p")
+        markers = self._markers(session)
+        assert len(markers) == 1, "a second switch must replace, not stack, the marker"
+        assert "model-b" in markers[0]["content"]
+        assert "model-a" not in markers[0]["content"]
+        # The surviving marker is the last history entry.
+        assert session["history"][-1] is markers[0]
+
+    def test_five_switches_leave_one_marker(self) -> None:
+        # Mirrors the issue's screenshot: 5 consecutive MoA preset switches.
+        session: dict = {"session_key": "s", "history": []}
+        for name in ("质量-非高峰", "省钱-非高峰", "代码编程-非高峰", "日常对话-非高峰", "智能-高峰"):
+            _append_model_switch_marker(session, model=name, provider="moa")
+        markers = self._markers(session)
+        assert len(markers) == 1
+        assert "智能-高峰" in markers[0]["content"]
+
+    def test_dedup_preserves_real_conversation_turns(self) -> None:
+        session: dict = {
+            "session_key": "s",
+            "history": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        }
+        _append_model_switch_marker(session, model="model-a", provider="p")
+        _append_model_switch_marker(session, model="model-b", provider="p")
+        # Real turns untouched; exactly one marker, appended at the end.
+        assert session["history"][0] == {"role": "user", "content": "hello"}
+        assert session["history"][1] == {"role": "assistant", "content": "hi"}
+        assert len(self._markers(session)) == 1
+        assert len(session["history"]) == 3
+
+    def test_prior_marker_between_turns_is_removed(self) -> None:
+        # A stale marker not at the tail (a later turn followed it) is still
+        # stripped on the next switch.
+        session: dict = {
+            "session_key": "s",
+            "history": [
+                {"role": "user", "content": "q1"},
+                _make_marker_entry("model-a"),
+                {"role": "assistant", "content": "a1"},
+            ],
+        }
+        _append_model_switch_marker(session, model="model-b", provider="p")
+        markers = self._markers(session)
+        assert len(markers) == 1
+        assert "model-b" in markers[0]["content"]
+        # The real turns are preserved in order.
+        assert [h["content"] for h in session["history"] if not _is_marker(h)] == ["q1", "a1"]
+
+    def test_history_version_increments_once_on_replace(self) -> None:
+        session: dict = {"session_key": "s", "history": [], "history_version": 0}
+        _append_model_switch_marker(session, model="model-a", provider="p")
+        _append_model_switch_marker(session, model="model-b", provider="p")
+        assert session["history_version"] == 2  # one increment per switch
+
+
+def _make_marker_entry(model: str) -> dict:
+    from tui_gateway.server import _MODEL_SWITCH_MARKER_PREFIX
+
+    return {"role": "user", "content": f"{_MODEL_SWITCH_MARKER_PREFIX}{model}.]"}
+
+
+def _is_marker(entry: dict) -> bool:
+    from tui_gateway.server import _is_model_switch_marker
+
+    return _is_model_switch_marker(entry)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_model_switch_reasoning_flag.py ===
+"""``config.set model "X --reasoning <level>"`` on the TUI gateway: the effort rides with the pick.
+
+Applied AFTER the live swap (``agent.switch_model`` re-resolves ``reasoning_config`` from
+config.yaml) and scoped like the pick: a session pin by default, ``agent.reasoning_effort`` on
+``--global``. The Ink TUI picker and the classic CLI both emit this exact shape.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+import tui_gateway.server as server
+
+
+class _Agent:
+    def __init__(self):
+        self.model, self.provider, self.base_url, self.api_key, self.api_mode = "old", "nous", "", "", ""
+        self.reasoning_config = {"enabled": True, "effort": "medium"}
+
+    def switch_model(self, **_kw):
+        self.reasoning_config = {"enabled": True, "effort": "medium"}  # re-resolved from config
+
+
+@pytest.fixture
+def _quiet_switch(monkeypatch):
+    result = SimpleNamespace(
+        success=True, new_model="new/model", target_provider="nous", base_url="", api_key="key",
+        api_mode="chat_completions", warning_message="", model_info=None, error_message="",
+        runtime_capabilities=None)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kw: result)
+    monkeypatch.setattr("hermes_cli.model_switch.persist_model_selection", lambda _r: None)
+    monkeypatch.setattr("hermes_cli.model_cost_guard.expensive_model_warning", lambda *a, **k: None)
+    for name in ("_restart_slash_worker", "_persist_live_session_runtime", "_persist_live_session_system_prompt",
+                 "_append_model_switch_marker", "_emit_session_info"):
+        monkeypatch.setattr(server, name, lambda *a, **k: None)
+    written = {}
+    monkeypatch.setattr(server, "_write_config_key", lambda k, v: written.__setitem__(k, v))
+    return written
+
+
+def test_reasoning_flag_survives_the_swap_and_pins_the_session(_quiet_switch):
+    agent = _Agent()
+    session = {"agent": agent}
+
+    out = server._apply_model_switch("sid", session, "new/model --provider nous --reasoning high --session")
+
+    assert out["value"] == "new/model"
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    assert session["create_reasoning_override"] == {"enabled": True, "effort": "high"}
+    assert "agent.reasoning_effort" not in _quiet_switch
+
+
+def test_reasoning_flag_with_global_writes_config_and_drops_the_pin(_quiet_switch):
+    agent = _Agent()
+    session = {"agent": agent, "create_reasoning_override": {"enabled": True, "effort": "low"}}
+
+    server._apply_model_switch("sid", session, "new/model --provider nous --reasoning none --global")
+
+    assert agent.reasoning_config == {"enabled": False}
+    assert _quiet_switch["agent.reasoning_effort"] == "none"
+    assert "create_reasoning_override" not in session
+
+    with pytest.raises(ValueError, match="--reasoning takes"):
+        server._apply_model_switch("sid", {"agent": _Agent()}, "new/model --reasoning turbo")
+

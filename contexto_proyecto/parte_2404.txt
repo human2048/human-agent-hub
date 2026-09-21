@@ -1,0 +1,159 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cron_origin_synthetic_thread.py ===
+"""Cron origin capture: Slack per-message session-key threads are not routing.
+
+Bug report (relay-fronted Slack, thread-per-message mode): creating a cron job
+from a top-level Slack DM message persisted the creation message's own id as
+``origin.thread_id`` — the relay adapter stamps ``source.thread_id = message_id``
+on every top-level Slack message purely for SESSION KEYING (native SlackAdapter
+parity: ``thread_ts = event.thread_ts or ts``). Every subsequent cron delivery
+then landed inside the ephemeral thread spawned around the creation message
+instead of the top-level conversation / configured home.
+
+The stamp is recognizable at capture time: a Slack session whose thread id
+equals the triggering message's own id is a synthetic per-message key, not a
+durable thread. A genuine in-thread creation has thread_id == the parent
+thread's id != the triggering message's own id, and must keep its thread.
+"""
+
+from unittest.mock import patch
+
+from tools.cronjob_tools import _origin_from_env
+
+
+def _session_env(env: dict):
+    """Patch gateway.session_context.get_session_env with a dict lookup."""
+    return patch(
+        "gateway.session_context.get_session_env",
+        side_effect=lambda name, default="": env.get(name, default),
+    )
+
+
+class TestSlackSyntheticThreadCapture:
+    def test_synthetic_slack_thread_not_captured(self):
+        """thread_id == message_id on Slack = per-message session key: drop it."""
+        env = {
+            "HERMES_SESSION_PLATFORM": "slack",
+            "HERMES_SESSION_CHAT_ID": "D0BJTDCSR7C",
+            "HERMES_SESSION_THREAD_ID": "1755043010.123456",
+            "HERMES_SESSION_MESSAGE_ID": "1755043010.123456",
+        }
+        with _session_env(env):
+            origin = _origin_from_env()
+        assert origin is not None
+        assert origin["platform"] == "slack"
+        assert origin["chat_id"] == "D0BJTDCSR7C"
+        assert origin["thread_id"] is None
+
+    def test_genuine_slack_thread_preserved(self):
+        """A real in-thread creation (thread != own message id) keeps its thread."""
+        env = {
+            "HERMES_SESSION_PLATFORM": "slack",
+            "HERMES_SESSION_CHAT_ID": "C0AGENERAL",
+            "HERMES_SESSION_THREAD_ID": "1755040000.000100",
+            "HERMES_SESSION_MESSAGE_ID": "1755043010.123456",
+        }
+        with _session_env(env):
+            origin = _origin_from_env()
+        assert origin is not None
+        assert origin["thread_id"] == "1755040000.000100"
+
+    def test_non_slack_platform_thread_untouched(self):
+        """Telegram forum topics legitimately reuse ids; the rule is Slack-scoped."""
+        env = {
+            "HERMES_SESSION_PLATFORM": "telegram",
+            "HERMES_SESSION_CHAT_ID": "-1003941067111",
+            "HERMES_SESSION_THREAD_ID": "2203",
+            "HERMES_SESSION_MESSAGE_ID": "2203",
+        }
+        with _session_env(env):
+            origin = _origin_from_env()
+        assert origin is not None
+        assert origin["thread_id"] == "2203"
+
+    def test_slack_no_message_id_keeps_thread(self):
+        """Without a message id to compare, never guess: keep the thread."""
+        env = {
+            "HERMES_SESSION_PLATFORM": "slack",
+            "HERMES_SESSION_CHAT_ID": "D0BJTDCSR7C",
+            "HERMES_SESSION_THREAD_ID": "1755040000.000100",
+        }
+        with _session_env(env):
+            origin = _origin_from_env()
+        assert origin is not None
+        assert origin["thread_id"] == "1755040000.000100"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cron_profile_isolation.py ===
+"""Regression tests for #4707 — cron must be per-profile.
+
+Design intent (Teknium, June 2026): a profile's cron jobs both LIVE in that
+profile's HERMES_HOME and EXECUTE under it.
+
+- Storage: a job created under profile ``coder`` writes to
+  ``~/.hermes/profiles/coder/cron/jobs.json`` — NOT the shared default root.
+- Execution: the profile-scoped gateway's in-process ticker resolves the
+  active HERMES_HOME (profile home) at call time, so jobs run with that
+  profile's ``.env`` / ``config.yaml`` / scripts / skills.
+
+This is the opposite direction from the (reverted) #50112/#32091 "anchor at the
+shared root" approach. Anchoring at the root funnels every profile's jobs into
+one store and runs them under whatever HERMES_HOME the ticker happens to have —
+leaking config/credentials/skills across profiles, the security boundary #4707
+was filed for. These tests pin per-profile isolation so a stale-branch merge or
+a re-anchor "fix" can't silently flip it back.
+"""
+import importlib
+from pathlib import Path
+
+
+def _set_profile_env(monkeypatch, root: Path, profile_home: Path) -> None:
+    """Pretend the platform default root is ``root`` and the active
+    HERMES_HOME is a profile under it (``<root>/profiles/<name>``)."""
+    import hermes_constants
+
+    monkeypatch.setattr(
+        hermes_constants, "_get_platform_default_hermes_home", lambda: root
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+
+def test_cron_storage_anchors_at_profile_home(tmp_path, monkeypatch):
+    """Under a profile HERMES_HOME (<root>/profiles/<name>), the cron store
+    resolves to <profile>/cron, NOT the shared <root>/cron."""
+    root = tmp_path / "hermes_home"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+
+    _set_profile_env(monkeypatch, root, profile_home)
+
+    import hermes_constants
+
+    # Sanity: the override is wired the way the gateway sees it.
+    assert hermes_constants.get_hermes_home().resolve() == profile_home.resolve()
+    assert hermes_constants.get_default_hermes_root().resolve() == root.resolve()
+
+    # cron/jobs.py computes HERMES_DIR from get_hermes_home() at import, so a
+    # fresh import under this env anchors the store at <profile>/cron.
+    import cron.jobs as jobs
+
+    importlib.reload(jobs)
+    try:
+        assert jobs.HERMES_DIR.resolve() == profile_home.resolve()
+        assert (
+            jobs.JOBS_FILE.resolve()
+            == (profile_home / "cron" / "jobs.json").resolve()
+        )
+        # The shared-root path must NOT be the store — that would re-break
+        # per-profile isolation (#4707).
+        assert (
+            jobs.JOBS_FILE.resolve() != (root / "cron" / "jobs.json").resolve()
+        )
+    finally:
+        monkeypatch.undo()
+        importlib.reload(jobs)
+
+
+

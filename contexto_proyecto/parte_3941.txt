@@ -1,0 +1,326 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_python_fallback_venv.py ===
+"""Regression: the Windows installer must honor its Python fallback at venv time.
+
+A user on Windows 11 reported (#50769) that the installer correctly detected a
+Python 3.12 fallback when 3.11 was absent::
+
+    [OK] Found fallback: Python 3.12.8
+    ...
+    -> Creating virtual environment with Python 3.11...
+
+and then failed with ``Failed to create virtual environment (uv venv exited
+with 2)``.
+
+Root cause: ``Test-Python`` records the fallback via an in-memory
+``$script:PythonVersion = $fallbackVer`` mutation, but under Hermes-Setup.exe
+each ``-Stage NAME`` runs in its *own* fresh ``powershell.exe`` process.  The
+``venv`` stage therefore starts with ``$PythonVersion`` back at its ``"3.11"``
+default, so ``uv venv venv --python 3.11`` runs on a machine that has no 3.11.
+
+The fix re-resolves the interpreter inside ``Install-Venv`` (via the
+cross-process-safe ``Resolve-AvailablePythonVersion`` helper) before creating
+the venv, so the venv stage uses whatever interpreter is actually present.
+These tests lock that contract at the source level (the script only runs on
+Windows, so there's no runner to execute it on Linux CI).
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+_INSTALL_PS1 = Path(__file__).resolve().parents[3] / "scripts" / "install.ps1"
+
+
+@pytest.fixture(scope="module")
+def source() -> str:
+    return _INSTALL_PS1.read_text(encoding="utf-8")
+
+
+def _function_body(source: str, name: str) -> str:
+    """Return the text of a PowerShell ``function <name> { ... }`` block."""
+    start = source.index(f"function {name}")
+    brace = source.index("{", start)
+    depth = 0
+    for i in range(brace, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace : i + 1]
+    raise AssertionError(f"unterminated function body for {name}")
+
+
+def test_resolver_helper_is_defined(source: str):
+    """A cross-process-safe Python-version resolver must exist."""
+    assert "function Resolve-AvailablePythonVersion" in source, (
+        "expected a Resolve-AvailablePythonVersion helper that re-resolves the "
+        "interpreter independently of the in-memory $script:PythonVersion mutation"
+    )
+
+
+def test_install_venv_reresolves_before_creating_venv(source: str):
+    """Install-Venv must re-resolve the interpreter BEFORE `uv venv`.
+
+    Otherwise the venv stage's fresh process trusts the stale "3.11" default
+    and fails on machines where only the fallback (e.g. 3.12) is installed.
+    """
+    body = _function_body(source, "Install-Venv")
+    resolve_at = body.find("Resolve-AvailablePythonVersion")
+    assert resolve_at != -1, (
+        "Install-Venv must call Resolve-AvailablePythonVersion so the venv "
+        "stage doesn't trust the stale $PythonVersion default across processes"
+    )
+    create_at = body.find("Creating virtual environment with Python")
+    assert create_at != -1, "expected the venv-creation log line in Install-Venv"
+    assert resolve_at < create_at, (
+        "the interpreter must be re-resolved BEFORE the 'Creating virtual "
+        "environment' step (and before `uv venv` runs)"
+    )
+
+
+def test_fallback_list_is_single_source_of_truth(source: str):
+    """The fallback versions live in one shared constant, used by both paths.
+
+    A drifting second copy of the list is how detection and venv creation
+    disagree in the first place.
+    """
+    assert re.search(r"\$PythonFallbackVersions\s*=", source), (
+        "expected a shared $PythonFallbackVersions constant"
+    )
+    # Test-Python's fallback loop must iterate the shared constant, not an
+    # inline literal list.
+    test_python = _function_body(source, "Test-Python")
+    assert "foreach ($fallbackVer in $PythonFallbackVersions)" in test_python, (
+        "Test-Python must iterate the shared $PythonFallbackVersions constant"
+    )
+    # The resolver must seed its candidate list from the same constant.
+    resolver = _function_body(source, "Resolve-AvailablePythonVersion")
+    assert "$PythonFallbackVersions" in resolver, (
+        "Resolve-AvailablePythonVersion must reuse the shared fallback constant"
+    )
+
+
+def test_resolver_prefers_requested_version_then_fallbacks(source: str):
+    """The resolver tries the requested version first, then the fallbacks."""
+    resolver = _function_body(source, "Resolve-AvailablePythonVersion")
+    assert "@($PythonVersion) + $PythonFallbackVersions" in resolver, (
+        "resolver candidate order must be: requested $PythonVersion first, "
+        "then the shared fallbacks"
+    )
+    assert "uv" in resolver and "python find" in resolver, (
+        "resolver must probe availability via `uv python find`"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_resolver_strictmode.py ===
+"""Regression: the ResolvedPathReport must not read an unset resolver.
+
+Issue #93017: fresh Windows installs died at the ``$script:ResolvedPathReport``
+block with ``The variable '$script:LastResolver' cannot be retrieved because
+it has not been set`` — before any install stage ran. The mechanism:
+``ConvertTo-LongPath`` short-circuits at the top for ordinary long paths
+(``-notmatch '~\\d'`` returns early, per the comment "skip every resolver for
+ordinary long paths, which is the overwhelmingly common case"), so
+``$script:LastResolver`` is only ever assigned when a 8.3 short path actually
+needs expansion. The report block read it unconditionally, which is fatal in
+a ``Set-StrictMode`` session (the reporter hit it through three different
+invocation styles, i.e. their host/session enables strict mode).
+
+The fix initializes ``$script:LastResolver = 'none'`` at script scope before
+``Set-LongProfileEnvVars`` can run any resolver — ``'none'`` being the
+resolver's own value for "nothing ran".
+
+install.ps1 only runs on Windows, so these tests lock the contract at the
+source-text level (same style as test_install_ps1_uv_install_fallback.py).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+_INSTALL_PS1 = Path(__file__).resolve().parents[3] / "scripts" / "install.ps1"
+
+
+def _ps1() -> str:
+    return _INSTALL_PS1.read_text(encoding="utf-8")
+
+
+def test_last_resolver_initialized_at_script_scope():
+    source = _ps1()
+    match = re.search(r"^\$script:LastResolver = 'none'\s*$", source, re.MULTILINE)
+    assert match is not None, (
+        "$script:LastResolver must be initialized at script scope ('none') — "
+        "ConvertTo-LongPath only assigns it when a short path needs expanding, "
+        "so an ordinary long profile leaves it unset (#93017)"
+    )
+
+
+def test_initialization_precedes_resolver_run_and_report_read():
+    source = _ps1()
+    init = re.search(r"^\$script:LastResolver = 'none'\s*$", source, re.MULTILINE)
+    run = re.search(r"^\$script:NormalizedProfilePaths = Set-LongProfileEnvVars", source, re.MULTILINE)
+    read = re.search(r"^\s+resolver\s+= \$script:LastResolver\s*$", source, re.MULTILINE)
+    assert init and run and read, "init / Set-LongProfileEnvVars / report read must all exist"
+    assert init.start() < run.start() < read.start(), (
+        "initialization must come before Set-LongProfileEnvVars can invoke a "
+        "resolver, and before the ResolvedPathReport reads the variable"
+    )
+
+
+def test_convert_to_long_path_still_short_circuits_before_assigning():
+    """Pin the mechanism that leaves the variable unset on normal paths.
+
+    The early return for paths without an 8.3 alias is what makes the
+    initialization load-bearing: if someone removes the short-circuit the
+    resolver always assigns, but the guard is a deliberate performance
+    choice (skip Add-Type for the overwhelmingly common case) and must
+    stay — so the init must stay too.
+    """
+    source = _ps1()
+    start = source.index("function ConvertTo-LongPath")
+    body = source[start : start + 2000]
+    assert re.search(r"-notmatch '~\\d'", body), (
+        "ConvertTo-LongPath must keep its ordinary-long-path short-circuit "
+        "(the reason $script:LastResolver can be unset without an init)"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_uv_install_fallback.py ===
+"""Regression: Install-Uv must surface installer errors and have fallbacks.
+
+Issue #69216: Windows installs died with only the generic message
+``uv installed but not found at ...\\bin\\uv.exe``.  Two root causes:
+
+1. ``Install-Uv`` piped the astral installer's entire output straight into
+   ``Out-Null`` (``2>&1 | Out-Null``), so any real failure -- download error,
+   corporate proxy block, AV quarantine, permissions -- was swallowed and
+   the user only ever saw the generic post-condition failure (first
+   identified in #69366).
+2. There was exactly one install source, ``astral.sh``.  Corporate proxies
+   commonly block astral.sh while the byte-identical installer published at
+   GitHub releases downloads fine (diagnosed by @gakugaku on #69216).
+
+The fix installs a three-rung ladder inside ``Install-Uv``:
+
+- Rung 1: astral.sh installer, output captured via ``Tee-Object``.
+- Rung 2: GitHub releases installer mirror, same ``UV_INSTALL_DIR``.
+- Rung 3: salvage an existing ``uv.exe`` (``Get-Command uv`` or
+  ``%USERPROFILE%\\.local\\bin\\uv.exe``) by copying it into
+  ``$HermesHome\\bin\\uv.exe`` so the managed-first invariant holds.
+
+Only after all three rungs fail does it error out -- and then it prints the
+tail of the captured installer output so the real cause reaches the user.
+
+install.ps1 only runs on Windows, so these tests lock the contract at the
+source-text level (same style as test_install_ps1_uv_powershell_host.py).
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+_INSTALL_PS1 = Path(__file__).resolve().parents[3] / "scripts" / "install.ps1"
+
+_GITHUB_INSTALLER_URL = (
+    "https://github.com/astral-sh/uv/releases/latest/download/uv-installer.ps1"
+)
+
+
+@pytest.fixture(scope="module")
+def source() -> str:
+    return _INSTALL_PS1.read_text(encoding="utf-8")
+
+
+def _install_uv_body(source: str) -> str:
+    """Extract the text of Install-Uv up to the next top-level function."""
+    start = source.index("function Install-Uv")
+    tail = source[start + 1 :]
+    match = re.search(r"^function ", tail, flags=re.MULTILINE)
+    end = start + 1 + (match.start() if match else len(tail))
+    return source[start:end]
+
+
+def test_astral_installer_output_not_swallowed_by_out_null(source: str):
+    """Regression pin for the suppression bug (#69366 / #69216).
+
+    The astral invocation must not discard the installer's merged output
+    stream; a failed download/AV block has to reach the user.
+    """
+    forbidden = 'irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Out-Null'
+    assert forbidden not in source, (
+        "Install-Uv pipes the astral uv installer's output straight to "
+        "Out-Null again -- failures become the generic 'uv installed but "
+        "not found' message. Capture the output (e.g. Tee-Object) instead."
+    )
+
+
+def test_astral_installer_output_is_captured(source: str):
+    body = _install_uv_body(source)
+    astral_lines = [
+        ln
+        for ln in body.splitlines()
+        if "irm https://astral.sh/uv/install.ps1 | iex" in ln
+    ]
+    assert astral_lines, "astral uv installer invocation not found in Install-Uv"
+    for ln in astral_lines:
+        assert "Tee-Object" in ln, (
+            "astral uv installer output must be captured (Tee-Object) so the "
+            f"failure path can show it to the user, got: {ln.strip()!r}"
+        )
+
+
+def test_github_releases_fallback_installer_present(source: str):
+    """Rung 2: the GitHub releases mirror of the installer must be tried."""
+    body = _install_uv_body(source)
+    assert _GITHUB_INSTALLER_URL in body, (
+        "Install-Uv must fall back to the GitHub releases uv installer "
+        f"({_GITHUB_INSTALLER_URL}) when astral.sh is blocked "
+        "(corporate proxies, #69216)."
+    )
+    fallback_lines = [ln for ln in body.splitlines() if _GITHUB_INSTALLER_URL in ln and "irm " in ln]
+    for ln in fallback_lines:
+        stripped = ln.strip()
+        assert stripped.startswith("& $"), (
+            "GitHub fallback installer must be invoked via the resolved "
+            f"PowerShell host variable (`& $...`), got: {stripped!r}"
+        )
+        assert "Tee-Object" in ln, (
+            f"GitHub fallback installer output must be captured too: {stripped!r}"
+        )
+
+
+def test_existing_uv_salvage_rung_present(source: str):
+    """Rung 3: probe PATH and the astral default dir, copy into managed bin."""
+    body = _install_uv_body(source)
+    assert "Get-Command uv" in body, (
+        "Install-Uv must probe for an existing uv on PATH (Get-Command uv) "
+        "before failing."
+    )
+    assert '".local\\bin\\uv.exe"' in body and "$env:USERPROFILE" in body, (
+        "Install-Uv must probe the astral default install location "
+        "(%USERPROFILE%\\.local\\bin\\uv.exe)."
+    )
+    assert "Copy-Item" in body and "$managedUv" in body, (
+        "A salvaged uv.exe must be copied into the managed location "
+        "($HermesHome\\bin\\uv.exe) so managed-first resolution holds."
+    )
+
+
+def test_failure_path_keeps_manual_install_pointer_and_shows_output(source: str):
+    body = _install_uv_body(source)
+    assert "https://docs.astral.sh/uv/getting-started/installation/" in body, (
+        "the manual-install pointer must survive in the failure path"
+    )
+    assert "$installerOutput" in body and "Select-Object -Last" in body, (
+        "the failure path must print the tail of the captured installer "
+        "output so the real error reaches the user"
+    )
+

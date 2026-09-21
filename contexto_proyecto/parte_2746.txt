@@ -1,0 +1,349 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_multiplex_shared_ingress.py ===
+"""Inbound-port platforms of a SECONDARY profile are served on the default profile's shared listener
+at ``/p/<profile>/<path>`` (gateway/platforms/shared_ingress.py).
+
+Invariants: the forwarded request is verified by the NAMED profile's adapter with that profile's
+secret and runs under that profile's runtime scope; the un-prefixed path is untouched; a profile
+without an adapter for the path is a 404 rather than the default's adapter; a shared-listener
+adapter binds no port of its own.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+pytest.importorskip("aiohttp")
+from aiohttp import web  # noqa: E402
+from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig  # noqa: E402
+
+
+def _line_sig(body: bytes, secret: str) -> str:
+    return base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
+
+
+class _Runner:
+    """Just enough GatewayRunner for shared_ingress: the served-profile adapter map."""
+
+    def __init__(self, adapters: dict[str, dict[Platform, Any]]):
+        self.config = GatewayConfig(multiplex_profiles=True)
+        self._profile_adapters = adapters
+        self.adapters: dict = {}
+
+
+def _line_adapter(secret: str, profile: str):
+    from plugins.platforms.line.adapter import LineAdapter
+    adapter = LineAdapter(PlatformConfig(enabled=True, extra={
+        "channel_access_token": f"tok-{profile}", "channel_secret": secret, "port": 1}))
+    adapter._shared_listener_profile = profile
+    adapter.set_owner_profile(profile)
+    return adapter
+
+
+async def _publish_line(adapter, runner) -> list[tuple[str, Path]]:
+    """Wire the LINE webhook app the way ``connect()`` does, without the LINE API or a bind, and
+    record the HERMES_HOME the handler ran under."""
+    from gateway.platforms.shared_ingress import bind_listener
+    from hermes_constants import get_hermes_home
+    seen: list[tuple[str, Path]] = []
+    adapter.gateway_runner = runner
+
+    async def dispatch(event):
+        seen.append((event.get("type"), Path(get_hermes_home())))
+
+    adapter._dispatch_event = dispatch
+    app = web.Application(client_max_size=1024)
+    app.router.add_post(adapter.webhook_path, adapter._handle_webhook)
+    bound = await bind_listener(adapter, app, "127.0.0.1", 1, adapter.webhook_path)
+    assert bound is None  # shared-listener mode never binds
+    return seen
+
+
+@pytest.fixture
+def mux_home(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    for name in ("coder", "ops"):
+        (root / "profiles" / name).mkdir(parents=True)
+        (root / "profiles" / name / ".env").write_text(f"LINE_CHANNEL_SECRET=secret-{name}\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from agent import secret_scope
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("default", root), ("coder", root / "profiles" / "coder"), ("ops", root / "profiles" / "ops")])
+    return root
+
+
+async def _shared_listener(runner) -> TestClient:
+    """The default profile's listener as the webhook adapter builds it: bare routes + /p/ forwarding."""
+    from gateway.platforms.webhook import WebhookAdapter
+    listener = WebhookAdapter(PlatformConfig(enabled=True, extra={"port": 1, "routes": {}}))
+    listener.gateway_runner = runner
+    app = web.Application()
+    app.router.add_post("/webhooks/{route_name}", listener._handle_webhook)
+    app.router.add_post("/p/{profile}/webhooks/{route_name}", listener._handle_webhook)
+    app.router.add_route("*", "/p/{profile}/{tail:.*}", listener._handle_profile_ingress)
+    return TestClient(TestServer(app))
+
+
+@pytest.mark.asyncio
+async def test_prefixed_line_webhook_is_verified_by_the_named_profiles_secret_under_its_scope(mux_home):
+    coder, ops = _line_adapter("secret-coder", "coder"), _line_adapter("secret-ops", "ops")
+    runner = _Runner({"coder": {Platform("line"): coder}, "ops": {Platform("line"): ops}})
+    coder_seen, ops_seen = await _publish_line(coder, runner), await _publish_line(ops, runner)
+    body = b'{"events":[{"type":"probe"}]}'
+    async with await _shared_listener(runner) as client:
+        ok = await client.post("/p/coder/line/webhook", data=body,
+                               headers={"X-Line-Signature": _line_sig(body, "secret-coder")})
+        assert ok.status == 200
+        # ops' secret is rejected at coder's URL — the adapter is per profile, so is the secret.
+        wrong = await client.post("/p/coder/line/webhook", data=body,
+                                  headers={"X-Line-Signature": _line_sig(body, "secret-ops")})
+        assert wrong.status == 401
+        # The un-prefixed path keeps serving only the default profile's own routes.
+        bare = await client.post("/line/webhook", data=body,
+                                 headers={"X-Line-Signature": _line_sig(body, "secret-coder")})
+        assert bare.status == 404
+        # An unserved profile, and a served profile without that platform, are 404 — never another adapter.
+        assert (await client.post("/p/nope/line/webhook", data=body)).status == 404
+        runner._profile_adapters["ops"] = {}
+        assert (await client.post("/p/ops/line/webhook", data=body,
+                                  headers={"X-Line-Signature": _line_sig(body, "secret-ops")})).status == 404
+    assert [t for t, _ in coder_seen] == ["probe"] and ops_seen == []
+    assert coder_seen[0][1] == mux_home / "profiles" / "coder"
+
+
+@pytest.mark.asyncio
+async def test_shared_listener_adapter_records_its_public_ingress_url(mux_home, monkeypatch):
+    """Runtime status carries the /p/<profile>/ URL so `gateway status` / the dashboard can show it."""
+    writes: list[dict] = []
+    monkeypatch.setattr("gateway.status.write_runtime_status", lambda **kw: writes.append(kw))
+    coder = _line_adapter("secret-coder", "coder")
+    coder._runtime_status_platform_key = "coder:line"
+    runner = _Runner({"coder": {Platform("line"): coder}})
+    runner.adapters = {Platform.API_SERVER: type("L", (), {"_host": "0.0.0.0", "_port": 8642})()}
+    await _publish_line(coder, runner)
+    assert coder._shared_ingress_url == "http://127.0.0.1:8642/p/coder/line/webhook"
+    assert {"platform": "coder:line", "ingress_url": coder._shared_ingress_url} == {
+        k: v for k, v in writes[-1].items() if k in ("platform", "ingress_url")}
+    assert coder._media_url("tok", "a.png").startswith("http://127.0.0.1:8642/p/coder/line/media/")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_multiplex_toolsets_profile_isolation.py ===
+"""Per-profile toolset isolation on the multiplexed api_server (#91583 defect 2).
+
+Two defects covered:
+
+1. With multiplexing ON, ``/p/<x>/v1/toolsets`` must reflect profile *x*'s own
+   ``platform_toolsets.api_server`` — for both the gateway-owning default
+   profile and a secondary profile — never the listener owner's config.
+
+2. With multiplexing OFF, a ``/p/<other>/`` prefix used to be silently
+   ignored, serving the gateway owner's config under another profile's URL.
+   It must now be rejected (404); only a self-referential prefix (naming the
+   profile this gateway actually serves) falls through.
+
+E2E-style: real profile homes under a temp HERMES root, real config.yaml
+files read through the canonical loaders, and real aiohttp request routing
+(TestClient) through the profile-prefix middleware. No mocked config reads.
+"""
+from __future__ import annotations
+
+import pytest
+
+aiohttp = pytest.importorskip("aiohttp")
+from aiohttp import web  # noqa: E402
+from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+
+from gateway.config import GatewayConfig, PlatformConfig  # noqa: E402
+from gateway.platforms.api_server import (  # noqa: E402
+    APIServerAdapter,
+    _PROFILE_REJECTED,
+)
+
+OWNER_KEY = "owner-key-1234567890abcdef"
+LOKAJ_KEY = "lokaj-key-1234567890abcdef"
+
+
+@pytest.fixture()
+def hermes_root(tmp_path, monkeypatch):
+    """Two real profile homes: default (owner) and 'lokaj' (secondary)."""
+    root = tmp_path / "hermes"
+    lokaj = root / "profiles" / "lokaj"
+    lokaj.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "platform_toolsets:\n  api_server: [web, file]\n",
+        encoding="utf-8",
+    )
+    (lokaj / "config.yaml").write_text(
+        "platform_toolsets:\n  api_server: [web, file, computer_use]\n",
+        encoding="utf-8",
+    )
+    (lokaj / ".env").write_text(f"API_SERVER_KEY={LOKAJ_KEY}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    # get_default_hermes_root memoizes per (native_home, env_home) pair, so
+    # the env change alone re-keys it; no cache reset needed.
+    return root
+
+
+def _make_adapter(multiplex: bool) -> APIServerAdapter:
+    cfg = PlatformConfig(enabled=True, extra={"key": OWNER_KEY})
+    adapter = APIServerAdapter(cfg)
+
+    class _Runner:
+        config = GatewayConfig(multiplex_profiles=multiplex)
+
+    adapter.gateway_runner = _Runner()
+    return adapter
+
+
+def _make_app(adapter: APIServerAdapter) -> web.Application:
+    """Mirror connect()'s wiring: middleware + native and /p/ mirror routes."""
+    app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+    app["api_server_adapter"] = adapter
+    for method, path, handler in adapter._http_route_table():
+        app.router.add_route(method, path, handler)
+        app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+    return app
+
+
+async def _enabled_toolsets(cli: TestClient, path: str, key: str):
+    resp = await cli.get(path, headers={"Authorization": f"Bearer {key}"})
+    if resp.status != 200:
+        return resp.status, None
+    body = await resp.json()
+    return resp.status, {d["name"] for d in body["data"] if d["enabled"]}
+
+
+class TestMultiplexOnToolsetIsolation:
+    @pytest.mark.asyncio
+    async def test_each_profile_sees_its_own_toolsets(self, hermes_root):
+        adapter = _make_adapter(multiplex=True)
+        async with TestClient(TestServer(_make_app(adapter))) as cli:
+            # Owner (default) profile: bare route and /p/default mirror.
+            for path in ("/v1/toolsets", "/p/default/v1/toolsets"):
+                status, enabled = await _enabled_toolsets(cli, path, OWNER_KEY)
+                assert status == 200, path
+                assert "computer_use" not in enabled, path
+                assert {"web", "file"} <= enabled, path
+
+            # Secondary profile: its own config, its own key.
+            status, enabled = await _enabled_toolsets(
+                cli, "/p/lokaj/v1/toolsets", LOKAJ_KEY
+            )
+            assert status == 200
+            # The exact repro from #91583 defect 2: computer_use enabled in
+            # lokaj's config must be reported enabled under /p/lokaj/…
+            assert "computer_use" in enabled
+
+    @pytest.mark.asyncio
+    async def test_owner_key_does_not_open_secondary_profile(self, hermes_root):
+        """Cross-profile auth stays closed: owner key must not read lokaj."""
+        adapter = _make_adapter(multiplex=True)
+        async with TestClient(TestServer(_make_app(adapter))) as cli:
+            status, _ = await _enabled_toolsets(
+                cli, "/p/lokaj/v1/toolsets", OWNER_KEY
+            )
+            assert status == 401
+
+    @pytest.mark.asyncio
+    async def test_unknown_profile_is_404(self, hermes_root):
+        adapter = _make_adapter(multiplex=True)
+        async with TestClient(TestServer(_make_app(adapter))) as cli:
+            resp = await cli.get(
+                "/p/ghost/v1/toolsets",
+                headers={"Authorization": f"Bearer {OWNER_KEY}"},
+            )
+            assert resp.status == 404
+
+
+class TestMultiplexOffPrefixFailsClosed:
+    """Single-profile gateways must not serve another profile's URL."""
+
+    def test_foreign_prefix_rejected(self, hermes_root):
+        adapter = _make_adapter(multiplex=False)
+
+        class _Req:
+            match_info = {"profile": "lokaj"}
+
+        assert adapter._resolve_request_profile(_Req()) is _PROFILE_REJECTED
+
+    def test_self_referential_prefix_falls_through(self, hermes_root):
+        """/p/default/ on the default-profile gateway keeps working."""
+        adapter = _make_adapter(multiplex=False)
+
+        class _Req:
+            match_info = {"profile": "default"}
+
+        assert adapter._resolve_request_profile(_Req()) is None
+
+    def test_own_named_profile_prefix_falls_through(self, hermes_root, monkeypatch):
+        """A gateway launched FOR profile lokaj accepts /p/lokaj/…"""
+        monkeypatch.setenv(
+            "HERMES_HOME", str(hermes_root / "profiles" / "lokaj")
+        )
+        adapter = _make_adapter(multiplex=False)
+
+        class _Req:
+            match_info = {"profile": "lokaj"}
+
+        assert adapter._resolve_request_profile(_Req()) is None
+
+    @pytest.mark.asyncio
+    async def test_foreign_prefix_is_404_end_to_end(self, hermes_root):
+        adapter = _make_adapter(multiplex=False)
+        async with TestClient(TestServer(_make_app(adapter))) as cli:
+            resp = await cli.get(
+                "/p/lokaj/v1/toolsets",
+                headers={"Authorization": f"Bearer {OWNER_KEY}"},
+            )
+            assert resp.status == 404
+            # Bare route unaffected.
+            status, enabled = await _enabled_toolsets(
+                cli, "/v1/toolsets", OWNER_KEY
+            )
+            assert status == 200
+            assert "computer_use" not in enabled
+
+
+class TestWebhookMultiplexOffPrefixFailsClosed:
+    """Same bug class in the webhook adapter's prefix resolver."""
+
+    def _adapter(self, multiplex: bool):
+        from gateway.platforms.webhook import WebhookAdapter, _PROFILE_REJECTED
+
+        class _Runner:
+            config = GatewayConfig(multiplex_profiles=multiplex)
+
+        adapter = WebhookAdapter.__new__(WebhookAdapter)
+        adapter.gateway_runner = _Runner()
+        return adapter, _PROFILE_REJECTED
+
+    def test_foreign_prefix_rejected(self, hermes_root):
+        adapter, rejected = self._adapter(multiplex=False)
+
+        class _Req:
+            match_info = {"profile": "lokaj"}
+
+        assert adapter._resolve_request_profile(_Req()) is rejected
+
+    def test_self_referential_prefix_falls_through(self, hermes_root):
+        adapter, _rejected = self._adapter(multiplex=False)
+
+        class _Req:
+            match_info = {"profile": "default"}
+
+        assert adapter._resolve_request_profile(_Req()) is None
+

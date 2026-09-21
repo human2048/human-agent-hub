@@ -1,0 +1,363 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_worker_exit_decode.py ===
+"""Worker exit classification must not depend on POSIX-only ``os.WIF*`` helpers.
+
+``_classify_worker_exit`` feeds the dead-worker reclaim: a ``rate_limited``
+verdict requeues the card without counting a failure, ``unknown`` counts as a
+crash. Windows has neither ``os.WIFEXITED`` nor ``waitpid(-1)``, so both the
+decode and the reaper's exit capture have a Windows-independent path.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+
+
+def _spawn_exit(code: int) -> subprocess.Popen:
+    proc = subprocess.Popen([sys.executable, "-c", f"raise SystemExit({code})"])  # noqa: S603
+    proc.wait()
+    return proc
+
+
+def test_windows_reaper_classifies_parked_popen_exit(monkeypatch):
+    """With the Windows flag on, the reaper learns exit codes from the parked
+    ``Popen`` handles (no ``waitpid``) and the decode needs no ``os.WIF*``:
+    the rate-limit sentinel is ``rate_limited``, a crash ``nonzero_exit``,
+    and a still-running worker is left alone."""
+    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    for name in ("WIFEXITED", "WEXITSTATUS", "WIFSIGNALED", "WTERMSIG"):
+        monkeypatch.delattr(os, name, raising=False)
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
+
+    limited = _spawn_exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    crashed = _spawn_exit(3)
+    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])  # noqa: S603
+    try:
+        for proc in (limited, crashed, alive):
+            kbd._live_worker_procs[proc.pid] = proc
+
+        reaped = kbd.reap_worker_zombies()
+
+        assert sorted(reaped) == sorted([limited.pid, crashed.pid])
+        assert kbd._classify_worker_exit(limited.pid) == ("rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        assert kbd._classify_worker_exit(crashed.pid) == ("nonzero_exit", 3)
+        assert kbd._classify_worker_exit(alive.pid) == ("unknown", None)
+        assert set(kbd._live_worker_procs) == {alive.pid}
+    finally:
+        alive.kill()
+        alive.wait()
+
+
+@pytest.mark.windows_only
+def test_native_windows_reaper_and_decode(monkeypatch):
+    """Native Windows, nothing patched: ``_IS_WINDOWS`` selects the Popen-poll
+    reaper and the decode runs where ``os.WIFEXITED`` does not exist, so the
+    rate-limit sentinel exit is a requeue, not a crash."""
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
+    assert not hasattr(os, "WIFEXITED")
+    proc = _spawn_exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    kbd._live_worker_procs[proc.pid] = proc
+    assert kbd.reap_worker_zombies() == [proc.pid]
+    assert kbd._classify_worker_exit(proc.pid) == ("rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_worker_exit_trailer.py ===
+"""A dead Kanban worker is booked the same way whichever process notices it.
+
+``_recent_worker_exits`` is filled by ``os.waitpid`` and so only knows children of
+the process running the sweep; a per-tick ``hermes kanban dispatch`` process finds it
+empty. The worker's own exit trailer in its log is the durable witness the sweep reads
+instead, and a tripped protocol-violation budget must hold the card until an operator
+unblocks it.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER, exit_single_query
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    kbd._recent_worker_exits.clear()
+    kb.init_db()
+    return home
+
+
+def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
+    """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here."""
+    host = kb._claimer_id().split(":", 1)[0]
+    kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, worker_started_at=NULL, started_at=? WHERE id=?",
+        (pid, int(time.time()) - 120, tid),
+    )
+    conn.commit()
+    log = kb.worker_log_path(tid)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(f"the model said something\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
+
+
+@pytest.mark.parametrize(
+    "rc, event, failure_counted",
+    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited", False)],
+)
+def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, failure_counted):
+    """Empty reap registry + exit trailer in the log: a clean exit is the protocol violation
+    (marker, streak, no unified-budget hit) and a 75 is a rate-limit requeue — not a bare
+    ``pid N not alive`` crash that counts a failure."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        _dead_worker_with_log(conn, tid, 70001, rc)
+
+        kbd.detect_crashed_workers(conn)
+
+        ev = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        run = conn.execute(
+            "SELECT outcome, error, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,)).fetchone()
+        task = kb.get_task(conn, tid)
+        assert ev["kind"] == event
+        assert "not alive" not in (run["error"] or "")
+        assert task.status == "ready"
+        assert task.consecutive_failures == (1 if failure_counted else 0)
+        # The decoded rc lands in the run row so quota (75) vs crash stays tellable after
+        # the fact even though the worker_output tail is trimmed (#113611).
+        assert kb._json_dict(run["metadata"]).get("exit_code") == rc
+        if rc == 0:
+            assert kb._json_dict(run["metadata"]).get("protocol_violation") is True
+            assert kbd._protocol_violation_streak(conn, tid) == 1
+            assert KANBAN_WORKER_EXIT_TRAILER not in (run["error"] or "")
+        else:
+            assert run["outcome"] == "rate_limited"
+
+
+def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
+    """The third consecutive clean exit trips the violation budget and ``recompute_ready``
+    must not promote the card back the same tick (``consecutive_failures`` is still below
+    ``failure_limit``); ``unblock_task`` lifts the hold."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="a")
+        for i in range(kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT):
+            _dead_worker_with_log(conn, tid, 71000 + i, 0)
+            kbd.detect_crashed_workers(conn)
+            kb.recompute_ready(conn, failure_limit=10)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures < 10
+
+        kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        kb.recompute_ready(conn, failure_limit=10)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_plain_budget_trip_still_auto_recovers(kanban_home):
+    """A unified-budget trip carries no ``sticky`` marker, so the two recovery paths on main
+    survive: raising the dispatcher ``failure_limit`` past the counter promotes the card, and
+    ``assign_task`` to a fresh profile (counter reset by design) promotes it too."""
+    with kbc.connect() as conn:
+        tids = [kb.create_task(conn, title=t, assignee="a") for t in ("raise-limit", "reassign")]
+        for tid in tids:
+            for i in range(2):
+                kbd._record_task_failure(
+                    conn, tid, error=f"boom{i}", outcome="crashed", failure_limit=2,
+                    release_claim=False, end_run=False,
+                )
+            assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn, failure_limit=2) == 0
+
+        assert kb.recompute_ready(conn, failure_limit=5) == 2
+        assert kb.get_task(conn, tids[0]).status == "ready"
+
+        for i in range(2):
+            kbd._record_task_failure(
+                conn, tids[1], error=f"again{i}", outcome="crashed", failure_limit=2,
+                release_claim=False, end_run=False,
+            )
+        assert kb.get_task(conn, tids[1]).status == "blocked"
+        kb.assign_task(conn, tids[1], "other-profile")
+        assert kb.recompute_ready(conn, failure_limit=2) == 1
+        assert kb.get_task(conn, tids[1]).status == "ready"
+
+
+def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, capsys):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        exit_single_query(1)
+    assert exc.value.code == 1
+    assert KANBAN_WORKER_EXIT_TRAILER not in capsys.readouterr().err
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    with pytest.raises(SystemExit) as exc:
+        exit_single_query(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    assert exc.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE}" in capsys.readouterr().err
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_worker_image_extraction.py ===
+"""Worker-side image enrichment for kanban tasks.
+
+When a kanban task body contains a local image path or an ``http(s)://``
+image URL, the worker must surface that image to the model on its first
+user turn — matching the CLI/gateway behaviour for inbound images.
+
+The dispatcher spawns the worker as
+``hermes -p <profile> chat -q "work kanban task <id>"``. The task body
+itself never appears in argv; the worker has to read it from the kanban
+DB during startup. These tests cover the round-trip:
+
+  task body  →  kanban_db.get_task  →  extract_image_refs  →
+  build_native_content_parts  →  multimodal user turn
+"""
+from __future__ import annotations
+
+import base64
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from agent.image_routing import (
+    build_native_content_parts,
+    extract_image_refs,
+)
+
+
+# Tiny 1×1 transparent PNG used to back any path the tests stick into a
+# task body. extract_image_refs validates the path exists on disk, so the
+# byte content has to be a real readable file (any image bytes will do).
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=="
+)
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch):
+    """Isolated HERMES_HOME with a fresh kanban DB for each test."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+def _add_task_with_body(body: str, *, title: str = "Look at this") -> str:
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body=body,
+            assignee="worker-a",
+            tenant=None,
+        )
+    finally:
+        conn.close()
+    return task_id
+
+
+def _read_body(task_id: str) -> str:
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        return (task.body if task is not None else "") or ""
+    finally:
+        conn.close()
+
+
+class TestExtractFromTaskBody:
+    """Read a real kanban task body and run it through extract_image_refs."""
+
+    def test_local_path_in_body_round_trips(self, kanban_home, tmp_path):
+        img = tmp_path / "screenshot.png"
+        img.write_bytes(_PNG)
+        tid = _add_task_with_body(
+            f"Please review the screenshot at {img} and confirm "
+            "the alignment is right."
+        )
+
+        body = _read_body(tid)
+        paths, urls = extract_image_refs(body)
+        assert paths == [str(img)]
+        assert urls == []
+
+
+class TestBuildPartsFromTaskBody:
+    """Verify the full pipeline produces a multimodal user turn."""
+
+    def test_local_path_becomes_native_image_part(self, kanban_home, tmp_path):
+        img = tmp_path / "design.png"
+        img.write_bytes(_PNG)
+        tid = _add_task_with_body(f"Check out {img} — what's broken?")
+        body = _read_body(tid)
+        paths, urls = extract_image_refs(body)
+
+        # Mirrors the cli.py wiring: pass the worker's literal -q argument
+        # (the dispatcher uses ``"work kanban task <id>"``) plus the
+        # extracted refs through build_native_content_parts.
+        parts, skipped = build_native_content_parts(
+            f"work kanban task {tid}",
+            paths,
+            image_urls=urls or None,
+        )
+
+        assert skipped == []
+        # text part + one image_url part
+        assert len(parts) == 2
+        assert parts[0]["type"] == "text"
+        assert parts[0]["text"].startswith(f"work kanban task {tid}")
+        assert f"[Image attached at: {img}]" in parts[0]["text"]
+        assert parts[1]["type"] == "image_url"
+        assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+
+
+    def test_code_block_example_is_not_attached(self, kanban_home, tmp_path):
+        # Only the real image outside the fenced code block should attach.
+        real = tmp_path / "real.png"
+        real.write_bytes(_PNG)
+        tid = _add_task_with_body(
+            f"Real screenshot:\n{real}\n\n"
+            "Example we DON'T want attached:\n"
+            "```\n"
+            "image: /tmp/example_only.png\n"
+            "url: https://example.com/example.png\n"
+            "```\n"
+        )
+        body = _read_body(tid)
+        paths, urls = extract_image_refs(body)
+
+        assert paths == [str(real)]
+        assert urls == []
+

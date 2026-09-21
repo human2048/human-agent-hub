@@ -1,0 +1,388 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\test_kanban_worker_runs.py ===
+"""Tests for kanban worker/runs read endpoints.
+
+Covers:
+  GET /workers/active
+  GET /runs/{run_id}
+  GET /runs/{run_id}/inspect
+  POST /runs/{run_id}/terminate
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import secrets
+import sys
+import time
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from hermes_cli import kanban_db as kb
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
+
+    mod_name = "hermes_dashboard_plugin_kanban_worker_runs_test"
+    # Re-use a cached module if already loaded to avoid duplicate-router issues.
+    if mod_name in sys.modules:
+        return sys.modules[mod_name].router
+
+    spec = importlib.util.spec_from_file_location(mod_name, plugin_file)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod.router
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with an empty kanban DB."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+@pytest.fixture
+def client(kanban_home):
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    return TestClient(app)
+
+
+def _insert_run(conn, task_id, *, worker_pid=None, ended_at=None):
+    """Insert a task_runs row directly (bypassing claim machinery) and return run_id."""
+    lock = secrets.token_hex(8)
+    future = int(time.time()) + 3600
+    cur = conn.execute(
+        "INSERT INTO task_runs "
+        "(task_id, status, claim_lock, claim_expires, worker_pid, started_at, ended_at) "
+        "VALUES (?, 'running', ?, ?, ?, ?, ?)",
+        (task_id, lock, future, worker_pid, int(time.time()), ended_at),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# GET /workers/active
+# ---------------------------------------------------------------------------
+
+def test_workers_active_empty_board(client):
+    """Board with no running tasks returns an empty workers list."""
+    r = client.get("/api/plugins/kanban/workers/active")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["workers"] == []
+    assert body["count"] == 0
+    assert "checked_at" in body
+
+
+# ---------------------------------------------------------------------------
+# GET /runs/{run_id}
+# ---------------------------------------------------------------------------
+
+def test_get_run_404_unknown_id(client):
+    """Non-existent run_id returns 404."""
+    r = client.get("/api/plugins/kanban/runs/999999")
+    assert r.status_code == 404
+    assert "999999" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# GET /runs/{run_id}/inspect
+# ---------------------------------------------------------------------------
+
+def test_inspect_run_404(client):
+    """Non-existent run_id returns 404."""
+    r = client.get("/api/plugins/kanban/runs/888888/inspect")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /runs/{run_id}/terminate
+# ---------------------------------------------------------------------------
+
+def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
+    """Create a task in 'running' state with a matching open task_runs row.
+
+    Mirrors what dispatcher_claim does: stamps tasks.status='running',
+    tasks.claim_lock, tasks.worker_pid; inserts task_runs row with the
+    same claim_lock so reclaim_task's preconditions are satisfied.
+    """
+    task_id = kb.create_task(conn, title=title, assignee=assignee)
+    lock = secrets.token_hex(8)
+    future = int(time.time()) + 3600
+    conn.execute(
+        "UPDATE tasks SET status='running', claim_lock=?, "
+        "claim_expires=?, worker_pid=? WHERE id=?",
+        (lock, future, worker_pid, task_id),
+    )
+    cur = conn.execute(
+        "INSERT INTO task_runs "
+        "(task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
+        "VALUES (?, 'running', ?, ?, ?, ?)",
+        (task_id, lock, future, worker_pid, int(time.time())),
+    )
+    conn.commit()
+    return task_id, cur.lastrowid
+
+
+def test_terminate_run_404_unknown_id(client):
+    """POST to unknown run_id returns 404."""
+    r = client.post(
+        "/api/plugins/kanban/runs/777777/terminate",
+        json={"reason": "test"},
+    )
+    assert r.status_code == 404
+    assert "777777" in r.json()["detail"]
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\test_kanban_ws_idle_disconnect.py ===
+"""Regressions for the kanban events WebSocket connection lifecycle.
+
+Before the fix (#77833), ``stream_events`` only awaited ``asyncio.sleep``
+between DB polls, so a disconnect was detected solely when ``send_json``
+raised — which never happens on a board with no new events. Every closed
+dashboard tab therefore left a zombie poll task querying SQLite forever.
+
+The event tail must also reuse one SQLite connection instead of opening and
+closing the last WAL connection on every idle poll. On Windows that repeatedly
+deletes and recreates ``kanban.db-wal`` and ``kanban.db-shm``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+
+
+def _load_plugin_module():
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
+    spec = importlib.util.spec_from_file_location(
+        "hermes_dashboard_plugin_kanban_ws_test", plugin_file,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _IdleDisconnectingWebSocket:
+    """Accepts, then reports a client disconnect on the first receive()."""
+
+    def __init__(self):
+        self.accepted = False
+        self.sent: list[dict] = []
+        self.query_params: dict[str, str] = {}
+        self.receive_calls = 0
+
+    async def accept(self):
+        self.accepted = True
+
+    async def receive(self):
+        self.receive_calls += 1
+        return {"type": "websocket.disconnect"}
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    async def close(self, code=None):
+        pass
+
+
+class _PollingWebSocket:
+    def __init__(self):
+        self.accepted = False
+        self.sent: list[dict] = []
+        self.query_params: dict[str, str] = {}
+        self._disconnect = asyncio.Event()
+
+    async def accept(self):
+        self.accepted = True
+
+    async def receive(self):
+        await self._disconnect.wait()
+        return {"type": "websocket.disconnect"}
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    async def close(self, code=None):
+        pass
+
+
+class _TrackingConnection:
+    def __init__(self, rows_by_poll=None, on_execute=None):
+        self.rows_by_poll = list(rows_by_poll or [])
+        self.on_execute = on_execute
+        self.execute_calls = 0
+        self.close_calls = 0
+        self.thread_ids: list[int] = []
+        self._rows: list[dict] = []
+
+    def execute(self, sql, params):
+        self.execute_calls += 1
+        self.thread_ids.append(threading.get_ident())
+        if self.on_execute is not None:
+            self.on_execute()
+        poll_index = self.execute_calls - 1
+        self._rows = (
+            self.rows_by_poll[poll_index]
+            if poll_index < len(self.rows_by_poll)
+            else []
+        )
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        self.close_calls += 1
+        self.thread_ids.append(threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+
+    ws = _IdleDisconnectingWebSocket()
+
+    # The disconnect must terminate the handler even though the board is idle
+    # and no event is ever sent. Before the fix this call never returned
+    # (the loop only slept between polls), so bound it with a timeout.
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert ws.accepted
+    assert ws.receive_calls == 1
+    assert ws.sent == []  # returned before any poll, no zombie loop
+
+
+@pytest.mark.asyncio
+async def test_stream_events_reuses_connection_and_closes_after_disconnect(
+    monkeypatch,
+):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+
+    event_row = {
+        "id": 7,
+        "task_id": "task-1",
+        "run_id": None,
+        "kind": "updated",
+        "payload": '{"status": "running"}',
+        "created_at": 1234,
+    }
+    conn = _TrackingConnection(rows_by_poll=[[], [event_row]])
+    connect_threads: list[int] = []
+
+    def _connect(*, board=None):
+        connect_threads.append(threading.get_ident())
+        return conn
+
+    monkeypatch.setattr(mod.kbc, "connect", _connect)
+
+    wait_calls = 0
+
+    async def _poll_twice_then_disconnect(awaitable, timeout):
+        nonlocal wait_calls
+        wait_calls += 1
+        awaitable.close()
+        if wait_calls <= 2:
+            raise asyncio.TimeoutError
+        return {"type": "websocket.disconnect"}
+
+    monkeypatch.setattr(mod.asyncio, "wait_for", _poll_twice_then_disconnect)
+    ws = _PollingWebSocket()
+
+    await mod.stream_events(ws)
+
+    assert ws.accepted
+    assert len(connect_threads) == 1
+    assert conn.execute_calls == 2
+    assert conn.close_calls == 1
+    assert len(set(connect_threads + conn.thread_ids)) == 1
+    assert ws.sent == [{
+        "events": [{
+            "id": 7,
+            "task_id": "task-1",
+            "run_id": None,
+            "kind": "updated",
+            "payload": {"status": "running"},
+            "created_at": 1234,
+        }],
+        "cursor": 7,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_stream_events_closes_connection_when_cancelled(monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+
+    loop = asyncio.get_running_loop()
+    first_fetch_done = asyncio.Event()
+    conn = _TrackingConnection(
+        on_execute=lambda: loop.call_soon_threadsafe(first_fetch_done.set),
+    )
+    connect_threads: list[int] = []
+
+    def _connect(*, board=None):
+        connect_threads.append(threading.get_ident())
+        return conn
+
+    monkeypatch.setattr(mod.kbc, "connect", _connect)
+
+    real_wait_for = asyncio.wait_for
+    wait_calls = 0
+
+    async def _poll_once_then_wait(awaitable, timeout):
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            awaitable.close()
+            raise asyncio.TimeoutError
+        return await awaitable
+
+    monkeypatch.setattr(mod.asyncio, "wait_for", _poll_once_then_wait)
+    ws = _PollingWebSocket()
+    task = asyncio.create_task(mod.stream_events(ws))
+
+    await real_wait_for(first_fetch_done.wait(), timeout=5)
+    task.cancel()
+    await task
+
+    assert len(connect_threads) == 1
+    assert conn.execute_calls == 1
+    assert conn.close_calls == 1
+    assert len(set(connect_threads + conn.thread_ids)) == 1
+

@@ -1,0 +1,224 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\derive-and-mapping.md ===
+# Dérive and Mapping
+
+Three traditions of *attentive movement through territory* as ideation:
+- **Situationist dérive** — Guy Debord, *Théorie de la dérive* (1958). Drift through a city, displacing productive uses with attentive wandering.
+- **Kevin Lynch's cognitive mapping** — *The Image of the City* (1960). Five-element vocabulary for mental maps: paths, edges, districts, nodes, landmarks.
+- **Gaston Bachelard's topoanalysis** — *La Poétique de l'espace* (1958). Phenomenological reading of intimate spaces.
+
+## When to use
+
+- Entering an unfamiliar field — drift before forming hypotheses
+- Picking a research subject or thesis topic
+- Major life decision (where to live, what to study) — visit the territories
+- Site-specific creative work
+- Refreshing your own work — small-space artist date
+
+## Don't use when
+
+- Time pressure (drift is slow)
+- Goal-directed search (drift is for *not knowing what you're looking for*)
+- Group sizes that make drift into tourism (works solo or 2–3)
+- Using "dérive" as alibi for procrastination (real dérive has discipline)
+
+## Single-day urban dérive
+
+1. Pick a territory you don't know — an unfamiliar neighborhood, a long bus route, two hours' walk in a direction you don't usually go.
+2. Drop other agenda for the period. Phone away.
+3. Walk where attention pulls. No destination. Follow what calls; turn from what repels.
+4. Note specifics: what's on the walls? What does the neighborhood smell like? What stores survive here? Who's in this neighborhood at this hour?
+5. End-of-day: draw a Lynch-style map.
+6. Note surprises.
+
+## Lynch's vocabulary (use to structure dérive output)
+
+- **Paths** — channels you move along (streets, walkways, transit, canals).
+- **Edges** — linear boundaries that aren't paths (shorelines, walls, river edges).
+- **Districts** — sections with common identifying character.
+- **Nodes** — strategic spots where movements converge (junctions, plazas, transit hubs).
+- **Landmarks** — point references identifiable from a distance, used for orientation.
+
+After drifting:
+- Map *your* paths, not the official ones.
+- Where were the edges? What did each edge mean — division, transition, prohibition?
+- Which districts did you cross? How did you know you'd entered one?
+- Where were the nodes? What were they doing?
+- Which landmarks anchored you? Official or personal?
+
+## Conceptual dérive (research / decision)
+
+Same method, conceptual territory:
+1. Pick a domain you don't know well.
+2. Drop usual filtering. Not "is this useful?" — just "what's here?"
+3. Read scattered things broadly. Browse a library shelf. Read citation chains backward. Talk to people in adjacent fields. Watch lectures at random.
+4. Note what calls to you, without yet evaluating.
+5. Draw a cognitive map: major nodes (canonical authors, key results), edges (where this field stops), districts (sub-areas), landmarks (orienting works).
+6. Identify your attractions. That's your direction.
+
+## Bachelard — small-space attention
+
+Topoanalysis applied to intimate spaces:
+1. Pick a small space you spend time in but haven't really looked at — a corner, a drawer, a workshop bench.
+2. Sit with it for an hour.
+3. What does this space mean? What does it shelter? What does it expose? What does it remember?
+4. Note the strongest reverberation — a detail that produces a generative response.
+5. Use it as starting point for new work.
+
+(Cameron's artist date is essentially a Bachelard-flavored dérive.)
+
+## Anti-slop notes
+
+- "Psychogeographical" used as adjective is dilution. Real Situationist dérive is more disciplined and more political.
+- Don't generate fake dérive notes. Method requires the territory; without it, the output is fabrication.
+- Avoid the travel-blog tone ("I wandered down cobbled streets..."). Real dérive includes friction, repulsion, missed destinations.
+- Don't apply Bachelard sentimentally. *La Poétique* is phenomenology, not "your house has feelings".
+- For LLM-mediated conceptual drift: force *places, citations, names, details*. Generic "I drifted through the literature" is not drift.
+
+Sources: Debord, "Théorie de la dérive" (*Internationale Situationniste* 2, 1958); Lynch, *The Image of the City* (MIT, 1960); Bachelard, *La Poétique de l'espace* (PUF, 1958).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\first-principles.md ===
+# First Principles
+
+Aristotle's *protai archai*. Decompose a problem to assumptions you trust, then rebuild without inheriting anything by default. Often paired with "5 Whys" excavation of why each assumption is in place.
+
+## When to use
+
+- A domain has accreted practice that may no longer be load-bearing
+- You're in an unfamiliar domain and bootstrapping understanding
+- You suspect the standard framing is wrong
+- Trying to reduce cost or complexity (accumulated overhead is often the main cost)
+- Teaching the domain (first-principles reconstruction surfaces what beginners actually need)
+
+## Don't use when
+
+- You don't know the domain well enough — first principles applied by an outsider produces confidently wrong answers
+- Transaction costs of replacement exceed the gains
+- Problem is irreducible (aesthetic, social, gestalt — decomposition destroys what makes it coherent)
+- You're trying to seem original — performance of first-principles thinking is slop
+
+## Procedure
+
+1. **State the problem precisely.**
+2. **List assumptions in the conventional solution.** What does the standard approach take for granted? List 5–10, including ones that "go without saying."
+3. **Categorize each:**
+   - **Physical** — law of nature; can't be relaxed.
+   - **Informational** — logical / mathematical / information-theoretic; can't be relaxed without contradiction.
+   - **Conventional** — could be different; matters for compatibility.
+   - **Historical** — was necessary at some point; may not be now.
+   - **Pedagogical** — simplification used for teaching; may not be how experts actually do it.
+4. **For each non-physical / non-informational assumption:** still load-bearing? Conventional and historical assumptions are where the gains live.
+5. **Rebuild.** Construct a candidate respecting only physical and informational constraints, plus your specific context.
+6. **Apply Chesterton's fence.** For each element you've removed, find the original reason it was added. If you can't find a reason, *don't conclude there isn't one* — assume you haven't looked hard enough.
+7. **Decide whether to switch.** Even when the rebuild is technically better, consider transaction cost, ecosystem compatibility, team familiarity.
+
+## Worked example
+
+**Problem**: typical CRUD web app — login, dashboard, few CRUD entities. Conventional stack: React + Node/Express + PostgreSQL + REST API + managed platform. ~12,000 LOC, monthly hosting ~$100.
+
+**Assumptions**:
+- React: conventional, was historical (SPA promise ~2014), pedagogical (taught everywhere).
+- Backend separate from frontend: conventional; informational *if* multi-client, otherwise historical.
+- PostgreSQL: physical *if* concurrency/ACID required; otherwise conventional.
+- REST API between frontend and backend: was informational (network boundary), now historical for single-client apps.
+- Managed platform: conventional; was historical (datacenter complexity); pedagogical.
+
+**Context**: 100 users, ~10 MB data, no real-time, single client (web), no HA constraint.
+
+**Rebuild**:
+- Server-rendered HTML + small JS islands. (No SPA. No build pipeline. No API layer.)
+- SQLite single file. (No PG server. Backup = copy a file.)
+- Single small VM. (No managed platform. Deploy = `rsync` + `systemctl restart`.)
+- Single Go/Python/Ruby binary.
+
+**Result**: ~1,500 LOC vs 12,000. ~$5/month vs $100. Tradeoffs: less impressive on resume, fewer contractors familiar with this style, no immediate path to 1M users.
+
+**Chesterton's fence**: the conventional choices are load-bearing for *some* applications. The rebuild is correct *only* for this app's constraints. A different app — high concurrency, multiple clients, large data — needs different choices.
+
+## Anti-slop notes
+
+- The biggest slop is the *performance* of first-principles thinking. "I'm going to think from first principles" followed by a slightly-rearranged conventional answer is slop. Output should look measurably different.
+- Don't claim first principles when you're applying common sense.
+- Avoid the engineer-hero archetype. Real first principles often reveals what the field already knows.
+- Don't recommend removing structure you don't understand. Chesterton's fence applies hard.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\jobs-to-be-done.md ===
+# Jobs to Be Done
+
+Clayton Christensen et al., *Competing Against Luck* (HarperBusiness, 2016). Customers don't buy products based on demographics — they "hire" products to do specific jobs in specific situations.
+
+## When to use
+
+- Product / service / business design
+- Differentiation from competitors (the real competitor is whatever currently does the job — often non-obvious)
+- Failure analysis (a product that "should have worked" often was designed for a job customers don't have)
+- Pricing (price in the unit of the job, not the cost of the product)
+- Marketing copy (speak to the job, not the features)
+
+## Don't use when
+
+- Artistic or expressive work — "what job is this novel hired to do?" collapses what makes it specific
+- Civic / social design — imports market logic that's wrong here
+- Pure-research questions (no customer, no hire — use compression-progress)
+- You don't have access to actual customers
+
+## Core form
+
+State the job as: **"When [situation/trigger], I want to [motivation], so I can [expected outcome]."**
+
+The form forces specificity. Generic jobs ("when I want to be productive") are slop. Specific situations ("when I'm finishing a paper at 11pm and need a citation") are real.
+
+## The four forces of switching (Bob Moesta)
+
+A customer changes from one solution to another when **(push + pull) > (anxiety + habit)**:
+
+1. **Push** of the situation — pain of current.
+2. **Pull** of the new solution — appeal of where they're moving.
+3. **Anxiety** about the new solution — fears it'll let them down.
+4. **Habit** of the present — inertia.
+
+Most failed product launches don't lose on (2). They have an excellent product. They lose on (3) and (4): unaddressed anxieties + inertia. **Design for forces 3 and 4, not just 2.**
+
+## Switch-interview procedure
+
+Talk to someone who recently switched to your category, or recently bought it for the first time. Recency matters; memory degrades.
+
+Walk the timeline:
+- When did you first realize you needed something different? (Be specific: time of day, where, what had just happened.)
+- What did you try first? Why didn't it work?
+- What were the alternatives?
+- When did you decide on this product?
+- What were you afraid would go wrong?
+- What was the moment of "I'm going to buy this"?
+
+Then identify the job ("When... I want to... so I can...") and the four forces.
+
+## Worked example
+
+*Switch from Mendeley to Zotero* (academic citation manager):
+
+- Push: Mendeley sync failed for 6 months; lost references.
+- Pull: Zotero free, open source, recommended by colleague.
+- Anxiety: losing 6 years of notes.
+- Habit: comfort with Mendeley UI.
+- Buying moment: colleague's library imported cleanly with notes preserved.
+
+**Job**: "When my reference manager fails me and I have years of accumulated work in it, I want to migrate to a new tool without losing my notes, so I can stay productive on my research."
+
+**Design implication**: a citation manager whose strongest pitch is *migration*, not features. Killer feature: "import from anywhere with notes preserved." Verified import quality from each major competitor. Reverse-migration tool. All addresses force 3 (anxiety) and force 4 (habit) — what most competitors neglect. The *features* (citation management) are barely differentiating. The *migration* is the product.
+
+## Anti-slop notes
+
+- Generic jobs ("customers want to feel valued") are not jobs; they're platitudes. Real jobs tie to specific situations and outcomes.
+- Don't fabricate switch-interview data. If you don't have customers, acknowledge the limit and recommend running real interviews.
+- Don't apply JTBD to artistic, research, or civic work. It's a market-logic tool.
+- Don't reduce humans to job-doers. JTBD is useful for purchase decisions; not all human behavior.
+- The "hired to do a job" can become catechism. Use where it fits; don't import where it doesn't.
+
+Source: Christensen et al., *Competing Against Luck* (HarperBusiness, 2016); Moesta, *Demand-Side Sales 101* (Lioncrest, 2020).
+

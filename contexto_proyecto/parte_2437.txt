@@ -1,0 +1,381 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_oneshot_dispatch_failure_run_claim.py ===
+"""Regression tests for #86522 — one-shot run_claim cleared on dispatch failure.
+
+``get_due_jobs`` stamps a ``run_claim`` on one-shot jobs before returning them
+as due (#59229); ``mark_job_run`` clears it on completion.  When dispatch
+itself fails (interpreter shutdown, execution-creation error, executor submit
+error) the job never reaches ``mark_job_run`` and the stale claim blocked
+re-dispatch until the TTL expired (default 30 min) — a precisely-timed
+one-shot reminder arrived up to 30 minutes late with no error surfaced.
+
+The fix (salvaged from PR #87591 by @RelaxJonh) adds
+``cron.jobs.clear_run_claim`` and calls it on all three ``_submit_with_guard``
+early-exit paths, wrapped best-effort so a failing store can never crash the
+tick these paths exist to protect.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+import cron.jobs as jobs_mod
+from cron.jobs import clear_run_claim
+
+
+@pytest.fixture
+def cron_store(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(jobs_mod, "HERMES_DIR", hermes_home)
+    monkeypatch.setattr(jobs_mod, "CRON_DIR", hermes_home / "cron")
+    monkeypatch.setattr(jobs_mod, "JOBS_FILE", hermes_home / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", hermes_home / "cron" / "output")
+    return hermes_home
+
+
+def _make_oneshot(claimed: bool = True) -> dict:
+    job = jobs_mod.create_job(prompt="remind me", schedule="in 30m")
+    if claimed:
+        jobs = jobs_mod.load_jobs()
+        for j in jobs:
+            if j["id"] == job["id"]:
+                j["run_claim"] = {"at": "2026-08-17T10:00:00+00:00", "by": "test:1"}
+        jobs_mod.save_jobs(jobs)
+    return job
+
+
+class TestClearRunClaim:
+    def test_clears_claim_on_oneshot(self, cron_store):
+        job = _make_oneshot(claimed=True)
+        assert clear_run_claim(job["id"]) is True
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is None
+
+    def test_noop_when_already_clear(self, cron_store):
+        job = _make_oneshot(claimed=False)
+        assert clear_run_claim(job["id"]) is False
+
+    def test_never_touches_recurring_jobs(self, cron_store):
+        job = jobs_mod.create_job(prompt="tick", schedule="every 10m")
+        jobs = jobs_mod.load_jobs()
+        for j in jobs:
+            if j["id"] == job["id"]:
+                j["run_claim"] = {"at": "2026-08-17T10:00:00+00:00", "by": "test:1"}
+        jobs_mod.save_jobs(jobs)
+        assert clear_run_claim(job["id"]) is False
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is not None  # untouched
+
+    def test_unknown_job_id_returns_false(self, cron_store):
+        assert clear_run_claim("no-such-job") is False
+
+
+class TestDispatchFailurePathsClearClaim:
+    """Each _submit_with_guard early-exit must clear the one-shot claim so the
+    next healthy tick re-dispatches instead of waiting out the 30-min TTL."""
+
+    def _tick_one(self, job):
+        from cron import scheduler as sched
+        with patch.object(sched, "get_due_jobs", return_value=[dict(job)]):
+            return sched.tick(verbose=False, sync=True)
+
+    def test_interpreter_shutdown_path_clears_claim(self, cron_store):
+        from cron import scheduler as sched
+        job = _make_oneshot(claimed=True)
+        with patch.object(sched, "_interpreter_shutting_down", return_value=True):
+            self._tick_one(job)
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is None, (
+            "shutdown-path dispatch failure must clear run_claim (#86522)"
+        )
+
+    def test_execution_creation_failure_clears_claim(self, cron_store):
+        from cron import scheduler as sched
+        job = _make_oneshot(claimed=True)
+        with patch.object(sched, "create_execution", side_effect=RuntimeError("db gone")):
+            self._tick_one(job)
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is None
+        assert job["id"] not in sched.get_running_job_ids()
+
+    def test_submit_failure_clears_claim(self, cron_store):
+        from cron import scheduler as sched
+        job = _make_oneshot(claimed=True)
+
+        class _ExplodingPool:
+            def submit(self, *a, **k):
+                raise RuntimeError("cannot schedule new futures")
+
+        pool = _ExplodingPool()
+        with patch.object(sched, "_get_parallel_pool", return_value=pool):
+            self._tick_one(job)
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is None
+        assert job["id"] not in sched.get_running_job_ids()
+
+    def test_clear_failure_is_best_effort_not_fatal(self, cron_store):
+        """A raising clear_run_claim (corrupt store, teardown I/O error) must
+        not crash the tick — these early-exit paths exist to skip cleanly; the
+        claim then simply expires at the TTL."""
+        from cron import scheduler as sched
+        job = _make_oneshot(claimed=True)
+        with patch.object(sched, "_interpreter_shutting_down", return_value=True), \
+             patch.object(sched, "clear_run_claim", side_effect=OSError(24, "Too many open files")):
+            n = self._tick_one(job)  # must not raise
+        assert n == 0
+
+    def test_recurring_dispatch_failure_skips_claim_io(self, cron_store):
+        """Recurring jobs carry no run_claim, so the dispatch-failure paths
+        must not pay clear_run_claim's lock acquisition + full jobs-file read
+        for a guaranteed no-op — the failure paths fire exactly when the
+        process can least afford pointless I/O (shutdown, EMFILE)."""
+        from cron import scheduler as sched
+        job = jobs_mod.create_job(prompt="hourly", schedule="every 1h")
+        with patch.object(sched, "_interpreter_shutting_down", return_value=True), \
+             patch.object(sched, "clear_run_claim") as mock_clear:
+            self._tick_one(job)
+        mock_clear.assert_not_called()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_oneshot_grace_due_scan.py ===
+"""Due-scan grace gate for one-shot cron jobs.
+
+create_job / update_job / resume_job all reject a one-shot whose run time is
+more than ONESHOT_GRACE_SECONDS in the past ("will never fire"), and
+``_recoverable_oneshot_run_at`` never recovers such a schedule — but the
+due-scan (``_get_due_jobs_locked``) used to dispatch any one-shot whose
+*persisted* ``next_run_at`` was in the past, even hours later (gateway down
+past the window, host asleep, hand-edited jobs.json). That fired a
+wall-clock one-shot late, contradicting the "will never fire" contract.
+
+These tests pin the due-scan grace gate:
+  - beyond grace  -> not due; record retired with a diagnostic
+  - within grace  -> still due (legitimate catch-up)
+  - beyond grace + claim -> not due, but the record is kept (a run may be
+    in flight in another process; its mark_job_run must still land)
+  - re-triggered  -> due again (the Run button still works)
+"""
+
+import pytest
+from datetime import datetime, timedelta, timezone
+
+from cron.jobs import (
+    get_due_jobs,
+    load_jobs,
+    save_jobs,
+    save_job_output,
+    trigger_job,
+    _hermes_now,
+    ONESHOT_GRACE_SECONDS,
+)
+
+FIXED_NOW = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture()
+def cron_store(tmp_path, monkeypatch):
+    """Redirect cron storage to a temp dir and pin the clock."""
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: FIXED_NOW)
+    return tmp_path
+
+
+def _oneshot(jid, run_at_dt, *, completed=0, run_claim=None, fire_claim=None):
+    return {
+        "id": jid,
+        "name": jid,
+        "prompt": "x",
+        "schedule": {"kind": "once", "run_at": run_at_dt.isoformat()},
+        "next_run_at": run_at_dt.isoformat(),
+        "last_run_at": None,
+        "enabled": True,
+        "state": "scheduled",
+        "repeat": {"times": 1, "completed": completed},
+        "deliver": "local",
+        "run_claim": run_claim,
+        "fire_claim": fire_claim,
+    }
+
+
+class TestOneShotGraceDueScan:
+    def test_stale_beyond_grace_not_due_and_retired_with_diagnostic(self, cron_store):
+        stale = _oneshot("stale", FIXED_NOW - timedelta(hours=3))
+        save_jobs([stale])
+
+        due = get_due_jobs()
+
+        assert [d["id"] for d in due] == []
+        # Record is retired (removed) so it stops being scanned — with a
+        # diagnostic left behind so the miss is operator-visible.
+        assert [j["id"] for j in load_jobs()] == []
+        out_dir = cron_store / "cron" / "output" / "stale"
+        diag = list(out_dir.glob("*.md")) if out_dir.exists() else []
+        assert diag, "expected a diagnostic file for the retired stale one-shot"
+        assert "outside grace window" in diag[0].read_text(encoding="utf-8")
+
+    def test_within_grace_still_due(self, cron_store):
+        recent = _oneshot("recent", FIXED_NOW - timedelta(seconds=60))
+        save_jobs([recent])
+
+        due = get_due_jobs()
+        assert [d["id"] for d in due] == ["recent"]
+        # Still stored (dispatch proceeds normally).
+        assert [j["id"] for j in load_jobs()] == ["recent"]
+
+    def test_stale_with_claim_skipped_but_record_kept(self, cron_store):
+        # A (possibly stale) run_claim means a run may still be in flight in
+        # another process — the due-scan must not fire OR retire the record,
+        # so mark_job_run can still land.
+        claimed = _oneshot(
+            "claimed",
+            FIXED_NOW - timedelta(hours=3),
+            completed=1,
+            run_claim={"at": (FIXED_NOW - timedelta(hours=3)).isoformat(), "by": "other"},
+        )
+        save_jobs([claimed])
+
+        due = get_due_jobs()
+        assert [d["id"] for d in due] == []
+        # Record preserved (not retired) despite being beyond grace.
+        assert [j["id"] for j in load_jobs()] == ["claimed"]
+
+    def test_retriggered_stale_oneshot_is_due(self, cron_store):
+        # A user can still explicitly re-run a stale one-shot: trigger_job
+        # sets next_run_at=now, which is inside the grace window -> due.
+        stale = _oneshot("stale", FIXED_NOW - timedelta(hours=3))
+        save_jobs([stale])
+        trigger_job("stale")
+
+        due = get_due_jobs()
+        assert [d["id"] for d in due] == ["stale"]
+
+    def test_recurring_jobs_unaffected(self, cron_store):
+        # The grace gate is once-kind only; a stale recurring job keeps its
+        # existing execute-now catch-up behavior.
+        interval = {
+            "id": "int",
+            "name": "int",
+            "prompt": "x",
+            "schedule": {"kind": "interval", "minutes": 60},
+            "next_run_at": (FIXED_NOW - timedelta(hours=2)).isoformat(),
+            "last_run_at": None,
+            "enabled": True,
+            "state": "scheduled",
+            "repeat": {"times": None, "completed": 0},
+            "deliver": "local",
+        }
+        save_jobs([interval])
+        due = get_due_jobs()
+        # Recurring stale handling still executes once now (existing behavior).
+        assert [d["id"] for d in due] == ["int"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_oneshot_guard_warning.py ===
+"""Due-scan dispatch-limit guard: removal of a re-armed consumed one-shot is
+operator-visible (#93524 follow-up to #93615).
+
+Pre-#93615 stores (or hand edits) can hold a record that already completed a
+run (last_run_at set) but was re-armed without a budget reset. The due-scan
+guard removes it without firing — correct, since #93615's policy routes
+re-runs through `cron resume` — but the removal must log at WARNING with a
+remediation hint, never a silent INFO delete.
+"""
+
+import logging
+from datetime import timedelta
+
+import pytest
+
+from cron.jobs import (
+    claim_dispatch,
+    create_job,
+    get_due_jobs,
+    load_jobs,
+    mark_job_run,
+    save_jobs,
+    _hermes_now,
+)
+
+
+@pytest.fixture()
+def temp_home(tmp_path, monkeypatch):
+    """Redirect cron storage to a temp dir (same pattern as the sibling
+    grace-gate tests)."""
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    return tmp_path
+
+
+def test_guard_warns_on_rearmed_consumed_record(temp_home, caplog):
+    job = create_job(
+        prompt="x",
+        schedule=(_hermes_now() + timedelta(hours=1)).isoformat(),
+        name="warn-guard",
+        deliver="local",
+    )
+    jid = job["id"]
+    assert claim_dispatch(jid)
+    mark_job_run(jid, True)
+
+    # Simulate a pre-#93615 re-arm: enabled+scheduled+due, budget still spent.
+    jobs = load_jobs()
+    for j in jobs:
+        if j["id"] == jid:
+            j["enabled"] = True
+            j["state"] = "scheduled"
+            j["next_run_at"] = (_hermes_now() - timedelta(seconds=5)).isoformat()
+    save_jobs(jobs)
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        due = get_due_jobs()
+
+    assert jid not in [d["id"] for d in due]
+    assert jid not in [j["id"] for j in load_jobs()]
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "WITHOUT firing" in r.getMessage()
+    ]
+    assert warnings, "expected WARNING on removal of a re-armed consumed one-shot"
+    assert "cron resume" in warnings[0].getMessage()
+
+
+def test_guard_stays_info_for_never_ran_stale_record(temp_home, caplog):
+    """The dead-tick recovery case (no last_run_at) keeps its quiet INFO."""
+    job = create_job(
+        prompt="x",
+        schedule=(_hermes_now() + timedelta(hours=1)).isoformat(),
+        name="quiet-guard",
+        deliver="local",
+    )
+    jid = job["id"]
+
+    jobs = load_jobs()
+    for j in jobs:
+        if j["id"] == jid:
+            j["repeat"] = {"times": 1, "completed": 1}
+            j["last_run_at"] = None
+            j["next_run_at"] = (_hermes_now() - timedelta(seconds=5)).isoformat()
+    save_jobs(jobs)
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        get_due_jobs()
+
+    warns = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "WITHOUT firing" in r.getMessage()
+    ]
+    assert not warns, "never-ran stale record must not trip the WARNING path"
+

@@ -1,0 +1,266 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_docker_teardown_drain.py ===
+"""#86317: a container-teardown worker must be joined at exit even after the idle reaper popped its
+env out of ``_active_environments`` (the atexit drain only knew the registry, so ``docker rm`` for a
+detached env died with the interpreter and left a stopped, labeled container behind)."""
+
+import subprocess
+import threading
+
+import tools.environments.docker as docker_env
+import tools.terminal_tool as terminal_tool
+
+
+def _env_with_slow_teardown(monkeypatch, release: threading.Event, seen: list):
+    docker_env._cgroup_limits_ok = True
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    def _run(cmd, **kwargs):
+        argv = list(cmd)
+        if argv[1] == "rm":
+            release.wait(5)  # the slow part: interpreter used to exit before it finished
+        if argv[1] in ("stop", "rm"):
+            seen.append(argv[1])
+        out = "fake-cid\n" if argv[1] == "run" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    monkeypatch.setattr(docker_env, "run_capture", lambda cmd, **kw: _run(cmd))
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
+    monkeypatch.setattr(docker_env.DockerEnvironment, "_remove_bind_dirs", lambda self: None)
+    return docker_env.DockerEnvironment(
+        image="python:3.11", cwd="/root", timeout=5, task_id="t-detach", persistent_filesystem=False,
+        persist_across_processes=False)
+
+
+def test_atexit_drain_joins_worker_of_env_already_popped_from_registry(monkeypatch):
+    release, seen = threading.Event(), []
+    env = _env_with_slow_teardown(monkeypatch, release, seen)
+    # The reaper's shape: pop first, then cleanup() — the registry no longer references env.
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    env.cleanup()
+    assert env._cleanup_thread.is_alive()
+
+    joined = {}
+
+    def _drain():
+        joined["result"] = None
+        terminal_tool._atexit_cleanup()
+        joined["result"] = True
+
+    drainer = threading.Thread(target=_drain)
+    drainer.start()
+    drainer.join(0.5)
+    assert drainer.is_alive(), "drain returned while a detached teardown worker was still running"
+    release.set()
+    drainer.join(5)
+    assert joined["result"] is True and seen == ["stop", "rm"]
+    assert not env._cleanup_thread.is_alive()
+
+
+def test_finished_workers_do_not_accumulate():
+    t = threading.Thread(target=lambda: None)
+    with docker_env._TEARDOWN_LOCK:
+        docker_env._TEARDOWN_THREADS.add(t)
+    t.start(); t.join()
+    assert docker_env.DockerEnvironment.wait_for_all_teardowns(timeout=1) is True
+    with docker_env._TEARDOWN_LOCK:
+        assert t not in docker_env._TEARDOWN_THREADS
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_drive_preview_tool.py ===
+"""Tests for the GUI-surface ``drive_preview`` tool."""
+
+import json
+
+from tools import drive_preview_tool as ap
+from tools.registry import registry
+
+
+def test_lives_in_the_gui_surface_toolset(monkeypatch):
+    """Mirrors read_preview: scoped by toolset, not by the backend's env."""
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    entry = registry.get_entry("drive_preview")
+
+    assert entry is not None
+    assert entry.toolset == "desktop_ui"
+    assert entry.check_fn is None
+
+
+def test_requires_callback():
+    """Outside the desktop GUI there is no bridge — a clear error, no crash."""
+    result = json.loads(ap.drive_preview_tool(action="elements", callback=None))
+    assert "desktop" in result["error"]
+
+
+def test_rejects_an_unknown_action():
+    result = json.loads(ap.drive_preview_tool(action="teleport", callback=lambda _p: "{}"))
+    assert "action must be one of" in result["error"]
+
+
+def test_interaction_verbs_need_a_target():
+    """A click with nowhere to land is a mistake worth naming before the bridge."""
+    for verb in ("click", "type", "press"):
+        result = json.loads(ap.drive_preview_tool(action=verb, text="x", key="Enter", callback=lambda _p: "{}"))
+        assert "ref" in result["error"], verb
+
+
+def test_type_needs_text_and_press_needs_a_key():
+    calls = []
+
+    def cb(payload):
+        calls.append(payload)
+        return json.dumps({"success": True})
+
+    assert "text" in json.loads(ap.drive_preview_tool(action="type", ref="@e1", callback=cb))["error"]
+    assert "key" in json.loads(ap.drive_preview_tool(action="press", ref="@e1", callback=cb))["error"]
+    assert calls == []
+
+
+def test_typing_an_empty_string_is_allowed():
+    """Clearing a field is a real intent — only a missing `text` is an error."""
+    seen = {}
+    ap.drive_preview_tool(action="type", ref="@e1", text="", callback=lambda p: seen.update(p) or "{}")
+
+    assert seen["text"] == ""
+
+
+def test_scroll_needs_no_target_and_validates_its_destination():
+    seen = {}
+
+    def cb(payload):
+        seen.clear()
+        seen.update(payload)
+        return json.dumps({"success": True})
+
+    ap.drive_preview_tool(action="scroll", callback=cb)
+    assert seen == {"action": "scroll"}
+
+    result = json.loads(ap.drive_preview_tool(action="scroll", to="sideways", callback=cb))
+    assert "to must be one of" in result["error"]
+
+
+def test_payload_forwards_only_what_was_given():
+    seen = {}
+    ap.drive_preview_tool(
+        action="type",
+        ref="inp-password",
+        text="hunter2",
+        submit=True,
+        callback=lambda p: seen.update(p) or json.dumps({"success": True}),
+    )
+
+    assert seen == {"action": "type", "ref": "inp-password", "text": "hunter2", "submit": True}
+
+
+def test_full_asks_the_renderer_for_a_whole_inventory():
+    seen = {}
+    ap.drive_preview_tool(
+        action="elements",
+        full=True,
+        callback=lambda p: seen.update(p) or json.dumps({"success": True}),
+    )
+
+    assert seen == {"action": "elements", "full": True}
+
+
+def test_numeric_arguments_are_validated():
+    result = json.loads(ap.drive_preview_tool(action="scroll", amount="lots", callback=lambda _p: "{}"))
+    assert "integers" in result["error"]
+
+
+def test_empty_answer_means_nothing_open():
+    result = json.loads(ap.drive_preview_tool(action="elements", callback=lambda _p: ""))
+    assert "open_preview" in result["error"]
+
+
+def test_passes_the_renderer_answer_through():
+    payload = {
+        "success": True,
+        "acted": 'clicked button "Sign in"',
+        "url": "https://example.com/app",
+        "elements": [{"ref": "@e1", "role": "button", "label": "Log out", "selector": "#out"}],
+    }
+    result = json.loads(ap.drive_preview_tool(action="click", ref="@e2", callback=lambda _p: json.dumps(payload)))
+
+    assert result == payload
+
+
+def test_wraps_non_json_text():
+    result = json.loads(ap.drive_preview_tool(action="elements", callback=lambda _p: "plain words"))
+    assert result == {"text": "plain words"}
+
+
+def test_callback_failure_is_reported():
+    def _boom(_payload):
+        raise RuntimeError("renderer went away")
+
+    result = json.loads(ap.drive_preview_tool(action="elements", callback=_boom))
+    assert "renderer went away" in result["error"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_ensure_task_env.py ===
+"""Unit tests for terminal_tool.ensure_task_env — the lazy sandbox bring-up
+used by vision_analyze so a session's first action can be an in-sandbox file
+read without a prior terminal command (issue #62825)."""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import tools.terminal_tool as tt
+import tools.terminal_tool_backends as ttb
+from tools.terminal_tool_lifecycle import get_active_env
+
+
+def _clear(*task_ids):
+    for task_id in task_ids:
+        tt._active_environments.pop(task_id, None)
+        tt._last_activity.pop(task_id, None)
+
+
+def test_local_backend_is_noop(monkeypatch):
+    """Local backend reads images host-side — no sandbox is created."""
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    with patch.object(ttb, "_create_environment") as create:
+        assert tt.ensure_task_env("t-local") is None
+    create.assert_not_called()
+
+
+def test_non_local_creates_and_reuses(monkeypatch):
+    """A non-local backend with no active env creates one, caches it, and a
+    second call reuses the cache instead of spawning a duplicate."""
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    task_id = "t-ssh"
+    eff = tt._resolve_container_task_id(task_id)
+    _clear(eff, task_id)
+    fake = SimpleNamespace(execute=lambda *a, **k: {"returncode": 0, "output": ""})
+    try:
+        with patch.object(ttb, "_create_environment", return_value=fake) as create:
+            assert tt.ensure_task_env(task_id) is fake
+            create.assert_called_once()
+            assert get_active_env(task_id) is fake
+
+            # Already active -> no second creation.
+            assert tt.ensure_task_env(task_id) is fake
+            create.assert_called_once()
+    finally:
+        _clear(eff, task_id)
+
+
+def test_creation_failure_returns_none_and_caches_nothing(monkeypatch):
+    """A failed bring-up is best-effort: return None and leave no env cached so
+    the caller keeps its fail-closed path."""
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    task_id = "t-ssh-fail"
+    eff = tt._resolve_container_task_id(task_id)
+    _clear(eff, task_id)
+    try:
+        with patch.object(ttb, "_create_environment", side_effect=RuntimeError("boom")):
+            assert tt.ensure_task_env(task_id) is None
+        assert get_active_env(task_id) is None
+    finally:
+        _clear(eff, task_id)
+

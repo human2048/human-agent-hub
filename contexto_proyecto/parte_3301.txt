@@ -1,0 +1,320 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_cli_dispatch_passthrough.py ===
+"""Regression tests for #33488 (CLI max_in_progress / max_spawn / per-profile
+config passthrough) and #29415 (kanban_swarm humanizer skill ref).
+
+These two fixes are bundled because they're both small, both touch the
+kanban dispatcher's CLI surface, and they each guard against a silent
+operator footgun that only manifests in long-running setups.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture()
+def isolated_kanban_home(monkeypatch):
+    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
+    os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", test_home)
+    for mod in list(sys.modules.keys()):
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+            del sys.modules[mod]
+    yield test_home
+
+
+def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
+    """#33488: hermes kanban dispatch must pass kanban.max_in_progress from
+    config to dispatch_once. Without this, the global concurrency cap is
+    unreachable from the CLI even though it works from the gateway."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    # Configure max_in_progress in the loaded config.
+    fake_config = {
+        "kanban": {
+            "max_in_progress": 3,
+            "max_spawn": 5,
+            "default_assignee": "default",
+            "max_in_progress_per_profile": 2,
+        }
+    }
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: fake_config
+    )
+
+    captured = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kanban_db.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    kb_cli._cmd_dispatch(args)
+
+    # Every config value must have reached dispatch_once.
+    assert captured.get("max_in_progress") == 3, (
+        f"CLI must pass kanban.max_in_progress from config; got {captured.get('max_in_progress')!r}"
+    )
+    assert captured.get("max_spawn") == 5, (
+        f"CLI must pass kanban.max_spawn from config when --max is not provided; got {captured.get('max_spawn')!r}"
+    )
+    assert captured.get("default_assignee") == "default"
+    assert captured.get("max_in_progress_per_profile") == 2
+
+
+def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):
+    """--max on the CLI takes precedence over kanban.max_spawn in config.
+    The CLI flag is the explicit operator signal; config is the default."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    fake_config = {"kanban": {"max_spawn": 10}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    captured = {}
+    monkeypatch.setattr(
+        kbd, "dispatch_once",
+        lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
+    )
+
+    args = argparse.Namespace(dry_run=True, max=2, failure_limit=2, json=False)
+    kb_cli._cmd_dispatch(args)
+
+    assert captured.get("max_spawn") == 2, (
+        f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
+    )
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_cli_exit_status.py ===
+"""Regression coverage for Kanban CLI process exit status propagation."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[2]
+
+
+def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_KANBAN_HOME"] = str(home)
+    for name in (
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    ):
+        env.pop(name, None)
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    if marker:
+        env["HERMES_DELEGATED_CHILD_CONTEXT"] = "1"
+    else:
+        env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", *args],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path):
+    """A printed Kanban mutation refusal must not look like CLI success."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    created = _run_hermes(home, "kanban", "create", "exit status probe", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+
+    refused = _run_hermes(
+        home,
+        "kanban",
+        "comment",
+        task_id,
+        "must be refused",
+        marker=True,
+    )
+
+    assert refused.returncode == 1
+    assert "delegate_task child contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_comment_queries.py ===
+"""Comment-watermark queries in kanban_db.
+
+``list_comments_after`` backs the live worker bridge: it returns only comments
+newer than a cursor so a running worker folds in new operator notes without
+re-reading the whole thread.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+_WORKTREE = Path(__file__).resolve().parents[2]
+if str(_WORKTREE) not in sys.path:
+    sys.path.insert(0, str(_WORKTREE))
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+
+@pytest.fixture
+def fresh_home(tmp_path, monkeypatch):
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        import hermes_constants
+        hermes_constants._cached_default_hermes_root = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    kb._INITIALIZED_PATHS.clear()
+    return home
+
+
+def test_list_comments_after_cursor(fresh_home):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="chat")
+        c1 = kb.add_comment(conn, tid, author="alice", body="first")
+        c2 = kb.add_comment(conn, tid, author="bob", body="second")
+
+        assert [c.id for c in kb.list_comments_after(conn, tid, after_id=0)] == [c1, c2]
+
+        newer = kb.list_comments_after(conn, tid, after_id=c1)
+        assert [c.id for c in newer] == [c2]
+        assert newer[0].body == "second"
+
+        assert kb.list_comments_after(conn, tid, after_id=c2) == []
+    finally:
+        conn.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_complete_live_claim_guard.py ===
+"""Invariant: ``complete_task`` never closes a live worker's run for a caller that
+neither owns the run nor asked for an operator override (issue #111764).
+
+A claim-less completion (a human at the CLI, an orchestrator session — anything
+without ``HERMES_KANBAN_*`` env) used to be authorised by task status alone, so it
+marked a ``running`` card done and ``_end_run`` closed the dispatcher worker's run
+row while that worker kept executing. The guard mirrors ``request_review``'s: a
+``running`` task under a live claim needs ``expected_run_id`` or ``force=True``.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_connect as kbc
+
+
+@pytest.fixture
+def conn(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = kb.kanban_db_path(board="default")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db()
+    with kbc.connect() as c:
+        yield c
+
+
+def _claimed_running_task(conn, *, live_worker: bool = True) -> tuple[str, int]:
+    tid = kb.create_task(conn, title="live", assignee="coder")
+    assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
+    if live_worker:
+        # This process stands in for the spawned worker: alive, fingerprinted.
+        kbd._set_worker_pid(conn, tid, os.getpid())
+    return tid, kb._current_run_id(conn, tid)
+
+
+def test_claimless_complete_refuses_live_run_until_forced(conn):
+    tid, run_id = _claimed_running_task(conn)
+
+    with pytest.raises(kb.LiveClaimError):
+        kb.complete_task(conn, tid, result="someone else says done")
+
+    # Nothing moved: the worker's run is still open and it can still finish its own card.
+    run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    assert run["ended_at"] is None
+    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()["status"] == "running"
+    assert kb.complete_task(conn, tid, result="worker done", expected_run_id=run_id) is True
+
+    # Explicit operator override still closes a live run.
+    tid2, run2 = _claimed_running_task(conn)
+    assert kb.complete_task(conn, tid2, result="operator override", force=True) is True
+    run = conn.execute("SELECT ended_at, outcome FROM task_runs WHERE id = ?", (run2,)).fetchone()
+    assert run["ended_at"] is not None and run["outcome"] == "completed"
+
+
+def test_claimless_complete_of_claim_without_live_worker_unchanged(conn):
+    """A claim whose worker never spawned (or is gone) protects no live run: the
+    library / CLI flow that claims and then completes keeps working."""
+    tid, run_id = _claimed_running_task(conn, live_worker=False)
+    assert kb.complete_task(conn, tid, result="done") is True
+    run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    assert run["ended_at"] is not None
+
+
+def test_claimless_complete_of_unclaimed_card_unchanged(conn):
+    """The legitimate manual flow — completing a card nobody is working on — needs no proof."""
+    tid = kb.create_task(conn, title="admin", assignee="coder")
+    assert kb.complete_task(conn, tid, result="done") is True
+    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()["status"] == "done"
+
+
+def test_request_review_shares_the_live_worker_fence(conn):
+    """``request_review`` keys on the same liveness as ``complete_task``: a claim
+    without a live worker process is not a live claim (the human/library flow
+    ``claim`` -> ``request_review`` works), a live worker's claim still is."""
+    tid, _ = _claimed_running_task(conn, live_worker=False)
+    assert kb.request_review(conn, tid, summary="handoff") is True
+    assert kb.get_task(conn, tid).status == "review"
+
+    tid2, run2 = _claimed_running_task(conn)
+    ok, reason = kb.request_review(conn, tid2, summary="steal", with_reason=True)
+    assert ok is False and "live claim" in reason
+    assert kb.request_review(conn, tid2, summary="own", expected_run_id=run2) is True
+

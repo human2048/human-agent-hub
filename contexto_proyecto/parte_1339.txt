@@ -1,0 +1,343 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\scripts\report.py ===
+"""Status dashboards, Markdown reports, human-task digest, and Google Sheets row export."""
+from __future__ import annotations
+
+import brokers as brokers_mod
+import ledger as ledger_mod
+
+STATE_LABELS = {
+    "new": "Not started",
+    "searching": "Searching",
+    "not_found": "Not found",
+    "found": "Found (action needed)",
+    "indirect_exposure": "Indirect exposure (PII on a relative's record)",
+    "action_selected": "Action selected",
+    "submitted": "Submitted",
+    "verification_pending": "Awaiting verification",
+    "awaiting_processing": "Processing",
+    "confirmed_removed": "Removed",
+    "reappeared": "Reappeared",
+    "human_task_queued": "Human task",
+    "blocked": "Blocked",
+}
+
+
+def status_counts(subject_id: str) -> dict:
+    counts: dict[str, int] = {}
+    for case in ledger_mod.load(subject_id).values():
+        state = case.get("state", "new")
+        counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
+def metrics(subject_id: str) -> dict:
+    """Outcome metrics: what's actually confirmed vs merely claimed, and what's overdue.
+
+    removal_rate is confirmed_removed over cases we actually acted on (found/submitted/... ),
+    NOT over the whole broker DB, so it reflects real progress on real exposure. `in_flight`
+    is 'claimed' (submitted/verifying/processing) but not yet re-scan-confirmed. `overdue`
+    counts cases whose recheck window has already passed (the cron backlog).
+    """
+    c = status_counts(subject_id)
+    removed = c.get("confirmed_removed", 0)
+    in_flight = c.get("submitted", 0) + c.get("verification_pending", 0) + c.get("awaiting_processing", 0)
+    open_found = c.get("found", 0) + c.get("reappeared", 0) + c.get("action_selected", 0) \
+        + c.get("indirect_exposure", 0)
+    acted = removed + in_flight + open_found + c.get("human_task_queued", 0) + c.get("blocked", 0)
+    return {
+        "confirmed_removed": removed,
+        "in_flight_claimed": in_flight,      # submitted but NOT yet verified gone
+        "open_needs_action": open_found,
+        "blocked": c.get("blocked", 0),
+        "human_tasks": c.get("human_task_queued", 0),
+        "acted_total": acted,
+        "removal_rate": round(removed / acted, 3) if acted else 0.0,
+        "overdue_rechecks": len(ledger_mod.due(subject_id)),
+    }
+
+
+def render_markdown(subject_id: str) -> str:
+    ledger = ledger_mod.load(subject_id)
+    counts = status_counts(subject_id)
+    total = sum(counts.values())
+    removed = counts.get("confirmed_removed", 0)
+
+    m = metrics(subject_id)
+    lines = [
+        f"# unbroker - status for `{subject_id}`",
+        "",
+        f"**{removed} / {total} confirmed removed**  ·  removal rate (of acted-on cases): "
+        f"{int(m['removal_rate'] * 100)}%",
+        "",
+        f"- Confirmed removed: {m['confirmed_removed']}",
+        f"- In flight (submitted, not yet re-scan-confirmed): {m['in_flight_claimed']}",
+        f"- Open / needs action: {m['open_needs_action']}",
+        f"- Blocked (anti-bot): {m['blocked']}  ·  Human tasks: {m['human_tasks']}",
+        f"- Overdue rechecks (cron backlog): {m['overdue_rechecks']}",
+        "",
+        "| State | Count |",
+        "|---|---|",
+    ]
+    for state in ledger_mod.STATES:
+        if counts.get(state):
+            lines.append(f"| {STATE_LABELS.get(state, state)} | {counts[state]} |")
+
+    tasks = [c for c in ledger.values() if c.get("state") == "human_task_queued"]
+    if tasks:
+        lines += ["", "## Outstanding human tasks"]
+        for c in tasks:
+            reason = c.get("human_task_reason", "manual step required")
+            lines.append(f"- **{c.get('broker_id')}** - {reason}")
+
+    indirect = [c for c in ledger.values() if c.get("state") == "indirect_exposure"]
+    if indirect:
+        lines += ["", "## Indirect exposure (your PII on third-party records)",
+                  "Not removable via the broker's self-service opt-out (the record is about someone "
+                  "else). Lever: a targeted CCPA/GDPR delete-my-PII request naming only your own "
+                  "identifiers."]
+        for c in indirect:
+            ev = c.get("evidence") or {}
+            note = ev.get("summary") or "subject's identifiers appear on another person's listing"
+            lines.append(f"- **{c.get('broker_id')}** - {note}")
+    return "\n".join(lines) + "\n"
+
+
+def human_tasks_markdown(subject_id: str) -> str:
+    """ONE consolidated digest of everything that genuinely needs a human.
+
+    The autonomous run accumulates human-only work silently (never interrupting);
+    this digest is presented once, at the end, so the operator clears it in a
+    single sitting. Includes queued tasks and blocked-site operator-browser checks.
+    """
+    ledger = ledger_mod.load(subject_id)
+    tasks = [(bid, c) for bid, c in sorted(ledger.items()) if c.get("state") == "human_task_queued"]
+    blocked = [(bid, c) for bid, c in sorted(ledger.items()) if c.get("state") == "blocked"]
+
+    lines = [f"# Human tasks for `{subject_id}`", ""]
+    if not tasks and not blocked:
+        lines.append("Nothing needs a human right now.")
+        return "\n".join(lines) + "\n"
+
+    lines.append(f"{len(tasks)} manual step(s) + {len(blocked)} blocked site(s). "
+                 "Everything else ran (or will run) autonomously.")
+    if tasks:
+        lines += ["", "## Manual steps"]
+        for bid, c in tasks:
+            b = brokers_mod.get(bid) or {}
+            opt = b.get("optout") or {}
+            lines.append(f"### {b.get('name', bid)}")
+            lines.append(f"- Why: {c.get('human_task_reason', 'manual step required')}")
+            where = opt.get("url") or opt.get("email") or "(see broker record)"
+            lines.append(f"- Where: {where}")
+            for q in (opt.get("quirks") or [])[:2]:
+                lines.append(f"- Note: {q}")
+            lines.append("- Withhold: SSN and full ID numbers - always.")
+            lines.append(f"- When done, tell the agent so it records the outcome for `{bid}`.")
+    if blocked:
+        lines += ["", "## Blocked sites (open in YOUR browser - it gets through where bots don't)"]
+        for bid, c in blocked:
+            b = brokers_mod.get(bid) or {}
+            url = ((b.get("search") or {}).get("url")) or "(see broker record)"
+            lines.append(f"- **{b.get('name', bid)}** - open {url}, search the subject, and report "
+                         "the verdict (or a screenshot) back to the agent.")
+    return "\n".join(lines) + "\n"
+
+
+def sheets_rows(subject_id: str) -> list[list[str]]:
+    """Header + one row per case for the optional Google Sheets tracker.
+
+    The agent appends these via the `google-workspace` skill, e.g.:
+      google_api.py sheets append <SHEET_ID> "Sheet1!A:F" --values <json-rows>
+    """
+    rows = [["broker_id", "state", "found", "tier", "removed_at", "next_recheck"]]
+    for bid, c in sorted(ledger_mod.load(subject_id).items()):
+        rows.append([
+            bid,
+            c.get("state", ""),
+            str(c.get("found", "")),
+            (c.get("automation") or {}).get("tier_used", ""),
+            c.get("removal_confirmed_at") or "",
+            c.get("next_recheck_at") or "",
+        ])
+    return rows
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\scripts\scan.py ===
+"""Stdlib fetch helper for simple url_pattern brokers (osint-style).
+
+For JS-rendered or anti-bot pages the agent should use the `web_extract` or
+`browser_navigate` tools (and the `scrapling` skill for stealth/Cloudflare).
+This helper only covers plain static pages and is intentionally network-light so
+it can be mocked in tests.
+"""
+from __future__ import annotations
+
+import urllib.error
+import urllib.request
+
+USER_AGENT = "Mozilla/5.0 (compatible; unbroker/1.0; data opt-out)"
+
+
+def fetch(url: str, timeout: int = 20) -> tuple[int, str]:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (https only by convention)
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return getattr(resp, "status", 200), resp.read().decode(charset, errors="replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, ""
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return 0, ""
+
+
+def looks_listed(html: str, match_signal: str | None) -> bool:
+    """Naive confirmation heuristic for static pages: does the match signal appear?"""
+    if not html or not match_signal:
+        return False
+    return match_signal.lower() in html.lower()
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\scripts\storage.py ===
+"""Storage helpers (stdlib only): atomic JSON, append-only JSONL, strict perms.
+
+Default backend is local-json. The optional google-sheets tracker is handled in
+report.py by emitting rows for the `google-workspace` skill; this module stays
+dependency-free so the hermetic tests never touch the network.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import crypto
+import paths
+
+
+@contextlib.contextmanager
+def locked(target: Path, timeout: float = 10.0, stale: float = 30.0):
+    """Portable advisory lock via an O_EXCL lockfile next to `target`.
+
+    Serializes read-modify-write on shared JSON (the ledger) across concurrent
+    processes - a cron re-scan overlapping a manual run, or multiple tenants -
+    so one writer can't clobber another's update. A lock older than `stale`
+    seconds is treated as abandoned (crashed writer) and broken, so a dead
+    process can never deadlock the queue. Works on macOS/Linux/Windows (O_EXCL).
+    """
+    ensure_dir(target.parent)
+    lock = target.with_name(target.name + ".lock")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > stale:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"could not acquire lock {lock} within {timeout}s")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            lock.unlink(missing_ok=True)
+
+
+def _secure(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass  # non-POSIX / unsupported FS; HERMES_HOME directory perms still apply
+
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _secure(path, 0o700)
+    return path
+
+
+def _is_sensitive(path: Path) -> bool:
+    """Per-subject docs (dossier, ledger) are sensitive; config/cache are not."""
+    try:
+        Path(path).resolve().relative_to(paths.subjects_dir().resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _age_path(path: Path) -> Path:
+    return path.with_name(path.name + ".age")
+
+
+def _atomic_write(path: Path, data: bytes) -> Path:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    _secure(tmp, 0o600)
+    os.replace(tmp, path)
+    _secure(path, 0o600)
+    return path
+
+
+def write_json(path: Path, obj: Any) -> Path:
+    ensure_dir(path.parent)
+    data = (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    if _is_sensitive(path) and crypto.encryption_setting() == "age":
+        if not crypto.age_available():
+            raise RuntimeError(
+                "encryption=age is configured but `age` is not available; "
+                "refusing to write PII as plaintext. Install age or run `setup --encryption none`."
+            )
+        target = _atomic_write(_age_path(path), crypto.encrypt(data))
+        if path.exists():
+            path.unlink()  # migrate plaintext -> ciphertext
+        return target
+    target = _atomic_write(path, data)
+    ap = _age_path(path)
+    if ap.exists():
+        ap.unlink()  # encryption turned off -> drop stale ciphertext
+    return target
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    ap = _age_path(path)
+    if ap.exists():
+        return json.loads(crypto.decrypt(ap.read_bytes()).decode("utf-8"))
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
+
+
+def append_jsonl(path: Path, record: dict) -> Path:
+    ensure_dir(path.parent)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _secure(path, 0o600)
+    return path
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            out.append(json.loads(line))
+    return out
+

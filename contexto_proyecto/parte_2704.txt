@@ -1,0 +1,241 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_handoff_thread.py ===
+"""Tests for MatrixAdapter.create_handoff_thread.
+
+Matrix has no channel-level "create thread" API, so the adapter seeds a root
+message and returns its event_id as the thread handle (Slack-style — mirrors
+``tests/gateway/test_slack_sdk_response.py::TestHandoffThread``). These tests
+cover: the seed event id becomes the thread id (and the root is registered as a
+participated thread), and ``None`` is returned when the seed send fails (#112918).
+"""
+
+import asyncio
+import time
+from unittest.mock import AsyncMock, MagicMock
+
+from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
+
+
+def _make_adapter():
+    """Create a MatrixAdapter with mocked config (no live client)."""
+    from plugins.platforms.matrix.adapter import MatrixAdapter
+
+    config = PlatformConfig(
+        enabled=True,
+        token="syt_test_token",
+        extra={
+            "homeserver": "https://matrix.example.org",
+            "user_id": "@hermes:example.org",
+        },
+    )
+    adapter = MatrixAdapter(config)
+    adapter._startup_ts = time.time() - 10
+    return adapter
+
+
+class TestHandoffThread:
+    """``create_handoff_thread`` anchors a session on the seed event's id."""
+
+    def test_seed_event_becomes_the_thread_id(self):
+        adapter = _make_adapter()
+        adapter._client = MagicMock()  # truthy: a client is connected
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="$root_evt"))
+
+        thread_id = asyncio.run(adapter.create_handoff_thread("!room1:example.org", "Hermes — daily brief"))
+
+        assert thread_id == "$root_evt"
+        adapter.send.assert_awaited_once_with("!room1:example.org", "Hermes — daily brief")
+        # Root registered so inbound replies in this thread are recognised.
+        assert "$root_evt" in adapter._threads
+
+    def test_failed_seed_send_yields_no_thread(self):
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=False, error="boom"))
+
+        assert asyncio.run(adapter.create_handoff_thread("!room1:example.org", "x")) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_latex_maths.py ===
+"""Outbound ``$...$`` / ``$$...$$`` become Element ``data-mx-maths`` markup (#106458)."""
+
+from gateway.config import PlatformConfig
+from plugins.platforms.matrix.adapter import MatrixAdapter
+
+
+def _adapter() -> MatrixAdapter:
+    return MatrixAdapter(PlatformConfig(
+        enabled=True, token="syt_test_token",
+        extra={"homeserver": "https://matrix.example.org", "user_id": "@bot:example.org"}))
+
+
+def test_inline_and_display_math_survive_sanitizer_with_escaped_tex():
+    content = _adapter()._build_text_message_content("Wave: $a<b$ and $$\\hat{H}\\Psi = E\\Psi$$")
+    html = content["formatted_body"]
+    assert '<span data-mx-maths="a&lt;b">a&lt;b</span>' in html
+    assert '<div data-mx-maths="\\hat{H}\\Psi = E\\Psi">\\hat{H}\\Psi = E\\Psi</div>' in html
+    assert "$" not in html
+    # Plain-text fallback keeps the raw TeX for clients without the Labs feature.
+    assert content["body"] == "Wave: $a<b$ and $$\\hat{H}\\Psi = E\\Psi$$"
+
+
+def test_unpaired_dollars_and_sentinel_collisions_pass_through_unchanged():
+    text = "Costs $5 or $10 today; HERMESTEXINLINE7HERMESTEXEND is not ours"
+    assert _adapter()._markdown_to_html(text) == text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_media_filename.py ===
+"""Tests for Matrix adapter media-filename blanking.
+
+Matrix ``m.image`` events were already handled (PR #16821, issue #13482).
+These tests verify that ``m.audio``, ``m.file``, and ``m.video`` events
+also have their transport filename stripped from ``body`` when no caption
+is present, so the filename doesn't leak into ``event.text`` and get fed
+to the model as user message text.
+"""
+
+import pytest
+
+from plugins.platforms.matrix.adapter import (
+    _looks_like_matrix_image_filename,
+    _looks_like_matrix_media_filename,
+)
+
+
+class TestLooksLikeMatrixMediaFilename:
+    """Unit tests for _looks_like_matrix_media_filename()."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "voice-20260725-114233.ogg",
+            "recording.wav",
+            "clip.opus",
+            "audio.amr",
+            "data.m4a",
+            "clip.webm",
+            "video.mkv",
+            "video.mov",
+            "CaPtIoN.mp3",
+        ],
+    )
+    def test_bare_media_filenames_detected(self, text):
+        assert _looks_like_matrix_media_filename(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "remind me to call the dentist",
+            "voice note.m4a",
+            "document.pdf",
+            "file.txt",
+            "noextension",
+            "data.csv",
+            "",
+            "  ",
+            None,
+        ],
+    )
+    def test_non_filenames_rejected(self, text):
+        assert _looks_like_matrix_media_filename(text) is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "/tmp/voice.ogg",
+            "./audio.mp3",
+        ],
+    )
+    def test_paths_with_separators_rejected(self, text):
+        assert _looks_like_matrix_media_filename(text) is False
+
+    def test_trailing_whitespace_stripped(self):
+        assert _looks_like_matrix_media_filename("audio.ogg\n") is True
+        assert _looks_like_matrix_media_filename("  photo.mp3  ") is True
+
+    def test_multi_token_filename_rejected(self):
+        """A filename with a space is treated as a caption, not a bare token."""
+        assert _looks_like_matrix_media_filename("my recording.ogg") is False
+
+    def test_newline_in_text_rejected(self):
+        """Multi-line text is never a bare filename."""
+        assert _looks_like_matrix_media_filename("voice.ogg\nmore text") is False
+
+    def test_image_extension_not_detected_by_media_function(self):
+        """Image extensions are handled by the image function, not the media function."""
+        assert _looks_like_matrix_media_filename("photo.jpg") is False
+        assert _looks_like_matrix_image_filename("photo.jpg") is True
+
+    def test_audio_extension_not_detected_by_image_function(self):
+        """Audio extensions are handled by the media function, not the image function."""
+        assert _looks_like_matrix_image_filename("voice.ogg") is False
+        assert _looks_like_matrix_media_filename("voice.ogg") is True
+
+    def test_mimetypes_audio_detected(self):
+        """mimetypes.guess_type catches audio types not in the hardcoded set."""
+        # .aiff is audio/x-aiff, NOT in _MATRIX_MEDIA_FILENAME_EXTS
+        assert _looks_like_matrix_media_filename("song.aiff") is True
+
+    def test_mimetypes_video_detected(self):
+        """mimetypes.guess_type catches video types."""
+        assert _looks_like_matrix_media_filename("clip.avi") is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_media_gate_before_download.py ===
+"""Matrix must gate (require_mention / allowed rooms) BEFORE downloading inbound media.
+
+An unmentioned ``m.image`` in a gated group room used to be fetched from the homeserver
+(``_download_and_cache_media``) and only then dropped by ``_resolve_message_context``.
+The invariant: a dropped media event performs zero downloads; a mentioned one still does.
+"""
+
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+
+def _make_adapter(monkeypatch):
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+    from gateway.config import PlatformConfig
+    from plugins.platforms.matrix.adapter import MatrixAdapter
+
+    adapter = MatrixAdapter(PlatformConfig(
+        enabled=True, token="syt_test_token",
+        extra={"homeserver": "https://matrix.example.org", "user_id": "@hermes:example.org"}))
+    adapter._startup_ts = time.time() - 10
+    adapter.handle_message = AsyncMock()
+    adapter._client = None
+    adapter._resolve_room_identity = AsyncMock(return_value=SimpleNamespace(
+        display_name="Group Room", room_topic=None, server_name="example.org", chat_type="group"))
+    adapter._is_dm_room = AsyncMock(return_value=False)
+    adapter._download_and_cache_media = AsyncMock(return_value="/tmp/cached.png")
+    return adapter
+
+
+def _image_event(body):
+    return SimpleNamespace(
+        sender="@alice:example.org", event_id="$img1", room_id="!group:example.org",
+        timestamp=int(time.time() * 1000),
+        content={"body": body, "msgtype": "m.image", "url": "mxc://example.org/abc",
+                 "info": {"mimetype": "image/png", "size": 1024}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body, downloads, dispatched", [
+    ("photo.png", 0, 0),           # unmentioned group media: never fetched
+    ("@hermes:example.org look", 1, 1),  # mentioned: fetched and dispatched
+])
+async def test_unmentioned_group_media_is_not_downloaded(monkeypatch, body, downloads, dispatched):
+    adapter = _make_adapter(monkeypatch)
+    await adapter._on_room_message(_image_event(body))
+    assert adapter._download_and_cache_media.await_count == downloads
+    assert adapter.handle_message.await_count == dispatched
+

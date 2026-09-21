@@ -1,0 +1,425 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\manim-video\references\animations.md ===
+# Animations Reference
+
+## Core Concept
+
+An animation is a Python object that computes intermediate visual states of a mobject over time. Animations are objects passed to `self.play()`, not functions.
+
+`run_time` controls seconds (default: 1). Always specify it explicitly for important animations.
+
+## Creation Animations
+
+```python
+self.play(Create(circle))          # traces outline
+self.play(Write(equation))         # simulates handwriting (for Text/MathTex)
+self.play(FadeIn(group))           # opacity 0 -> 1
+self.play(GrowFromCenter(dot))     # scale 0 -> 1 from center
+self.play(DrawBorderThenFill(sq))  # outline first, then fill
+```
+
+## Removal Animations
+
+```python
+self.play(FadeOut(mobject))         # opacity 1 -> 0
+self.play(Uncreate(circle))        # reverse of Create
+self.play(ShrinkToCenter(group))   # scale 1 -> 0
+```
+
+## Transform Animations
+
+```python
+# Transform -- modifies the original in place
+self.play(Transform(circle, square))
+# After: circle IS the square (same object, new appearance)
+
+# ReplacementTransform -- replaces old with new
+self.play(ReplacementTransform(circle, square))
+# After: circle removed, square on screen
+
+# TransformMatchingTex -- smart equation morphing
+eq1 = MathTex(r"a^2 + b^2")
+eq2 = MathTex(r"a^2 + b^2 = c^2")
+self.play(TransformMatchingTex(eq1, eq2))
+```
+
+**Critical**: After `Transform(A, B)`, variable `A` references the on-screen mobject. Variable `B` is NOT on screen. Use `ReplacementTransform` when you want to work with `B` afterwards.
+
+## The .animate Syntax
+
+```python
+self.play(circle.animate.set_color(RED))
+self.play(circle.animate.shift(RIGHT * 2).scale(0.5))  # chain multiple
+```
+
+## Additional Creation Animations
+
+```python
+self.play(GrowFromPoint(circle, LEFT * 3))     # scale 0 -> 1 from a specific point
+self.play(GrowFromEdge(rect, DOWN))             # grow from one edge
+self.play(SpinInFromNothing(square))            # scale up while rotating (default PI/2)
+self.play(GrowArrow(arrow))                     # grows arrow from start to tip
+```
+
+## Movement Animations
+
+```python
+# Move a mobject along an arbitrary path
+path = Arc(radius=2, angle=PI)
+self.play(MoveAlongPath(dot, path), run_time=2)
+
+# Rotate (as a Transform, not .animate — supports about_point)
+self.play(Rotate(square, angle=PI / 2, about_point=ORIGIN), run_time=1.5)
+
+# Rotating (continuous rotation, updater-style — good for spinning objects)
+self.play(Rotating(gear, angle=TAU, run_time=4, rate_func=linear))
+```
+
+`MoveAlongPath` takes any `VMobject` as the path — use `Arc`, `CubicBezier`, `Line`, or a custom `VMobject`. Position is computed via `path.point_from_proportion()`.
+
+## Emphasis Animations
+
+```python
+self.play(Indicate(mobject))             # brief yellow flash + scale
+self.play(Circumscribe(mobject))         # draw rectangle around it
+self.play(Flash(point))                  # radial flash
+self.play(Wiggle(mobject))               # shake side to side
+```
+
+## Rate Functions
+
+```python
+self.play(FadeIn(mob), rate_func=smooth)          # default: ease in/out
+self.play(FadeIn(mob), rate_func=linear)           # constant speed
+self.play(FadeIn(mob), rate_func=rush_into)        # start slow, end fast
+self.play(FadeIn(mob), rate_func=rush_from)        # start fast, end slow
+self.play(FadeIn(mob), rate_func=there_and_back)   # animate then reverse
+```
+
+## Composition
+
+```python
+# Simultaneous
+self.play(FadeIn(title), Create(circle), run_time=2)
+
+# AnimationGroup with lag
+self.play(AnimationGroup(*[FadeIn(i) for i in items], lag_ratio=0.2))
+
+# LaggedStart
+self.play(LaggedStart(*[Write(l) for l in lines], lag_ratio=0.3, run_time=3))
+
+# Succession (sequential in one play call)
+self.play(Succession(FadeIn(title), Wait(0.5), Write(subtitle)))
+```
+
+## Updaters
+
+```python
+tracker = ValueTracker(0)
+dot = Dot().add_updater(lambda m: m.move_to(axes.c2p(tracker.get_value(), 0)))
+self.play(tracker.animate.set_value(5), run_time=3)
+```
+
+## Subtitles
+
+```python
+# Method 1: standalone
+self.add_subcaption("Key insight", duration=2)
+self.play(Write(equation), run_time=2.0)
+
+# Method 2: inline
+self.play(Write(equation), subcaption="Key insight", subcaption_duration=2)
+```
+
+Manim auto-generates `.srt` subtitle files. Always add subcaptions for accessibility.
+
+## Timing Patterns
+
+```python
+# Pause-after-reveal
+self.play(Write(key_equation), run_time=2.0)
+self.wait(2.0)
+
+# Dim-and-focus
+self.play(old_content.animate.set_opacity(0.3), FadeIn(new_content))
+
+# Clean exit
+self.play(FadeOut(Group(*self.mobjects)), run_time=0.5)
+self.wait(0.3)
+```
+
+## Reactive Mobjects: always_redraw()
+
+Rebuild a mobject from scratch every frame — essential when its geometry depends on other animated objects:
+
+```python
+# Brace that follows a resizing square
+brace = always_redraw(Brace, square, UP)
+self.add(brace)
+self.play(square.animate.scale(2))  # brace auto-adjusts
+
+# Horizontal line that tracks a moving dot
+h_line = always_redraw(lambda: axes.get_h_line(dot.get_left()))
+
+# Label that always stays next to another mobject
+label = always_redraw(lambda: Text("here", font_size=20).next_to(dot, UP, buff=0.2))
+```
+
+Note: `always_redraw` recreates the mobject every frame. For simple property tracking, use `add_updater` instead (cheaper):
+```python
+label.add_updater(lambda m: m.next_to(dot, UP))
+```
+
+## TracedPath — Trajectory Tracing
+
+Draw the path a point has traveled:
+
+```python
+dot = Dot(color=YELLOW)
+path = TracedPath(dot.get_center, stroke_color=YELLOW, stroke_width=2)
+self.add(dot, path)
+self.play(dot.animate.shift(RIGHT * 3 + UP * 2), run_time=2)
+# path shows the trail the dot left behind
+
+# Fading trail (dissipates over time):
+path = TracedPath(dot.get_center, dissipating_time=0.5, stroke_opacity=[0, 1])
+```
+
+Use cases: gradient descent paths, planetary orbits, function tracing, particle trajectories.
+
+## FadeTransform — Smoother Cross-Fades
+
+`Transform` morphs shapes through ugly intermediate warping. `FadeTransform` cross-fades with position matching — use it when source and target look different:
+
+```python
+# UGLY: Transform warps circle into square through a blob
+self.play(Transform(circle, square))
+
+# SMOOTH: FadeTransform cross-fades cleanly
+self.play(FadeTransform(circle, square))
+
+# FadeTransformPieces: per-submobject FadeTransform
+self.play(FadeTransformPieces(group1, group2))
+
+# TransformFromCopy: animate a COPY while keeping the original visible
+self.play(TransformFromCopy(source, target))
+# source stays on screen, a copy morphs into target
+```
+
+**Recommendation:** Use `FadeTransform` as default for dissimilar shapes. Use `Transform`/`ReplacementTransform` only for similar shapes (circle→ellipse, equation→equation).
+
+## ApplyMatrix — Linear Transformation Visualization
+
+Animate a matrix transformation on mobjects:
+
+```python
+# Apply a 2x2 matrix to a grid
+matrix = [[2, 1], [1, 1]]
+self.play(ApplyMatrix(matrix, number_plane), run_time=2)
+
+# Also works on individual mobjects
+self.play(ApplyMatrix([[0, -1], [1, 0]], square))  # 90-degree rotation
+```
+
+Pairs with `LinearTransformationScene` — see `camera-and-3d.md`.
+
+## squish_rate_func — Time-Window Staggering
+
+Compress any rate function into a time window within an animation. Enables overlapping stagger without `LaggedStart`:
+
+```python
+self.play(
+    FadeIn(a, rate_func=squish_rate_func(smooth, 0, 0.5)),    # 0% to 50%
+    FadeIn(b, rate_func=squish_rate_func(smooth, 0.25, 0.75)), # 25% to 75%
+    FadeIn(c, rate_func=squish_rate_func(smooth, 0.5, 1.0)),  # 50% to 100%
+    run_time=2
+)
+```
+
+More precise than `LaggedStart` when you need exact overlap control.
+
+## Additional Rate Functions
+
+```python
+from manim import (
+    smooth, linear, rush_into, rush_from,
+    there_and_back, there_and_back_with_pause,
+    running_start, double_smooth, wiggle,
+    lingering, exponential_decay, not_quite_there,
+    squish_rate_func
+)
+
+# running_start: pulls back before going forward (anticipation)
+self.play(FadeIn(mob, rate_func=running_start))
+
+# there_and_back_with_pause: goes there, holds, comes back
+self.play(mob.animate.shift(UP), rate_func=there_and_back_with_pause)
+
+# not_quite_there: stops at a fraction of the full animation
+self.play(FadeIn(mob, rate_func=not_quite_there(0.7)))
+```
+
+## ShowIncreasingSubsets / ShowSubmobjectsOneByOne
+
+Reveal group members progressively — ideal for algorithm visualization:
+
+```python
+# Reveal array elements one at a time
+array = Group(*[Square() for _ in range(8)]).arrange(RIGHT)
+self.play(ShowIncreasingSubsets(array), run_time=3)
+
+# Show submobjects with staggered appearance
+self.play(ShowSubmobjectsOneByOne(code_lines), run_time=4)
+```
+
+## ShowPassingFlash
+
+A flash of light travels along a path:
+
+```python
+# Flash traveling along a curve
+self.play(ShowPassingFlash(curve.copy().set_color(YELLOW), time_width=0.3))
+
+# Great for: data flow, electrical signals, network traffic
+```
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\manim-video\references\camera-and-3d.md ===
+# Camera and 3D Reference
+
+## MovingCameraScene (2D Camera Control)
+
+```python
+class ZoomExample(MovingCameraScene):
+    def construct(self):
+        circle = Circle(radius=2, color=BLUE)
+        self.play(Create(circle))
+        # Zoom in
+        self.play(self.camera.frame.animate.set(width=4).move_to(circle.get_top()), run_time=2)
+        self.wait(2)
+        # Zoom back out
+        self.play(self.camera.frame.animate.set(width=14.222).move_to(ORIGIN), run_time=2)
+```
+
+### Camera Operations
+
+```python
+self.camera.frame.animate.set(width=6)     # zoom in
+self.camera.frame.animate.set(width=20)    # zoom out
+self.camera.frame.animate.move_to(target)  # pan
+self.camera.frame.save_state()             # save
+self.play(Restore(self.camera.frame))      # restore
+```
+
+## ThreeDScene
+
+```python
+class ThreeDExample(ThreeDScene):
+    def construct(self):
+        self.set_camera_orientation(phi=60*DEGREES, theta=-45*DEGREES)
+        axes = ThreeDAxes()
+        surface = Surface(
+            lambda u, v: axes.c2p(u, v, np.sin(u) * np.cos(v)),
+            u_range=[-PI, PI], v_range=[-PI, PI], resolution=(30, 30)
+        )
+        surface.set_color_by_gradient(BLUE, GREEN, YELLOW)
+        self.play(Create(axes), Create(surface))
+        self.begin_ambient_camera_rotation(rate=0.2)
+        self.wait(5)
+        self.stop_ambient_camera_rotation()
+```
+
+### Camera Control in 3D
+
+```python
+self.set_camera_orientation(phi=70*DEGREES, theta=-45*DEGREES)
+self.move_camera(phi=45*DEGREES, theta=30*DEGREES, run_time=2)
+self.begin_ambient_camera_rotation(rate=0.2)
+```
+
+### 3D Mobjects
+
+```python
+sphere = Sphere(radius=1).set_color(BLUE).set_opacity(0.7)
+cube = Cube(side_length=2, fill_color=GREEN, fill_opacity=0.5)
+arrow = Arrow3D(start=ORIGIN, end=[2, 1, 1], color=RED)
+# 2D text facing camera:
+label = Text("Label", font_size=30)
+self.add_fixed_in_frame_mobjects(label)
+```
+
+### Parametric Curves
+
+```python
+helix = ParametricFunction(
+    lambda t: [np.cos(t), np.sin(t), t / (2*PI)],
+    t_range=[0, 4*PI], color=YELLOW
+)
+```
+
+## When to Use 3D
+- Surfaces, vector fields, spatial geometry, 3D transforms
+## When NOT to Use 3D
+- 2D concepts, text-heavy scenes, flat data (bar charts, time series)
+
+## ZoomedScene — Inset Zoom
+
+Show a magnified inset of a detail while keeping the full view visible:
+
+```python
+class ZoomExample(ZoomedScene):
+    def __init__(self, **kwargs):
+        super().__init__(
+            zoom_factor=0.3,           # how much of the scene the zoom box covers
+            zoomed_display_height=3,   # size of the inset
+            zoomed_display_width=3,
+            zoomed_camera_frame_starting_position=ORIGIN,
+            **kwargs
+        )
+
+    def construct(self):
+        self.camera.background_color = BG
+        # ... create your scene content ...
+
+        # Activate the zoom
+        self.activate_zooming()
+
+        # Move the zoom frame to a point of interest
+        self.play(self.zoomed_camera.frame.animate.move_to(detail_point))
+        self.wait(2)
+
+        # Deactivate
+        self.play(self.get_zoomed_display_pop_out_animation(), rate_func=lambda t: smooth(1-t))
+```
+
+Use cases: zooming into a specific term in an equation, showing fine detail in a diagram, magnifying a region of a plot.
+
+## LinearTransformationScene — Linear Algebra
+
+Pre-built scene with basis vectors and grid for visualizing matrix transformations:
+
+```python
+class LinearTransformExample(LinearTransformationScene):
+    def __init__(self, **kwargs):
+        super().__init__(
+            show_coordinates=True,
+            show_basis_vectors=True,
+            **kwargs
+        )
+
+    def construct(self):
+        matrix = [[2, 1], [1, 1]]
+
+        # Add a vector before applying the transform
+        vector = self.get_vector([1, 2], color=YELLOW)
+        self.add_vector(vector)
+
+        # Apply the transformation — grid, basis vectors, and your vector all transform
+        self.apply_matrix(matrix)
+        self.wait(2)
+```
+
+This produces the signature 3Blue1Brown "Essence of Linear Algebra" look — grid lines deforming, basis vectors stretching, determinant visualized through area change.
+

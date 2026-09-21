@@ -1,0 +1,340 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\data-science\DESCRIPTION.md ===
+---
+description: Skills for data science workflows — interactive exploration, Jupyter notebooks, data analysis, and visualization.
+---
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\data-science\jupyter-notebook\SKILL.md ===
+---
+name: jupyter-notebook
+description: "Iterative Python via live Jupyter kernel (hamelnb)."
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [jupyter, notebook, repl, data-science, exploration, iterative]
+    category: data-science
+---
+
+# Jupyter Notebook (hamelnb live kernel)
+
+Gives you a **stateful Python REPL** via a live Jupyter kernel. Variables persist
+across executions. Use this instead of `execute_code` when you need to build up
+state incrementally, explore APIs, inspect DataFrames, or iterate on complex code.
+
+## When to Use This vs Other Tools
+
+| Tool | Use When |
+|------|----------|
+| **This skill** | Iterative exploration, state across steps, data science, ML, "let me try this and check" |
+| `execute_code` | One-shot scripts needing hermes tool access (web_search, file ops). Stateless. |
+| `terminal` | Shell commands, builds, installs, git, process management |
+
+**Rule of thumb:** If you'd want a Jupyter notebook for the task, use this skill.
+
+## Prerequisites
+
+1. **uv** must be installed (check: `which uv`)
+2. **JupyterLab** must be installed: `uv tool install jupyterlab`
+3. A Jupyter server must be running (see Setup below)
+
+## Setup
+
+The hamelnb script location:
+```
+SCRIPT="$HOME/.agent-skills/hamelnb/skills/jupyter-live-kernel/scripts/jupyter_live_kernel.py"
+```
+
+If not cloned yet:
+```
+git clone https://github.com/hamelsmu/hamelnb.git ~/.agent-skills/hamelnb
+```
+
+### Starting JupyterLab
+
+Check if a server is already running:
+```
+uv run "$SCRIPT" servers
+```
+
+If no servers found, start one:
+```
+jupyter-lab --no-browser --port=8888 --notebook-dir=$HOME/notebooks \
+  --IdentityProvider.token='' --ServerApp.password='' > /tmp/jupyter.log 2>&1 &
+sleep 3
+```
+
+Note: Token/password disabled for local agent access. The server runs headless.
+
+### Creating a Notebook for REPL Use
+
+If you just need a REPL (no existing notebook), create a minimal notebook file:
+```
+mkdir -p ~/notebooks
+```
+Write a minimal .ipynb JSON file with one empty code cell, then start a kernel
+session via the Jupyter REST API:
+```
+curl -s -X POST http://127.0.0.1:8888/api/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"path":"scratch.ipynb","type":"notebook","name":"scratch.ipynb","kernel":{"name":"python"}}'
+```
+
+## Core Workflow
+
+All commands return structured JSON. Always use `--compact` to save tokens.
+
+### 1. Discover servers and notebooks
+
+```
+uv run "$SCRIPT" servers --compact
+uv run "$SCRIPT" notebooks --compact
+```
+
+### 2. Execute code (primary operation)
+
+```
+uv run "$SCRIPT" execute --path <notebook.ipynb> --code '<python code>' --compact
+```
+
+State persists across execute calls. Variables, imports, objects all survive.
+
+Multi-line code works with $'...' quoting:
+```
+uv run "$SCRIPT" execute --path scratch.ipynb --code $'import os\nfiles = os.listdir(".")\nprint(f"Found {len(files)} files")' --compact
+```
+
+### 3. Inspect live variables
+
+```
+uv run "$SCRIPT" variables --path <notebook.ipynb> list --compact
+uv run "$SCRIPT" variables --path <notebook.ipynb> preview --name <varname> --compact
+```
+
+### 4. Edit notebook cells
+
+```
+# View current cells
+uv run "$SCRIPT" contents --path <notebook.ipynb> --compact
+
+# Insert a new cell
+uv run "$SCRIPT" edit --path <notebook.ipynb> insert \
+  --at-index <N> --cell-type code --source '<code>' --compact
+
+# Replace cell source (use cell-id from contents output)
+uv run "$SCRIPT" edit --path <notebook.ipynb> replace-source \
+  --cell-id <id> --source '<new code>' --compact
+
+# Delete a cell
+uv run "$SCRIPT" edit --path <notebook.ipynb> delete --cell-id <id> --compact
+```
+
+### 5. Verification (restart + run all)
+
+Only use when the user asks for a clean verification or you need to confirm
+the notebook runs top-to-bottom:
+
+```
+uv run "$SCRIPT" restart-run-all --path <notebook.ipynb> --save-outputs --compact
+```
+
+## Practical Tips from Experience
+
+1. **First execution after server start may timeout** — the kernel needs a moment
+   to initialize. If you get a timeout, just retry.
+
+2. **The kernel Python is JupyterLab's Python** — packages must be installed in
+   that environment. If you need additional packages, install them into the
+   JupyterLab tool environment first.
+
+3. **--compact flag saves significant tokens** — always use it. JSON output can
+   be very verbose without it.
+
+4. **For pure REPL use**, create a scratch.ipynb and don't bother with cell editing.
+   Just use `execute` repeatedly.
+
+5. **Argument order matters** — subcommand flags like `--path` go BEFORE the
+   sub-subcommand. E.g.: `variables --path nb.ipynb list` not `variables list --path nb.ipynb`.
+
+6. **If a session doesn't exist yet**, you need to start one via the REST API
+   (see Setup section). The tool can't execute without a live kernel session.
+
+7. **Errors are returned as JSON** with traceback — read the `ename` and `evalue`
+   fields to understand what went wrong.
+
+8. **Occasional websocket timeouts** — some operations may timeout on first try,
+   especially after a kernel restart. Retry once before escalating.
+
+9. **If websocket consistently times out on this host**, force zmq transport:
+   `uv run "$SCRIPT" execute --transport zmq ...`. Symptom: every execute returns
+   "Websocket execution may already have reached the kernel, so auto fallback was
+   skipped". The kernel actually ran fine (REST shows execution_state=idle and
+   execution_count increments) — only the websocket reply channel is broken.
+   zmq transport uses jupyter_client directly and sidesteps the issue.
+
+10. **When starting a fresh server for REST-only use**, add
+    `--ServerApp.disable_check_xsrf=True` — otherwise POST /api/sessions returns
+    `"'_xsrf' argument missing from POST"` and kernel session creation fails.
+
+## Timeout Defaults
+
+The script has a 30-second default timeout per execution. For long-running
+operations, pass `--timeout 120`. Use generous timeouts (60+) for initial
+setup or heavy computation.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\devops\actual-setup\SKILL.md ===
+---
+name: actual-setup
+description: Set up Actual Computer (actual.inc) inference in Hermes.
+version: 2.0.0
+author: shl0ms + Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [actual, actual-inc, provider, local-inference, relay, gguf, setup]
+    category: devops
+---
+
+# Actual Computer Setup Skill
+
+Sets up [actual.inc](https://actual.inc) (Actual Computer) as a Hermes inference
+provider. Actual turns the user's own hardware into a private inference cluster
+and exposes an OpenAI-compatible API two ways: a hosted end-to-end-encrypted
+relay at `https://api.actual.inc` (authenticated with an `ac_` key), and a local
+on-device daemon at `http://127.0.0.1:8080` (no auth on loopback). This skill
+does not install the Actual daemon for the user — device authorization requires
+a human in a browser.
+
+## When to Use
+
+- User wants to add actual.inc as an inference provider (cloud relay or local).
+- User has an `ac_` key and wants Hermes routed through their Actual cluster.
+- User wants fully-local, on-device inference via the Actual daemon.
+- Troubleshooting: Actual requests failing with cryptic 400s or empty streams.
+
+## Prerequisites
+
+- Hermes has **first-class `actual` provider support** (provider id `actual`,
+  aliases `actual-computer`, `actualcomputer`, `aci`). Do NOT configure Actual
+  as a `custom_providers` / `providers.actual.*` entry on current Hermes — the
+  built-in provider owns the name and handles base-url normalization, the
+  Responses transport, and local no-auth automatically.
+- Relay mode: an Actual account and an `ac_` inference key from
+  https://actual.inc/user/keys.
+- Local mode: the user has installed the daemon
+  (`curl -fsSL "https://actual.inc/install" | bash`) and completed device
+  authorization by running `actual` once and opening the printed
+  `https://actual.inc/device?code=...` URL in a browser. Relay that URL to the
+  user and WAIT — never invent an email or authorize on their behalf. Codes
+  expire in 5 minutes; re-run `actual` for a fresh one.
+
+## How to Run
+
+### Relay / API mode
+
+1. Put the key in `.env` (secrets only — never config.yaml):
+   append `ACTUAL_API_KEY=ac_...` to `~/.hermes/.env`.
+2. Verify the key and discover models with `terminal`:
+   ```bash
+   curl -s https://api.actual.inc/v1/models -H "Authorization: Bearer $ACTUAL_API_KEY"
+   ```
+3. Select provider + model:
+   ```bash
+   hermes config set model.provider actual
+   hermes config set model.default "MODEL_ID_FROM_DISCOVERY"
+   ```
+4. Verify end-to-end:
+   ```bash
+   hermes chat -Q -q "Reply with exactly: ACTUAL_OK" --provider actual -m MODEL_ID
+   ```
+
+### Local mode
+
+1. Human has installed + authorized the daemon (see Prerequisites).
+2. Download and load a model (scriptable once authorized):
+   ```bash
+   actual models search "qwen2.5 0.5b instruct gguf" --limit 8 --no-prompt
+   # Downloads REQUIRE an explicit quantization (409 ambiguous_model_download otherwise):
+   actual models download "Qwen/Qwen2.5-0.5B-Instruct-GGUF/Q4_K_M"
+   actual models list        # note the INSTALLED name (differs from download id)
+   actual models load "qwen2.5-0.5b-instruct-q4_k_m"   # load by installed name
+   ```
+3. Point Hermes at the daemon. `ACTUAL_BASE_URL` with a loopback host flips the
+   built-in provider into local no-auth mode automatically — no key needed:
+   append `ACTUAL_BASE_URL=http://127.0.0.1:8080` to `~/.hermes/.env`, then:
+   ```bash
+   hermes config set model.provider actual
+   hermes config set model.default "INSTALLED_MODEL_NAME"
+   ```
+4. Verify (reduced toolset — see context-window pitfall below):
+   ```bash
+   hermes chat -Q -q "Reply with exactly: LOCAL_OK" --provider actual -m INSTALLED_NAME -t file,web
+   ```
+
+## Quick Reference
+
+| Thing | Value |
+|---|---|
+| Hosted relay | `https://api.actual.inc/v1` (normalized from bare host automatically) |
+| Local daemon | `http://127.0.0.1:8080/v1` (no auth on loopback) |
+| Key env var | `ACTUAL_API_KEY` (`ac_...`) |
+| Base URL env var | `ACTUAL_BASE_URL` (loopback host ⇒ local no-auth mode) |
+| Provider id / aliases | `actual` / `actual-computer`, `actualcomputer`, `aci` |
+| Transport | Responses API (`codex_responses`) — built-in, do not override |
+| Cluster pinning | `X-Cluster-ID` header via `providers.actual.extra_headers` in config.yaml |
+| Model size guide | 0.5B Q4_K_M ~470MB (toy), 7-8B Q4_K_M ~4.5GB (daily driver), 32B ~20GB |
+
+## Pitfalls
+
+1. **reasoning_effort trap (handled by Hermes since the first-class provider).**
+   Actual's SGLang/vLLM backends accept only `none/low/medium/high/max`;
+   `xhigh`/`ultra` used to fail with a cryptic
+   `Expecting value: line 1 column 1 (char 0)` (a wrapped HTTP 400). The
+   built-in provider clamps `xhigh→high` and `ultra→max` on the wire. If a
+   request still 400s this way on an old Hermes, set a per-model cap:
+   `agent.reasoning_overrides.<model>: high` in config.yaml.
+2. **Context-window overflow on small local models.** Hermes' default toolset
+   is ~26k tokens of schemas plus a ~9k-token system prompt. A model loaded
+   with a 32k context overflows before the first turn, and llama.cpp-family
+   servers emit a bare `data: [DONE]` — Hermes reports
+   `Provider returned an empty stream with no finish_reason`. This is NOT an
+   SSE bug. Fixes: restrict tools (`-t file,web`), load the model with a
+   larger `n_ctx`, or pick a >=64k-context model for the full toolset.
+   Upstream tracking: #51448 (do not file new issues; add evidence there).
+   Related but distinct: #65631 (HTTP-200 SSE carrying a 400), #56516
+   (reasoning-only streams).
+3. **Download ids vs installed names.** `actual models download` takes
+   `repo/QUANT` and 409s without an explicit quantization;
+   `actual models load` takes the INSTALLED name from `actual models list`.
+4. **Reasoning models returning empty content.** GLM/Qwen reasoning variants
+   emit thinking in a separate `reasoning` field and can burn a small
+   `max_tokens` entirely on reasoning. Give generous max_tokens before
+   assuming failure.
+5. **Do not create a custom provider named `actual`.** Older setup guides
+   (pre first-class support) wrote `providers.actual.*` config blocks. On
+   current Hermes the built-in provider wins the name; stale custom blocks
+   are ignored or conflict. Remove them and use the env vars + model.provider
+   flow above.
+
+## Verification
+
+```bash
+# Relay:
+hermes chat -Q -q "Reply with exactly: ACTUAL_OK" --provider actual -m MODEL
+# Local (small model — reduced toolset):
+hermes chat -Q -q "Reply with exactly: LOCAL_OK" --provider actual -m MODEL -t file,web
+# Provider status (local no-auth shows key_source=local-offline):
+hermes status
+```
+
+For other OpenAI-compatible clients (e.g. OpenCode), see
+`references/opencode.md`.
+

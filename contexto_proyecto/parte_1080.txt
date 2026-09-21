@@ -1,0 +1,383 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\kanban-video-orchestrator\scripts\monitor.py ===
+#!/usr/bin/env python3
+"""
+Monitor a running video-production kanban. Polls `hermes kanban list` and
+`events` for a tenant and surfaces issues (stuck tasks, missing heartbeats,
+repeated retries, dependency deadlocks).
+
+Usage:
+    monitor.py --tenant <project-slug> [--interval 30]
+
+Outputs a periodic snapshot to stdout. Sends alerts via stderr when issues
+are detected. Designed to run alongside the kanban — kill with Ctrl-C when
+you're satisfied (or scripted to stop on completion).
+
+This is best-effort observability. It does not auto-restart tasks; intervention
+decisions should remain human/AI-overseen.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+
+def hermes_available() -> bool:
+    return shutil.which("hermes") is not None
+
+
+def kanban_list(tenant: str) -> list[dict]:
+    """Returns parsed task rows. Falls back to plain stdout parsing if JSON
+    output isn't supported by the installed hermes CLI."""
+    try:
+        out = subprocess.run(
+            ["hermes", "kanban", "list", "--tenant", tenant, "--json"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip().startswith("["):
+            return json.loads(out.stdout)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    # Fallback: textual parse of `hermes kanban list`
+    out = subprocess.run(
+        ["hermes", "kanban", "list", "--tenant", tenant],
+        capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
+    )
+    rows = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "STATUS" in line.upper():
+            continue
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].startswith("t_"):
+            rows.append({
+                "id": parts[0],
+                "status": parts[1] if len(parts) > 1 else "?",
+                "assignee": parts[2] if len(parts) > 2 else "?",
+                "title": " ".join(parts[3:]) if len(parts) > 3 else "",
+                "started_at": None,
+                "heartbeat_at": None,
+                "max_runtime_s": None,
+            })
+    return rows
+
+
+def kanban_show(task_id: str) -> dict | None:
+    out = subprocess.run(
+        ["hermes", "kanban", "show", task_id, "--json"],
+        capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
+    )
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def detect_issues(tasks: list[dict]) -> list[str]:
+    """Return a list of issue strings, one per concern."""
+    now = datetime.now()
+    issues: list[str] = []
+    by_status = defaultdict(list)
+    for t in tasks:
+        by_status[t.get("status", "?")].append(t)
+
+    # Stuck tasks: RUNNING with no heartbeat in 2 min
+    for t in by_status.get("running", []) + by_status.get("RUNNING", []):
+        hb = t.get("heartbeat_at")
+        if not hb:
+            continue
+        try:
+            hb_dt = datetime.fromisoformat(str(hb).rstrip("Z"))
+        except ValueError:
+            continue
+        if now - hb_dt > timedelta(minutes=2):
+            issues.append(
+                f"STUCK: {t['id']} ({t.get('assignee', '?')}) — "
+                f"no heartbeat in {(now - hb_dt).total_seconds():.0f}s"
+            )
+
+    # Tasks exceeding max_runtime
+    for t in by_status.get("running", []) + by_status.get("RUNNING", []):
+        started = t.get("started_at")
+        max_rt = t.get("max_runtime_s")
+        if not started or not max_rt:
+            continue
+        try:
+            started_dt = datetime.fromisoformat(str(started).rstrip("Z"))
+        except ValueError:
+            continue
+        elapsed = (now - started_dt).total_seconds()
+        if elapsed > max_rt:
+            issues.append(
+                f"OVERTIME: {t['id']} ({t.get('assignee', '?')}) — "
+                f"running {elapsed:.0f}s, cap was {max_rt}s"
+            )
+
+    # Repeated retries
+    for t in tasks:
+        retries = t.get("retries", 0)
+        if retries and retries >= 2:
+            issues.append(
+                f"FLAPPING: {t['id']} ({t.get('assignee', '?')}) — "
+                f"retried {retries}× — fix root cause before next run"
+            )
+
+    return issues
+
+
+def snapshot(tenant: str) -> tuple[list[dict], list[str]]:
+    tasks = kanban_list(tenant)
+    issues = detect_issues(tasks)
+    return tasks, issues
+
+
+def print_snapshot(tasks: list[dict], issues: list[str]):
+    counts = defaultdict(int)
+    for t in tasks:
+        counts[str(t.get("status", "?")).lower()] += 1
+
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] "
+          f"Total: {len(tasks)} | "
+          + " | ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+
+    for t in tasks:
+        bar = "✓" if str(t.get("status", "")).lower() == "done" else \
+              "▶" if str(t.get("status", "")).lower() == "running" else \
+              "·" if str(t.get("status", "")).lower() == "ready" else \
+              "✗" if str(t.get("status", "")).lower() == "failed" else "?"
+        print(f"  {bar} {t.get('id', '?'):14} {t.get('assignee', '?'):20}  "
+              f"{t.get('title', '')[:60]}")
+
+    if issues:
+        print("\n  ⚠  ISSUES:", file=sys.stderr)
+        for i in issues:
+            print(f"     {i}", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tenant", required=True,
+                    help="Project tenant slug to monitor")
+    ap.add_argument("--interval", type=int, default=30,
+                    help="Poll interval in seconds (default: 30)")
+    ap.add_argument("--once", action="store_true",
+                    help="Print one snapshot and exit (no polling loop)")
+    args = ap.parse_args()
+
+    if not hermes_available():
+        print("ERROR: 'hermes' CLI not found in PATH", file=sys.stderr)
+        sys.exit(1)
+
+    if args.once:
+        tasks, issues = snapshot(args.tenant)
+        print_snapshot(tasks, issues)
+        sys.exit(0 if not issues else 2)
+
+    print(f"Monitoring tenant '{args.tenant}' every {args.interval}s. "
+          "Ctrl-C to exit.")
+    try:
+        while True:
+            tasks, issues = snapshot(args.tenant)
+            print_snapshot(tasks, issues)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\meme-generation\EXAMPLES.md ===
+# Meme Generation Examples
+
+## Example 1: Debugging at 2 AM
+
+**Topic:** debugging production at 2 AM
+**Template:** this-is-fine
+
+```bash
+python generate_meme.py this-is-fine /tmp/meme.png "PRODUCTION IS DOWN" "This is fine"
+```
+
+## Example 2: Developer Priorities
+
+**Topic:** choosing between writing tests and shipping features
+**Template:** drake
+
+```bash
+python generate_meme.py drake /tmp/meme.png "Writing unit tests" "Shipping straight to prod"
+```
+
+## Example 3: Exam Stress
+
+**Topic:** final exam preparation
+**Template:** two-buttons
+
+```bash
+python generate_meme.py two-buttons /tmp/meme.png "Study everything" "Sleep" "Me at midnight"
+```
+
+## Example 4: Escalating Solutions
+
+**Topic:** fixing a CSS bug
+**Template:** expanding-brain
+
+```bash
+python generate_meme.py expanding-brain /tmp/meme.png "Reading the docs" "Stack Overflow" "!important on everything" "Deleting the stylesheet"
+```
+
+## Example 5: Hot Take
+
+**Topic:** tabs vs spaces
+**Template:** change-my-mind
+
+```bash
+python generate_meme.py change-my-mind /tmp/meme.png "Tabs are just thicc spaces"
+```
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\meme-generation\SKILL.md ===
+---
+name: meme-generation
+description: Create meme PNGs from templates with Pillow text overlay.
+version: 2.0.0
+author: adanaleycio
+license: MIT
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [creative, memes, humor, images]
+    related_skills: [ascii-art]
+    category: creative
+---
+
+# Meme Generation
+
+Generate actual meme images from a topic. Picks a template, writes captions, and renders a real .png file with text overlay.
+
+## When to Use
+
+- User asks you to make or generate a meme
+- User wants a meme about a specific topic, situation, or frustration
+- User says "meme this" or similar
+
+## Available Templates
+
+The script supports **any of the ~100 popular imgflip templates** by name or ID, plus 10 curated templates with hand-tuned text positioning.
+
+### Curated Templates (custom text placement)
+
+| ID | Name | Fields | Best for |
+|----|------|--------|----------|
+| `this-is-fine` | This is Fine | top, bottom | chaos, denial |
+| `drake` | Drake Hotline Bling | reject, approve | rejecting/preferring |
+| `distracted-boyfriend` | Distracted Boyfriend | distraction, current, person | temptation, shifting priorities |
+| `two-buttons` | Two Buttons | left, right, person | impossible choice |
+| `expanding-brain` | Expanding Brain | 4 levels | escalating irony |
+| `change-my-mind` | Change My Mind | statement | hot takes |
+| `woman-yelling-at-cat` | Woman Yelling at Cat | woman, cat | arguments |
+| `one-does-not-simply` | One Does Not Simply | top, bottom | deceptively hard things |
+| `grus-plan` | Gru's Plan | step1-3, realization | plans that backfire |
+| `batman-slapping-robin` | Batman Slapping Robin | robin, batman | shutting down bad ideas |
+
+### Dynamic Templates (from imgflip API)
+
+Any template not in the curated list can be used by name or imgflip ID. These get smart default text positioning (top/bottom for 2-field, evenly spaced for 3+). Search with:
+```bash
+python "$SKILL_DIR/scripts/generate_meme.py" --search "disaster"
+```
+
+## Procedure
+
+### Mode 1: Classic Template (default)
+
+1. Read the user's topic and identify the core dynamic (chaos, dilemma, preference, irony, etc.)
+2. Pick the template that best matches. Use the "Best for" column, or search with `--search`.
+3. Write short captions for each field (8-12 words max per field, shorter is better).
+4. Find the skill's script directory:
+   ```
+   SKILL_DIR=$(dirname "$(find ~/.hermes/skills -path '*/meme-generation/SKILL.md' 2>/dev/null | head -1)")
+   ```
+5. Run the generator:
+   ```bash
+   python "$SKILL_DIR/scripts/generate_meme.py" <template_id> /tmp/meme.png "caption 1" "caption 2" ...
+   ```
+6. Return the image with `MEDIA:/tmp/meme.png`
+
+### Mode 2: Custom AI Image (when image_generate is available)
+
+Use this when no classic template fits, or when the user wants something original.
+
+1. Write the captions first.
+2. Use `image_generate` to create a scene that matches the meme concept. Do NOT include any text in the image prompt — text will be added by the script. Describe only the visual scene.
+3. Find the generated image path from the image_generate result URL. Download it to a local path if needed.
+4. Run the script with `--image` to overlay text, choosing a mode:
+   - **Overlay** (text directly on image, white with black outline):
+     ```bash
+     python "$SKILL_DIR/scripts/generate_meme.py" --image /path/to/scene.png /tmp/meme.png "top text" "bottom text"
+     ```
+   - **Bars** (black bars above/below with white text — cleaner, always readable):
+     ```bash
+     python "$SKILL_DIR/scripts/generate_meme.py" --image /path/to/scene.png --bars /tmp/meme.png "top text" "bottom text"
+     ```
+   Use `--bars` when the image is busy/detailed and text would be hard to read on top of it.
+5. **Verify with vision** (if `vision_analyze` is available): Check the result looks good:
+   ```
+   vision_analyze(image_url="/tmp/meme.png", question="Is the text legible and well-positioned? Does the meme work visually?")
+   ```
+   If the vision model flags issues (text hard to read, bad placement, etc.), try the other mode (switch between overlay and bars) or regenerate the scene.
+6. Return the image with `MEDIA:/tmp/meme.png`
+
+## Examples
+
+**"debugging production at 2 AM":**
+```bash
+python generate_meme.py this-is-fine /tmp/meme.png "SERVERS ARE ON FIRE" "This is fine"
+```
+
+**"choosing between sleep and one more episode":**
+```bash
+python generate_meme.py drake /tmp/meme.png "Getting 8 hours of sleep" "One more episode at 3 AM"
+```
+
+**"the stages of a Monday morning":**
+```bash
+python generate_meme.py expanding-brain /tmp/meme.png "Setting an alarm" "Setting 5 alarms" "Sleeping through all alarms" "Working from bed"
+```
+
+## Listing Templates
+
+To see all available templates:
+```bash
+python generate_meme.py --list
+```
+
+## Pitfalls
+
+- Keep captions SHORT. Memes with long text look terrible.
+- Match the number of text arguments to the template's field count.
+- Pick the template that fits the joke structure, not just the topic.
+- Do not generate hateful, abusive, or personally targeted content.
+- The script caches template images in `scripts/.cache/` after first download.
+
+## Verification
+
+The output is correct if:
+- A .png file was created at the output path
+- Text is legible (white with black outline) on the template
+- The joke lands — caption matches the template's intended structure
+- File can be delivered via MEDIA: path
+

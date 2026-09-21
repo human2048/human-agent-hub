@@ -1,0 +1,369 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\sketch-notes.md ===
+# sketch-notes
+
+Soft hand-drawn illustration style with warm, educational feel
+
+## Design Aesthetic
+
+Hand-drawn feel with soft, relaxed brush strokes. Fresh, refined style with minimalist editorial approach. Emphasis on precision, clarity and intelligent elegance while prioritizing warmth, approachability and friendliness.
+
+## Background
+
+- Color: Warm Off-White (#FAF8F0)
+- Texture: Subtle paper grain, warm tone
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Warm Off-White | #FAF8F0 | Primary background |
+| Primary Text | Deep Charcoal | #2C3E50 | Main elements |
+| Alt Text | Deep Brown | #4A4A4A | Secondary elements |
+| Accent 1 | Soft Orange | #F4A261 | Highlights, emphasis |
+| Accent 2 | Mustard Yellow | #E9C46A | Secondary highlights |
+| Accent 3 | Sage Green | #87A96B | Nature, growth concepts |
+| Accent 4 | Light Blue | #7EC8E3 | Tech, digital elements |
+| Accent 5 | Red Brown | #A0522D | Earthy elements |
+
+## Visual Elements
+
+- Connection lines with hand-drawn wavy feel
+- Conceptual abstract icons illustrating ideas
+- Color fills don't completely fill outlines (hand-painted feel)
+- Simple geometric shapes with rounded corners
+- Arrows and pointers with sketchy style
+- Doodle decorations: stars, spirals, underlines
+
+## Style Rules
+
+### Do
+
+- Keep layouts open and well-structured
+- Emphasize information hierarchy
+- Use hand-drawn quality for all elements
+- Allow imperfection (slight wobbles add character)
+- Layer elements with subtle overlaps
+
+### Don't
+
+- Use perfect geometric shapes
+- Create photorealistic elements
+- Overcrowd with too many elements
+- Use pure white backgrounds
+- Make it look computer-generated
+
+## Best For
+
+Educational content, knowledge sharing, technical explanations, tutorials, onboarding materials, friendly articles
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\sketch.md ===
+# sketch
+
+Raw, authentic notebook-style illustration for ideas and processes
+
+## Design Aesthetic
+
+Hand-drawn sketch aesthetic that feels authentic and in-progress. Pencil-on-paper quality with intentional imperfection. Suggests thinking, brainstorming, and creative exploration. Raw and honest visual approach that invites collaboration.
+
+## Background
+
+- Color: Off-White Paper (#F7FAFC) or Cream (#FAFAFA)
+- Texture: Paper texture with visible grain
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Paper White | #F7FAFC | Primary background |
+| Primary | Pencil Gray | #4A5568 | Main sketch lines |
+| Secondary | Light Gray | #A0AEC0 | Shading, soft marks |
+| Highlight Blue | Note Blue | #3182CE | Highlight color |
+| Highlight Red | Mark Red | #E53E3E | Emphasis color |
+| Highlight Yellow | Marker Yellow | #F6E05E | Highlighter effect |
+| Text | Charcoal | #2D3748 | Text elements |
+
+## Visual Elements
+
+- Rough sketch lines with natural variation
+- Arrows and directional pointers
+- Handwritten labels and notes
+- Crossed-out marks and corrections
+- Underlines and emphasis marks
+- Simple diagram shapes
+- Margin notes style
+- Quick icon sketches
+
+## Style Rules
+
+### Do
+
+- Use pencil-like line quality
+- Include natural imperfections
+- Add handwritten annotations
+- Create diagram-style layouts
+- Show thinking process
+
+### Don't
+
+- Use perfect geometric shapes
+- Add polished or refined elements
+- Create colorful compositions
+- Use digital effects
+- Make it look finished
+
+## Best For
+
+Ideas in progress, brainstorming articles, thought processes, concept exploration, draft-stage thinking, planning content, problem-solving pieces
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\vector-illustration.md ===
+# vector-illustration
+
+Flat vector illustration style with clear black outlines and retro soft colors
+
+## Design Aesthetic
+
+Flat vector illustration with no gradients or 3D effects. Clear, uniform-thickness black outlines on all elements. Geometric simplification reducing complex objects to basic shapes. Toy model aesthetic that's cute, playful, and approachable. Coloring book style with closed outlines.
+
+## Background
+
+- Color: Cream Off-White (#F5F0E6)
+- Texture: Subtle paper texture, warm nostalgic feel
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Cream Off-White | #F5F0E6 | Primary background |
+| Outlines | Deep Charcoal | #2D2D2D | All element outlines |
+| Primary | Coral Red | #E07A5F | Primary accent, warmth |
+| Secondary | Mint Green | #81B29A | Nature, growth |
+| Tertiary | Mustard Yellow | #F2CC8F | Highlights, energy |
+| Accent 1 | Burnt Orange | #D4764A | Warm accents |
+| Accent 2 | Rock Blue | #577590 | Cool balance |
+| Text | Black | #1A1A1A | Text elements |
+
+## Visual Elements
+
+- All objects have closed black outlines (coloring book style)
+- Rounded line endings, avoid sharp corners
+- Trees simplified to lollipop or triangle shapes
+- Buildings as rectangular blocks with grid windows
+- Depth through layering and overlap
+- Decorative elements: sunbursts, pill-shaped clouds, dots, stars
+- People as simple geometric figures
+
+## Style Rules
+
+### Do
+
+- Maintain consistent outline thickness
+- Use soft, vintage color palette
+- Simplify objects to basic geometric shapes
+- Create depth through layering
+- Add playful decorative elements
+
+### Don't
+
+- Use gradients or realistic shading
+- Create photorealistic elements
+- Use thin or varying line weights
+- Include complex detailed illustrations
+- Add textures inside shapes
+
+## Best For
+
+Educational content, creative articles, children's content, brand showcases, explainer pieces, warm approachable topics
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\vintage.md ===
+# vintage
+
+Nostalgic aged-paper aesthetic for historical and heritage content
+
+## Design Aesthetic
+
+Nostalgic vintage aesthetic with aged paper textures and historical document styling. Explorer's journal and antique map quality. Rich warm tones with weathered textures. Evokes discovery, heritage, and timeless knowledge.
+
+## Background
+
+- Color: Aged Parchment (#F5E6D3) or Sepia Cream (#FFF8DC)
+- Texture: Heavy aged paper texture with subtle stains and worn edges
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Aged Parchment | #F5E6D3 | Primary background |
+| Alt Background | Sepia Cream | #FFF8DC | Secondary areas |
+| Primary Text | Dark Brown | #3D2914 | Main elements |
+| Secondary | Medium Brown | #6B4423 | Supporting details |
+| Accent 1 | Forest Green | #2D5A3D | Nature, maps |
+| Accent 2 | Navy Blue | #1E3A5F | Ocean, lines |
+| Accent 3 | Burgundy | #722F37 | Emphasis |
+| Accent 4 | Gold | #C9A227 | Highlights |
+| Ink | Sepia Black | #3D3D3D | Fine details |
+
+## Visual Elements
+
+- Antique map styling with route lines
+- Compass roses and navigation elements
+- Specimen-style drawings
+- Handwritten annotations
+- Rope, leather, brass decorative motifs
+- Vintage photograph frames
+- Aged paper edge effects
+- Historical document styling
+
+## Style Rules
+
+### Do
+
+- Apply consistent aged texture
+- Use period-appropriate styling
+- Include map and journey elements
+- Create layered compositions
+- Maintain warm sepia tones
+
+### Don't
+
+- Use modern digital styling
+- Create crisp clean edges
+- Use cold or bright colors
+- Add contemporary elements
+- Make it look new or fresh
+
+## Best For
+
+Historical articles, travel and exploration, biography pieces, heritage stories, scientific discovery narratives, museum-style content, classic literature references
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\warm.md ===
+# warm
+
+Friendly, approachable illustration style for human-centered content
+
+## Design Aesthetic
+
+Warm and inviting visual approach that feels personal and approachable. Soft, friendly colors that evoke comfort and connection. Emphasizes human elements and emotional resonance. Creates an atmosphere of trust and openness.
+
+## Background
+
+- Color: Cream (#FFFAF0) or Soft Peach (#FED7AA)
+- Texture: Soft paper texture with warm undertones
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Cream | #FFFAF0 | Primary background |
+| Alt Background | Soft Peach | #FED7AA | Accent sections |
+| Primary | Warm Orange | #ED8936 | Main accent color |
+| Secondary | Golden Yellow | #F6AD55 | Supporting warmth |
+| Tertiary | Terracotta | #C05621 | Earthy depth |
+| Accent | Deep Brown | #744210 | Grounding elements |
+| Alt Accent | Soft Red | #E53E3E | Emotional touches |
+| Text | Warm Charcoal | #4A4A4A | Text elements |
+
+## Visual Elements
+
+- Rounded shapes and soft corners
+- Friendly character illustrations
+- Sun rays and warm light motifs
+- Heart symbols and care icons
+- Cozy lighting effects
+- Gentle gradients with warmth
+- Soft shadows without harsh edges
+- Hand-drawn quality touches
+
+## Style Rules
+
+### Do
+
+- Use warm, inviting colors
+- Create rounded, friendly shapes
+- Include human-centered elements
+- Evoke feelings of comfort
+- Maintain soft, gentle contrasts
+
+### Don't
+
+- Use cold or stark colors
+- Create sharp, aggressive shapes
+- Add technical or clinical elements
+- Use dark, moody backgrounds
+- Create sterile compositions
+
+## Best For
+
+Personal growth articles, lifestyle content, education, human interest stories, wellness topics, relationship advice, self-help content, community building
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\watercolor.md ===
+# watercolor
+
+Soft, artistic watercolor illustration style with natural warmth
+
+## Design Aesthetic
+
+Gentle watercolor aesthetic with visible brush strokes and natural color bleeding. Hand-painted feel with soft edges and organic shapes. Warm, approachable, and artistically refined. Combines artistic expression with clear visual communication.
+
+## Background
+
+- Color: Warm Off-White (#FAF8F0) or Soft Cream (#FFF9E6)
+- Texture: Subtle watercolor paper texture with visible grain
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Warm Off-White | #FAF8F0 | Primary background |
+| Primary | Soft Coral | #F4A261 | Primary warmth |
+| Secondary | Dusty Rose | #E8A0A0 | Secondary warmth |
+| Tertiary | Sage Green | #87A96B | Nature, growth |
+| Accent 1 | Sky Blue | #7EC8E3 | Water, calm |
+| Accent 2 | Soft Lavender | #C5B4E3 | Accent, creativity |
+| Wash | Pale Yellow | #FFF3C4 | Background washes |
+| Text | Warm Charcoal | #3D3D3D | Text elements |
+
+## Visual Elements
+
+- Watercolor washes as backgrounds
+- Illustrated elements with visible brush strokes
+- Natural elements: leaves, flowers, bubbles
+- Color bleeds and soft edges
+- Hand-drawn arrows and lines
+- Layered wash effects
+- Soft gradients through water
+- Expressive character illustrations
+
+## Style Rules
+
+### Do
+
+- Allow color to bleed beyond edges
+- Use visible brush stroke textures
+- Create soft, organic shapes
+- Include hand-drawn quality
+- Maintain warm color palette
+
+### Don't
+
+- Use sharp geometric shapes
+- Create hard digital edges
+- Use cold or stark colors
+- Add photographic elements
+- Create overly precise illustrations
+
+## Best For
+
+Lifestyle articles, wellness content, travel pieces, food and cooking, personal stories, creative topics, artistic portfolios, warm educational content
+

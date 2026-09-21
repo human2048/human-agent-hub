@@ -1,11 +1,16 @@
 import time
 import json
 import sqlite3
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 # Importación de los agentes core de la colmena
 from database.db_agent import DatabaseAgent
 from backend.financial_agent import FinancialAgent
+
+
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "cyberniche.db"
+
 
 class RealPaymentSyncService:
     """
@@ -14,7 +19,7 @@ class RealPaymentSyncService:
     aprovisionamiento automático de Tenants en BD y actualización de métricas MRR/Cashflow.
     """
 
-    def __init__(self, db_path: str = "cyberniche.db"):
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db = DatabaseAgent(db_path=db_path)
         self.financial_agent = FinancialAgent(monthly_fee=29.00)
         self._ensure_audit_schema()

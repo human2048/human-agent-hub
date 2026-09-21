@@ -1,0 +1,399 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_voice_mode_playback_env_scrub.py ===
+"""Voice-mode system playback must scrub credential env (sibling of #70342)."""
+
+from unittest.mock import MagicMock, patch
+
+
+def test_play_audio_file_scrubbed_env(tmp_path, monkeypatch):
+    audio = tmp_path / "t.mp3"
+    audio.write_bytes(b"ID3fake")
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "secret-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        proc.returncode = 0
+        return proc
+
+    import tools.voice_mode as vm
+
+    with patch.object(vm, "platform") as plat, patch.object(
+        vm.shutil, "which", return_value="/usr/bin/ffplay"
+    ), patch.object(vm.subprocess, "Popen", side_effect=fake_popen):
+        plat.system.return_value = "Linux"
+        ok = vm.play_audio_file(str(audio))
+
+    assert ok is True
+    assert captured.get("env") is not None
+    assert "TELEGRAM_BOT_TOKEN" not in captured["env"]
+    assert "OPENAI_API_KEY" not in captured["env"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_voice_stop_phrase.py ===
+"""Tests for the voice-chat stop phrase (say "stop" and nothing else to end).
+
+Contract:
+  - `is_voice_stop_phrase` matches ONLY when the whole utterance equals a
+    configured phrase (case-insensitive, surrounding punctuation stripped).
+  - Default phrase list is ("stop",); `voice.stop_phrases` in config.yaml
+    customizes it; `[]` disables the feature.
+  - In the shared continuous loop, a stop phrase halts the loop (like the
+    silent-cycle limit) and is NEVER delivered to the agent.
+"""
+
+from unittest.mock import patch
+
+import pytest
+
+from tools.voice_mode_transcript import (
+    DEFAULT_VOICE_STOP_PHRASES,
+    _load_voice_stop_phrases,
+    is_voice_stop_phrase,
+    voice_stop_hint,
+)
+
+
+class TestVoiceStopHint:
+    """The 'Say "stop" to end the voice chat.' hint shown on voice-mode start."""
+
+    def test_default_phrase(self):
+        with patch("tools.voice_mode_transcript._load_voice_stop_phrases", return_value=("stop",)):
+            assert voice_stop_hint() == 'Say "stop" to end the voice chat.'
+
+
+    def test_disabled_phrases_show_no_hint(self):
+        with patch("tools.voice_mode_transcript._load_voice_stop_phrases", return_value=()):
+            assert voice_stop_hint() == ""
+
+
+class TestIsVoiceStopPhrase:
+    @pytest.mark.parametrize("utterance", [
+        "stop", "Stop", "STOP", "stop.", "Stop!", " stop ", '"Stop."', "stop?",
+    ])
+    def test_bare_stop_matches(self, utterance):
+        assert is_voice_stop_phrase(utterance, ("stop",)) is True
+
+
+    def test_uses_config_when_phrases_omitted(self):
+        with patch("tools.voice_mode_transcript._load_voice_stop_phrases", return_value=("halt",)):
+            assert is_voice_stop_phrase("halt") is True
+            assert is_voice_stop_phrase("stop") is False
+
+
+class TestLoadVoiceStopPhrases:
+    def _with_cfg(self, voice_cfg):
+        return patch(
+            "hermes_cli.config.load_config",
+            return_value={"voice": voice_cfg},
+        )
+
+    def test_default(self):
+        with self._with_cfg({}):
+            assert _load_voice_stop_phrases() == DEFAULT_VOICE_STOP_PHRASES
+
+
+    def test_config_error_falls_back(self):
+        with patch("hermes_cli.config.load_config", side_effect=RuntimeError):
+            assert _load_voice_stop_phrases() == DEFAULT_VOICE_STOP_PHRASES
+
+
+class TestContinuousLoopStopPhrase:
+    """The shared continuous-loop silence callback ends the loop on a stop
+    phrase and never forwards it to on_transcript."""
+
+    def _run_silence_cycle(self, transcript_text):
+        import hermes_cli.voice as v
+
+        delivered = []
+        silent_limit_fired = []
+
+        class _FakeRecorder:
+            _peak_rms = 500
+
+            def stop(self):
+                return "/tmp/fake.wav"
+
+            def cancel(self):
+                pass
+
+            def start(self, on_silence_stop=None):
+                pass
+
+        fake_result = {"success": True, "transcript": transcript_text}
+        with patch.object(v, "_continuous_active", True), \
+             patch.object(v, "_continuous_recorder", _FakeRecorder()), \
+             patch.object(v, "_continuous_callbacks",
+                          (delivered.append, None, lambda: silent_limit_fired.append(True), None)), \
+             patch.object(v, "_continuous_no_speech_count", 0), \
+             patch.object(v, "transcribe_recording", return_value=fake_result), \
+             patch.object(v, "_play_beep", lambda **kw: None), \
+             patch.object(v.os.path, "isfile", return_value=False):
+            v._continuous_on_silence()
+            still_active = v._continuous_active
+        return delivered, silent_limit_fired, still_active
+
+    def test_stop_phrase_halts_loop_and_is_not_delivered(self):
+        delivered, silent_limit, still_active = self._run_silence_cycle("Stop.")
+        assert delivered == []
+        assert silent_limit == [True]
+        assert still_active is False
+
+    def test_normal_transcript_is_delivered(self):
+        delivered, silent_limit, _ = self._run_silence_cycle("stop the build and rerun")
+        assert delivered == ["stop the build and rerun"]
+        assert silent_limit == []
+
+
+class TestContinuousLoopStopPhraseSignal:
+    """The explicit on_stop_phrase signal: fired on a spoken stop phrase so
+    consumers (TUI, desktop) end the conversation as user intent, with
+    on_silent_limit as the legacy fallback when it isn't wired."""
+
+    class _FakeRecorder:
+        _peak_rms = 500
+
+        def stop(self):
+            return "/tmp/fake.wav"
+
+        def cancel(self):
+            pass
+
+        def start(self, on_silence_stop=None):
+            pass
+
+    def _run_silence_cycle(self, transcript_text, on_stop_phrase):
+        import hermes_cli.voice as v
+
+        delivered = []
+        silent_limit_fired = []
+
+        fake_result = {"success": True, "transcript": transcript_text}
+        with patch.object(v, "_continuous_active", True), \
+             patch.object(v, "_continuous_recorder", self._FakeRecorder()), \
+             patch.object(v, "_continuous_callbacks",
+                          (delivered.append, None, lambda: silent_limit_fired.append(True), on_stop_phrase)), \
+             patch.object(v, "_continuous_no_speech_count", 0), \
+             patch.object(v, "transcribe_recording", return_value=fake_result), \
+             patch.object(v, "_play_beep", lambda **kw: None), \
+             patch.object(v.os.path, "isfile", return_value=False):
+            v._continuous_on_silence()
+            still_active = v._continuous_active
+        return delivered, silent_limit_fired, still_active
+
+    def test_stop_phrase_fires_dedicated_signal_not_silent_limit(self):
+        stop_fired = []
+        delivered, silent_limit, still_active = self._run_silence_cycle(
+            "Stop.", stop_fired.append
+        )
+        assert stop_fired == ["Stop."]
+        assert silent_limit == []
+        assert delivered == []
+        assert still_active is False
+
+
+    def test_start_continuous_accepts_on_stop_phrase_kwarg(self):
+        import inspect
+
+        import hermes_cli.voice as v
+
+        assert "on_stop_phrase" in inspect.signature(v.start_continuous).parameters
+
+
+class _ImmediateThread:
+    """Thread stand-in that runs the target synchronously on start()."""
+
+    def __init__(self, target):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+class TestStopPhraseSurvivesHallucinationFilter:
+    """Ordering contract: a configured stop phrase must never be eaten by the
+    Whisper hallucination filter inside transcribe_recording. "bye" is BOTH a
+    known hallucination and a plausible stop phrase — when configured as a
+    stop phrase it must come through so the stop check can end the chat."""
+
+    def _transcribe(self, text, phrases):
+        import tools.voice_mode as vm
+        import tools.voice_mode_transcript as vmt
+
+        with patch.object(
+            vmt, "_load_voice_stop_phrases", return_value=tuple(phrases)
+        ), patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={"success": True, "transcript": text},
+        ):
+            return vm.transcribe_recording("/tmp/fake.wav")
+
+    def test_configured_stop_phrase_survives_blocklist(self):
+        result = self._transcribe("Bye.", ["stop", "bye"])
+        assert result["success"] is True
+        assert result["transcript"] == "Bye."
+        assert not result.get("filtered")
+
+    def test_unconfigured_hallucination_still_filtered(self):
+        result = self._transcribe("Bye.", ["stop"])
+        assert result["success"] is True
+        assert result["transcript"] == ""
+        assert result.get("filtered") is True
+
+    def test_default_stop_survives_repeat_regex_adjacent_phrases(self):
+        # "stop." is not in the blocklist/repeat regex today; this pins the
+        # contract so a future blocklist addition can't swallow it.
+        result = self._transcribe("Stop.", ["stop"])
+        assert result["transcript"] == "Stop."
+        assert not result.get("filtered")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_voice_thinking_sound.py ===
+"""Tests for the ambient voice-chat "thinking" sound (tools/voice_mode.py).
+
+Contract:
+  - `voice.thinking_sound` config gates it (default True).
+  - `start_thinking_sound()` is idempotent, returns False when disabled.
+  - The loop synthesizes blips with numpy (no assets), scales volume by
+    `voice.beep_volume`, and NEVER plays through sounddevice on macOS
+    (_sounddevice_output_allowed → TCC-safe silent skip).
+  - `stop_thinking_sound()` stops the loop instantly and is idempotent.
+  - The should_play callback gates each blip (no blips while TTS speaks
+    or the mic captures).
+  - mark_audio_output_active / is_audio_output_active ref-count playback.
+"""
+
+import threading
+import time
+from unittest.mock import patch
+
+import pytest
+
+np = pytest.importorskip(
+    "numpy", reason="numpy is a lazy voice dependency, absent in hermetic CI"
+)
+
+import tools.voice_mode as vm
+
+
+class _FakeSD:
+    def __init__(self):
+        self.played = []
+
+    def play(self, audio, samplerate=None):
+        self.played.append((audio, samplerate))
+
+    def stop(self):
+        pass
+
+
+def _reset():
+    vm.stop_thinking_sound()
+    # Drain any residual output ref-counts from prior tests.
+    with vm._audio_output_lock:
+        vm._audio_output_active_count = 0
+
+
+class TestConfigGate:
+    def test_default_enabled(self):
+        with patch("hermes_cli.config.load_config", return_value={"voice": {}}):
+            assert vm.thinking_sound_enabled() is True
+
+
+    def test_start_refuses_when_disabled(self):
+        _reset()
+        with patch.object(vm, "thinking_sound_enabled", return_value=False):
+            assert vm.start_thinking_sound() is False
+        assert vm._thinking_stop is None
+
+
+class TestBlipSynthesis:
+    def test_blip_is_int16_low_volume(self):
+        with patch.object(vm, "_get_beep_volume", return_value=0.3):
+            blip = vm._synth_thinking_blip(np, 392.0)
+        assert blip.dtype == np.int16
+        assert len(blip) == int(vm.SAMPLE_RATE * 0.16)
+        # Quieter than the beeps: 0.3 * 0.5 * 32767 ≈ 4915 peak ceiling.
+        assert int(np.abs(blip).max()) <= int(0.3 * 0.5 * 32767) + 1
+        assert int(np.abs(blip).max()) > 0
+
+
+    def test_no_click_smooth_attack(self):
+        blip = vm._synth_thinking_blip(np, 392.0)
+        # First sample near zero (enveloped attack, no click).
+        assert abs(int(blip[0])) < 200
+
+
+class TestLoopLifecycle:
+    def test_loop_plays_blips_and_stops_instantly(self):
+        _reset()
+        fake = _FakeSD()
+        stop = threading.Event()
+        with patch.object(vm, "_sounddevice_output_allowed", return_value=True), \
+             patch.object(vm, "_import_audio", return_value=(fake, np)), \
+             patch.object(vm, "_get_beep_volume", return_value=0.3):
+            t = threading.Thread(
+                target=vm._thinking_sound_loop, args=(stop, None), daemon=True
+            )
+            t.start()
+            deadline = time.monotonic() + 3.0
+            while not fake.played and time.monotonic() < deadline:
+                time.sleep(0.01)
+            stop.set()
+            t.join(timeout=3.0)
+        assert fake.played, "loop never played a blip"
+        assert not t.is_alive()
+
+
+    def test_start_is_idempotent_and_stop_clears(self):
+        _reset()
+        with patch.object(vm, "thinking_sound_enabled", return_value=True), \
+             patch.object(vm, "_sounddevice_output_allowed", return_value=False):
+            assert vm.start_thinking_sound() is True
+            first_stop = vm._thinking_stop
+            assert vm.start_thinking_sound() is True
+            assert vm._thinking_stop is first_stop  # no second loop
+            vm.stop_thinking_sound()
+            assert vm._thinking_stop is None
+            assert first_stop.is_set()
+            vm.stop_thinking_sound()  # idempotent
+
+
+class TestAudioOutputRefcount:
+    def test_refcount_tracks_nested_playback(self):
+        _reset()
+        assert vm.is_audio_output_active() is False
+        vm.mark_audio_output_active(True)
+        vm.mark_audio_output_active(True)
+        assert vm.is_audio_output_active() is True
+        vm.mark_audio_output_active(False)
+        assert vm.is_audio_output_active() is True
+        vm.mark_audio_output_active(False)
+        assert vm.is_audio_output_active() is False
+        # Never goes negative.
+        vm.mark_audio_output_active(False)
+        assert vm.is_audio_output_active() is False
+
+    def test_play_audio_file_brackets_refcount(self, tmp_path):
+        """play_audio_file flags real speaker output for its whole duration,
+        so the thinking loop knows audio is flowing."""
+        _reset()
+        seen = []
+
+        def fake_impl(path):
+            seen.append(vm.is_audio_output_active())
+            return True
+
+        with patch.object(vm, "_play_audio_file_impl", fake_impl):
+            vm.play_audio_file(str(tmp_path / "x.wav"))
+        assert seen == [True]
+        assert vm.is_audio_output_active() is False
+

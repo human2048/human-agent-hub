@@ -1,0 +1,328 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_anthropic_models_pagination.py ===
+"""Anthropic /v1/models cursor pagination — regression tests.
+
+The endpoint defaults to a 20-item page and signals continuation via
+``has_more``/``last_id``/``after_id``. An unpaginated read silently drops
+every model past the first page (bug class ported from
+OpenHands/OpenHands#16758). Covers ``_fetch_anthropic_models`` and the
+anthropic provider-plugin ``fetch_models``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+
+from hermes_cli.models import _fetch_anthropic_models
+
+MODELS = [f"claude-fake-{i:03d}" for i in range(55)]
+
+
+class _PagedHandler(BaseHTTPRequestHandler):
+    page_cap = 20  # server-side max page size (forces pagination even at limit=1000)
+    repeat_cursor = False  # simulate a buggy server that never advances
+
+    def log_message(self, *args):  # noqa: D102
+        pass
+
+    def do_GET(self):  # noqa: N802
+        u = urlparse(self.path)
+        if not u.path.endswith("/models"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        q = parse_qs(u.query)
+        limit = min(int(q.get("limit", ["20"])[0]), self.page_cap)
+        after = q.get("after_id", [None])[0]
+        start = MODELS.index(after) + 1 if after in MODELS else 0
+        page = MODELS[start : start + limit]
+        last_id = page[-1] if page else None
+        if self.repeat_cursor and after is not None:
+            last_id = after  # cursor never advances
+        body = {
+            "data": [{"id": m, "type": "model"} for m in page],
+            "has_more": True if self.repeat_cursor else start + limit < len(MODELS),
+            "first_id": page[0] if page else None,
+            "last_id": last_id,
+        }
+        raw = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+@pytest.fixture()
+def paged_server():
+    handler = type("Handler", (_PagedHandler,), {})
+    srv = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}", handler
+    finally:
+        srv.shutdown()
+
+
+def _load_plugin_profile():
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "anthropic_provider_under_test",
+        root / "plugins" / "model-providers" / "anthropic" / "__init__.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.anthropic
+
+
+class TestFetchAnthropicModelsPagination:
+    def test_follows_cursor_across_all_pages(self, paged_server):
+        base, _handler = paged_server
+        got = _fetch_anthropic_models(base_url=base, api_key="sk-ant-api-test")
+        assert got is not None
+        assert len(got) == len(MODELS)
+        assert set(got) == set(MODELS)
+
+    def test_single_page_catalog_still_works(self, paged_server):
+        base, handler = paged_server
+        handler.page_cap = 1000  # whole catalog fits one page
+        got = _fetch_anthropic_models(base_url=base, api_key="sk-ant-api-test")
+        assert got is not None and len(got) == len(MODELS)
+
+    def test_repeated_cursor_terminates(self, paged_server):
+        base, handler = paged_server
+        handler.repeat_cursor = True
+        got = _fetch_anthropic_models(base_url=base, api_key="sk-ant-api-test")
+        # Must not hang or loop forever; returns the de-duped pages it saw.
+        assert got is not None
+        assert 0 < len(got) <= len(MODELS)
+
+
+class TestPluginFetchModelsPagination:
+    def test_follows_cursor_across_all_pages(self, paged_server):
+        base, _handler = paged_server
+        profile = _load_plugin_profile()
+        got = profile.fetch_models(api_key="sk-ant-api-test", base_url=base)
+        assert got is not None
+        assert len(got) == len(MODELS)
+
+    def test_no_api_key_returns_none(self):
+        profile = _load_plugin_profile()
+        assert profile.fetch_models(api_key=None) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_anthropic_model_flow_stale_oauth.py ===
+"""Tests for Bug #12905 fix — stale OAuth token detection in hermes model flow.
+
+Bug 3: `hermes model` with `provider=anthropic` skips OAuth re-authentication
+when a stale ANTHROPIC_TOKEN exists in ~/.hermes/.env but no valid
+Claude Code credentials are available. The fast-path silently proceeds to
+model selection with a broken token instead of offering re-auth.
+"""
+
+
+from hermes_cli.config import save_env_value
+
+
+class TestStaleOAuthTokenDetection:
+    """Bug 3: stale OAuth token must trigger needs_auth=True in _model_flow_anthropic."""
+
+    def test_stale_oauth_token_triggers_reauth(self, tmp_path, monkeypatch, capsys):
+        """
+        Scenario: ANTHROPIC_TOKEN is an expired OAuth token and there are no
+        valid Claude Code credentials anywhere. The flow MUST offer re-auth
+        instead of silently skipping to model selection.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        # Pre-load .env with an expired OAuth token (sk-ant- prefix = OAuth)
+        save_env_value("ANTHROPIC_TOKEN", "sk-ant-oat-ExpiredToken00000")
+        save_env_value("ANTHROPIC_API_KEY", "")
+
+        # No valid Claude Code credentials available (expired, no refresh token)
+        monkeypatch.setattr(
+            "agent.anthropic_credentials.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "expired-cc-token",
+                "refreshToken": "",          # No refresh — can't recover
+                "expiresAt": 0,               # Already expired
+                "source": "claude_code_credentials_file",
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_credentials.is_claude_code_token_valid",
+            lambda creds: False,             # Explicitly expired
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_credentials._is_oauth_token",
+            lambda key: key.startswith("sk-ant-"),
+        )
+        # _resolve_claude_code_token_from_credentials has no valid path
+        monkeypatch.setattr(
+            "agent.anthropic_credentials._resolve_claude_code_token_from_credentials",
+            lambda creds=None: None,
+        )
+
+        # Simulate user types "3" (Cancel) when prompted for re-auth
+        monkeypatch.setattr("builtins.input", lambda _: "3")
+        monkeypatch.setattr("hermes_cli.secret_prompt.masked_secret_prompt", lambda _: "")
+
+        from hermes_cli.model_setup_flows import _model_flow_anthropic
+        cfg = {}
+
+        _model_flow_anthropic(cfg)
+
+        output = capsys.readouterr().out
+        # Must show auth method choice since token is stale
+        assert "subscription" in output or "API key" in output, (
+            f"Expected auth method menu but got: {output!r}"
+        )
+
+    def test_valid_api_key_skips_stale_check(self, tmp_path, monkeypatch, capsys):
+        """
+        A non-OAuth ANTHROPIC_API_KEY (regular pay-per-token key) must NOT be
+        flagged as stale even when cc_creds are invalid. Regular API keys don't
+        expire the same way OAuth tokens do.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        # Regular API key — NOT an OAuth token
+        save_env_value("ANTHROPIC_API_KEY", "sk-ant-api03-RegularPayPerTokenKey")
+        save_env_value("ANTHROPIC_TOKEN", "")
+
+        monkeypatch.setattr(
+            "agent.anthropic_credentials.read_claude_code_credentials",
+            lambda: None,   # No CC creds
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_credentials.is_claude_code_token_valid",
+            lambda creds: False,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_credentials._is_oauth_token",
+            lambda key: key.startswith("sk-ant-") and "oat" in key,
+        )
+
+        # Simulate user picks "1" (use existing)
+        monkeypatch.setattr("builtins.input", lambda _: "1")
+
+        from hermes_cli.model_setup_flows import _model_flow_anthropic
+        cfg = {}
+
+        _model_flow_anthropic(cfg)
+
+        output = capsys.readouterr().out
+        # Should show "Use existing credentials" menu, NOT auth method choice
+        assert "Use existing" in output or "credentials" in output.lower()
+
+
+class TestStaleOAuthGuardLogic:
+    """Unit-level test of the stale-OAuth detection guard logic."""
+
+    def test_stale_oauth_flag_logic_no_cc_creds(self):
+        """
+        When existing_key is OAuth and cc_available is False,
+        existing_is_stale_oauth should be True → has_creds = False.
+        """
+        existing_key = "sk-ant-oat-expiredtoken123"
+        _is_oauth_token = lambda k: k.startswith("sk-ant-")
+        cc_available = False
+
+        existing_is_stale_oauth = (
+            bool(existing_key) and
+            _is_oauth_token(existing_key) and
+            not cc_available
+        )
+        has_creds = (bool(existing_key) and not existing_is_stale_oauth) or cc_available
+
+        assert existing_is_stale_oauth is True
+        assert has_creds is False
+
+    def test_stale_oauth_flag_logic_with_valid_cc_creds(self):
+        """
+        When existing_key is OAuth but cc_available is True (valid creds exist),
+        has_creds should be True — the cc_creds will be used instead.
+        """
+        existing_key = "sk-ant-oat-sometoken"
+        _is_oauth_token = lambda k: k.startswith("sk-ant-")
+        cc_available = True
+
+        existing_is_stale_oauth = (
+            bool(existing_key) and
+            _is_oauth_token(existing_key) and
+            not cc_available
+        )
+        has_creds = (bool(existing_key) and not existing_is_stale_oauth) or cc_available
+
+        assert existing_is_stale_oauth is False
+        assert has_creds is True
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_anthropic_oauth_flow.py ===
+"""Tests for Anthropic OAuth setup flow behavior."""
+
+from hermes_cli.config import load_env, save_env_value
+
+
+def test_run_anthropic_oauth_flow_prefers_claude_code_credentials(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.run_oauth_setup_token",
+        lambda: "sk-ant-oat01-from-claude-setup",
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.read_claude_code_credentials",
+        lambda: {
+            "accessToken": "cc-access-token",
+            "refreshToken": "cc-refresh-token",
+            "expiresAt": 9999999999999,
+        },
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.is_claude_code_token_valid",
+        lambda creds: True,
+    )
+
+    from hermes_cli.main_provider_setup import _run_anthropic_oauth_flow
+
+    save_env_value("ANTHROPIC_TOKEN", "stale-env-token")
+    assert _run_anthropic_oauth_flow(save_env_value) is True
+
+    env_vars = load_env()
+    assert env_vars["ANTHROPIC_TOKEN"] == ""
+    assert env_vars["ANTHROPIC_API_KEY"] == ""
+    output = capsys.readouterr().out
+    assert "Claude Code credentials linked" in output
+
+
+def test_run_anthropic_oauth_flow_manual_token_still_persists(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("agent.anthropic_credentials.run_oauth_setup_token", lambda: None)
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr("agent.anthropic_credentials.is_claude_code_token_valid", lambda creds: False)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "sk-ant-oat01-manual-token")
+    monkeypatch.setattr(
+        "hermes_cli.secret_prompt.masked_secret_prompt",
+        lambda _prompt="": "sk-ant-oat01-manual-token",
+    )
+
+    from hermes_cli.main_provider_setup import _run_anthropic_oauth_flow
+
+    assert _run_anthropic_oauth_flow(save_env_value) is True
+
+    env_vars = load_env()
+    assert env_vars["ANTHROPIC_TOKEN"] == "sk-ant-oat01-manual-token"
+    output = capsys.readouterr().out
+    assert "Setup-token saved" in output
+

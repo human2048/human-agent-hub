@@ -1,0 +1,402 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_server_media_data_urls.py ===
+"""MEDIA: tag → base64 data-URL resolution for the API server (salvage of #2696).
+
+Remote OpenAI-compatible frontends can't read local file paths, so
+``MEDIA:<path>`` image tags in final responses are inlined as markdown
+data URLs before crossing the HTTP boundary.
+"""
+
+import base64
+import unittest
+
+import pytest
+
+pytest.importorskip("aiohttp")
+
+from gateway.platforms.api_server import _resolve_media_to_data_urls  # noqa: E402
+
+# 1x1 transparent PNG
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+    "h6FO1AAAAABJRU5ErkJggg=="
+)
+
+
+class TestResolveMediaToDataUrls(unittest.TestCase):
+    def _write_png(self, tmpdir_name="hermes_media_test"):
+        import tempfile
+        from pathlib import Path
+
+        d = Path(tempfile.mkdtemp(prefix=tmpdir_name))
+        p = d / "shot.png"
+        p.write_bytes(_PNG_BYTES)
+        return p
+
+    def test_media_tag_inlined(self):
+        p = self._write_png()
+        out = _resolve_media_to_data_urls(f"Here you go: MEDIA:{p}")
+        self.assertIn("data:image/png;base64,", out)
+        self.assertNotIn("MEDIA:", out)
+
+    def test_backtick_wrapped_tag(self):
+        p = self._write_png()
+        out = _resolve_media_to_data_urls(f"See `MEDIA:{p}` above")
+        self.assertIn("data:image/png;base64,", out)
+
+    def test_terminal_eos_sentinel_does_not_block_inlining(self):
+        """A leaked terminal ``<|eos|>`` glued to the tag (#111046) inlines exactly like the clean
+        response; the control token is dropped rather than returned to the HTTP client."""
+        p = self._write_png()
+        clean = f"Here you go: MEDIA:{p}"
+        self.assertEqual(_resolve_media_to_data_urls(clean + "<|eos|>"), _resolve_media_to_data_urls(clean))
+
+    def test_missing_file_left_untouched(self):
+        text = "MEDIA:/nonexistent/path/shot.png"
+        self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+    def test_non_image_left_untouched(self):
+        text = "MEDIA:/tmp/archive.zip"
+        self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_server_multimodal.py ===
+"""End-to-end tests for inline image inputs on /v1/chat/completions and /v1/responses.
+
+Covers the multimodal normalization path added to the API server.  Unlike the
+adapter-level tests that patch ``_run_agent``, these tests patch
+``AIAgent.run_conversation`` instead so the adapter's full request-handling
+path (including the ``run_agent`` prologue that used to crash on list content)
+executes against a real aiohttp app.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import (
+    APIServerAdapter,
+    _content_has_visible_payload,
+    _normalize_multimodal_content,
+    cors_middleware,
+    security_headers_middleware,
+)
+
+
+# ---------------------------------------------------------------------------
+# Pure-function tests for _normalize_multimodal_content
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeMultimodalContent:
+    def test_string_passthrough(self):
+        assert _normalize_multimodal_content("hello") == "hello"
+
+    def test_none_returns_empty_string(self):
+        assert _normalize_multimodal_content(None) == ""
+
+    def test_text_only_list_collapses_to_string(self):
+        content = [{"type": "text", "text": "hi"}, {"type": "text", "text": "there"}]
+        assert _normalize_multimodal_content(content) == "hi\nthere"
+
+    def test_responses_input_text_canonicalized(self):
+        content = [{"type": "input_text", "text": "hello"}]
+        assert _normalize_multimodal_content(content) == "hello"
+
+
+    def test_input_image_converted_to_canonical_shape(self):
+        content = [
+            {"type": "input_text", "text": "hi"},
+            {"type": "input_image", "image_url": "https://example.com/cat.png"},
+        ]
+        out = _normalize_multimodal_content(content)
+        assert out == [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ]
+
+
+class TestContentHasVisiblePayload:
+
+
+    def test_list_with_image_only(self):
+        assert _content_has_visible_payload([{"type": "image_url", "image_url": {"url": "x"}}])
+
+
+# ---------------------------------------------------------------------------
+# HTTP integration — real aiohttp client hitting the adapter handlers
+# ---------------------------------------------------------------------------
+
+
+def _make_adapter() -> APIServerAdapter:
+    return APIServerAdapter(PlatformConfig(enabled=True))
+
+
+def _create_app(adapter: APIServerAdapter) -> web.Application:
+    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=mws)
+    app["api_server_adapter"] = adapter
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/responses", adapter._handle_responses)
+    app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
+    return app
+
+
+@pytest.fixture
+def adapter():
+    return _make_adapter()
+
+
+class TestChatCompletionsMultimodalHTTP:
+    @pytest.mark.asyncio
+    async def test_inline_image_preserved_to_run_agent(self, adapter):
+        """Multimodal user content reaches _run_agent as a list of parts."""
+        image_payload = [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png", "detail": "high"}},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new=MagicMock(),
+            ) as mock_run:
+                async def _stub(**kwargs):
+                    mock_run.captured = kwargs
+                    return (
+                        {"final_response": "A cat.", "messages": [], "api_calls": 1},
+                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    )
+                mock_run.side_effect = _stub
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": image_payload}],
+                    },
+                )
+
+            assert resp.status == 200, await resp.text()
+            assert mock_run.captured["user_message"] == image_payload
+
+
+class TestResponsesMultimodalHTTP:
+    @pytest.mark.asyncio
+    async def test_input_image_canonicalized_and_forwarded(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
+                async def _stub(**kwargs):
+                    mock_run.captured = kwargs
+                    return (
+                        {"final_response": "ok", "messages": [], "api_calls": 1},
+                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    )
+                mock_run.side_effect = _stub
+
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "Describe."},
+                                    {
+                                        "type": "input_image",
+                                        "image_url": "https://example.com/cat.png",
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+            assert resp.status == 200, await resp.text()
+            expected = [
+                {"type": "text", "text": "Describe."},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            ]
+            assert mock_run.captured["user_message"] == expected
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_server_multiplex_secret_scope.py ===
+"""Regression for #61276: api_server agent entry under multiplex isolation.
+
+When gateway.multiplex_profiles is on, get_secret fails closed without a
+profile secret scope. Requests with a ``/p/<profile>/`` prefix are scoped by
+``_profile_scope(profile)``, but plain requests on the default listener used
+to get ``nullcontext()`` — so agent runs crashed with UnscopedSecretError on
+their first credential read (e.g. OPENROUTER_BASE_URL). ``_profile_scope``
+now enters the DEFAULT profile's runtime scope when multiplex is active and
+no profile was requested.
+
+Adapted from PR #61283 by @giggling-ginger (originally targeting a
+pre-``_profile_scope`` helper); no live gateway or network.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agent import secret_scope as ss
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import APIServerAdapter
+
+
+@pytest.fixture(autouse=True)
+def _reset_multiplex():
+    ss.set_multiplex_active(False)
+    yield
+    ss.set_multiplex_active(False)
+
+
+@pytest.fixture
+def adapter():
+    return APIServerAdapter(PlatformConfig(enabled=True))
+
+
+class TestProfileScopeDefaultFallback:
+    def test_noop_when_multiplex_off(self, adapter, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_BASE_URL", "https://from-environ.example/v1")
+        with adapter._profile_scope(None):
+            # Legacy single-profile path: unscoped get_secret reads os.environ.
+            assert ss.get_secret("OPENROUTER_BASE_URL") == "https://from-environ.example/v1"
+        assert ss.current_secret_scope() is None
+
+
+# Regression coverage for #72041: profile-bound API authentication
+class TestProfileScopedApiAuthentication:
+    @staticmethod
+    def _request(token: str):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            headers={"Authorization": f"Bearer {token}"},
+            remote="127.0.0.1",
+            transport=None,
+            method="GET",
+            path_qs="/p/worker/v1/models",
+        )
+
+    def test_named_profile_rejects_default_listener_key(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        from gateway.platforms.api_server import _api_request_profile
+
+        profile_home = tmp_path / "profiles" / "worker"
+        profile_home.mkdir(parents=True)
+        profile_key = "worker-profile-api-key-123456"
+        default_key = "default-listener-api-key-123456"
+        (profile_home / ".env").write_text(
+            f"API_SERVER_KEY={profile_key}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir",
+            lambda name: profile_home,
+        )
+        adapter._api_key = default_key
+        ss.set_multiplex_active(True)
+
+        profile_token = _api_request_profile.set("worker")
+        try:
+            with adapter._profile_scope("worker"):
+                assert adapter._check_auth(self._request(profile_key)) is None
+
+                rejected = adapter._check_auth(self._request(default_key))
+                assert rejected is not None
+                assert rejected.status == 401
+        finally:
+            _api_request_profile.reset(profile_token)
+
+
+@pytest.mark.asyncio
+async def test_profile_middleware_binds_auth_before_handler(
+    adapter, tmp_path, monkeypatch
+):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import GatewayConfig
+    from gateway.platforms.api_server import _api_request_profile
+
+    worker_home = tmp_path / "profiles" / "worker"
+    worker_home.mkdir(parents=True)
+    profile_key = "a" * 32
+    default_key = "b" * 32
+    (worker_home / ".env").write_text(
+        f"API_SERVER_KEY={profile_key}\n", encoding="utf-8"
+    )
+    adapter._api_key = default_key
+    adapter.gateway_runner = type(
+        "_Runner", (), {"config": GatewayConfig(multiplex_profiles=True)}
+    )()
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [
+            ("default", tmp_path), ("worker", worker_home)
+        ],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: tmp_path if name == "default" else worker_home,
+    )
+    ss.set_multiplex_active(True)
+
+    async def authenticated(request):
+        auth_error = adapter._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        return web.json_response(
+            {"profile": _api_request_profile.get() or "default"}
+        )
+
+    app = web.Application(
+        middlewares=[adapter._make_profile_prefix_middleware()]
+    )
+    app.router.add_get("/v1/test", authenticated)
+    app.router.add_get("/p/{profile}/v1/test", authenticated)
+
+    async with TestClient(TestServer(app)) as client:
+        default_response = await client.get(
+            "/v1/test",
+            headers={"Authorization": f"Bearer {default_key}"},
+        )
+        assert default_response.status == 200
+
+        default_alias = await client.get(
+            "/p/default/v1/test",
+            headers={"Authorization": f"Bearer {default_key}"},
+        )
+        assert default_alias.status == 200
+
+        rejected = await client.get(
+            "/p/worker/v1/test",
+            headers={"Authorization": f"Bearer {default_key}"},
+        )
+        assert rejected.status == 401
+
+        accepted = await client.get(
+            "/p/worker/v1/test",
+            headers={"Authorization": f"Bearer {profile_key}"},
+        )
+        assert accepted.status == 200
+        assert (await accepted.json())["profile"] == "worker"
+
+
+

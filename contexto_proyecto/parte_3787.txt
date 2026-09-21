@@ -1,0 +1,358 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_wal_checkpoint_strategy.py ===
+"""Tests for SessionDB WAL checkpoint strategy (issue #45383).
+
+Verifies that ALL checkpoints on the shared state.db use PASSIVE mode:
+periodic, close(), and pre-VACUUM. TRUNCATE fires a full WAL reset, and
+transient per-cron-run connections closing many times an hour would race
+the live gateway writer and corrupt B-tree pages (#45383).
+"""
+
+import sqlite3
+import logging
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from hermes_state import SessionDB
+
+
+class TrackingConnection:
+    """sqlite3.Connection proxy that records executed SQL strings."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.execute_calls = []
+
+    def execute(self, sql, *args, **kwargs):
+        self.execute_calls.append(sql)
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+@pytest.fixture()
+def db(tmp_path):
+    """Create a SessionDB with a temp database file."""
+    db_path = tmp_path / "test_state.db"
+    session_db = SessionDB(db_path=db_path)
+    yield session_db
+    try:
+        session_db.close()
+    except Exception:
+        pass
+
+
+class TestTryWalCheckpointPassive:
+    """_try_wal_checkpoint() should use PASSIVE mode for periodic use."""
+
+    def test_checkpoint_uses_passive_mode(self, db):
+        """PASSIVE checkpoint does not require exclusive lock — safe for large DBs."""
+        # Capture the real connection's execute before mocking
+        real_conn = db._conn
+        execute_calls = []
+
+        def tracking_execute(sql, *args, **kwargs):
+            execute_calls.append(sql)
+            return real_conn.execute(sql, *args, **kwargs)
+
+        # sqlite3.Connection.execute is read-only (C extension) — replace _conn
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = tracking_execute
+        mock_conn.fetchone.return_value = None
+        db._conn = mock_conn
+
+        db._try_wal_checkpoint()
+
+        passive_calls = [c for c in execute_calls if "wal_checkpoint(PASSIVE)" in c]
+        truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
+        assert len(passive_calls) == 1, (
+            f"Expected 1 PASSIVE checkpoint call, got {len(passive_calls)}"
+        )
+        assert len(truncate_calls) == 0, (
+            "Periodic checkpoint should NOT use TRUNCATE"
+        )
+
+    def test_checkpoint_logs_warning_on_failure(self, db, caplog):
+        """Failed PASSIVE checkpoint logs a warning instead of silent pass."""
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
+        db._conn = mock_conn
+
+        with caplog.at_level(logging.WARNING):
+            db._try_wal_checkpoint()
+
+        assert any("WAL checkpoint (PASSIVE) failed" in r.message for r in caplog.records), (
+            f"Expected warning log about PASSIVE checkpoint failure, got: {caplog.text}"
+        )
+
+    def test_checkpoint_returns_result_on_success(self, db):
+        """Successful PASSIVE checkpoint does not raise."""
+        db._try_wal_checkpoint()
+
+
+class TestCloseUsesPassive:
+    """close() must use PASSIVE. Transient per-cron-run SessionDB connections
+    close many times an hour; a TRUNCATE reset there races the live gateway
+    writer on the large WAL DB and corrupts B-tree pages (#45383)."""
+
+    def test_close_uses_passive_mode(self, db):
+        """close() checkpoints PASSIVE, never TRUNCATE."""
+        real_conn = db._conn
+        execute_calls = []
+
+        def tracking_execute(sql, *args, **kwargs):
+            execute_calls.append(sql)
+            return real_conn.execute(sql, *args, **kwargs)
+
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = tracking_execute
+        db._conn = mock_conn
+
+        db.close()
+
+        truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
+        passive_calls = [c for c in execute_calls if "wal_checkpoint(PASSIVE)" in c]
+        assert len(truncate_calls) == 0, (
+            "close() must NOT TRUNCATE (races the live gateway writer, #45383)"
+        )
+        assert len(passive_calls) == 1, (
+            f"Expected 1 PASSIVE checkpoint at close, got {len(passive_calls)}"
+        )
+
+    def test_close_logs_debug_on_failure(self, db, caplog):
+        """Failed PASSIVE checkpoint at close logs debug (close is best-effort)."""
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = sqlite3.OperationalError("database is locked")
+        db._conn = mock_conn
+
+        with caplog.at_level(logging.DEBUG):
+            db.close()
+
+        assert any("WAL checkpoint (PASSIVE) at close failed" in r.message for r in caplog.records), (
+            f"Expected debug log about PASSIVE failure at close, got: {caplog.text}"
+        )
+
+
+class TestVacuumUsesPassive:
+    """Manual vacuum paths must checkpoint PASSIVE, never TRUNCATE."""
+
+    def test_vacuum_uses_passive_before_vacuum(self, db):
+        """SessionDB.vacuum() checkpoints PASSIVE before VACUUM.
+
+        A TRUNCATE checkpoint AFTER the VACUUM is expected: VACUUM rewrites
+        every page through the WAL, so without it a 3 GB database leaves a
+        3 GB state.db-wal behind and `sessions optimize` becomes a net disk
+        LOSS. The #45383 tearing concern is about truncating while another
+        writer is mid-transaction — the pre-VACUUM checkpoint stays PASSIVE
+        for that reason; the post-VACUUM truncate runs under the same
+        exclusive-lock window the VACUUM itself required.
+        """
+        real_conn = db._conn
+        tracking_conn = TrackingConnection(real_conn)
+        db._conn = tracking_conn
+
+        db.vacuum()
+
+        checkpoint_calls = [
+            c for c in tracking_conn.execute_calls if "wal_checkpoint" in c.lower()
+        ]
+        truncate_calls = [c for c in checkpoint_calls if "TRUNCATE" in c]
+        passive_calls = [c for c in checkpoint_calls if "PASSIVE" in c]
+        vacuum_calls = [
+            c for c in tracking_conn.execute_calls if c.strip().upper() == "VACUUM"
+        ]
+        assert passive_calls == ["PRAGMA wal_checkpoint(PASSIVE)"]
+        assert vacuum_calls == ["VACUUM"]
+        assert truncate_calls == ["PRAGMA wal_checkpoint(TRUNCATE)"]
+        vacuum_index = tracking_conn.execute_calls.index(vacuum_calls[0])
+        assert tracking_conn.execute_calls.index(passive_calls[0]) < vacuum_index
+        # TRUNCATE must come only AFTER the VACUUM (never before it).
+        assert tracking_conn.execute_calls.index(truncate_calls[0]) > vacuum_index
+
+    def test_optimize_storage_uses_passive_after_vacuum(self, db):
+        """optimize_fts_storage() checkpoints PASSIVE after its VACUUM."""
+        real_conn = db._conn
+        tracking_conn = TrackingConnection(real_conn)
+        db._conn = tracking_conn
+
+        result = db.optimize_fts_storage(vacuum=True)
+
+        checkpoint_calls = [
+            c for c in tracking_conn.execute_calls if "wal_checkpoint" in c.lower()
+        ]
+        truncate_calls = [c for c in checkpoint_calls if "TRUNCATE" in c]
+        passive_calls = [c for c in checkpoint_calls if "PASSIVE" in c]
+        vacuum_calls = [
+            c for c in tracking_conn.execute_calls if c.strip().upper() == "VACUUM"
+        ]
+        assert result["ok"] is True
+        assert result["vacuumed"] is True
+        assert truncate_calls == []
+        assert passive_calls == ["PRAGMA wal_checkpoint(PASSIVE)"]
+        assert vacuum_calls == ["VACUUM"]
+        assert tracking_conn.execute_calls.index(
+            vacuum_calls[0]
+        ) < tracking_conn.execute_calls.index(passive_calls[0])
+
+
+class TestCheckpointFrequency:
+    """Checkpoint triggers every N writes."""
+
+    def test_checkpoint_triggers_at_interval(self, db):
+        """_try_wal_checkpoint is called every _CHECKPOINT_EVERY_N_WRITES writes."""
+        call_count = [0]
+        original = db._try_wal_checkpoint
+
+        def counting_checkpoint():
+            call_count[0] += 1
+            original()
+
+        db._try_wal_checkpoint = counting_checkpoint
+
+        # Write exactly _CHECKPOINT_EVERY_N_WRITES sessions to trigger one checkpoint
+        n = db._CHECKPOINT_EVERY_N_WRITES
+        import time as _time
+        for i in range(n):
+            db._execute_write(lambda conn, _i=i: conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                (f"sess_{_i}", "test", _time.time()),
+            ))
+
+        assert call_count[0] == 1, (
+            f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_wal_lock_guard.py ===
+"""A live writer's WAL generation survives lock cancellation and sibling closes.
+
+SQLite guards a WAL generation with per-PROCESS POSIX locks, so any raw ``open()``/``close()`` of
+``state.db`` or ``-shm`` inside the holder (howtocorrupt.html §2.2) silently drops them; the next
+last-connection close anywhere then checkpoints and unlinks ``-wal``/``-shm`` and the holder
+sticky-halts with ``DeletedWalGenerationError`` (#109727, #110042, #110276, Desktop "chat fails
+after update"). ``hermes_state_lockguard`` re-holds the same ranges as OFD locks that a stray
+close cannot cancel. Linux-only: the scenario needs ``/proc``-visible POSIX lock semantics.
+"""
+
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from hermes_state import SessionDB
+from tests.hermes_state._wal_generation_harness import make_db, pin_wal, require_wal
+
+pytestmark = pytest.mark.linux_only
+
+
+def _foreign_open_close(db_path: Path) -> None:
+    """Another process opens state.db, reads, closes: SQLite's last-connection WAL reset runs there."""
+    subprocess.run([sys.executable, "-c",
+                    f"import sqlite3; c = sqlite3.connect({str(db_path)!r}); "
+                    "c.execute('select count(*) from messages').fetchone(); c.close()"], check=True)
+
+
+def test_holder_survives_stray_close_then_sibling_closes(tmp_path, monkeypatch):
+    pin_wal(monkeypatch)
+    db = make_db(tmp_path / "state.db", "s", "seed")
+    wal = require_wal(db)
+    wal_inode = wal.stat().st_ino
+    try:
+        for name in ("state.db", "state.db-shm"):  # the §2.2 bug, e.g. a raw header probe
+            os.close(os.open(tmp_path / name, os.O_RDONLY))
+        # Same-process second handle (Desktop backend / Herder tab shape) closing...
+        sibling = SessionDB(db_path=db.db_path)
+        sibling.append_message("s", role="user", content="tab")
+        sibling.close()
+        # ...and a foreign process (cron worker / one-shot CLI shape) closing.
+        _foreign_open_close(db.db_path)
+        assert wal.exists() and wal.stat().st_ino == wal_inode, "a sibling close unlinked the live WAL"
+        db.append_message("s", role="user", content="after")  # would raise DeletedWalGenerationError
+    finally:
+        db.close()
+    assert sqlite3.connect(db.db_path).execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_wal_lock_guard_lifecycle.py ===
+"""The WAL lock guard tracks the lifecycle of the handle it protects.
+
+Three shapes the first cut got wrong (review on #110544): a writer reopened after ``close()``
+raced a live caller came back unguarded; the periodic checkpoint's guard refresh could land after
+``close()`` and pin an OFD lock with no connection behind it; and refcounts keyed on a reusable
+descriptor NUMBER mistook a recycled fd for a surviving lock. Linux-only: OFD locks + ``/proc``.
+"""
+
+import os
+import sqlite3
+import subprocess
+import sys
+
+import pytest
+
+import hermes_state_lockguard as lg
+from hermes_state import SessionDB
+from tests.hermes_state._wal_generation_harness import make_db, pin_wal, require_wal
+
+pytestmark = pytest.mark.linux_only
+
+
+def _foreign_exclusive_ok(path: str) -> bool:
+    """Another process tries the EXCLUSIVE a close-time WAL reset needs; True = nothing guards."""
+    code = (
+        "import fcntl, os, struct, sys\n"
+        f"fd = os.open({path!r}, os.O_RDWR)\n"
+        "lk = struct.pack('@hhqqi', fcntl.F_WRLCK, 0, 0x40000002, 510, 0)\n"
+        "try:\n    fcntl.fcntl(fd, 37, lk); print('EXCLUSIVE_ACQUIRED')\n"
+        "except BlockingIOError:\n    print('REFUSED')\n"
+    )
+    return "EXCLUSIVE_ACQUIRED" in subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+
+
+def test_reopened_writer_is_guarded_again(tmp_path, monkeypatch):
+    pin_wal(monkeypatch)
+    db = make_db(tmp_path / "state.db", "s", "seed")
+    require_wal(db)
+    db.close()
+    db.append_message("s", role="user", content="after close")  # #94736 teardown/worker reopen
+    try:
+        assert db._conn is not None and db._wal_lock_guard, "reopen returned an unguarded writer"
+        assert not _foreign_exclusive_ok(str(db.db_path))
+    finally:
+        db.close()
+    assert _foreign_exclusive_ok(str(db.db_path))  # a true last close lifts the guard
+
+
+def test_guard_never_outlives_the_handle_under_fd_reuse(tmp_path, monkeypatch):
+    """A+B live -> close A (its fd number is recycled by C) -> close B: C must still be guarded,
+    and once C closes nothing may be left locked."""
+    pin_wal(monkeypatch)
+    path = tmp_path / "state.db"
+    a = make_db(path, "s", "seed")
+    require_wal(a)
+    b = SessionDB(db_path=path)
+    a.close()
+    c = SessionDB(db_path=path)
+    b.close()
+    try:
+        assert not _foreign_exclusive_ok(str(path)), "C recorded as guarded while nothing locks"
+        for name in ("state.db", "state.db-shm"):  # the stray close the guard exists for
+            os.close(os.open(tmp_path / name, os.O_RDONLY))
+        subprocess.run([sys.executable, "-c",
+                        f"import sqlite3; c = sqlite3.connect({str(path)!r}); "
+                        "c.execute('select count(*) from messages').fetchone(); c.close()"], check=True)
+        c.append_message("s", role="user", content="still writes")
+    finally:
+        c.close()
+    assert _foreign_exclusive_ok(str(path)), "a lock survived the last handle's close"
+    assert not lg._HANDLES
+    assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
+

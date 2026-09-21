@@ -1,0 +1,358 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\health\fitness-nutrition\SKILL.md ===
+---
+name: fitness-nutrition
+description: "Workout planning, macros, and body metrics via wger/USDA."
+platforms: [linux, macos, windows]
+version: 1.0.0
+author: Hailey Marshall (haileymarshall), Hermes Agent
+authors:
+  - haileymarshall
+license: MIT
+metadata:
+  hermes:
+    tags: [health, fitness, nutrition, gym, workout, diet, exercise]
+    category: health
+    prerequisites:
+      commands: [curl, python]
+required_environment_variables:
+  - name: USDA_API_KEY
+    prompt: "USDA FoodData Central API key (free)"
+    help: "Get one free at https://fdc.nal.usda.gov/api-key-signup/ — or skip to use DEMO_KEY with lower rate limits"
+    required_for: "higher rate limits on food/nutrition lookups (DEMO_KEY works without signup)"
+    optional: true
+---
+
+# Fitness & Nutrition
+
+Expert fitness coach and sports nutritionist skill. Two data sources
+plus offline calculators — everything a gym-goer needs in one place.
+
+**Data sources (all free, no pip dependencies):**
+
+- **wger** (https://wger.de/api/v2/) — open exercise database, 690+ exercises with muscles, equipment, images. Public endpoints need zero authentication.
+- **USDA FoodData Central** (https://api.nal.usda.gov/fdc/v1/) — US government nutrition database, 380,000+ foods. `DEMO_KEY` works instantly; free signup for higher limits.
+
+**Offline calculators (pure stdlib Python):**
+
+- BMI, TDEE (Mifflin-St Jeor), one-rep max (Epley/Brzycki/Lombardi), macro splits, body fat % (US Navy method)
+
+---
+
+## When to Use
+
+Trigger this skill when the user asks about:
+- Exercises, workouts, gym routines, muscle groups, workout splits
+- Food macros, calories, protein content, meal planning, calorie counting
+- Body composition: BMI, body fat, TDEE, caloric surplus/deficit
+- One-rep max estimates, training percentages, progressive overload
+- Macro ratios for cutting, bulking, or maintenance
+
+---
+
+## Procedure
+
+### Exercise Lookup (wger API)
+
+All wger public endpoints return JSON and require no auth. Always add
+`format=json` and `language=2` (English) to exercise queries.
+
+**Step 1 — Identify what the user wants:**
+
+- By muscle → use `/api/v2/exercise/?muscles={id}&language=2&status=2&format=json`
+- By category → use `/api/v2/exercise/?category={id}&language=2&status=2&format=json`
+- By equipment → use `/api/v2/exercise/?equipment={id}&language=2&status=2&format=json`
+- By name → use `/api/v2/exercise/search/?term={query}&language=english&format=json`
+- Full details → use `/api/v2/exerciseinfo/{exercise_id}/?format=json`
+
+**Step 2 — Reference IDs (so you don't need extra API calls):**
+
+Exercise categories:
+
+| ID | Category    |
+|----|-------------|
+| 8  | Arms        |
+| 9  | Legs        |
+| 10 | Abs         |
+| 11 | Chest       |
+| 12 | Back        |
+| 13 | Shoulders   |
+| 14 | Calves      |
+| 15 | Cardio      |
+
+Muscles:
+
+| ID | Muscle                    | ID | Muscle                  |
+|----|---------------------------|----|-------------------------|
+| 1  | Biceps brachii            | 2  | Anterior deltoid        |
+| 3  | Serratus anterior         | 4  | Pectoralis major        |
+| 5  | Obliquus externus         | 6  | Gastrocnemius           |
+| 7  | Rectus abdominis          | 8  | Gluteus maximus         |
+| 9  | Trapezius                 | 10 | Quadriceps femoris      |
+| 11 | Biceps femoris            | 12 | Latissimus dorsi        |
+| 13 | Brachialis                | 14 | Triceps brachii         |
+| 15 | Soleus                    |    |                         |
+
+Equipment:
+
+| ID | Equipment      |
+|----|----------------|
+| 1  | Barbell        |
+| 3  | Dumbbell       |
+| 4  | Gym mat        |
+| 5  | Swiss Ball     |
+| 6  | Pull-up bar    |
+| 7  | none (bodyweight) |
+| 8  | Bench          |
+| 9  | Incline bench  |
+| 10 | Kettlebell     |
+
+**Step 3 — Fetch and present results:**
+
+```bash
+# Search exercises by name
+QUERY="$1"
+ENCODED=$(python -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$QUERY")
+curl -s "https://wger.de/api/v2/exercise/search/?term=${ENCODED}&language=english&format=json" \
+  | python -c "
+import json,sys
+data=json.load(sys.stdin)
+for s in data.get('suggestions',[])[:10]:
+    d=s.get('data',{})
+    print(f\"  ID {d.get('id','?'):>4} | {d.get('name','N/A'):<35} | Category: {d.get('category','N/A')}\")
+"
+```
+
+```bash
+# Get full details for a specific exercise
+EXERCISE_ID="$1"
+curl -s "https://wger.de/api/v2/exerciseinfo/${EXERCISE_ID}/?format=json" \
+  | python -c "
+import json,sys,html,re
+data=json.load(sys.stdin)
+trans=[t for t in data.get('translations',[]) if t.get('language')==2]
+t=trans[0] if trans else data.get('translations',[{}])[0]
+desc=re.sub('<[^>]+>','',html.unescape(t.get('description','N/A')))
+print(f\"Exercise  : {t.get('name','N/A')}\")
+print(f\"Category  : {data.get('category',{}).get('name','N/A')}\")
+print(f\"Primary   : {', '.join(m.get('name_en','') for m in data.get('muscles',[])) or 'N/A'}\")
+print(f\"Secondary : {', '.join(m.get('name_en','') for m in data.get('muscles_secondary',[])) or 'none'}\")
+print(f\"Equipment : {', '.join(e.get('name','') for e in data.get('equipment',[])) or 'bodyweight'}\")
+print(f\"How to    : {desc[:500]}\")
+imgs=data.get('images',[])
+if imgs: print(f\"Image     : {imgs[0].get('image','')}\")
+"
+```
+
+```bash
+# List exercises filtering by muscle, category, or equipment
+# Combine filters as needed: ?muscles=4&equipment=1&language=2&status=2
+FILTER="$1"  # e.g. "muscles=4" or "category=11" or "equipment=3"
+curl -s "https://wger.de/api/v2/exercise/?${FILTER}&language=2&status=2&limit=20&format=json" \
+  | python -c "
+import json,sys
+data=json.load(sys.stdin)
+print(f'Found {data.get(\"count\",0)} exercises.')
+for ex in data.get('results',[]):
+    print(f\"  ID {ex['id']:>4} | muscles: {ex.get('muscles',[])} | equipment: {ex.get('equipment',[])}\")
+"
+```
+
+### Nutrition Lookup (USDA FoodData Central)
+
+Uses `USDA_API_KEY` env var if set, otherwise falls back to `DEMO_KEY`.
+DEMO_KEY = 30 requests/hour. Free signup key = 1,000 requests/hour.
+
+```bash
+# Search foods by name
+FOOD="$1"
+API_KEY="${USDA_API_KEY:-DEMO_KEY}"
+ENCODED=$(python -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$FOOD")
+curl -s "https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${API_KEY}&query=${ENCODED}&pageSize=5&dataType=Foundation,SR%20Legacy" \
+  | python -c "
+import json,sys
+data=json.load(sys.stdin)
+foods=data.get('foods',[])
+if not foods: print('No foods found.'); sys.exit()
+for f in foods:
+    n={x['nutrientName']:x.get('value','?') for x in f.get('foodNutrients',[])}
+    cal=n.get('Energy','?'); prot=n.get('Protein','?')
+    fat=n.get('Total lipid (fat)','?'); carb=n.get('Carbohydrate, by difference','?')
+    print(f\"{f.get('description','N/A')}\")
+    print(f\"  Per 100g: {cal} kcal | {prot}g protein | {fat}g fat | {carb}g carbs\")
+    print(f\"  FDC ID: {f.get('fdcId','N/A')}\")
+    print()
+"
+```
+
+```bash
+# Detailed nutrient profile by FDC ID
+FDC_ID="$1"
+API_KEY="${USDA_API_KEY:-DEMO_KEY}"
+curl -s "https://api.nal.usda.gov/fdc/v1/food/${FDC_ID}?api_key=${API_KEY}" \
+  | python -c "
+import json,sys
+d=json.load(sys.stdin)
+print(f\"Food: {d.get('description','N/A')}\")
+print(f\"{'Nutrient':<40} {'Amount':>8} {'Unit'}\")
+print('-'*56)
+for x in sorted(d.get('foodNutrients',[]),key=lambda x:x.get('nutrient',{}).get('rank',9999)):
+    nut=x.get('nutrient',{}); amt=x.get('amount',0)
+    if amt and float(amt)>0:
+        print(f\"  {nut.get('name',''):<38} {amt:>8} {nut.get('unitName','')}\")
+"
+```
+
+### Offline Calculators
+
+Use the helper scripts in `scripts/` for batch operations,
+or run inline for single calculations:
+
+- `python scripts/body_calc.py bmi <weight_kg> <height_cm>`
+- `python scripts/body_calc.py tdee <weight_kg> <height_cm> <age> <M|F> <activity 1-5>`
+- `python scripts/body_calc.py 1rm <weight> <reps>`
+- `python scripts/body_calc.py macros <tdee_kcal> <cut|maintain|bulk>`
+- `python scripts/body_calc.py bodyfat <M|F> <neck_cm> <waist_cm> [hip_cm] <height_cm>`
+
+See `references/FORMULAS.md` for the science behind each formula.
+
+---
+
+## Pitfalls
+
+- wger exercise endpoint returns **all languages by default** — always add `language=2` for English
+- wger includes **unverified user submissions** — add `status=2` to only get approved exercises
+- USDA `DEMO_KEY` has **30 req/hour** — add `sleep 2` between batch requests or get a free key
+- USDA data is **per 100g** — remind users to scale to their actual portion size
+- BMI does not distinguish muscle from fat — high BMI in muscular people is not necessarily unhealthy
+- Body fat formulas are **estimates** (±3-5%) — recommend DEXA scans for precision
+- 1RM formulas lose accuracy above 10 reps — use sets of 3-5 for best estimates
+- wger's `exercise/search` endpoint uses `term` not `query` as the parameter name
+
+---
+
+## Verification
+
+After running exercise search: confirm results include exercise names, muscle groups, and equipment.
+After nutrition lookup: confirm per-100g macros are returned with kcal, protein, fat, carbs.
+After calculators: sanity-check outputs (e.g. TDEE should be 1500-3500 for most adults).
+
+---
+
+## Quick Reference
+
+| Task | Source | Endpoint |
+|------|--------|----------|
+| Search exercises by name | wger | `GET /api/v2/exercise/search/?term=&language=english` |
+| Exercise details | wger | `GET /api/v2/exerciseinfo/{id}/` |
+| Filter by muscle | wger | `GET /api/v2/exercise/?muscles={id}&language=2&status=2` |
+| Filter by equipment | wger | `GET /api/v2/exercise/?equipment={id}&language=2&status=2` |
+| List categories | wger | `GET /api/v2/exercisecategory/` |
+| List muscles | wger | `GET /api/v2/muscle/` |
+| Search foods | USDA | `GET /fdc/v1/foods/search?query=&dataType=Foundation,SR Legacy` |
+| Food details | USDA | `GET /fdc/v1/food/{fdcId}` |
+| BMI / TDEE / 1RM / macros | offline | `python scripts/body_calc.py` |
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\health\fitness-nutrition\references\FORMULAS.md ===
+# Formulas Reference
+
+Scientific references for all calculators used in the fitness-nutrition skill.
+
+## BMI (Body Mass Index)
+
+**Formula:** BMI = weight (kg) / height (m)²
+
+| Category     | BMI Range  |
+|-------------|------------|
+| Underweight | < 18.5     |
+| Normal      | 18.5 – 24.9 |
+| Overweight  | 25.0 – 29.9 |
+| Obese       | 30.0+      |
+
+**Limitation:** BMI does not distinguish muscle from fat. A muscular person
+can have a high BMI while being lean. Use body fat % for a better picture.
+
+Reference: Quetelet, A. (1832). Keys et al., Int J Obes (1972).
+
+## TDEE (Total Daily Energy Expenditure)
+
+Uses the **Mifflin-St Jeor equation** — the most accurate BMR predictor for
+the general population according to the ADA (2005).
+
+**BMR formulas:**
+
+- Male: BMR = 10 × weight(kg) + 6.25 × height(cm) − 5 × age + 5
+- Female: BMR = 10 × weight(kg) + 6.25 × height(cm) − 5 × age − 161
+
+**Activity multipliers:**
+
+| Level | Description                    | Multiplier |
+|-------|--------------------------------|------------|
+| 1     | Sedentary (desk job)           | 1.200      |
+| 2     | Lightly active (1-3 days/wk)   | 1.375      |
+| 3     | Moderately active (3-5 days)   | 1.550      |
+| 4     | Very active (6-7 days)         | 1.725      |
+| 5     | Extremely active (2x/day)      | 1.900      |
+
+Reference: Mifflin et al., Am J Clin Nutr 51, 241-247 (1990).
+
+## One-Rep Max (1RM)
+
+Three validated formulas. Average of all three is most reliable.
+
+- **Epley:** 1RM = w × (1 + r/30)
+- **Brzycki:** 1RM = w × 36 / (37 − r)
+- **Lombardi:** 1RM = w × r^0.1
+
+All formulas are most accurate for r ≤ 10. Above 10 reps, error increases.
+
+Reference: LeSuer et al., J Strength Cond Res 11(4), 211-213 (1997).
+
+## Macro Splits
+
+Recommended splits based on goal:
+
+| Goal         | Protein | Fat  | Carbs | Calorie Offset |
+|-------------|---------|------|-------|----------------|
+| Fat loss    | 40%     | 30%  | 30%   | −500 kcal      |
+| Maintenance | 30%     | 30%  | 40%   | 0              |
+| Lean bulk   | 30%     | 25%  | 45%   | +400 kcal      |
+
+Protein targets for muscle growth: 1.6–2.2 g/kg body weight per day.
+Minimum fat intake: 0.5 g/kg to support hormone production.
+
+Conversion: Protein = 4 kcal/g, Fat = 9 kcal/g, Carbs = 4 kcal/g.
+
+Reference: Morton et al., Br J Sports Med 52, 376–384 (2018).
+
+## Body Fat % (US Navy Method)
+
+**Male:**
+
+BF% = 86.010 × log₁₀(waist − neck) − 70.041 × log₁₀(height) + 36.76
+
+**Female:**
+
+BF% = 163.205 × log₁₀(waist + hip − neck) − 97.684 × log₁₀(height) − 78.387
+
+All measurements in centimeters.
+
+| Category      | Male   | Female |
+|--------------|--------|--------|
+| Essential    | 2-5%   | 10-13% |
+| Athletic     | 6-13%  | 14-20% |
+| Fitness      | 14-17% | 21-24% |
+| Average      | 18-24% | 25-31% |
+| Obese        | 25%+   | 32%+   |
+
+Accuracy: ±3-5% compared to DEXA. Measure at the navel (waist),
+at the Adam's apple (neck), and widest point (hip, females only).
+
+Reference: Hodgdon & Beckett, Naval Health Research Center (1984).
+
+## APIs
+
+- wger: https://wger.de/api/v2/ — AGPL-3.0, exercise data is CC-BY-SA 3.0
+- USDA FoodData Central: https://api.nal.usda.gov/fdc/v1/ — public domain (CC0 1.0)

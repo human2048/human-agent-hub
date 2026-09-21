@@ -1,0 +1,335 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_session_foreign.py ===
+"""Real foreign logs through the registered desktop RPCs and profile stores."""
+
+import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+
+def test_foreign_rpc_preview_import_and_profile_isolation(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    from tui_gateway import server
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    folder = tmp_path / ".claude" / "projects" / "project"
+    folder.mkdir(parents=True)
+    log = folder / "session.jsonl"
+    lines = [{"type": role, "sessionId": "foreign-one", "cwd": str(tmp_path),
+              "message": {"role": role, "content": content}}
+             for role, content in [("user", "# Files mentioned by the user:\nplan.md\n\n## My request:\nFix the import"), ("assistant", "Here is the fix."),
+                                   ("assistant", "And its test."), ("user", "Continue")]]
+    log.write_text("\n".join(map(json.dumps, lines)), encoding="utf-8")
+    original = log.read_bytes()
+    db = SessionDB(tmp_path / ".hermes" / "state.db")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_profile_home", lambda profile: None)
+
+    def rpc(method, **params):
+        result = server._methods[f"session.foreign.{method}"](1, params)
+        assert "error" not in result, result
+        return result["result"]
+
+    try:
+        page = rpc("list", limit=1)
+        handle = page["sessions"][0]["id"]
+        assert page["sessions"][0]["title"] == "Fix the import"
+        assert "path" not in page["sessions"][0]
+        preview = rpc("preview", id=handle)
+        assert preview["already_imported"] is None
+        assert db.session_count() == 0
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: rpc("import", id=handle), range(2)))
+        assert results[0]["session_id"] == results[1]["session_id"]
+        sid = results[0]["session_id"]
+        stored = db.get_session(sid)
+        assert json.loads(stored["origin_json"])["imported_from"]["foreign_session_id"] == "foreign-one"
+        history = db.get_messages(sid)
+        assert [message["role"] for message in history] == ["user", "assistant", "user"]
+        assert len(history) == preview["total"] == stored["message_count"]
+        assert rpc("preview", id=handle)["already_imported"] == sid
+        assert log.read_bytes() == original
+        with SessionDB(tmp_path / "other" / "state.db") as other:
+            monkeypatch.setattr(server, "_get_db", lambda: other)
+            assert rpc("preview", id=handle)["already_imported"] is None
+            assert rpc("import", id=handle)["session_id"] != sid
+    finally:
+        db.close()
+
+
+def test_foreign_pages_confine_handles_and_failed_import_rolls_back(tmp_path, monkeypatch):
+    from hermes_cli import foreign_sessions_browser as browser
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    folder = tmp_path / ".codex" / "sessions"
+    folder.mkdir(parents=True)
+    for index in range(3):
+        (folder / f"rollout-{index}.jsonl").write_text(json.dumps({
+            "type": "response_item", "payload": {"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": f"Question {index}"}]}}), encoding="utf-8")
+    calls = []
+    parse = browser._parse
+    monkeypatch.setattr(browser, "_parse", lambda row: (calls.append(row[1]), parse(row))[1])
+    page = browser.list_foreign_sessions(limit=1)
+    assert len(calls) == 1
+    next_page = browser.list_foreign_sessions(offset=page["next_offset"], limit=1)
+    assert page["sessions"][0]["id"] != next_page["sessions"][0]["id"]
+    with pytest.raises(ValueError):
+        browser.resolve_foreign_session(str(tmp_path / "secret.jsonl"))
+    # A fabricated well-shaped handle cannot become a file-read request.
+    with pytest.raises(ValueError):
+        browser.resolve_foreign_session("0" * 64)
+    db = SessionDB(tmp_path / ".hermes" / "state.db")
+    insert = db._insert_message_rows
+    def failing_insert(*args):
+        insert(*args)
+        raise RuntimeError("interrupted write")
+    monkeypatch.setattr(db, "_insert_message_rows", failing_insert)
+    try:
+        with pytest.raises(RuntimeError, match="interrupted write"):
+            browser.import_browser_session(page["sessions"][0]["id"], db, "default")
+        assert db.session_count() == 0
+    finally:
+        db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_session_git_metadata_generation.py ===
+"""Gateway wiring for generation-scoped Git metadata publication."""
+
+from __future__ import annotations
+
+import tui_gateway.server as server
+
+
+class _ImmediateThread:
+    def __init__(self, *, target, **_kwargs):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+def test_cwd_claim_precedes_probe_and_generation_reaches_publish(monkeypatch):
+    events = []
+
+    class DB:
+        def update_session_cwd(self, session_id, cwd):
+            events.append(("claim", session_id, cwd))
+            return 17
+
+        def publish_session_git_metadata(
+            self, session_id, cwd, generation, branch, root
+        ):
+            events.append(
+                ("publish", session_id, cwd, generation, branch, root)
+            )
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: DB())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server.git_probe,
+        "branch",
+        lambda cwd: events.append(("probe", cwd)) or "feature",
+    )
+    monkeypatch.setattr(server.git_probe, "common_repo_root", lambda _cwd: "/repo")
+
+    generation = server._persist_session_cwd_and_schedule_git_meta(
+        {"session_key": "session"}, "/repo/worktree"
+    )
+
+    assert generation == 17
+    assert events == [
+        ("claim", "session", "/repo/worktree"),
+        ("probe", "/repo/worktree"),
+        (
+            "publish",
+            "session",
+            "/repo/worktree",
+            17,
+            "feature",
+            "/repo",
+        ),
+    ]
+
+
+def test_missing_db_claim_never_starts_git_probe(monkeypatch):
+    probed = []
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server.git_probe, "branch", lambda cwd: probed.append(cwd)
+    )
+
+    generation = server._persist_session_cwd_and_schedule_git_meta(
+        {"session_key": "session"}, "/repo"
+    )
+
+    assert generation is None
+    assert probed == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_session_hidden_rpc.py ===
+"""RPC-level tests for the generic hidden-session surface (tui_gateway).
+
+Covers the two seams Bot Mode's "sessions are always hidden" policy leans on:
+
+* ``session.set_hidden`` resolves a DURABLE stored session id when no live
+  runtime session matches — plugins reconciling sessions they own (Bot Mode's
+  hide sweep) hold stored ids for chats that aren't live right now. The old
+  live-only lookup failed those with 4001 and the sweep silently no-opped.
+* ``session.list`` honors ``include_hidden`` so owning surfaces (the Bots
+  pane's per-profile browser) can still enumerate the rows they hid, while
+  every default caller keeps the hidden rows dropped.
+"""
+
+import pytest
+
+import tui_gateway.server as srv
+import tui_gateway.methods_session  # noqa: F401  (registers the RPC methods)
+from hermes_state import SessionDB
+
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    database = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(srv, "_get_db", lambda: database)
+    try:
+        yield database
+    finally:
+        database.close()
+
+
+def _call(method: str, params: dict) -> dict:
+    return srv._methods[method](1, params)
+
+
+def _seed(db, sid: str) -> None:
+    db.create_session(sid, source="desktop")
+    db._conn.execute("UPDATE sessions SET message_count = 1 WHERE id = ?", (sid,))
+    db._conn.commit()
+
+
+def test_set_hidden_resolves_stored_id_without_live_session(db):
+    """A stored (non-live) session id must be hideable — the sweep path."""
+    _seed(db, "stored-chat")
+    assert srv._find_live_session_by_key("stored-chat") is None
+
+    envelope = _call("session.set_hidden", {"session_id": "stored-chat", "hidden": True})
+    assert "error" not in envelope, envelope
+    assert envelope["result"]["hidden"] is True
+    assert db.get_session("stored-chat")["hidden"] == 1
+
+    # And back — unhide through the same durable path.
+    envelope = _call("session.set_hidden", {"session_id": "stored-chat", "hidden": False})
+    assert "error" not in envelope, envelope
+    assert db.get_session("stored-chat")["hidden"] == 0
+
+
+def test_set_hidden_unknown_id_still_errors(db):
+    envelope = _call("session.set_hidden", {"session_id": "no-such-session", "hidden": True})
+    assert envelope.get("error"), envelope
+
+
+def test_set_hidden_stored_id_does_not_log_a_rejection(db, caplog):
+    """The stored-id tier is this method's design, not a stale-runtime-id rejection: a fulfilled hide must
+    not emit the "session-scoped RPC rejected … not in memory" warning that diagnoses vanished messages."""
+    _seed(db, "stored-chat")
+    with caplog.at_level("WARNING", logger=srv.logger.name):
+        envelope = _call("session.set_hidden", {"session_id": "stored-chat", "hidden": True})
+    assert "error" not in envelope, envelope
+    assert not [r for r in caplog.records if "session-scoped RPC rejected" in r.getMessage()]
+
+
+def test_session_list_include_hidden(db):
+    _seed(db, "plain-chat")
+    _seed(db, "bot-chat")
+    assert db.set_session_hidden("bot-chat", True) is True
+
+    default_rows = _call("session.list", {})["result"]["sessions"]
+    assert {s["id"] for s in default_rows} == {"plain-chat"}
+
+    all_rows = _call("session.list", {"include_hidden": True})["result"]["sessions"]
+    assert {s["id"] for s in all_rows} == {"plain-chat", "bot-chat"}
+
+
+@pytest.mark.parametrize("source", ["oneshot", "kanban", "tool"])
+def test_session_list_hides_internal_sources(db, source):
+    """Finite one-shot runs (`hermes -z`, `chat -q`) and other non-conversation rows never reach the
+    human picker; interactive rows stay (#112550)."""
+    _seed(db, "plain-chat")
+    db.create_session("internal-run", source=source)
+    db._conn.execute("UPDATE sessions SET message_count = 1 WHERE id = ?", ("internal-run",))
+    db._conn.commit()
+
+    rows = _call("session.list", {})["result"]["sessions"]
+    assert {s["id"] for s in rows} == {"plain-chat"}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_session_history_codex_sidecar.py ===
+"""RPC history must retain visible Responses-API assistant sidecars (#68321)."""
+
+from __future__ import annotations
+
+import threading
+
+from hermes_state import SessionDB
+import tui_gateway.server as server
+
+
+def test_session_history_preserves_codex_message_items(tmp_path):
+    message_items = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "Persisted answer"}],
+        }
+    ]
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("stored-session", source="desktop")
+    db.append_message(
+        "stored-session",
+        "assistant",
+        "",
+        codex_message_items=message_items,
+        reasoning="Thinking before the tool",
+        tool_calls=[{"id": "call-1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}],
+    )
+    previous_db = server._db
+    setattr(server, "_db", db)
+    server._sessions["runtime-session"] = {
+        "session_key": "stored-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "agent": None,
+    }
+
+    try:
+        response = server.handle_request(
+            {"id": "1", "method": "session.history", "params": {"session_id": "runtime-session"}}
+        )
+    finally:
+        server._sessions.pop("runtime-session", None)
+        setattr(server, "_db", previous_db)
+        db.close()
+
+    assert isinstance(response, dict)
+    assert "error" not in response
+    assert response["result"]["count"] == 1
+    messages = response["result"]["messages"]
+    assert len(messages) == 1
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["text"] == ""
+    assert messages[0]["codex_message_items"] == message_items
+

@@ -1,0 +1,387 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_reasoning_config_per_model.py ===
+"""Tests for per-model reasoning_effort override in gateway _load_reasoning_config."""
+
+import pytest
+
+import gateway.run as gateway_run
+
+
+class TestGatewayPerModelReasoningConfig:
+    """Test GatewayRunner._load_reasoning_config respects per-model overrides."""
+
+    def test_per_model_override_takes_precedence(self, monkeypatch):
+        """Per-model override wins over global reasoning_effort."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        fake_cfg = {
+            "model": {"default": "anthropic/claude-opus-4.5"},
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {
+                    "anthropic/claude-opus-4.5": "xhigh",
+                },
+            },
+        }
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: fake_cfg)
+
+        result = gateway_run.GatewayRunner._load_reasoning_config()
+        assert result is not None
+        assert result["enabled"] is True
+        assert result["effort"] == "xhigh"
+
+
+    def test_global_fallback_with_yaml_false(self, monkeypatch):
+        """YAML boolean False must reach parse_reasoning_effort uncoerced.
+
+        Regression: str(... or "").strip() turned False into "", silently
+        re-enabling thinking. The raw value must pass through so
+        parse_reasoning_effort(False) returns {'enabled': False}.
+        """
+        fake_cfg = {
+            "model": {"default": "gpt-5"},
+            "agent": {
+                "reasoning_effort": False,  # YAML boolean, not string
+            },
+        }
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: fake_cfg)
+
+        result = gateway_run.GatewayRunner._load_reasoning_config()
+        assert result is not None
+        assert result.get("enabled") is False
+
+
+class TestGatewaySessionEffectiveModel:
+    """The reasoning override must track the SESSION's effective model.
+
+    Regression guard: _load_reasoning_config used to always read
+    model.default from config.yaml, so a session-only /model switch to a
+    different model kept resolving the config default's override.
+    """
+
+    def test_explicit_model_beats_config_default(self, monkeypatch):
+        """_load_reasoning_config(model=...) resolves for that model, not model.default."""
+        fake_cfg = {
+            "model": {"default": "gpt-5"},
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {
+                    "gpt-5": "low",
+                    "claude-opus-4.5": "xhigh",
+                },
+            },
+        }
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: fake_cfg)
+
+        # Session switched (session-only) to claude-opus-4.5 — its override
+        # must win over the config default model's override.
+        result = gateway_run.GatewayRunner._load_reasoning_config("claude-opus-4.5")
+        assert result is not None
+        assert result["effort"] == "xhigh"
+
+        # And without a model arg, the config default's override applies.
+        result_default = gateway_run.GatewayRunner._load_reasoning_config()
+        assert result_default is not None
+        assert result_default["effort"] == "low"
+
+
+
+class TestApiServerPerModelReasoning:
+    """The OpenAI-compatible surface must resolve reasoning for the model the
+    request actually runs, not ``model.default``.
+
+    e81d18dfb removed exactly this defect from the native gateway paths
+    ("the gateway resolving reasoning against config model.default instead of
+    the session's effective model"); the API server adapter kept it because it
+    resolved reasoning at function entry, before the model precedence chain.
+    """
+
+    @staticmethod
+    def _cfg():
+        return {
+            "model": {"default": "cheap/model-mini"},
+            "agent": {
+                "reasoning_effort": "low",
+                "reasoning_overrides": {"premium/model-max": "xhigh"},
+            },
+        }
+
+    def _run(self, monkeypatch, effective_model):
+        from unittest.mock import MagicMock, patch
+
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+
+        monkeypatch.setattr(
+            gateway_run, "_load_gateway_config", lambda: self._cfg(),
+        )
+        adapter = APIServerAdapter(PlatformConfig())
+
+        with patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True), \
+             patch("gateway.run._resolve_runtime_agent_kwargs") as kwargs_mock, \
+             patch("gateway.run._resolve_gateway_model") as model_mock, \
+             patch("gateway.run._load_gateway_config") as cfg_mock, \
+             patch("run_agent.AIAgent") as agent_cls:
+            kwargs_mock.return_value = {
+                "api_key": "k", "base_url": None, "provider": None,
+                "api_mode": None, "command": None, "args": [],
+            }
+            model_mock.return_value = effective_model
+            cfg_mock.return_value = self._cfg()
+            agent_cls.return_value = MagicMock()
+
+            adapter._create_agent()
+
+            return agent_cls.call_args.kwargs
+
+    def test_reasoning_follows_the_requested_model(self, monkeypatch):
+        kwargs = self._run(monkeypatch, "premium/model-max")
+
+        assert kwargs["model"] == "premium/model-max"
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_model_without_an_override_falls_back_to_global(self, monkeypatch):
+        kwargs = self._run(monkeypatch, "cheap/model-mini")
+
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "low"}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_rekey_profile_routing.py ===
+"""In-memory routing rekey for `hermes profile rename`.
+
+The routing index lives in ``SessionStore._entries`` and is written back periodically, so a durable
+DB rewrite alone is clobbered — the live store must rekey its in-memory copy too. This is why a
+renamed profile's old namespace kept resurfacing until the gateway restarted.
+"""
+from __future__ import annotations
+
+
+def _make_store(tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    store = SessionStore(
+        sessions_dir,
+        GatewayConfig(sessions_dir=sessions_dir, write_sessions_json=False,
+                      multiplex_profiles=True),
+    )
+    store._ensure_loaded()
+    return store
+
+
+def _entry(session_key, chat_id, profile):
+    from gateway.session import SessionEntry, SessionSource, Platform
+    from gateway.session_lifecycle import _now
+    now = _now()
+    return SessionEntry(
+        session_key=session_key, session_id=f"sid-{chat_id}",
+        platform=Platform.FEISHU, chat_type="dm", created_at=now, updated_at=now,
+        origin=SessionSource(platform=Platform.FEISHU, chat_id=chat_id, profile=profile),
+    )
+
+
+def test_rekeys_old_namespace_and_origin_profile(tmp_path):
+    store = _make_store(tmp_path)
+    with store._lock:
+        store._entries["agent:oldname:feishu:dm:chatA"] = _entry(
+            "agent:oldname:feishu:dm:chatA", "chatA", "oldname")
+        store._entries["agent:keepme:feishu:dm:chatB"] = _entry(
+            "agent:keepme:feishu:dm:chatB", "chatB", "keepme")
+
+    moved = store.rekey_profile_routing("oldname", "newname")
+    assert moved == 1
+
+    assert "agent:oldname:feishu:dm:chatA" not in store._entries
+    new_entry = store._entries["agent:newname:feishu:dm:chatA"]
+    assert new_entry.session_key == "agent:newname:feishu:dm:chatA"
+    assert new_entry.origin.profile == "newname"
+    # Bystander namespace untouched.
+    assert store._entries["agent:keepme:feishu:dm:chatB"].origin.profile == "keepme"
+
+
+def test_does_not_overwrite_existing_new_namespace_key(tmp_path):
+    store = _make_store(tmp_path)
+    with store._lock:
+        store._entries["agent:oldname:feishu:dm:chatA"] = _entry(
+            "agent:oldname:feishu:dm:chatA", "chatA", "oldname")
+        # A collision on the target key (should not happen in practice) is left alone.
+        store._entries["agent:newname:feishu:dm:chatA"] = _entry(
+            "agent:newname:feishu:dm:chatA", "chatA", "newname")
+
+    import pytest
+    with pytest.raises(ValueError, match="routing collision"):
+        store.rekey_profile_routing("oldname", "newname")
+    assert "agent:oldname:feishu:dm:chatA" in store._entries
+    assert "agent:newname:feishu:dm:chatA" in store._entries
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_relay_capability_surface.py ===
+"""Phase 0 regression harness for the relay/connector work.
+
+Locks the *behavioral contract* that the future ``RelayAdapter`` must reproduce:
+the gateway's ``stream_consumer`` and ``BasePlatformAdapter`` read per-platform
+capabilities through a small, stable surface. A relay adapter that exposes the
+same surface (``MAX_MESSAGE_LENGTH`` attribute, ``message_len_fn`` property,
+``supports_draft_streaming`` probe, and only the abstract methods) slots into
+the existing consumer with no consumer changes.
+
+These are deliberately *behavioral* (construct an adapter, drive the code,
+assert the observable outcome) rather than source-string snapshots, per the
+repo's "don't write change-detector tests" rule. They pass on ``main`` before
+any ``RelayAdapter`` exists — they describe the contract, not the relay.
+"""
+
+import inspect
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter
+
+
+class _MinAdapter(BasePlatformAdapter):
+    """Smallest concrete adapter: implements exactly the abstract methods."""
+
+    async def connect(self, *, is_reconnect: bool = False):  # pragma: no cover - not called
+        return True
+
+    async def disconnect(self):  # pragma: no cover - not called
+        return None
+
+    async def send(self, *args, **kwargs):  # pragma: no cover - not called
+        return None
+
+    async def get_chat_info(self, chat_id):  # pragma: no cover - not called
+        return {}
+
+
+def _make() -> BasePlatformAdapter:
+    return _MinAdapter(PlatformConfig(), Platform.LOCAL)
+
+
+def test_abstract_methods_are_the_known_set():
+    """The relay adapter must implement exactly this set of abstract methods.
+
+    Everything else on BasePlatformAdapter has a default, so ONE generic
+    RelayAdapter overriding the right subset is feasible without per-platform
+    gateway classes. If a new abstractmethod is added here, the relay design
+    (and the cross-repo contract) must be revisited — hence the lock.
+
+    NOTE: this is four methods, not three — ``get_chat_info`` is abstract too
+    (defined far below the connect/disconnect/send cluster in base.py). The
+    RelayAdapter must implement it (proxying a chat-info lookup to the
+    connector, or returning a descriptor-derived stub).
+    """
+    abstract = {
+        name
+        for name, member in inspect.getmembers(BasePlatformAdapter)
+        if getattr(member, "__isabstractmethod__", False)
+    }
+    assert abstract == {"connect", "disconnect", "send", "get_chat_info"}
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_relay_completion_injection_routing.py ===
+"""Regression: completion injection must resolve the RELAY adapter for
+fronted platforms.
+
+Staging incident 2026-08-09 (second occurrence): async delegation batch
+completed, watcher drained the event, and delivery silently vanished — no
+injection log, no terminal-drop warning, no retry. Root cause:
+``_inject_watch_notification`` resolves its adapter with a literal
+``p.value == platform_name`` scan of ``self.adapters``. A relay-fronted
+gateway registers ONE adapter under ``Platform.RELAY`` fronting N logical
+platforms, so the literal scan misses "slack" and the injection returns
+``None`` ("no gateway route") — the completion is dropped without a trace.
+
+run.py already documents the trap and ships the alias-aware resolver
+(``resolve_delivery_transport``); the handoff path uses it. Contract under
+test: the injection path (and by extension every completion delivered on a
+relay-plane deployment) must resolve through the shared resolver.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import Platform
+from gateway.run import GatewayRunner
+
+
+class _RelayAdapter:
+    """Stub relay adapter fronting slack."""
+
+    name = "relay"
+
+    def __init__(self):
+        self.handled = []
+        self.handle_message = AsyncMock(side_effect=self._admit)
+
+    def _admit(self, event):
+        self.handled.append(event)
+        event._gateway_accepted = True
+
+    def fronts_platform(self, platform):
+        return platform == Platform.SLACK
+
+
+def _runner_with_relay(adapter):
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.RELAY: adapter}
+    runner.config = SimpleNamespace(platforms={})
+    return runner
+
+
+def _slack_async_event():
+    return {
+        "type": "async_delegation",
+        "delegation_id": "deleg_relay_route",
+        "session_key": "agent:main:slack:dm:D0BJTDCSR7C:1786298425.877239",
+        "platform": "slack",
+        "chat_type": "dm",
+        "chat_id": "D0BJTDCSR7C",
+        "status": "completed",
+        "is_batch": True,
+        "results": [{"goal": "g1", "status": "completed", "summary": "done"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_injection_resolves_relay_adapter_for_fronted_platform():
+    """A gateway whose only adapter is the relay (fronting slack) must
+    deliver a slack-routed completion through it — not drop it as
+    'no gateway route'."""
+    adapter = _RelayAdapter()
+    runner = _runner_with_relay(adapter)
+
+    result = await runner._inject_watch_notification(
+        "[delegation completed]", _slack_async_event()
+    )
+
+    assert result is True, (
+        f"injection returned {result!r} on a relay-fronted gateway — the "
+        "completion was dropped exactly as in the 2026-08-09 staging "
+        "incident (literal adapter scan misses Platform.RELAY)"
+    )
+    assert adapter.handle_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_injection_retries_when_platform_not_fronted():
+    """Unavailable transport stays retryable without letting relay hijack unrelated targets."""
+    adapter = _RelayAdapter()  # fronts slack only
+    runner = _runner_with_relay(adapter)
+    evt = _slack_async_event()
+    evt["session_key"] = "agent:main:discord:dm:123:456"
+    evt["platform"] = "discord"
+
+    result = await runner._inject_watch_notification("[x]", evt)
+    assert result is False
+    assert adapter.handle_message.await_count == 0
+

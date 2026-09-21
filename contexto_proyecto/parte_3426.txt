@@ -1,0 +1,351 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_oneshot_usage_file.py ===
+"""Tests for hermes -z --usage-file (per-run JSON usage report)."""
+
+import json
+
+import pytest
+
+from hermes_cli.oneshot import _write_usage_file
+
+
+def _result(**overrides):
+    base = {
+        "estimated_cost_usd": 0.1234,
+        "cost_status": "estimated",
+        "cost_source": "pricing-table",
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "cache_read_tokens": 800,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 50,
+        "total_tokens": 1250,
+        "api_calls": 3,
+        "model": "openai/gpt-5.5",
+        "provider": "openrouter",
+        "session_id": "abc123",
+        "completed": True,
+        "failed": False,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestWriteUsageFile:
+    def test_writes_report_with_cost_and_tokens(self, tmp_path):
+        path = tmp_path / "usage.json"
+        _write_usage_file(str(path), _result())
+        report = json.loads(path.read_text())
+        assert report["estimated_cost_usd"] == 0.1234
+        assert report["input_tokens"] == 1000
+        assert report["output_tokens"] == 200
+        assert report["model"] == "openai/gpt-5.5"
+        assert report["api_calls"] == 3
+        assert report["failed"] is False
+        assert "failure" not in report
+
+    def test_none_path_is_noop(self, tmp_path):
+        # Must not raise and must not create a report file.
+        _write_usage_file(None, _result())
+        assert not (tmp_path / "usage.json").exists()
+
+    def test_failure_marks_failed_and_records_message(self, tmp_path):
+        path = tmp_path / "usage.json"
+        _write_usage_file(str(path), {}, failure="boom")
+        report = json.loads(path.read_text())
+        assert report["failed"] is True
+        assert report["failure"] == "boom"
+        # Missing result fields serialize as null, not KeyError.
+        assert report["estimated_cost_usd"] is None
+
+
+
+
+class TestAuxiliaryLedger:
+    """#112848: auxiliary LLM spend (title generation, vision, ...) recorded in session_model_usage
+    belongs in the pipeline ledger, additively — the main-loop keys stay main-loop-only."""
+
+    def test_aux_usage_is_a_separate_breakdown_and_main_keys_unchanged(self, tmp_path):
+        from hermes_cli.oneshot import _auxiliary_usage, _attach_auxiliary_usage
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            db.create_session("root", "cli", model="main")
+            # Rows from an earlier run of a resumed session must not count toward this run.
+            db.record_auxiliary_usage("root", "vision", model="v", input_tokens=500, output_tokens=5,
+                                      estimated_cost_usd=0.5)
+            before = _auxiliary_usage(db, "root")
+            # This run: aux billed to the id the turn started with; compression mints a child id.
+            db.record_auxiliary_usage("root", "title_generation", model="t", input_tokens=40, output_tokens=8,
+                                      estimated_cost_usd=0.001)
+            db.create_session("child", "cli", model="main", parent_session_id="root")
+            result = _result(session_id="child")
+            _attach_auxiliary_usage(result, db, before)
+        finally:
+            db.close()
+
+        path = tmp_path / "usage.json"
+        _write_usage_file(str(path), result)
+        report = json.loads(path.read_text())
+        assert report["api_calls"] == 3 and report["total_tokens"] == 1250  # main loop untouched
+        assert report["auxiliary"]["by_task"] == {
+            "title_generation": {"api_calls": 1, "input_tokens": 40, "output_tokens": 8, "cache_read_tokens": 0,
+                                 "cache_write_tokens": 0, "reasoning_tokens": 0, "estimated_cost_usd": 0.001},
+        }
+        assert report["auxiliary"]["total_tokens"] == 48
+        assert report["total_including_auxiliary"] == {
+            "api_calls": 4, "total_tokens": 1298, "estimated_cost_usd": pytest.approx(0.1244),
+        }
+
+    def test_waits_for_in_flight_title_thread(self, tmp_path):
+        import threading
+        import time
+
+        from agent import title_generator
+        from hermes_cli.oneshot import _attach_auxiliary_usage
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            db.create_session("s", "cli", model="main")
+
+            def late_row():
+                time.sleep(0.2)
+                db.record_auxiliary_usage("s", "title_generation", model="t", input_tokens=7, output_tokens=1)
+
+            thread = threading.Thread(target=late_row, name="auto-title")
+            title_generator._UPGRADE_THREADS.add(thread)
+            thread.start()
+            result = _result(session_id="s")
+            _attach_auxiliary_usage(result, db, {})
+        finally:
+            db.close()
+        assert result["auxiliary_usage"]["title_generation"]["api_calls"] == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_openai_codex_model_validation_fallback.py ===
+"""Regression tests for OpenAI Codex model validation when the listing lags behind
+actually usable backend model IDs.
+
+The bug originally reported in #16172: `/model` and `switch_model()` rejected
+`gpt-5.3-codex-spark` because the curated listing omitted it, even though direct
+runtime calls succeeded. PR #19729 fixed this by soft-accepting unknown-but-
+plausible Codex slugs with a warning, and this test pins the soft-accept
+behavior so it doesn't regress.
+
+Note: gpt-5.3-codex-spark itself is now in the curated catalog (PR #22991),
+so the real-world Spark request takes the `recognized=True` fast path. This
+test still uses Spark as the example slug but explicitly mocks
+``provider_model_ids`` to omit it, exercising the soft-accept path generically
+for any future entitlement-gated Codex slug that ships before Hermes catalogs
+it.
+"""
+
+from unittest.mock import patch
+
+from hermes_cli.model_switch import switch_model
+from hermes_cli.models_validate import validate_requested_model
+
+
+def test_openai_codex_unknown_but_plausible_model_is_accepted_with_warning():
+    """If the Codex listing is incomplete, `/model` should soft-accept the model
+    with a warning instead of hard-rejecting it.
+    """
+    with patch(
+        "hermes_cli.models.provider_model_ids",
+        return_value=["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"],
+    ):
+        result = validate_requested_model("gpt-5.3-codex-spark", "openai-codex")
+
+    assert result["accepted"] is True
+    assert result["persist"] is True
+    assert result["recognized"] is False
+    assert "gpt-5.3-codex-spark" in result["message"]
+    assert "OpenAI Codex model listing" in result["message"]
+    assert "Similar models" in result["message"]
+    assert "gpt-5.3-codex" in result["message"]
+
+
+def test_switch_model_allows_openai_codex_model_missing_from_listing():
+    """switch_model() should succeed for Codex models that the runtime accepts
+    even when the listing has not caught up yet.
+    """
+    with patch(
+        "hermes_cli.models.provider_model_ids",
+        return_value=["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"],
+    ):
+        result = switch_model(
+            "gpt-5.3-codex-spark",
+            current_provider="openai-codex",
+            current_model="gpt-5.4",
+            current_base_url="",
+            current_api_key="",
+            user_providers=None,
+        )
+
+    assert result.success is True
+    assert result.new_model == "gpt-5.3-codex-spark"
+    assert result.target_provider == "openai-codex"
+    assert result.warning_message
+    assert "OpenAI Codex model listing" in result.warning_message
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_openai_discovery_endpoint.py ===
+"""Discovery honors ``model.base_url`` and cache identity tracks the endpoint.
+
+Coatue data-residency report, issues 3 and 4: with
+``model.base_url: https://us.api.openai.com/v1`` in config and
+``$OPENAI_BASE_URL`` unset, model discovery probed ``api.openai.com`` (the
+wrong endpoint) and the catalog-cache fingerprint did not change when the
+configured endpoint changed, so ``hermes config set model.base_url ...``
+kept serving the stale cached catalog. Regional hosts also bypassed the
+curated intersection, flooding the picker with whisper/tts/embedding rows.
+
+Contracts pinned here:
+  1. ``_openai_discovery_base_url()`` resolves config ``model.base_url``
+     (when the configured provider matches) → ``$OPENAI_BASE_URL`` → default.
+  2. ``_credential_fingerprint()`` changes when the effective configured
+     endpoint changes.
+  3. Official OpenAI hosts (canonical + regional) all get the curated∩live
+     intersection; custom proxies keep the verbatim live list.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch as mock_patch
+
+import pytest
+
+from hermes_cli import models as models_mod
+
+
+def _cfg(base_url: str | None, provider: str = "openai-api"):
+    cfg = {"provider": provider}
+    if base_url is not None:
+        cfg["base_url"] = base_url
+    return cfg
+
+
+class TestDiscoveryBaseUrl:
+    def test_config_base_url_wins_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        with mock_patch.object(
+            models_mod,
+            "_get_model_config_dict",
+            return_value=_cfg("https://us.api.openai.com/v1"),
+        ):
+            assert (
+                models_mod._openai_discovery_base_url("openai-api")
+                == "https://us.api.openai.com/v1"
+            )
+
+    def test_env_wins_over_config(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://eu.api.openai.com/v1")
+        with mock_patch.object(
+            models_mod,
+            "_get_model_config_dict",
+            return_value=_cfg("https://us.api.openai.com/v1"),
+        ):
+            assert (
+                models_mod._openai_discovery_base_url("openai-api")
+                == "https://eu.api.openai.com/v1"
+            )
+
+    def test_config_ignored_when_provider_differs(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        with mock_patch.object(
+            models_mod,
+            "_get_model_config_dict",
+            return_value=_cfg("https://proxy.test/v1", provider="openrouter"),
+        ):
+            assert (
+                models_mod._openai_discovery_base_url("openai-api")
+                == "https://api.openai.com/v1"
+            )
+
+    def test_default_when_nothing_configured(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        with mock_patch.object(
+            models_mod, "_get_model_config_dict", return_value=_cfg(None)
+        ):
+            assert (
+                models_mod._openai_discovery_base_url("openai-api")
+                == "https://api.openai.com/v1"
+            )
+
+
+class TestFingerprintTracksEndpoint:
+    def test_config_endpoint_change_changes_fingerprint(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        with mock_patch.object(
+            models_mod,
+            "_get_model_config_dict",
+            return_value=_cfg("https://us.api.openai.com/v1"),
+        ):
+            fp_us = models_mod._credential_fingerprint("openai-api")
+        with mock_patch.object(
+            models_mod,
+            "_get_model_config_dict",
+            return_value=_cfg("https://eu.api.openai.com/v1"),
+        ):
+            fp_eu = models_mod._credential_fingerprint("openai-api")
+        assert fp_us != fp_eu
+
+    def test_unrelated_provider_fingerprint_stable_across_openai_config(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        with mock_patch.object(
+            models_mod,
+            "_get_model_config_dict",
+            return_value=_cfg("https://us.api.openai.com/v1"),
+        ):
+            fp_a = models_mod._credential_fingerprint("openrouter")
+        with mock_patch.object(
+            models_mod,
+            "_get_model_config_dict",
+            return_value=_cfg("https://eu.api.openai.com/v1"),
+        ):
+            fp_b = models_mod._credential_fingerprint("openrouter")
+        assert fp_a == fp_b
+
+
+class TestRegionalCatalogFiltering:
+    _RAW_DUMP = [
+        "gpt-5.6-terra",
+        "whisper-1",
+        "tts-1",
+        "text-embedding-ada-002",
+    ]
+
+    @pytest.mark.parametrize(
+        "base",
+        [
+            "https://api.openai.com/v1",
+            "https://us.api.openai.com/v1",
+            "https://eu.api.openai.com/v1",
+        ],
+    )
+    def test_official_hosts_intersect_with_curated(self, monkeypatch, base):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_BASE_URL", base)
+        with mock_patch.object(
+            models_mod, "fetch_api_models", return_value=list(self._RAW_DUMP)
+        ):
+            ids = models_mod.provider_model_ids("openai-api", force_refresh=True)
+        assert "whisper-1" not in ids
+        assert "tts-1" not in ids
+        assert "text-embedding-ada-002" not in ids
+        assert "gpt-5.6-terra" in ids
+
+    def test_custom_proxy_keeps_live_list_verbatim(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.corp.test/v1")
+        with mock_patch.object(
+            models_mod, "fetch_api_models", return_value=list(self._RAW_DUMP)
+        ):
+            ids = models_mod.provider_model_ids("openai-api", force_refresh=True)
+        assert ids == self._RAW_DUMP
+

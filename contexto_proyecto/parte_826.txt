@@ -1,0 +1,344 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\terminal_breadcrumbs.py ===
+"""Per-terminal session breadcrumbs for ``hermes -c`` / ``--continue``. Strictly best-effort: no
+function raises; without a stable terminal identity (no tty, no known multiplexer env var) ``-c``
+falls back to latest-session. Gated by ``session.terminal_continue`` (default true)."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+from utils import atomic_json_write
+
+# Multiplexer / terminal-emulator identity env vars, checked in order when no real tty path is
+# available (e.g. stdin piped but stdout still a pty owned by a known terminal).
+_TERMINAL_ENV_VARS = ("ZELLIJ_PANE_ID", "TMUX_PANE", "KITTY_WINDOW_ID", "WEZTERM_PANE", "TERM_SESSION_ID", "WT_SESSION")
+
+# Breadcrumbs older than this are pruned opportunistically on each write — a pane id from a tmux
+# server restarted last month means nothing today.
+_STALE_AFTER_SECONDS = 30 * 24 * 60 * 60
+
+_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _breadcrumbs_dir() -> Path:
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "terminal-sessions"
+
+
+def _sanitize(raw: str) -> str:
+    """Make an id safe to use as a filename (``/dev/pts/3`` -> ``dev-pts-3``)."""
+    return _SANITIZE_RE.sub("-", raw.strip().strip("/"))[:120]
+
+
+def get_terminal_id() -> Optional[str]:
+    """Stable identity for this terminal: the tty device path (stdin, then stdout), else the first
+    present multiplexer/emulator env var; ``None`` when neither exists (callers skip breadcrumbs)."""
+    for fd in (sys.stdin, sys.stdout):
+        try:
+            name = os.ttyname(fd.fileno())
+        except Exception:
+            continue
+        if name:
+            return f"tty-{_sanitize(name)}"
+    for var in _TERMINAL_ENV_VARS:
+        val = os.environ.get(var)
+        if val:
+            return f"{var.lower()}-{_sanitize(val)}"
+    return None
+
+
+def is_enabled() -> bool:
+    """Config gate: ``session.terminal_continue`` (default true)."""
+    try:
+        from hermes_cli.config import load_config
+
+        return bool((load_config().get("session") or {}).get("terminal_continue", True))
+    except Exception:
+        return True
+
+
+def _prune_stale(directory: Path, now: float) -> None:
+    """Best-effort removal of breadcrumbs older than the staleness window."""
+    try:
+        for entry in directory.iterdir():
+            try:
+                if entry.is_file() and now - entry.stat().st_mtime > _STALE_AFTER_SECONDS:
+                    entry.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def write_breadcrumb(session_id: str, cwd: Optional[str] = None) -> None:
+    """Record that this terminal's live session is ``session_id``. Never raises; no-op when the
+    feature is disabled, the session id is empty, or no terminal identity exists."""
+    try:
+        if not session_id or not is_enabled():
+            return
+        terminal_id = get_terminal_id()
+        if not terminal_id:
+            return
+        directory = _breadcrumbs_dir()
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(directory)
+        now = time.time()
+        payload = {"session_id": session_id, "cwd": cwd or os.getcwd(), "ts": now}
+        atomic_json_write(directory / terminal_id, payload, indent=None)
+        _prune_stale(directory, now)
+    except Exception:
+        pass
+
+
+def read_breadcrumb() -> Optional[dict]:
+    """This terminal's breadcrumb payload, or ``None`` (missing, corrupt, or stale). Never raises."""
+    try:
+        terminal_id = get_terminal_id()
+        if not terminal_id:
+            return None
+        path = _breadcrumbs_dir() / terminal_id
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not str(data.get("session_id") or "").strip():
+            return None
+        ts = data.get("ts")
+        if isinstance(ts, (int, float)) and time.time() - ts > _STALE_AFTER_SECONDS:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def resolve_breadcrumb_session() -> Optional[str]:
+    """Resolve a bare ``-c`` for this terminal, or ``None`` to fall back. The breadcrumb's session
+    id counts only if it still exists in the DB, projected through the compression chain so the
+    resume lands on the live tip (same projection as ``main._resolve_session_by_name_or_id``)."""
+    if not is_enabled():
+        return None
+    crumb = read_breadcrumb()
+    if not crumb:
+        return None
+    session_id = str(crumb.get("session_id") or "").strip()
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(read_only=True)  # existence + lineage lookup only; no writer connection
+    except Exception:
+        return None
+    try:
+        if not db.get_session(session_id):
+            return None  # session was deleted — fall back to latest
+        try:
+            return db.get_compression_tip(session_id) or session_id
+        except Exception:
+            return session_id
+    except Exception:
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\terminal_notify.py ===
+"""Terminal-native desktop notifications: OSC 9 and Warp's OSC 777 CLI-agent protocol.
+
+OSC 9 (``ESC ] 9 ; <body> BEL``): Ghostty, iTerm2, Kitty and WezTerm raise an OS notification;
+others drop it. OSC 777 (``ESC ] 777 ; notify ; warp://cli-agent ; <json> BEL``): Warp's
+structured CLI-agent protocol (tab status + notification mailbox).
+
+Inside the running CLI, ``HermesCLI._ring_bell`` sends ``notification_sequence()`` through the
+prompt_toolkit output on the app loop (a second writer on the tty would splice into an in-flight kitty
+pet frame). ``write_tty`` is the no-app path: ``/dev/tty`` because ``patch_stdout``'s wrapper strips raw
+escapes, falling back to ``sys.stdout`` when ``/dev/tty`` can't be opened (Windows, no controlling
+terminal). Never raises.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+
+_C0_AND_DEL = re.compile(r"[\x00-\x1f\x7f]")
+_WARP_PROTOCOL_VERSION = 1
+# Last Warp release per channel that set WARP_CLI_AGENT_PROTOCOL_VERSION but could not render
+# structured payloads (Warp's should-use-structured.sh). Bash compares lexicographically; so do we.
+_WARP_LAST_BROKEN = {"stable": "v0.2026.03.25.08.24.stable_05", "preview": "v0.2026.03.25.08.24.preview_05"}
+
+
+def write_tty(seq: str) -> None:
+    """Write raw escapes to /dev/tty, falling back to sys.stdout. Never raises."""
+    try:
+        with open("/dev/tty", "w", encoding="utf-8") as tty:
+            tty.write(seq)
+        return
+    except OSError:
+        pass
+    try:
+        sys.stdout.write(seq)
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def osc9(body: str) -> str:
+    """OSC 9 sequence with C0 controls and DEL stripped from the body."""
+    return f"\x1b]9;{_C0_AND_DEL.sub('', body)}\x07"
+
+
+def warp_supported(env=None) -> bool:
+    """True when running in a Warp build that can render OSC 777 agent payloads."""
+    env = os.environ if env is None else env
+    client = env.get("WARP_CLIENT_VERSION", "")
+    if env.get("TERM_PROGRAM") != "WarpTerminal" or not env.get("WARP_CLI_AGENT_PROTOCOL_VERSION") or not client:
+        return False
+    return not any(channel in client and client <= last_broken for channel, last_broken in _WARP_LAST_BROKEN.items())
+
+
+def warp_osc777(event: str, detail: str, session_id: str = "") -> str:
+    """OSC 777 ``warp://cli-agent`` notification; ``event`` is ``stop`` or ``permission_request``."""
+    try:
+        advertised = int(os.environ.get("WARP_CLI_AGENT_PROTOCOL_VERSION", "1"))
+    except ValueError:
+        advertised = 1
+    cwd = os.getcwd()
+    payload = {"v": min(advertised, _WARP_PROTOCOL_VERSION), "agent": "hermes", "event": event,
+               "session_id": session_id, "cwd": cwd, "project": os.path.basename(cwd)}
+    payload["summary" if event == "permission_request" else "response"] = detail[:200]
+    return f"\x1b]777;notify;warp://cli-agent;{json.dumps(payload, separators=(',', ':'))}\x07"
+
+
+def notification_sequence(context: str, *, prompt: bool, session_id: str = "", detail: str = "") -> str:
+    """OSC 9 (plus Warp OSC 777 when supported) for a blocking prompt or turn end."""
+    seq = osc9(f"Hermes: {context}")
+    if warp_supported():
+        event = "permission_request" if prompt else "stop"
+        seq += warp_osc777(event, detail or context, session_id)
+    return seq
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\timefmt.py ===
+"""Small shared time-formatting helpers for CLI output."""
+
+from __future__ import annotations
+
+import logging
+import math
+import time as _time
+from datetime import datetime
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# Epoch-seconds window a stored timestamp must fall in to be trusted: 1970 .. ~2103 (inside 32-bit
+# ``time_t`` so ``fromtimestamp`` accepts it on every platform). SQLite dynamic typing lets a TEXT
+# cell, ``inf``/``nan`` or a garbage double (``8.4e252`` salvaged from a damaged page) sit in a REAL
+# column; ``datetime.fromtimestamp`` then raises and one bad row killed the whole listing, export
+# or report (#102399, #102352, #99959).
+EPOCH_MIN = 0.0
+EPOCH_MAX = 4_200_000_000.0
+
+
+def coerce_epoch(value: Any, *, session_id: Optional[str] = None, field: str = "timestamp") -> Optional[float]:
+    """A stored timestamp cell as float epoch seconds, or ``None`` when it cannot be trusted.
+
+    Numbers, numeric strings and ``datetime`` are accepted; anything else, non-finite values and
+    values outside ``EPOCH_MIN..EPOCH_MAX`` return ``None`` after a WARNING naming the session so
+    the corrupt row can be found. ``None``/``""`` mean "unset" and stay silent. Every reader that
+    renders a row timestamp goes through here (a bad row degrades to one ``?`` cell, never a dead
+    command) and every writer uses it to refuse persisting a new bad row.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        ts = float(value.timestamp()) if isinstance(value, datetime) else float(value)
+    except (TypeError, ValueError):
+        ts = math.nan
+    if not (EPOCH_MIN <= ts <= EPOCH_MAX):  # also False for nan
+        logger.warning("Ignoring corrupt %s %r%s", field, value, f" on session {session_id}" if session_id else "")
+        return None
+    return ts
+
+
+def relative_time(ts, *, session_id: Optional[str] = None) -> str:
+    """Format a timestamp as relative time (e.g., '2h ago', 'yesterday'); ``?`` when unset or corrupt."""
+    if not ts or (ts := coerce_epoch(ts, session_id=session_id, field="last_active")) is None:
+        return "?"
+    delta = _time.time() - ts
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta / 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta / 3600)}h ago"
+    if delta < 172800:
+        return "yesterday"
+    if delta < 604800:
+        return f"{int(delta / 86400)}d ago"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\timeouts.py ===
+from __future__ import annotations
+
+
+def _coerce_timeout(raw: object) -> float | None:
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return timeout if timeout > 0 else None
+
+
+def _configured_timeout(provider_id: str, model: str | None, model_key: str, provider_key: str) -> float | None:
+    """Per-model ``providers.<id>.models.<model>.<model_key>`` wins over ``providers.<id>.<provider_key>``."""
+    if not provider_id:
+        return None
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+    except Exception:
+        return None
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    provider_config = providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+    if not isinstance(provider_config, dict):
+        return None
+    model_config = _get_model_config(provider_config, model)
+    if model_config is not None:
+        timeout = _coerce_timeout(model_config.get(model_key))
+        if timeout is not None:
+            return timeout
+    return _coerce_timeout(provider_config.get(provider_key))
+
+
+def get_provider_request_timeout(provider_id: str, model: str | None = None) -> float | None:
+    """Return a configured provider request timeout in seconds, if any."""
+    return _configured_timeout(provider_id, model, "timeout_seconds", "request_timeout_seconds")
+
+
+def get_provider_stale_timeout(provider_id: str, model: str | None = None) -> float | None:
+    """Return a configured non-stream stale timeout in seconds, if any."""
+    return _configured_timeout(provider_id, model, "stale_timeout_seconds", "stale_timeout_seconds")
+
+
+def _get_model_config(provider_config: dict[str, object], model: str | None) -> dict[str, object] | None:
+    if not model:
+        return None
+    models = provider_config.get("models", {})
+    model_config = models.get(model, {}) if isinstance(models, dict) else {}
+    return model_config if isinstance(model_config, dict) else None
+

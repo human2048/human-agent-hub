@@ -1,0 +1,189 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_browser_extension_router_wiring.py ===
+"""Wiring regression tests for the browser extension router.
+
+These guard the *registry wiring* — that every ``browser_*`` handler routes
+through :func:`tools.browser_extension_router.routed_browser_handler` with
+the tool's action name, its raw args, and its identity kwargs, instead of
+calling the legacy backend directly. The routing contract itself is tested
+by ``test_browser_extension_router.py``; here we only pin the plumbing.
+"""
+
+import pytest
+
+from tools.registry import registry
+
+
+@pytest.fixture(autouse=True)
+def _route_spy(monkeypatch):
+    """Replace the wrapper with a spy that records the route and then runs
+    the legacy fallback, so each test proves the handler is wired without
+    exercising real routing or a real browser backend."""
+    calls = []
+
+    def spy(action, args, *, fallback, task_id=None, session_id=None, tool_call_id=None):
+        calls.append(
+            {
+                "action": action,
+                "args": dict(args),
+                "task_id": task_id,
+                "session_id": session_id,
+                "tool_call_id": tool_call_id,
+            }
+        )
+        return fallback()
+
+    import tools.browser_tool as browser_tool
+    import tools.browser_cdp_tool as browser_cdp_tool
+
+    monkeypatch.setattr(browser_tool, "routed_browser_handler", spy)
+    monkeypatch.setattr(browser_cdp_tool, "routed_browser_handler", spy)
+    monkeypatch.setattr(
+        browser_tool,
+        "browser_navigate",
+        lambda url="", task_id=None, local_browser=False: "legacy-nav",
+    )
+    monkeypatch.setattr(browser_cdp_tool, "browser_cdp", lambda *a, **k: "legacy-cdp")
+    return calls
+
+
+BROWSER_ACTIONS = [
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_scroll",
+    "browser_back",
+    "browser_press",
+    "browser_get_images",
+    "browser_vision",
+    "browser_console",
+]
+
+
+def test_every_browser_registry_handler_routes_through_wrapper(_route_spy):
+    for name in BROWSER_ACTIONS:
+        _route_spy.clear()
+        handler = registry.get_entry(name).handler
+        args = {"url": "https://example.test", "ref": "@e1", "text": "hi"}
+        result = handler(dict(args), task_id="task-fixture", session_id="session-fixture")
+        assert result is not None
+        assert len(_route_spy) == 1, f"{name} did not route through the wrapper"
+        route = _route_spy[0]
+        assert route["action"] == name
+        assert route["task_id"] == "task-fixture"
+        assert route["session_id"] == "session-fixture"
+
+
+def test_browser_navigate_forwards_raw_args_and_identity(_route_spy):
+    handler = registry.get_entry("browser_navigate").handler
+    args = {"url": "https://example.test"}
+    result = handler(dict(args), task_id="task-fixture", session_id="session-fixture")
+    assert result == "legacy-nav"
+    route = _route_spy[0]
+    assert route["args"] == args
+    # The router must not mutate the args dict.
+    assert args == {"url": "https://example.test"}
+
+
+def test_browser_cdp_handler_routes_through_wrapper(_route_spy):
+    handler = registry.get_entry("browser_cdp").handler
+    args = {"method": "Target.getTargets", "params": {"filter": []}}
+    result = handler(dict(args), task_id="task-fixture", session_id="session-fixture")
+    assert result == "legacy-cdp"
+    route = _route_spy[0]
+    assert route["action"] == "browser_cdp"
+    assert route["args"] == args
+    assert route["task_id"] == "task-fixture"
+    assert route["session_id"] == "session-fixture"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_browser_get_images_ssrf.py ===
+"""Tests that browser_get_images blocks image data from eval-navigated private pages.
+
+browser_snapshot, browser_vision, and _browser_eval all re-check the page URL
+before returning content, but browser_get_images bypasses _browser_eval and
+calls _run_browser_command("eval", ...) directly. Without its own guard, image
+src URLs and alt text from a private page would leak.
+
+Sibling of the snapshot/vision/eval guards for issue #44731.
+"""
+
+import json
+
+import pytest
+
+from tools import browser_tool
+from tools import browser_tool_eval_policy as bt_eval_policy
+from tools import browser_tool_session as bt_session
+
+PRIVATE_URL = "http://127.0.0.1:8080/internal"
+IMAGES_JS_RESULT = json.dumps([
+    {"src": "http://127.0.0.1:8080/logo.png", "alt": "Internal Logo", "width": 200, "height": 100},
+])
+
+
+@pytest.fixture(autouse=True)
+def _patches(monkeypatch):
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_last_session_key", lambda key: key)
+
+
+def _mock_run_success(monkeypatch):
+    def _run(task_id, command, args=None, **kwargs):
+        return {"success": True, "data": {"result": IMAGES_JS_RESULT}}
+    monkeypatch.setattr(bt_session, "_run_browser_command", _run)
+
+
+def test_blocks_images_on_private_page(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: True)
+    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda tid: PRIVATE_URL)
+
+    result = json.loads(browser_tool.browser_get_images(task_id="test"))
+    assert result["success"] is False
+    assert "private or internal address" in result["error"]
+    assert PRIVATE_URL in result["error"]
+
+
+def test_allows_images_on_public_page(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: True)
+    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda tid: None)
+
+    result = json.loads(browser_tool.browser_get_images(task_id="test"))
+    assert result["success"] is True
+    assert result["count"] == 1
+    assert result["images"][0]["src"] == "http://127.0.0.1:8080/logo.png"
+
+
+def test_skips_guard_for_local_backend(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: False)
+
+    result = json.loads(browser_tool.browser_get_images(task_id="test"))
+    assert result["success"] is True
+    assert result["count"] == 1
+
+
+def test_skips_guard_when_private_urls_allowed(monkeypatch):
+    _mock_run_success(monkeypatch)
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda tid: False)
+
+    result = json.loads(browser_tool.browser_get_images(task_id="test"))
+    assert result["success"] is True
+    assert result["count"] == 1
+
+
+def test_guard_does_not_block_on_failed_eval(monkeypatch):
+    """If the eval itself fails, browser_get_images returns its own error — no guard needed."""
+    def _run(task_id, command, args=None, **kwargs):
+        return {"success": False, "error": "eval failed"}
+    monkeypatch.setattr(bt_session, "_run_browser_command", _run)
+
+    result = json.loads(browser_tool.browser_get_images(task_id="test"))
+    assert result["success"] is False
+    assert "eval failed" in result["error"]
+

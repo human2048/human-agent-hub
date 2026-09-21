@@ -1,0 +1,292 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\estop.py ===
+"""Global emergency stop (ESTOP) — a resumable pause for NEW work only.
+
+``hermes pause`` writes a sentinel at ``$HERMES_HOME/ESTOP``; ``hermes resume``
+removes it. While it exists the cron scheduler, kanban dispatcher and new gateway
+turns skip work; in-flight work is never killed. The check is one or two uncached
+``os.stat`` calls (process home + fleet root when they differ). The body is optional
+JSON ``{"reason", "engaged_at"}``; a corrupt/empty file still counts as engaged
+(fail safe, e.g. ``touch ~/.hermes/ESTOP``). Ported from gastownhall/gastown estop.go (MIT).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+from contextlib import suppress
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+# Same profile-aware / fleet-root resolvers the file-safety guards use (fail-open to ~/.hermes).
+from agent.file_safety import _hermes_home_path as _hermes_home, _hermes_root_path as _canonical_root
+
+SENTINEL_NAME = "ESTOP"
+
+# Per-component "logged already for this engagement" flags: log once per engagement, not per tick.
+_log_lock = threading.Lock()
+_logged_components: set[str] = set()
+
+
+def sentinel_path() -> Path:
+    """Path of the ESTOP sentinel this process would write on `hermes pause`."""
+    return _hermes_home() / SENTINEL_NAME
+
+
+def _candidate_sentinel_paths() -> list:
+    """Profile home first, then the fleet root if it is a different directory: a profile
+    gateway (HERMES_HOME=~/.hermes/profiles/<n>) must still honor an operator's ~/.hermes/ESTOP."""
+    primary = sentinel_path()
+    try:
+        root = _canonical_root() / SENTINEL_NAME
+    except Exception:
+        return [primary]
+    try:
+        distinct = root.resolve() != primary.resolve()
+    except Exception:
+        # Non-Path test doubles fail .resolve(); plain equality still dedupes.
+        distinct = root != primary
+    return [primary, root] if distinct else [primary]
+
+
+def is_engaged() -> bool:
+    """True if ANY candidate sentinel exists; fail SAFE (True) on stat errors."""
+    saw_stat_error = False
+    for path in _candidate_sentinel_paths():
+        try:
+            if path.exists():
+                return True
+        except OSError:
+            saw_stat_error = True
+    return saw_stat_error
+
+
+def engage(reason: Optional[str] = None) -> Path:
+    """Create the ESTOP sentinel. Idempotent; re-engaging updates the file."""
+    path = sentinel_path()
+    payload = {"engaged_at": datetime.now(timezone.utc).isoformat(), "reason": reason or None}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        with suppress(OSError):  # Best effort: an empty/partial sentinel still pauses (fail safe).
+            path.touch(exist_ok=True)
+    return path
+
+
+def disengage() -> bool:
+    """Remove every visible sentinel (process-local and fleet-root)."""
+    lifted = False
+    for path in _candidate_sentinel_paths():
+        try:
+            path.unlink()
+            lifted = True
+        except (OSError, AttributeError):
+            continue
+    return lifted
+
+
+def get_state() -> Optional[dict]:
+    """Return ``{"reason", "engaged_at"}`` or None when not engaged; an unreadable/corrupt
+    body still reports engaged with both fields None."""
+    if not is_engaged():
+        return None
+    state = {"reason": None, "engaged_at": None}
+    found = False
+    for path in _candidate_sentinel_paths():
+        try:
+            if not path.exists():
+                continue
+        except OSError:
+            return state
+        except AttributeError:
+            continue
+        found = True
+        with suppress(OSError, ValueError, AttributeError):
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                state = {"reason": raw.get("reason") or None, "engaged_at": raw.get("engaged_at") or None}
+                break
+    return state if found else None
+
+
+def paused_reply() -> Optional[str]:
+    """Short user-facing notice for new gateway turns, or None if not paused."""
+    state = get_state()
+    if state is None:
+        return None
+    tag = f" ({state['reason']})" if state.get("reason") else ""
+    return f"⏸️ Hermes is paused{tag}. New work is on hold; run `hermes resume` to pick things back up."
+
+
+def check_paused(component: str, logger: logging.Logger) -> bool:
+    """Return True when engaged, logging once per engagement per component (re-armed after a resume)."""
+    if not is_engaged():
+        with _log_lock:
+            _logged_components.discard(component)
+        return False
+    with _log_lock:
+        first = component not in _logged_components
+        _logged_components.add(component)
+    if first:
+        reason = (get_state() or {}).get("reason")
+        suffix = f" (reason: {reason})" if reason else ""
+        logger.info(
+            "%s dispatch paused by global emergency stop%s — remove with `hermes resume` (%s)",
+            component, suffix, sentinel_path(),
+        )
+    return True
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import os  # noqa: F401,E402
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\fallback_cooldown.py ===
+"""Primary rate-limit cooldown arming and per-session model rejection markers, shared by the
+fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers)."""
+import logging
+import time
+
+from agent.error_classifier import FailoverReason
+
+logger = logging.getLogger(__name__)
+
+_RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
+
+
+def _arm_rate_limit_cooldown(agent, reason: "FailoverReason | None") -> int | None:
+    """Arm the primary's exponential cooldown (60s → 2m → ... → 4h cap) on CONSECUTIVE rate-limits;
+    restore_primary_runtime resets the counter. Only when leaving the primary: chain-switching from
+    an active fallback means the primary was not the 429 source, so its cooldown is left alone.
+    Return the armed cooldown in seconds, or None when no cooldown was armed."""
+    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+        return None
+    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
+    if getattr(agent, "_fallback_activated", False) and not (primary_provider and current_provider == primary_provider):
+        return None
+    backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
+    agent._rate_limit_backoff_count = backoff_count + 1
+    backoff_seconds = min(60 * (2 ** backoff_count), 14400)
+    agent._rate_limited_until = time.monotonic() + backoff_seconds
+    logging.info("Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)", backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1)
+    return backoff_seconds
+
+
+# Codex ChatGPT-account entitlement 400 — the account can never use the named slug, so with
+# nothing to rotate it is a config error, not a transient failure (#106475).
+_CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER = "model is not supported when using codex with a chatgpt account"
+
+
+def _mark_entitlement_rejected_model(agent, api_error) -> bool:
+    """Record a Codex ChatGPT-account 400 that rejects the current model for this account.
+
+    With a single credential there is no pool to rotate (#71970 covers that case), so the
+    (provider, model) pair is treated as dead for the session: the fallback walk skips it and
+    restore_primary_runtime stops switching back — otherwise every turn re-fails on the primary,
+    announces an unverified "Primary model restored", and oscillates forever (#106475).
+    """
+    if getattr(api_error, "status_code", None) != 400:
+        return False
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is not None and len(pool.entries()) > 1:
+        return False  # another account in the pool may be entitled; leave rotation to it
+    haystack = str(getattr(api_error, "message", "") or api_error).lower()
+    if _CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER not in haystack:
+        return False
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    model = str(getattr(agent, "model", "") or "").strip()
+    if not provider or not model:
+        return False
+    rejected = getattr(agent, "_entitlement_rejected_models", None)
+    if rejected is None:
+        rejected = agent._entitlement_rejected_models = set()
+    if (provider, model) in rejected:
+        return True
+    rejected.add((provider, model))
+    logger.warning(
+        "Model entitlement rejection: this account is not entitled to %s via %s; "
+        "treating it as unavailable for this session",
+        model, provider,
+    )
+    agent._buffer_diagnostic_status(
+        f"🚫 This account is not entitled to {model} via {provider}; it will be skipped "
+        "until restart. Switch to an entitled model via /model or `hermes model`."
+    )
+    return True
+
+
+def _is_entitlement_rejected(agent, provider: str, model: str) -> bool:
+    """True when (provider, model) — as configured or normalized — was rejected as unentitled
+    for this account (see _mark_entitlement_rejected_model)."""
+    rejected = getattr(agent, "_entitlement_rejected_models", None) or ()
+    if not rejected:
+        return False
+    if (provider, model) in rejected:
+        return True
+    from hermes_cli.model_normalize import normalize_model_for_provider
+    return (provider, normalize_model_for_provider(model, provider)) in rejected
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\fast_mode.py ===
+"""Bounded fast-mode windows (``/fast auto`` and ``/fast cold``).
+
+``agent.service_tier``: ``None`` (normal), ``"priority"`` (static fast, pinned into
+``agent.request_overrides`` at build time), ``"auto"`` (every user turn opens a
+window of ``agent.fast_auto_seconds``) or ``"cold"`` (only a session's first turn,
+no prior history, opens it). The provider's fast override is layered onto request
+kwargs only while the window is open; only per-request params (``service_tier`` /
+``speed``) vary, so the prompt cache survives the boundary.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+BOUNDED_MODES = frozenset({"auto", "cold"})
+DEFAULT_WINDOW_SECONDS = 60
+
+
+def begin_turn(agent: Any, conversation_history: Any) -> None:
+    """Open (or refuse) the fast window at a user-turn boundary."""
+    mode = getattr(agent, "service_tier", None)
+    agent._fast_until = 0.0
+    if mode not in BOUNDED_MODES:
+        return
+    if mode == "cold" and any(
+        isinstance(m, dict) and m.get("role") in ("user", "assistant", "tool")
+        for m in (conversation_history or ())
+    ):
+        return
+    try:
+        window = float(getattr(agent, "fast_auto_seconds", DEFAULT_WINDOW_SECONDS))
+    except (TypeError, ValueError):
+        window = DEFAULT_WINDOW_SECONDS
+    agent._fast_until = time.monotonic() + max(window, 0.0)
+
+
+def effective_request_overrides(agent: Any) -> dict[str, Any]:
+    """``agent.request_overrides`` plus the fast override while the window is open."""
+    overrides = dict(getattr(agent, "request_overrides", None) or {})
+    if getattr(agent, "service_tier", None) not in BOUNDED_MODES or time.monotonic() >= getattr(agent, "_fast_until", 0.0):
+        return overrides
+    from hermes_cli.models import resolve_fast_mode_overrides
+    base_url = getattr(agent, "base_url", None)
+    if getattr(agent, "api_mode", None) == "anthropic_messages":
+        base_url = getattr(agent, "_anthropic_base_url", None) or base_url
+    overrides.update(
+        resolve_fast_mode_overrides(getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url) or {}
+    )
+    return overrides
+

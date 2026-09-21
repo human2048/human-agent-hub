@@ -1,0 +1,352 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_length_continuation_window_headroom.py ===
+"""Length continuation stops when the PROMPT filled the context window (#106120).
+
+``finish_reason='length'`` with ``usage.prompt_tokens`` ≈ context length means there was
+no room to generate, not that the answer was long. Continuing appends a fragment + nudge
+— strictly more prompt — so every retry is worse. The turn must end on the first
+truncation and name the context window as the cause; a real output-cap truncation (plenty
+of headroom) keeps continuing.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from hermes_constants import FINISH_REASON_LENGTH
+
+
+@pytest.fixture()
+def loop_agent():
+    from run_agent import AIAgent
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        a = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        a.client = MagicMock()
+        a._cached_system_prompt = "You are helpful."
+        a._use_prompt_caching = False
+        a.compression_enabled = False
+        a.save_trajectories = False
+        a.context_compressor.context_length = 32768
+        return a
+
+
+def _length_response(content: str, prompt_tokens: int):
+    from tests.agent.test_run_agent import _mock_assistant_msg
+    return SimpleNamespace(
+        id="resp",
+        model="test/model",
+        choices=[SimpleNamespace(
+            index=0, message=_mock_assistant_msg(content=content), finish_reason=FINISH_REASON_LENGTH,
+        )],
+        usage=SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=40,
+                              total_tokens=prompt_tokens + 40),
+    )
+
+
+def _run(agent, message):
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        return agent.run_conversation(message)
+
+
+def test_prompt_filling_the_window_ends_the_turn_on_first_truncation(loop_agent):
+    # Reporter's live numbers: 32,638-token prompt in a 32,768 window (~130 tokens of room).
+    loop_agent.client.chat.completions.create.side_effect = [
+        _length_response(f"part {i} ", prompt_tokens=32638 + 47 * i) for i in range(4)
+    ]
+    result = _run(loop_agent, "summarize everything so far")
+
+    assert loop_agent.client.chat.completions.create.call_count == 1
+    assert result["partial"] is True
+    assert "part 0" in result["final_response"]
+    assert "context window" in result["final_response"].lower()
+    assert "32,638" in result["final_response"] and "32,768" in result["final_response"]
+    assert "continuation attempts" not in (result.get("error") or "")
+    # No continuation trail is left behind for the next turn.
+    assert not any(
+        m.get("_length_continuation_fragment") or m.get("_length_continuation_nudge")
+        for m in result["messages"] if isinstance(m, dict)
+    )
+
+
+def test_output_cap_truncation_with_headroom_still_continues(loop_agent):
+    loop_agent.client.chat.completions.create.side_effect = [
+        _length_response(f"part {i} ", prompt_tokens=4_000 + 500 * i) for i in range(4)
+    ]
+    result = _run(loop_agent, "write me a long report")
+
+    assert loop_agent.client.chat.completions.create.call_count == 4
+    assert "truncated after 4 continuation attempts" in (result.get("error") or "")
+    assert "part 3" in result["final_response"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_litellm_tool_part_cache_markers.py ===
+"""Regression tests for #89886: part-level cache_control on role:tool messages
+must be suppressed on LiteLLM-style envelope routes.
+
+LiteLLM's OpenAI→Anthropic translation copies tool-message content parts
+verbatim, so a part-level ``cache_control`` lands at ``tool_result.content[0]``
+— a placement the Anthropic Messages schema rejects with a non-retryable
+HTTP 400 that kills the whole turn. OpenRouter relocates the marker correctly,
+so the part-level form stays on for it.
+"""
+
+import copy
+
+from agent.prompt_caching import (
+    apply_anthropic_cache_control,
+    build_prompt_cache_plan,
+    envelope_tool_part_cache_markers_supported,
+)
+
+
+def _tool_history():
+    return [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "run the tool"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "t", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "tool output"},
+    ]
+
+
+def _tool_messages(msgs):
+    return [m for m in msgs if m.get("role") == "tool"]
+
+
+def _has_part_marker(msg):
+    content = msg.get("content")
+    if isinstance(content, list):
+        return any(
+            isinstance(p, dict) and "cache_control" in p for p in content
+        )
+    return False
+
+
+class TestEnvelopeToolPartMarkerSuppression:
+    def test_litellm_route_detected_as_unsupported(self):
+        assert not envelope_tool_part_cache_markers_supported(
+            "litellm", "https://litellm.internal.example/v1"
+        )
+        assert not envelope_tool_part_cache_markers_supported(
+            "custom:litellm", "https://gw.example.com/v1"
+        )
+        assert not envelope_tool_part_cache_markers_supported(
+            "custom", "https://litellm-proxy.example.com/v1"
+        )
+
+    def test_openrouter_route_stays_supported(self):
+        assert envelope_tool_part_cache_markers_supported(
+            "openrouter", "https://openrouter.ai/api/v1"
+        )
+        # Lookalike names must not be swept in.
+        assert envelope_tool_part_cache_markers_supported(
+            "custom:notlitellm", "https://notlitellm.example.com/v1"
+        )
+
+    def test_tool_message_not_marked_when_part_markers_off(self):
+        decorated = apply_anthropic_cache_control(
+            copy.deepcopy(_tool_history()),
+            native_anthropic=False,
+            tool_part_markers=False,
+        )
+        for tool_msg in _tool_messages(decorated):
+            assert "cache_control" not in tool_msg
+            assert not _has_part_marker(tool_msg)
+            # Content must stay a plain string — no decoration-produced
+            # part list that LiteLLM would forward into tool_result.content.
+            assert isinstance(tool_msg.get("content"), str)
+
+    def test_breakpoint_reallocates_to_non_tool_message(self):
+        decorated = apply_anthropic_cache_control(
+            copy.deepcopy(_tool_history()),
+            native_anthropic=False,
+            tool_part_markers=False,
+        )
+        non_tool_marked = [
+            m
+            for m in decorated
+            if m.get("role") != "tool"
+            and ("cache_control" in m or _has_part_marker(m))
+        ]
+        assert non_tool_marked, "budget must reallocate, not vanish"
+
+    def test_openrouter_default_keeps_tool_part_marker(self):
+        decorated = apply_anthropic_cache_control(
+            copy.deepcopy(_tool_history()), native_anthropic=False
+        )
+        assert any(_has_part_marker(m) for m in _tool_messages(decorated))
+
+    def test_build_prompt_cache_plan_threads_flag(self):
+        plan = build_prompt_cache_plan(
+            _tool_history(),
+            [],
+            native_anthropic=False,
+            tool_part_markers=False,
+        )
+        for tool_msg in _tool_messages(plan.messages):
+            assert "cache_control" not in tool_msg
+            assert not _has_part_marker(tool_msg)
+
+    def test_native_anthropic_layout_unaffected(self):
+        # Native layout relies on the adapter to relocate a top-level marker
+        # onto the tool_result block; the flag must not interfere.
+        decorated = apply_anthropic_cache_control(
+            copy.deepcopy(_tool_history()),
+            native_anthropic=True,
+            tool_part_markers=False,
+        )
+        assert any(
+            "cache_control" in m for m in _tool_messages(decorated)
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_lmstudio_load_mode.py ===
+from types import SimpleNamespace
+from typing import Any, cast
+
+from hermes_cli.models_local import LMStudioLoadResult
+from run_agent import AIAgent
+
+
+def _agent(load_mode="explicit"):
+    return SimpleNamespace(
+        provider="lmstudio",
+        model="test/model",
+        base_url="http://127.0.0.1:1234/v1",
+        api_key="",
+        lmstudio_load_mode=load_mode,
+        _config_context_length=None,
+        context_compressor=None,
+        api_mode="chat_completions",
+    )
+
+
+def test_lmstudio_jit_load_mode_skips_explicit_preload(monkeypatch):
+    calls = []
+
+    def fake_ensure(*args, **kwargs):
+        calls.append((args, kwargs))
+        return LMStudioLoadResult(64_000)
+
+    monkeypatch.setattr("hermes_cli.models_local.ensure_lmstudio_model_loaded", fake_ensure)
+
+    result = AIAgent._ensure_lmstudio_runtime_loaded(cast(Any, _agent("jit")))
+
+    assert result is None
+    assert calls == []
+
+
+
+
+
+
+def test_explicit_budget_below_loaded_runtime_limits_effective_context():
+    result = AIAgent._effective_lmstudio_context_length(
+        80_000,
+        LMStudioLoadResult(120_000),
+    )
+
+    assert result == 80_000
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_lmstudio_reasoning.py ===
+"""Reasoning-effort resolution for LM Studio.
+
+Covers the contract that Hermes' generic effort ladder must stay monotonic
+once it is mapped onto LM Studio's narrower vocabulary: a stronger requested
+level may resolve to an equal-or-stronger LM Studio level, never a weaker one.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from hermes_constants import VALID_REASONING_EFFORTS
+
+# Rank of each value LM Studio accepts, weakest to strongest. Used to assert
+# the resolved ladder never inverts.
+_LM_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
+
+
+
+
+def test_effort_ladder_is_monotonic():
+    """Resolving Hermes' canonical ladder never produces an inversion."""
+    resolved = [
+        resolve_lmstudio_effort({"enabled": True, "effort": effort}, None)
+        for effort in VALID_REASONING_EFFORTS
+    ]
+    ranks = [_LM_RANK[value] for value in resolved]
+    assert ranks == sorted(ranks), dict(zip(VALID_REASONING_EFFORTS, resolved))
+
+
+
+
+
+
+
+
+@pytest.mark.parametrize("effort", ["max", "ultra"])
+def test_clamped_effort_is_still_checked_against_allowed_options(effort):
+    """A clamped value stays subject to the model's published allowed set.
+
+    "max" resolves to "xhigh"; a model that does not publish "xhigh" gets the
+    field omitted (``None``) so LM Studio applies the model's own default --
+    exactly how a directly-requested "xhigh" already behaves.
+    """
+    assert (
+        resolve_lmstudio_effort(
+            {"enabled": True, "effort": effort}, ["off", "minimal", "low"]
+        )
+        is None
+    )
+    assert (
+        resolve_lmstudio_effort(
+            {"enabled": True, "effort": effort}, ["low", "medium", "high", "xhigh"]
+        )
+        == "xhigh"
+    )
+
+
+def test_clamp_does_not_rewrite_published_allowed_options():
+    """The clamp must not leak into allowed_options normalization.
+
+    A model publishing "max" is not claiming LM Studio's request vocabulary
+    accepts it; allowed_options passes through untouched, so a resolved
+    "xhigh" that the model does not publish is still omitted.
+    """
+    assert resolve_lmstudio_effort({"enabled": True, "effort": "max"}, ["max"]) is None
+

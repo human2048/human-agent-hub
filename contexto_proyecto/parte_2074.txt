@@ -1,0 +1,366 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_hermetic_side_effect_guards.py ===
+"""Regression tests for hermetic guards around local desktop side effects."""
+
+from __future__ import annotations
+
+import webbrowser
+
+
+def test_webbrowser_open_calls_are_neutralized(monkeypatch):
+    """OAuth/browser tests should never reach the real browser registry."""
+
+    def _real_browser_lookup_reached(*_args, **_kwargs):
+        raise AssertionError("test reached the real webbrowser registry")
+
+    monkeypatch.setattr(webbrowser, "get", _real_browser_lookup_reached)
+
+    url = "https://provider.example.invalid/oauth/authorize"
+
+    assert webbrowser.open(url) is True
+    assert webbrowser.open_new(url) is True
+    assert webbrowser.open_new_tab(url) is True
+
+
+def test_webbrowser_get_controller_is_neutralized(_neutralize_webbrowser):
+    """Direct controller access should still stay inside the test recorder."""
+    url = "https://provider.example.invalid/oauth/authorize"
+
+    controller = webbrowser.get("hermes-test-browser")
+
+    assert controller.open(url) is True
+    assert controller.open_new(url) is True
+    assert controller.open_new_tab(url) is True
+    assert _neutralize_webbrowser == [url, url, url]
+
+
+def _isolate_anthropic_credentials(monkeypatch, tmp_path):
+    from agent import anthropic_credentials as ac
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(ac.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(ac.platform, "system", lambda: "Darwin")
+
+    def _real_keychain_reached(*_args, **_kwargs):
+        raise AssertionError("test reached the real macOS Keychain command")
+
+    monkeypatch.setattr(ac.subprocess, "run", _real_keychain_reached)
+    return ac
+
+
+def test_claude_code_credential_read_does_not_touch_macos_keychain(
+    monkeypatch, tmp_path
+):
+    """The real credential reader should be safe under the suite guard."""
+    ac = _isolate_anthropic_credentials(monkeypatch, tmp_path)
+
+    assert ac.read_claude_code_credentials() is None
+
+
+def test_anthropic_token_resolution_does_not_touch_macos_keychain(
+    monkeypatch, tmp_path
+):
+    """Token resolution should be safe under the same suite guard."""
+    ac = _isolate_anthropic_credentials(monkeypatch, tmp_path)
+
+    assert ac.resolve_anthropic_token() is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_hygiene_timeout_cooldown_isolation.py ===
+"""Pre-agent hygiene retry spacing must not block in-agent compression."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+from agent.context_compressor import ContextCompressor
+from hermes_state import SessionDB
+
+_HYGIENE_TIMEOUT_ERROR = (
+    "session hygiene compression timed out with no output from the summary model"
+)
+
+_HYGIENE_TURNHOLD_ERROR = (
+    "hygiene compression deferred: turn-hold budget expired while the "
+    "summary was still streaming"
+)
+
+
+def _bound_compressor(db: SessionDB, session_id: str) -> ContextCompressor:
+    with patch(
+        "agent.context_compressor.get_model_context_length",
+        return_value=100_000,
+    ):
+        compressor = ContextCompressor(
+            model="test/model",
+            threshold_percent=0.85,
+            protect_first_n=2,
+            protect_last_n=2,
+            quiet_mode=True,
+        )
+    compressor.bind_session_state(db, session_id)
+    return compressor
+
+
+def test_hygiene_idle_timeout_does_not_block_in_agent_compressor(tmp_path: Path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "hyg-timeout-sid"
+    db.create_session(session_id, source="telegram")
+    db.record_compression_failure_cooldown(
+        session_id,
+        time.time() + 300,
+        _HYGIENE_TIMEOUT_ERROR,
+    )
+
+    compressor = _bound_compressor(db, session_id)
+
+    # Hygiene still sees the durable row so the pre-agent pass can skip.
+    assert db.get_compression_failure_cooldown(session_id) is not None
+    # The in-conversation compressor must not inherit that watchdog timeout.
+    assert compressor.get_active_compression_failure_cooldown() is None
+    db.close()
+
+
+def test_hygiene_turnhold_deferral_does_not_block_in_agent_compressor(
+    tmp_path: Path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "hyg-turnhold-sid"
+    db.create_session(session_id, source="telegram")
+    db.record_compression_failure_cooldown(
+        session_id,
+        time.time() + 300,
+        _HYGIENE_TURNHOLD_ERROR,
+    )
+
+    compressor = _bound_compressor(db, session_id)
+
+    # Hygiene still sees its flat retry-spacing row and avoids respawning a
+    # doomed 15-second turn-hold attempt on every incoming message.
+    assert db.get_compression_failure_cooldown(session_id) is not None
+    # The in-conversation compressor has a separate budget. A healthy hygiene
+    # stream being deferred must not suppress that path for another minute.
+    assert compressor.get_active_compression_failure_cooldown() is None
+    db.close()
+
+
+def test_aux_model_fault_cooldown_still_blocks_in_agent_compressor(tmp_path: Path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "aux-fault-sid"
+    db.create_session(session_id, source="telegram")
+    db.record_compression_failure_cooldown(
+        session_id,
+        time.time() + 300,
+        "rate limited",
+    )
+
+    compressor = _bound_compressor(db, session_id)
+
+    state = compressor.get_active_compression_failure_cooldown()
+    assert state is not None
+    assert state["error"] == "rate limited"
+    db.close()
+
+
+def test_hygiene_row_clears_stale_in_memory_aux_cooldown(tmp_path: Path):
+    """A later hygiene overwrite must not leave the in-memory aux cooldown armed."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "hyg-overwrite-sid"
+    db.create_session(session_id, source="telegram")
+    db.record_compression_failure_cooldown(
+        session_id,
+        time.time() + 300,
+        "rate limited",
+    )
+
+    compressor = _bound_compressor(db, session_id)
+    loaded = compressor.get_active_compression_failure_cooldown()
+    assert loaded is not None
+    assert loaded["error"] == "rate limited"
+
+    db.record_compression_failure_cooldown(
+        session_id,
+        time.time() + 300,
+        _HYGIENE_TIMEOUT_ERROR,
+    )
+
+    assert compressor.get_active_compression_failure_cooldown(refresh=True) is None
+    assert compressor.get_active_compression_failure_cooldown() is None
+    db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_i18n.py ===
+"""Tests for agent.i18n -- catalog parity, fallback, language resolution."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from agent import i18n
+
+
+LOCALES_DIR = Path(__file__).resolve().parents[2] / "locales"
+
+
+def _load_raw(lang: str) -> dict:
+    with (LOCALES_DIR / f"{lang}.yaml").open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _flatten(d, prefix="") -> dict:
+    flat = {}
+    for k, v in (d or {}).items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            flat.update(_flatten(v, key))
+        else:
+            flat[key] = v
+    return flat
+
+
+# ---------------------------------------------------------------------------
+# Catalog completeness -- this is the key invariant test.  If someone adds a
+# new key to en.yaml they MUST add it to every other locale, else runtime
+# falls back to English for those users and defeats the feature.
+# ---------------------------------------------------------------------------
+
+
+
+@pytest.mark.parametrize("lang", [l for l in i18n.SUPPORTED_LANGUAGES if l != "en"])
+def test_catalog_keys_match_english(lang: str):
+    """Every non-English catalog must have exactly the same key set as English."""
+    en_keys = set(_flatten(_load_raw("en")).keys())
+    lang_keys = set(_flatten(_load_raw(lang)).keys())
+    missing = en_keys - lang_keys
+    extra = lang_keys - en_keys
+    assert not missing, f"{lang}.yaml missing keys: {sorted(missing)}"
+    assert not extra, f"{lang}.yaml has keys not in en.yaml: {sorted(extra)}"
+
+
+@pytest.mark.parametrize("lang", list(i18n.SUPPORTED_LANGUAGES))
+def test_catalog_placeholders_match_english(lang: str):
+    """Every translated value must use the same {placeholder} tokens as English.
+
+    A mistranslated placeholder (e.g. ``{description}`` typoed as ``{descricao}``)
+    would either raise KeyError at runtime or silently drop the interpolated
+    value.  Pin parity at the test layer.
+    """
+    import re
+    placeholder_re = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+    en_flat = _flatten(_load_raw("en"))
+    lang_flat = _flatten(_load_raw(lang))
+    for key, en_value in en_flat.items():
+        en_placeholders = set(placeholder_re.findall(en_value))
+        lang_value = lang_flat.get(key, "")
+        lang_placeholders = set(placeholder_re.findall(lang_value))
+        assert en_placeholders == lang_placeholders, (
+            f"{lang}.yaml key={key!r}: placeholders {lang_placeholders} "
+            f"don't match English {en_placeholders}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Language resolution
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+def test_default_when_nothing_set(monkeypatch):
+    """With no env var and no config override, falls back to English."""
+    monkeypatch.delenv("HERMES_LANGUAGE", raising=False)
+    # Force config lookup to return None -- patch the cached reader.
+    i18n.reset_language_cache()
+    monkeypatch.setattr(i18n, "_config_language", lambda: None)
+    assert i18n.get_language() == "en"
+
+
+def test_language_is_per_profile_under_multiplex(monkeypatch, tmp_path):
+    """HERMES_LANGUAGE in the DEFAULT profile's environ must not leak into a secondary profile's
+    turn, and the config-language cache must not freeze one profile's ``display.language`` for all."""
+    from agent import secret_scope
+
+    default_home = tmp_path / "default"; default_home.mkdir()
+    prof_b = tmp_path / "b"; prof_b.mkdir()
+    (default_home / "config.yaml").write_text("display:\n  language: fr\n")
+    (prof_b / "config.yaml").write_text("display:\n  language: de\n")
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")  # default profile's .env, bridged into environ
+    i18n.reset_language_cache()
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({})
+    try:
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        assert i18n.get_language() == "fr"  # scoped miss: env ignored, this profile's config wins
+        monkeypatch.setenv("HERMES_HOME", str(prof_b))
+        assert i18n.get_language() == "de"  # not the first profile's cached "fr"
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+        i18n.reset_language_cache()
+
+
+# ---------------------------------------------------------------------------
+# t() semantics
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+def test_t_missing_key_in_non_english_falls_back_to_english(tmp_path, monkeypatch):
+    """If a key exists in English but not in the target locale, fall back."""
+    # Stand up a fake incomplete locale under a temp locales dir.
+    fake_locales = tmp_path / "locales"
+    fake_locales.mkdir()
+    (fake_locales / "en.yaml").write_text("foo: English Foo\n", encoding="utf-8")
+    (fake_locales / "zh.yaml").write_text("# intentionally empty\n", encoding="utf-8")
+    monkeypatch.setattr(i18n, "_locales_dir", lambda: fake_locales)
+    i18n.reset_language_cache()
+    try:
+        assert i18n.t("foo", lang="zh") == "English Foo"
+    finally:
+        # Clear the cache on teardown so subsequent tests don't see the
+        # fake "foo: English Foo" catalog instead of the real locales/*.yaml.
+        i18n.reset_language_cache()
+
+
+
+
+# ---------------------------------------------------------------------------
+# _locales_dir resolution ladder -- regression for #23943 / #27632 / #35374.
+# Sealed installs (Nix store venv, pip wheel) have no source tree next to
+# agent/, so _locales_dir must resolve via env override or the data scheme.
+# ---------------------------------------------------------------------------
+
+
+
+def test_locales_dir_env_override_ignored_when_missing(tmp_path, monkeypatch):
+    """A bogus HERMES_BUNDLED_LOCALES falls through to source/wheel resolution
+    instead of returning a path that doesn't exist."""
+    monkeypatch.setenv("HERMES_BUNDLED_LOCALES", str(tmp_path / "does-not-exist"))
+    result = i18n._locales_dir()
+    assert result != tmp_path / "does-not-exist"
+    # In a source checkout this is the repo-root locales dir.
+    assert result.name == "locales"
+
+
+

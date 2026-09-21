@@ -1,0 +1,286 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cron_failure_notice_copy.py ===
+"""User-facing cron failure notices: plain words, the real output path, and the exact `hermes cron`
+command to act on. Contract tests, not snapshots (root AGENTS.md).
+
+The classifier is `agent.error_classifier.classify_api_error`; these tests pin what the copy table
+does with its verdict, not the verdict itself.
+"""
+
+import re
+
+import cron.scheduler as scheduler
+from cron.scheduler import _compose_run_delivery, _summarize_cron_failure_for_delivery
+from hermes_constants import display_hermes_home
+
+JOB = {"name": "Morning brief", "id": "ab12cd34"}
+_HTTP_LEAD = re.compile(r"failed: (HTTP|Error code:|provider )")
+
+
+def _no_chain(monkeypatch):
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+
+
+def test_generic_failure_names_runs_and_pause_commands_and_the_real_output_dir():
+    msg = _summarize_cron_failure_for_delivery(JOB, "[Errno 2] No such file or directory: '/x.py'")
+    assert "/x.py" in msg  # the raw detail survives as the cause
+    for cmd in ("hermes cron runs ab12cd34", "hermes cron run ab12cd34", "hermes cron pause ab12cd34"):
+        assert f"`{cmd}`" in msg
+    assert f"{display_hermes_home()}/cron/output/ab12cd34/" in msg
+    assert "cron output" not in msg  # the unnamed internal location is gone
+
+
+def test_auth_failure_points_at_login_and_a_retry_command(monkeypatch):
+    _no_chain(monkeypatch)
+    msg = _summarize_cron_failure_for_delivery(JOB, "Error code: 401 - Unauthorized")
+    assert "/login" in msg and "`hermes auth add <provider>`" in msg
+    assert "hermes login" not in msg  # that command was removed
+    assert "`hermes cron run ab12cd34`" in msg
+    assert not _HTTP_LEAD.search(msg)
+    assert "401" not in msg
+
+
+def test_auth_failure_names_the_pinned_provider_and_the_failing_profile(monkeypatch, tmp_path):
+    """A profile's credentials are its own (93889b770da): the notice must send the operator to
+    THIS profile's sign-in for the job's pinned provider, never a bare placeholder (#114012)."""
+    _no_chain(monkeypatch)
+    profile_home = tmp_path / ".hermes" / "profiles" / "ops"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    msg = _summarize_cron_failure_for_delivery(
+        {**JOB, "provider": "openai-codex"}, "Error code: 401 - Unauthorized")
+    assert "`hermes -p ops auth add openai-codex --type oauth`" in msg, msg
+    assert "<provider>" not in msg
+    unpinned = _summarize_cron_failure_for_delivery(JOB, "Error code: 401 - Unauthorized")
+    assert "`hermes -p ops auth add <provider>`" in unpinned, unpinned
+
+
+def test_rate_and_usage_limit_phrases_still_yield_a_provider_notice(monkeypatch):
+    """The old cron regex ladder matched these substrings; the shared classifier must too, or a
+    Nous Portal limit turns into a raw generic notice."""
+    _no_chain(monkeypatch)
+    for text in (
+        "Nous Portal rate limit active until 15:00",
+        "RuntimeError: usage limit reached for this key",
+        "You have hit your weekly usage limit",
+        "insufficient quota",
+    ):
+        msg = _summarize_cron_failure_for_delivery(JOB, text)
+        assert "limit" in msg.lower(), msg
+        assert not _HTTP_LEAD.search(msg), msg
+        assert "`hermes cron run ab12cd34`" in msg or "`hermes cron edit ab12cd34" in msg, msg
+
+
+def test_cron_cause_gloss_is_the_shared_table():
+    """Cron, subagent and chat notices read one reason->cause table (agent/turn_failure_copy.py)."""
+    from agent.turn_failure_copy import FAILURE_CAUSE_GLOSS
+    from cron.scheduler_failure_copy import provider_failure_notice
+
+    for reason in FAILURE_CAUSE_GLOSS:
+        notice = provider_failure_notice("Morning brief", "ab12cd34", reason, backup_provider_phrase="x.")
+        assert notice is not None and "`hermes cron" in notice, reason
+    assert provider_failure_notice("Morning brief", "ab12cd34", "unknown", backup_provider_phrase="x.") is None
+
+
+def test_transient_provider_failures_never_lead_with_jargon(monkeypatch):
+    _no_chain(monkeypatch)
+    for err in ("Request timed out.", "HTTP 429: Too Many Requests"):
+        msg = _summarize_cron_failure_for_delivery(JOB, err)
+        assert not _HTTP_LEAD.search(msg), msg
+        assert "fallback chain" not in msg.lower()
+        assert "`hermes cron run ab12cd34`" in msg
+        assert "`hermes cron runs ab12cd34`" in msg
+
+
+def test_blocked_config_notice_says_it_did_not_run_and_will_self_heal():
+    text, blocked, *_ = _compose_run_delivery(
+        JOB, success=False, error="[blocked_config] provider credential missing: no key",
+        final_response="", output_file=None)
+    assert blocked is True
+    assert "did not run" in text
+    assert "provider credential missing: no key" in text
+    assert "Nothing was charged" in text
+    # Some blocks (MCP server temporarily down) clear on their own, so the retry
+    # line must not condition the retry on the user fixing something.
+    assert "once this is fixed" not in text
+    assert "`hermes cron doctor`" in text
+    for jargon in ("configuration validation", "LLM call", "pre-dispatch"):
+        assert jargon not in text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cron_failure_summarizer_inactivity.py ===
+"""_summarize_cron_failure_for_delivery must not mislabel the scheduler's own
+inactivity-timeout abort as a provider/fallback-chain failure, and must not
+claim a fallback chain was "exhausted" when none is configured.
+
+Field-reported regression: a stuck `terminal`
+tool call tripped the 600s cron inactivity watchdog. The TimeoutError raised
+by the watchdog contains the substring "limit 600s" and its message reads
+"idle for 1239s (limit 600s)" -- no provider or fallback chain was ever
+involved -- but the old branch order matched the generic "timed out"/"timeout"
+substring check before any inactivity-specific check existed, so the operator
+saw "provider timeout. Fallback chain was exhausted or unavailable." for a
+failure that had nothing to do with either.
+
+Second bug bundled into the same fix: even on a *genuine* provider failure,
+"Fallback chain was exhausted or unavailable." fired unconditionally --
+regardless of whether fallback_providers was ever configured. Most installs
+have fallback_providers: [], so the message always implied an
+attempted-and-failed fallback that never existed. _fallback_chain_phrase() now checks the effective chain
+via get_fallback_chain() and reports "No fallback chain configured." when
+it's empty.
+"""
+
+import cron.scheduler as scheduler
+from cron.scheduler import _summarize_cron_failure_for_delivery
+
+
+def test_inactivity_timeout_is_not_reported_as_provider_timeout():
+    job = {"name": "Daily Repo Sweep", "id": "82d65bdd5ba9"}
+    error = (
+        "TimeoutError: Cron job 'Daily Repo Sweep' idle for 1239s "
+        "(limit 600s) — last activity: terminal command running (30s elapsed)"
+    )
+    msg = _summarize_cron_failure_for_delivery(job, error)
+    assert "did not respond in time" not in msg
+    assert "backup provider" not in msg.lower()
+    assert "stalled" in msg.lower()
+    assert "Daily Repo Sweep" in msg
+
+
+def test_genuine_provider_timeout_with_no_fallback_configured(monkeypatch):
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
+    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    job = {"name": "CI Autofix Poller", "id": "f7fe78574bda"}
+    error = "Request timed out."
+    msg = _summarize_cron_failure_for_delivery(job, error)
+    assert "did not respond in time" in msg
+    assert "No backup provider is configured" in msg
+    assert "succeeded either" not in msg
+
+
+def test_genuine_provider_timeout_with_fallback_configured(monkeypatch):
+    monkeypatch.setattr(scheduler, "load_config", lambda: {
+        "fallback_providers": [{"provider": "openrouter", "model": "anthropic/claude-sonnet-5"}]
+    })
+    monkeypatch.setattr(
+        scheduler,
+        "get_fallback_chain",
+        lambda cfg: [{"provider": "openrouter", "model": "anthropic/claude-sonnet-5"}],
+    )
+    job = {"name": "CI Autofix Poller", "id": "f7fe78574bda"}
+    error = "Request timed out."
+    msg = _summarize_cron_failure_for_delivery(job, error)
+    assert "did not respond in time" in msg
+    assert "No backup provider succeeded either." in msg
+    assert "No backup provider is configured" not in msg
+
+
+def test_fallback_chain_phrase_fails_open_on_config_error(monkeypatch):
+    def _raise():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(scheduler, "load_config", _raise)
+    assert scheduler._fallback_chain_phrase() == "No backup provider succeeded either."
+
+
+def test_readtimeout_error_still_classified_as_provider_timeout(monkeypatch):
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
+    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    job = {"name": "some-job", "id": "abc123"}
+    error = "httpx.ReadTimeout: The read operation timed out"
+    msg = _summarize_cron_failure_for_delivery(job, error)
+    assert "did not respond in time" in msg
+
+
+def test_rate_limit_classification_still_takes_priority_over_inactivity_text(monkeypatch):
+    # A rate-limit error mentioning "usage limit" must still classify as a
+    # rate limit even though it could theoretically also contain "timeout"-
+    # adjacent wording; rate-limit check runs first and should be unaffected
+    # by the new inactivity branch inserted after it.
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
+    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    job = {"name": "some-job", "id": "abc123"}
+    error = "HTTP 429: weekly usage limit exceeded"
+    msg = _summarize_cron_failure_for_delivery(job, error)
+    # A usage-limit wall is a billing verdict: it names the limit and the provider-pin fix,
+    # never the transient "backup provider" retry clause.
+    assert "usage or credit limit" in msg
+    assert "hermes cron edit abc123 --provider" in msg
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_cron_home_target_profile_scope.py ===
+"""Regression: multiplex cron delivery destination must follow the OWNING profile.
+
+#94862 / #97909 / #99028: the winning ticker process delivered a profile's cron
+job through the EXECUTING process's home channel — `_env_home_target_chat_id`
+read `os.getenv` directly, so the default profile's TELEGRAM_HOME_CHANNEL (or
+Feishu/Discord equivalent) won over the owning profile's `.env`. The fix reads
+through `agent.secret_scope.get_secret`, which resolves the job-owning
+profile's scope installed by run_one_job for the whole execute→deliver span.
+"""
+
+import pytest
+
+from agent import secret_scope
+
+
+@pytest.fixture()
+def profile_home(tmp_path):
+    home = tmp_path / "profiles" / "tecnologia"
+    home.mkdir(parents=True)
+    (home / ".env").write_text(
+        'TELEGRAM_HOME_CHANNEL="111111111"\n'
+        'TELEGRAM_HOME_CHANNEL_THREAD_ID="42"\n',
+        encoding="utf-8",
+    )
+    return home
+
+
+@pytest.fixture()
+def owning_profile_scope(profile_home):
+    """Install the owning profile's secret scope, as run_one_job does."""
+    token = secret_scope.set_secret_scope(
+        secret_scope.build_profile_secret_scope(profile_home)
+    )
+    try:
+        yield profile_home
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+
+class TestHomeTargetFollowsOwningProfile:
+    def test_chat_id_resolves_from_profile_scope_not_process_env(
+        self, owning_profile_scope, monkeypatch
+    ):
+        # The executing process (e.g. the Desktop/default backend that won the
+        # tick lock) carries the DEFAULT profile's home channel in os.environ.
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "5697433938")
+
+        from cron.scheduler_delivery import _env_home_target_chat_id
+
+        assert _env_home_target_chat_id("telegram") == "111111111"
+
+    def test_thread_id_resolves_from_profile_scope_not_process_env(
+        self, owning_profile_scope, monkeypatch
+    ):
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "7")
+
+        from cron.scheduler_delivery import _get_home_target_thread_id
+
+        assert _get_home_target_thread_id("telegram") == "42"
+
+    def test_no_scope_keeps_legacy_process_env_behavior(self, monkeypatch):
+        """Single-profile deployments (no scope installed) read os.environ."""
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "5697433938")
+
+        from cron.scheduler_delivery import _env_home_target_chat_id
+
+        assert secret_scope.current_secret_scope() is None
+        assert _env_home_target_chat_id("telegram") == "5697433938"
+

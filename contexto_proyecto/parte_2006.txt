@@ -1,0 +1,378 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_auto_detect.py ===
+"""Reproduction test for issue #63425: Provider auto-detection discards credential pools.
+
+When AIAgent is constructed with provider=None and a recognized endpoint URL,
+the provider auto-detection works but the credential pool is discarded because
+pool validation runs before URL-based provider inference.
+"""
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+
+def _mock_client(api_key="test-key", base_url="https://api.anthropic.com"):
+    c = MagicMock()
+    c.api_key = api_key
+    c.base_url = base_url
+    c._default_headers = None
+    return c
+
+
+class TestCredentialPoolPreservedOnAutoDetect:
+    """Issue #63425: credential pool should survive provider auto-detection."""
+
+    def test_anthropic_pool_preserved_with_url_auto_detect(self):
+        """When provider=None and base_url=api.anthropic.com, the passed
+        credential_pool should remain attached after auto-detection."""
+        from agent.agent_init import init_agent
+
+        # Build a minimal agent-like object (like tests use object.__new__)
+        from run_agent import AIAgent
+        agent = object.__new__(AIAgent)
+        agent._base_url = ""
+        agent._base_url_lower = ""
+        agent._base_url_hostname = ""
+
+        pool = SimpleNamespace(provider="anthropic")
+
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \
+             patch("model_tools.get_tool_definitions", return_value=[]), \
+             patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()), \
+             patch('agent.anthropic_credentials.resolve_anthropic_token', return_value=''), \
+             patch('agent.anthropic_credentials._is_oauth_token', return_value=False), \
+             patch('agent.azure_identity_adapter.is_token_provider', return_value=False), \
+             patch('hermes_cli.model_normalize.normalize_model_for_provider', return_value='test-model'), \
+             patch('agent.credential_pool.load_pool', return_value=MagicMock()), \
+             patch('hermes_cli.config.load_config', return_value={}), \
+             patch('hermes_cli.config.get_compatible_custom_providers', return_value=[]), \
+             patch('agent.iteration_budget.IterationBudget'), \
+             patch('hermes_cli.config.cfg_get', return_value=None):
+
+            init_agent(
+                agent,
+                base_url="https://api.anthropic.com",
+                api_key="test-key",
+                provider=None,
+                model="test-model",
+                credential_pool=pool,
+                skip_context_files=True,
+                skip_memory=True,
+                quiet_mode=True,
+            )
+
+        print(f"agent.provider = {agent.provider!r}")
+        print(f"agent.api_mode = {agent.api_mode!r}")
+        print(f"agent._credential_pool is pool = {agent._credential_pool is pool}")
+
+        assert agent.provider == "anthropic", (
+            f"Provider should be auto-detected as 'anthropic', got {agent.provider!r}"
+        )
+        assert agent.api_mode == "anthropic_messages", (
+            f"api_mode should be 'anthropic_messages', got {agent.api_mode!r}"
+        )
+        assert agent._credential_pool is pool, (
+            "Credential pool was discarded! agent._credential_pool is NOT the "
+            "same object that was passed to AIAgent().\n"
+            f"  Expected: {id(pool)}\n"
+            f"  Got:      {id(agent._credential_pool)}"
+        )
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_deferred_refresh.py ===
+"""Thread-safety of the deferred single-use-token refresh path (#71775).
+
+The deferred path deliberately runs OAuth network I/O outside the pool
+lock. These tests pin the two invariants that make that safe:
+
+1. `select()` does NOT hold the pool lock while the deferred refresh's
+   network call runs (the whole point of the PR).
+2. The pool mutations that follow the network call (`_replace_entry`,
+   `_persist`) DO re-serialize under the pool lock, so a concurrent
+   `select()`/rotation cannot tear `self._entries` or double-write
+   auth.json.
+"""
+
+import threading
+from dataclasses import replace
+
+from agent.credential_pool import (
+    AUTH_TYPE_OAUTH,
+    CredentialPool,
+    PooledCredential,
+)
+
+
+def _codex_entry(entry_id: str = "codex-1") -> PooledCredential:
+    return PooledCredential(
+        provider="openai-codex",
+        id=entry_id,
+        label="test codex",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="device_code",
+        access_token="at-stale",
+        refresh_token="rt-stale",
+        expires_at_ms=1,  # long expired -> needs refresh
+    )
+
+
+def test_select_does_not_hold_pool_lock_during_deferred_refresh(monkeypatch):
+    pool = CredentialPool("openai-codex", [_codex_entry()])
+    lock_free_during_refresh = {}
+
+    def _fake_refresh(entry, *, force):
+        # If select() still held the pool lock here, this non-blocking
+        # acquire would fail — the regression this PR exists to fix.
+        acquired = pool._lock.acquire(blocking=False)
+        lock_free_during_refresh["value"] = acquired
+        if acquired:
+            pool._lock.release()
+        refreshed = replace(entry, access_token="at-fresh", expires_at_ms=2**53)
+        pool._replace_entry(entry, refreshed)
+        return refreshed
+
+    monkeypatch.setattr(
+        pool, "_entry_needs_refresh", lambda e: e.access_token == "at-stale"
+    )
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
+    monkeypatch.setattr(pool, "_persist", lambda **kw: None)
+
+    selected = pool.select()
+
+    assert lock_free_during_refresh.get("value") is True, (
+        "select() held the pool lock during the deferred refresh network window"
+    )
+    assert selected is not None
+    assert selected.access_token == "at-fresh"
+
+
+def test_deferred_mutations_serialize_against_concurrent_rotation(monkeypatch):
+    """_replace_entry/_persist from the deferred path must contend on the
+    pool lock: with the lock held by another thread, the deferred mutation
+    must block rather than mutate concurrently."""
+    pool = CredentialPool("openai-codex", [_codex_entry()])
+    monkeypatch.setattr(pool, "_persist", lambda **kw: None)
+
+    entry = pool._entries[0]
+    refreshed = replace(entry, access_token="at-fresh")
+
+    mutated = threading.Event()
+
+    def _deferred_mutation():
+        pool._replace_entry(entry, refreshed)  # self-locking
+        mutated.set()
+
+    with pool._lock:
+        t = threading.Thread(target=_deferred_mutation)
+        t.start()
+        # While we hold the lock, the deferred mutation must NOT complete.
+        assert not mutated.wait(timeout=0.3), (
+            "_replace_entry mutated the pool while another thread held the lock"
+        )
+    t.join(timeout=5)
+    assert mutated.is_set()
+    assert pool._entries[0].access_token == "at-fresh"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_interrupt.py ===
+"""Regression test for #26145: credential pool rotation after interrupt-resume.
+
+When has_retried_429 is lost (user cancels between 429s), the pool should
+still rotate if the current credential is already marked exhausted.
+"""
+from unittest.mock import MagicMock, patch
+
+from agent.credential_pool import PooledCredential, STATUS_EXHAUSTED
+from agent.error_classifier import FailoverReason
+
+
+def _make_entry(idx, **overrides):
+    defaults = dict(
+        provider="test-provider",
+        id=f"cred-{idx}",
+        label=f"Credential {idx}",
+        auth_type="api_key",
+        priority=idx,
+        source="manual",
+        access_token=f"key-{idx}",
+    )
+    defaults.update(overrides)
+    return PooledCredential(**defaults)
+
+
+def _make_pool(entries):
+    pool = MagicMock()
+    pool.entries = MagicMock(return_value=entries)
+    pool.current.return_value = entries[0]
+    # Must be set explicitly — MagicMock.provider returns a truthy
+    # child mock, which would trigger the provider-mismatch guard.
+    pool.provider = ""
+    return pool
+
+
+def test_rotate_immediately_when_credential_already_exhausted():
+    """If current credential has last_status='exhausted', rotate on first 429
+    instead of retrying (Option A fix for #26145)."""
+    entries = [_make_entry(0, last_status=STATUS_EXHAUSTED, last_error_code=429), _make_entry(1)]
+    pool = _make_pool(entries)
+    pool.mark_exhausted_and_rotate.return_value = entries[1]
+
+    from run_agent import AIAgent
+    with patch("model_tools.get_tool_definitions", return_value=[]),          patch("model_tools.check_toolset_requirements", return_value={}),          patch("agent.process_bootstrap.OpenAI"):
+        agent = MagicMock(spec=AIAgent)
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        recovered, retried = AIAgent._recover_with_credential_pool(
+            agent,
+            status_code=429,
+            has_retried_429=False,  # Key: False on first 429 after interrupt
+            classified_reason=FailoverReason.rate_limit,
+        )
+
+    assert recovered is True
+    assert retried is False
+    pool.mark_exhausted_and_rotate.assert_called_once()
+    agent._swap_credential.assert_called_once_with(entries[1])
+
+
+
+
+def test_rotate_on_second_429_when_not_exhausted():
+    """When credential is active and this is the second 429, rotate (existing behavior)."""
+    entries = [_make_entry(0, last_status=None), _make_entry(1)]
+    pool = _make_pool(entries)
+    pool.mark_exhausted_and_rotate.return_value = entries[1]
+
+    from run_agent import AIAgent
+    with patch("model_tools.get_tool_definitions", return_value=[]),          patch("model_tools.check_toolset_requirements", return_value={}),          patch("agent.process_bootstrap.OpenAI"):
+        agent = MagicMock(spec=AIAgent)
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        recovered, retried = AIAgent._recover_with_credential_pool(
+            agent,
+            status_code=429,
+            has_retried_429=True,  # Second 429
+            classified_reason=FailoverReason.rate_limit,
+        )
+
+    assert recovered is True
+    assert retried is False
+    pool.mark_exhausted_and_rotate.assert_called_once()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_credential_pool_key_rotation.py ===
+"""Tests for credential pool upsert — key rotation clears exhaustion state."""
+
+from __future__ import annotations
+
+import json
+
+
+def _write_auth_store(tmp_path, payload: dict) -> None:
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps(payload, indent=2))
+
+
+def test_key_rotation_clears_exhausted_status(tmp_path, monkeypatch):
+    """Replacing an exhausted API key via _upsert_entry resets last_status.
+
+    Regression: `hermes setup` saves a new OPENROUTER_API_KEY to .env, which
+    triggers _seed_from_env → _upsert_entry.  If the existing pool entry was
+    marked exhausted (e.g. from a rate-limit on the old key), the stale status
+    was preserved on the new key — making the pool appear unusable even though
+    a fresh valid key was present.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "OPENROUTER_API_KEY",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "env:OPENROUTER_API_KEY",
+                        "access_token": "old-key",
+                        "last_status": "exhausted",
+                        "last_status_at": 1000.0,
+                        "last_error_code": 429,
+                        "last_error_reason": "rate_limit",
+                        "last_error_message": "Too many requests",
+                        "last_error_reset_at": 2000.0,
+                    }
+                ]
+            },
+        },
+    )
+
+    # Simulate the user rotating their key (new value in env)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "new-rotated-key")
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    entry = pool.select()
+
+    assert entry is not None, "Pool should have a usable entry after key rotation"
+    assert entry.access_token == "new-rotated-key"
+    assert entry.last_status is None, "last_status should be cleared after key rotation"
+    assert entry.last_status_at is None
+    assert entry.last_error_code is None
+    assert entry.last_error_reason is None
+    assert entry.last_error_message is None
+    assert entry.last_error_reset_at is None
+
+
+def test_same_key_preserves_exhausted_status(tmp_path, monkeypatch):
+    """If the key has NOT changed, _upsert_entry does not clear exhaustion state."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+    from agent.credential_pool import PooledCredential, _upsert_entry
+
+    existing = PooledCredential.from_dict(
+        "openrouter",
+        {
+            "id": "cred-1",
+            "label": "OPENROUTER_API_KEY",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "env:OPENROUTER_API_KEY",
+            "access_token": "same-key",
+            "last_status": "exhausted",
+            "last_status_at": 1000.0,
+            "last_error_code": 429,
+            "last_error_reason": "rate_limit",
+            "last_error_message": "Too many requests",
+            "last_error_reset_at": 2000.0,
+        },
+    )
+    entries = [existing]
+
+    # Upsert with the same token — should NOT clear exhaustion
+    _upsert_entry(
+        entries,
+        "openrouter",
+        "env:OPENROUTER_API_KEY",
+        {
+            "source": "env:OPENROUTER_API_KEY",
+            "auth_type": "api_key",
+            "access_token": "same-key",
+        },
+    )
+
+    assert entries[0].last_status == "exhausted", (
+        "last_status should not be cleared when the key is unchanged"
+    )
+

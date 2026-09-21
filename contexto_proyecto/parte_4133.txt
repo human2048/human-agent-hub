@@ -1,0 +1,224 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_file_sync_perf.py ===
+"""Reproducible perf benchmark for file sync overhead.
+
+Measures actual env.execute() wall-clock time, no LLM in the loop.
+Run with: uv run pytest tests/tools/test_file_sync_perf.py -v -o "addopts=" -s
+
+Requires backends to be configured (SSH host, Modal creds, etc).
+Skip markers gate each backend.
+"""
+
+import statistics
+import time
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Backend fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def local_env():
+    from tools.environments.local import LocalEnvironment
+    env = LocalEnvironment(cwd="/tmp", timeout=30)
+    yield env
+    env.cleanup()
+
+
+@pytest.fixture
+def ssh_env():
+    import os
+    host = os.environ.get("TERMINAL_SSH_HOST")
+    user = os.environ.get("TERMINAL_SSH_USER")
+    if not host or not user:
+        pytest.skip("TERMINAL_SSH_HOST and TERMINAL_SSH_USER required")
+    from tools.environments.ssh import SSHEnvironment
+    env = SSHEnvironment(host=host, user=user, cwd="/tmp", timeout=30)
+    yield env
+    env.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _time_executions(env, command: str, n: int = 10) -> list[float]:
+    """Run *command* n times and return per-call wall-clock durations."""
+    durations = []
+    for _ in range(n):
+        t0 = time.monotonic()
+        result = env.execute(command, timeout=10)
+        elapsed = time.monotonic() - t0
+        durations.append(elapsed)
+        assert result.get("returncode", result.get("exit_code", -1)) == 0, \
+            f"command failed: {result}"
+    return durations
+
+
+def _report(label: str, durations: list[float]):
+    """Print timing stats."""
+    med = statistics.median(durations)
+    mean = statistics.mean(durations)
+    p95 = sorted(durations)[int(len(durations) * 0.95)]
+    print(f"\n  {label}:")
+    print(f"    n={len(durations)}  median={med*1000:.0f}ms  mean={mean*1000:.0f}ms  p95={p95*1000:.0f}ms")
+    print(f"    raw: {[f'{d*1000:.0f}ms' for d in durations]}")
+    return med
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class TestLocalPerf:
+    """Local baseline — no file sync, no network. Sets the floor."""
+
+    def test_echo_latency(self, local_env):
+        durations = _time_executions(local_env, "echo hello", n=20)
+        med = _report("local echo", durations)
+        # Spawn-per-call overhead should be < 500ms
+        assert med < 0.5, f"local echo median {med*1000:.0f}ms exceeds 500ms"
+
+
+@pytest.mark.ssh
+class TestSSHPerf:
+    """SSH with FileSyncManager — mtime skip should make sync ~0ms."""
+
+    def test_echo_latency(self, ssh_env):
+        """Sequential echo commands — measures per-command overhead including sync check."""
+        durations = _time_executions(ssh_env, "echo hello", n=20)
+        med = _report("ssh echo (with sync check)", durations)
+        # SSH round-trip + spawn-per-call, but sync should be ~0ms (rate limited)
+        assert med < 2.0, f"ssh echo median {med*1000:.0f}ms exceeds 2000ms"
+
+
+    def test_no_sync_within_interval(self, ssh_env):
+        """Rapid sequential commands within 5s window — no sync at all."""
+        # First command triggers sync
+        ssh_env.execute("echo prime", timeout=10)
+
+        # Immediately run 10 more — all within rate-limit window
+        durations = _time_executions(ssh_env, "echo rapid", n=10)
+        med = _report("ssh echo (within interval, no sync)", durations)
+
+        # Should be pure SSH overhead, no sync
+        assert med < 1.5, f"within-interval median {med*1000:.0f}ms exceeds 1500ms"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_file_sync_sigint.py ===
+"""Cross-platform regression for the deferred-SIGINT re-delivery in sync-back.
+
+``_sync_back_once`` defers a Ctrl+C that lands mid-sync, then re-delivers it once
+the sync completes. It must do so via ``signal.raise_signal`` — which invokes the
+handler through C ``raise()`` on every platform — and NOT via
+``os.kill(os.getpid(), signal.SIGINT)``: on Windows the latter routes SIGINT (2)
+to ``TerminateProcess`` and hard-kills the whole CLI instead of raising
+``KeyboardInterrupt``.
+
+Unlike ``test_file_sync_back.py`` this module does not depend on ``fcntl`` (the
+locked sync body is stubbed), so it runs on Windows too — the platform the bug
+actually manifests on.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+
+from tools.environments.file_sync import FileSyncManager
+
+
+def _make_manager() -> FileSyncManager:
+    return FileSyncManager(
+        get_files_fn=lambda: {},
+        upload_fn=lambda *a, **k: None,
+        delete_fn=lambda *a, **k: None,
+    )
+
+
+def test_deferred_sigint_redelivered_via_raise_signal(tmp_path, monkeypatch):
+    mgr = _make_manager()
+
+    # Simulate a Ctrl+C arriving during the sync body: invoke the deferring
+    # handler that _sync_back_once installed, so `deferred_sigint` is populated.
+    def fake_locked(lock_path):
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+
+    monkeypatch.setattr(mgr, "_sync_back_locked", fake_locked)
+
+    raised: list[int] = []
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "tools.environments.file_sync.signal.raise_signal", raised.append
+    )
+    monkeypatch.setattr(
+        "tools.environments.file_sync.os.kill",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+
+    mgr._sync_back_once(tmp_path / "sync.lock")
+
+    # The deferred Ctrl+C is re-delivered cross-platform via raise_signal,
+    assert raised == [signal.SIGINT]
+    # and never through os.kill(getpid, SIGINT) (which hard-kills on Windows).
+    assert (os.getpid(), signal.SIGINT) not in killed
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_file_sync_upload_snapshot.py ===
+"""Upload hashes must describe the bytes received by the remote sandbox."""
+
+import hashlib
+import tarfile
+from pathlib import Path
+
+import pytest
+
+from tools.environments.file_sync import FileSyncManager
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+@pytest.mark.parametrize("edit_before_read", [False, True])
+def test_host_save_during_upload_survives_unchanged_remote(
+    tmp_path, monkeypatch, bulk, edit_before_read,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    host = tmp_path / "home" / "skills" / "example" / "SKILL.md"
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"original skill")
+    remote_path = "/root/.hermes/skills/example/SKILL.md"
+    remote = tmp_path / "remote.md"
+
+    def upload(source, destination):
+        assert destination == remote_path
+        if edit_before_read:
+            host.write_bytes(b"saved while upload is starting")
+        remote.write_bytes(Path(source).read_bytes())
+        host.write_bytes(b"new local version saved before upload acknowledgement")
+
+    def download(destination):
+        with tarfile.open(destination, "w") as archive:
+            archive.add(remote, arcname=remote_path.lstrip("/"))
+
+    manager = FileSyncManager(
+        get_files_fn=lambda: [(str(host), remote_path)],
+        upload_fn=upload,
+        bulk_upload_fn=(lambda files: [upload(*pair) for pair in files]) if bulk else None,
+        delete_fn=lambda paths: None,
+        bulk_download_fn=download,
+    )
+    manager.sync(force=True)
+    saved = host.read_bytes()
+    assert manager._pushed_hashes[remote_path] == hashlib.sha256(remote.read_bytes()).hexdigest()
+    manager.sync_back()
+    assert host.read_bytes() == saved
+
+    # A subsequent cycle still detects and uploads the newer local version.
+    manager._upload_fn = lambda source, destination: remote.write_bytes(Path(source).read_bytes())
+    manager._bulk_upload_fn = None
+    manager.sync(force=True)
+    assert remote.read_bytes() == saved
+

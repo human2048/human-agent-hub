@@ -1,0 +1,395 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_provider_persistence.py ===
+"""Tests that provider selection via `hermes model` always persists correctly.
+
+Regression tests for the bug where _save_model_choice could save config.model
+as a plain string, causing subsequent provider writes (which check
+isinstance(model, dict)) to silently fail — leaving the provider unset and
+falling back to auto-detection.
+"""
+
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+
+@pytest.fixture
+def config_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with a minimal string-format config."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    config_yaml = home / "config.yaml"
+    # Start with model as a plain string — the format that triggered the bug
+    config_yaml.write_text("model: some-old-model\n")
+    env_file = home / ".env"
+    env_file.write_text("")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Clear env vars that could interfere
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("STEPFUN_API_KEY", raising=False)
+    monkeypatch.delenv("STEPFUN_BASE_URL", raising=False)
+    return home
+
+
+class TestSaveModelChoiceAlwaysDict:
+    def test_string_model_becomes_dict(self, config_home):
+        """When config.model is a plain string, _save_model_choice must
+        convert it to a dict so provider can be set afterwards."""
+        from hermes_cli.auth import _save_model_choice
+
+        _save_model_choice("kimi-k2.5")
+
+        import yaml
+        config = yaml.safe_load((config_home / "config.yaml").read_text()) or {}
+        model = config.get("model")
+        assert isinstance(model, dict), (
+            f"Expected model to be a dict after save, got {type(model)}: {model}"
+        )
+        assert model["default"] == "kimi-k2.5"
+
+
+class TestProviderPersistsAfterModelSave:
+    def test_update_config_for_provider_uses_atomic_yaml_write(self, config_home):
+        """Provider switches should delegate config writes to atomic_yaml_write."""
+        from hermes_cli.auth import _update_config_for_provider
+
+        config_path = config_home / "config.yaml"
+        original_text = config_path.read_text(encoding="utf-8")
+
+        def _boom(path, data, **kwargs):
+            assert path == config_path
+            assert data["model"]["provider"] == "nous"
+            assert data["model"]["base_url"] == "https://inference.example.com/v1"
+            assert data["model"]["default"] == "some-old-model"
+            assert kwargs["sort_keys"] is False
+            raise OSError("simulated atomic write failure")
+
+        with patch("hermes_cli.auth.atomic_yaml_write", side_effect=_boom) as mock_write:
+            with pytest.raises(OSError, match="simulated atomic write failure"):
+                _update_config_for_provider(
+                    "nous",
+                    "https://inference.example.com/v1/",
+                    default_model="llama-3.3",
+                )
+
+        assert mock_write.call_count == 1
+        assert config_path.read_text(encoding="utf-8") == original_text
+
+    def test_api_key_provider_saved_when_model_was_string(self, config_home, monkeypatch):
+        """_model_flow_api_key_provider must persist the provider even when
+        config.model started as a plain string."""
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        pconfig = PROVIDER_REGISTRY.get("kimi-coding")
+        if not pconfig:
+            pytest.skip("kimi-coding not in PROVIDER_REGISTRY")
+
+        # Simulate: user has a Kimi API key, model was a string
+        monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-test-key")
+
+        from hermes_cli.model_setup_flows import _model_flow_api_key_provider
+        from hermes_cli.config import load_config
+
+        # Mock the model selection prompt to return "kimi-k2.5"
+        # Also mock input() for the base URL prompt and builtins.input
+        with patch("hermes_cli.auth._prompt_model_selection", return_value="kimi-k2.5"), \
+             patch("hermes_cli.auth.deactivate_provider"), \
+             patch("builtins.input", return_value=""):
+            _model_flow_api_key_provider(load_config(), "kimi-coding", "old-model")
+
+        import yaml
+        config = yaml.safe_load((config_home / "config.yaml").read_text()) or {}
+        model = config.get("model")
+        assert isinstance(model, dict), f"model should be dict, got {type(model)}"
+        assert model.get("provider") == "kimi-coding", (
+            f"provider should be 'kimi-coding', got {model.get('provider')}"
+        )
+        assert model.get("default") == "kimi-k2.5"
+
+
+
+
+
+
+
+class TestBaseUrlValidation:
+    """Reject non-URL values in the base URL prompt (e.g. shell commands).
+
+    Uses MiniMax instead of Z.AI because Z.AI now uses a curses-based
+    endpoint picker (_select_zai_endpoint) rather than the plain text
+    input() prompt. Z.AI picker behavior is covered in
+    TestZaiEndpointPicker below.
+    """
+
+
+    def test_empty_base_url_keeps_default(self, config_home, monkeypatch):
+        """Pressing Enter (empty) should not change the base URL."""
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        pconfig = PROVIDER_REGISTRY.get("minimax")
+        if not pconfig:
+            pytest.skip("minimax not in PROVIDER_REGISTRY")
+
+        monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
+        monkeypatch.delenv("MINIMAX_BASE_URL", raising=False)
+
+        from hermes_cli.model_setup_flows import _model_flow_api_key_provider
+        from hermes_cli.config import load_config, get_env_value
+
+        with patch("hermes_cli.auth._prompt_model_selection", return_value="MiniMax-M2"), \
+             patch("hermes_cli.auth.deactivate_provider"), \
+             patch("builtins.input", return_value=""):
+            _model_flow_api_key_provider(load_config(), "minimax", "old-model")
+
+        saved = get_env_value("MINIMAX_BASE_URL") or ""
+        assert saved == "", "Empty input should not save a base URL"
+
+
+class TestZaiEndpointPicker:
+    """Z.AI setup should present a curses picker for endpoint selection."""
+
+
+
+    def test_custom_proxy_rejects_invalid_url(self, config_home, monkeypatch, capsys):
+        """Custom proxy must start with http:// or https://."""
+        from hermes_cli.model_setup_flows import _model_flow_api_key_provider
+        from hermes_cli.config import load_config
+
+        monkeypatch.setenv("GLM_API_KEY", "test-key")
+        monkeypatch.delenv("GLM_BASE_URL", raising=False)
+        from hermes_cli.auth import ZAI_ENDPOINTS
+        custom_idx = len(ZAI_ENDPOINTS)
+
+        with patch("hermes_cli.main_provider_setup._prompt_provider_choice", return_value=custom_idx), \
+             patch("hermes_cli.auth._prompt_model_selection", return_value="glm-5"), \
+             patch("hermes_cli.auth.deactivate_provider"), \
+             patch("builtins.input", return_value="not-a-url"):
+            _model_flow_api_key_provider(load_config(), "zai", "old-model")
+
+        # The invalid URL should not have been saved as base_url
+        model = load_config()["model"]
+        assert model["base_url"] != "not-a-url"
+        captured = capsys.readouterr()
+        assert "Invalid URL" in captured.out
+
+
+    def test_current_endpoint_is_default_choice(self, config_home, monkeypatch):
+        """When a known endpoint is already active, it should be the default."""
+        from hermes_cli.auth import ZAI_ENDPOINTS
+        from hermes_cli.model_setup_flows import _select_zai_endpoint
+
+        coding_url = ZAI_ENDPOINTS[2][1]  # coding-global
+
+        captured = {}
+
+        def fake_choice(choices, *, default=0, title=""):
+            captured["default"] = default
+            captured["choices"] = choices
+            return default
+
+        with patch("hermes_cli.main_provider_setup._prompt_provider_choice", side_effect=fake_choice):
+            result = _select_zai_endpoint(coding_url)
+
+        # Default should point at index 2 (coding-global)
+        assert captured["default"] == 2
+        assert result == coding_url
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_search.py ===
+"""Picker search aliases for brand-less wire model ids."""
+
+from hermes_cli.curses_ui import _filter_indices
+from hermes_cli.model_search import model_search_text
+
+
+def test_model_search_text_keeps_ordinary_ids():
+    assert model_search_text("kimi-k2.6") == "kimi-k2.6"
+    assert model_search_text("glm-5.2") == "glm-5.2"
+
+
+def test_filter_indices_surfaces_k3_for_kimi_query():
+    models = ["kimi-k2.6", "kimi-k2.5", "k3", "kimi-for-coding"]
+    haystacks = [model_search_text(m) for m in models]
+    ranked = [models[i] for i in _filter_indices(haystacks, "kimi")]
+    assert "k3" in ranked
+
+
+def test_model_search_text_adds_ox_alpha_aliases():
+    assert model_search_text("x-preview-f-free") == "x-preview-f-free ox-alpha ox"
+    assert model_search_text("X-Preview-F-Free") == "X-Preview-F-Free ox-alpha ox"
+
+
+def test_filter_indices_surfaces_ox_alpha_preview_slug():
+    models = ["x-preview-f-free", "gpt-5.6-sol", "kimi-k3"]
+    haystacks = [model_search_text(m) for m in models]
+    for query in ("ox", "ox-alpha"):
+        ranked = [models[i] for i in _filter_indices(haystacks, query)]
+        assert "x-preview-f-free" in ranked, query
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_search_alias_dedup.py ===
+"""Picker dedup must fold live bare wire-ids into their curated public slug.
+
+Kimi Coding Plan live-discovers its flagship as the bare id ``k3`` while the
+curated catalog carries ``kimi-k3``. The curated-first picker merge must not
+render both as separate rows for the same model.
+"""
+
+from unittest.mock import patch
+
+from hermes_cli.model_search import model_alias_canonical
+from hermes_cli.models import provider_model_ids
+
+
+class TestModelAliasCanonical:
+    def test_bare_k3_folds_to_public_slug(self):
+        assert model_alias_canonical("k3") == "kimi-k3"
+        assert model_alias_canonical("K3") == "kimi-k3"
+
+
+class TestPickerMergeAliasDedup:
+    def test_live_bare_k3_not_duplicated_against_curated_kimi_k3(self):
+        """Coding Plan key: live returns bare ``k3``; curated has ``kimi-k3``.
+        Exactly one k3-family row must survive (the curated slug leads)."""
+        with (
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                return_value={
+                    "api_key": "sk-kimi-x",
+                    "base_url": "https://api.kimi.com/coding",
+                },
+            ),
+            patch(
+                "providers.base.ProviderProfile.fetch_models",
+                return_value=["k3", "kimi-for-coding"],
+            ),
+        ):
+            out = provider_model_ids("kimi-coding")
+
+        k3_rows = [m for m in out if model_alias_canonical(m) == "kimi-k3"]
+        assert k3_rows == ["kimi-k3"], out
+        # Live-only entries with no curated twin still surface.
+        assert "kimi-for-coding" in out
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_selection_guards.py ===
+"""Tests for the unified model-selection guard registry."""
+
+from unittest.mock import patch
+
+from hermes_cli.model_selection_guards import (
+    SelectionWarning,
+    combined_message,
+    combined_selection_warning,
+    selection_warnings,
+)
+
+
+def test_no_guard_fires_on_ordinary_model():
+    # No pricing data (no provider), no data-policy rule match.
+    assert selection_warnings("some/ordinary-model") == []
+    assert combined_selection_warning("some/ordinary-model") is None
+
+
+def test_data_policy_guard_fires_through_registry():
+    warnings = selection_warnings("muse-spark-1.2-contributor", provider="custom")
+    kinds = [w.kind for w in warnings]
+    assert "data_policy" in kinds
+    w = next(w for w in warnings if w.kind == "data_policy")
+    assert "train" in w.message.lower()
+    assert w.title == "Data-Training Tier Warning"
+
+
+def test_include_kinds_filters_guards():
+    warnings = selection_warnings(
+        "muse-spark-1.2-contributor",
+        provider="custom",
+        include_kinds=["cost"],
+    )
+    assert all(w.kind == "cost" for w in warnings)
+    assert not any(w.kind == "data_policy" for w in warnings)
+
+
+def test_combined_selection_warning_single():
+    w = combined_selection_warning("muse-spark-1.2-contributor")
+    assert w is not None
+    assert w.kind == "data_policy"
+
+
+def test_combined_selection_warning_merges_multiple():
+    cost = SelectionWarning(
+        kind="cost",
+        title="Expensive Model Warning",
+        model="m",
+        provider="p",
+        message="COST BLOCK",
+    )
+    policy = SelectionWarning(
+        kind="data_policy",
+        title="Data-Training Tier Warning",
+        model="m",
+        provider="p",
+        message="POLICY BLOCK",
+    )
+    with patch(
+        "hermes_cli.model_selection_guards._GUARDS",
+        (lambda *a: cost, lambda *a: policy),
+    ):
+        merged = combined_selection_warning("m")
+    assert merged is not None
+    assert merged.kind == "multiple"
+    assert "COST BLOCK" in merged.message
+    assert "POLICY BLOCK" in merged.message
+
+
+def test_misbehaving_guard_never_breaks_selection():
+    def _boom(*args):
+        raise RuntimeError("bad guard")
+
+    with patch(
+        "hermes_cli.model_selection_guards._GUARDS",
+        (_boom,),
+    ):
+        assert selection_warnings("anything") == []
+
+
+def test_combined_message_joins_blocks():
+    a = SelectionWarning("cost", "t1", "m", "p", "AAA")
+    b = SelectionWarning("data_policy", "t2", "m", "p", "BBB")
+    assert combined_message([a, b]) == "AAA\n\nBBB"
+
+
+def test_cost_guard_still_fires_through_registry():
+    # The registry must preserve the existing cost-guard behavior; feed it
+    # explicit model_info so no network lookup is needed.
+    from agent.models_dev import ModelInfo
+
+    info = ModelInfo(
+        id="pricey/model",
+        name="pricey/model",
+        family="",
+        provider_id="anthropic",
+        cost_input=50.0,
+        cost_output=200.0,
+    )
+    warnings = selection_warnings(
+        "pricey/model", provider="anthropic", model_info=info
+    )
+    assert any(w.kind == "cost" for w in warnings)
+

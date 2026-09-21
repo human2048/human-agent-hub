@@ -1,0 +1,196 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\manim-video\references\visual-design.md ===
+# Visual Design Principles
+
+## 12 Core Principles
+
+1. **Geometry Before Algebra** — Show the shape first, the equation second.
+2. **Opacity Layering** — PRIMARY=1.0, CONTEXT=0.4, GRID=0.15. Direct attention through brightness.
+3. **One New Idea Per Scene** — Each scene introduces exactly one concept.
+4. **Spatial Consistency** — Same concept occupies the same screen region throughout.
+5. **Color = Meaning** — Assign colors to concepts, not mobjects. If velocity is blue, it stays blue.
+6. **Progressive Disclosure** — Show simplest version first, add complexity incrementally.
+7. **Transform, Don't Replace** — Use Transform/ReplacementTransform to show connections.
+8. **Breathing Room** — `self.wait(1.5)` minimum after showing something new.
+9. **Visual Weight Balance** — Don't cluster everything on one side.
+10. **Consistent Motion Vocabulary** — Pick a small set of animation types and reuse them.
+11. **Dark Background, Light Content** — #1C1C1C to #2D2B55 backgrounds maximize contrast.
+12. **Intentional Empty Space** — Leave at least 15% of the frame empty.
+
+## Layout Templates
+
+### FULL_CENTER
+One main element centered, title above, note below.
+Best for: single equations, single diagrams, title cards.
+
+### LEFT_RIGHT
+Two elements side by side at x=-3.5 and x=3.5.
+Best for: equation + visual, before/after, comparison.
+
+### TOP_BOTTOM
+Main element at y=1.5, supporting content at y=-1.5.
+Best for: concept + examples, theorem + cases.
+
+### GRID
+Multiple elements via `arrange_in_grid()`.
+Best for: comparison matrices, multi-step processes.
+
+### PROGRESSIVE
+Elements appear one at a time, arranged DOWN with aligned_edge=LEFT.
+Best for: algorithms, proofs, step-by-step processes.
+
+### ANNOTATED_DIAGRAM
+Central diagram with floating labels connected by arrows.
+Best for: architecture diagrams, annotated figures.
+
+## Color Palettes
+
+### Classic 3B1B
+```python
+BG="#1C1C1C"; PRIMARY=BLUE; SECONDARY=GREEN; ACCENT=YELLOW; HIGHLIGHT=RED
+```
+
+### Warm Academic
+```python
+BG="#2D2B55"; PRIMARY="#FF6B6B"; SECONDARY="#FFD93D"; ACCENT="#6BCB77"
+```
+
+### Neon Tech
+```python
+BG="#0A0A0A"; PRIMARY="#00F5FF"; SECONDARY="#FF00FF"; ACCENT="#39FF14"
+```
+
+## Font Selection
+
+**Use monospace fonts for all text.** Manim's Pango text renderer produces broken kerning with proportional fonts (Helvetica, Inter, SF Pro, Arial) at all sizes and resolutions. Characters overlap and spacing is inconsistent. This is a fundamental Pango limitation, not a Manim bug.
+
+Monospace fonts have fixed character widths — zero kerning issues by design.
+
+### Recommended Fonts
+
+| Use case | Font | Fallback |
+|----------|------|----------|
+| **All text (default)** | `"Menlo"` | `"Courier New"`, `"DejaVu Sans Mono"` |
+| Code, labels | `"JetBrains Mono"`, `"SF Mono"` | `"Menlo"` |
+| Math | Use `MathTex` (renders via LaTeX, not Pango) | — |
+
+```python
+MONO = "Menlo"  # define once at top of file
+
+title = Text("Fourier Series", font_size=48, color=PRIMARY, weight=BOLD, font=MONO)
+label = Text("n=1: (4/pi) sin(x)", font_size=20, color=BLUE, font=MONO)
+note = Text("Convergence at discontinuities", font_size=18, color=DIM, font=MONO)
+
+# Math — always use MathTex, not Text
+equation = MathTex(r"\nabla L = \frac{\partial L}{\partial w}")
+```
+
+### When Proportional Fonts Are Acceptable
+
+Large title text (font_size >= 48) with short strings (1-3 words) can use proportional fonts without visible kerning issues. For anything else — labels, descriptions, multi-word text, small sizes — use monospace.
+
+### Font Availability
+
+- **macOS**: Menlo (pre-installed), SF Mono
+- **Linux**: DejaVu Sans Mono (pre-installed), Liberation Mono
+- **Cross-platform**: JetBrains Mono (install from jetbrains.com)
+
+`"Menlo"` is the safest default — pre-installed on macOS, and Linux systems fall back to DejaVu Sans Mono.
+
+### Fine-Grained Text Control
+
+`Text()` does not support `letter_spacing` or kerning parameters. For fine control, use `MarkupText` with Pango attributes:
+
+```python
+# Letter spacing (Pango units: 1/1024 of a point)
+MarkupText('<span letter_spacing="6000">HERMES</span>', font_size=18, font="Menlo")
+
+# Bold specific words
+MarkupText('This is <b>important</b>', font_size=24, font="Menlo")
+
+# Color specific words
+MarkupText('Red <span foreground="#FF6B6B">warning</span>', font_size=24, font="Menlo")
+```
+
+### Minimum Font Size
+
+`font_size=18` is the minimum for readable text at any resolution. Below 18, characters become blurry at `-ql` and barely readable even at `-qh`.
+
+## Visual Hierarchy Checklist
+
+For every frame:
+1. What is the ONE thing to look at? (brightest/largest)
+2. What is context? (dimmed to 0.3-0.4)
+3. What is structural? (dimmed to 0.15)
+4. Enough empty space? (>15%)
+5. All text readable at phone size?
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\creative\p5js\README.md ===
+# p5.js Skill
+
+Production pipeline for interactive and generative visual art using [p5.js](https://p5js.org/).
+
+## What it does
+
+Creates browser-based visual art from text prompts. The agent handles the full pipeline: creative concept, code generation, preview, export, and iterative refinement. Output is a single self-contained HTML file that runs in any browser — no build step, no server, no dependencies beyond a CDN script tag.
+
+The output is real interactive art. Not tutorial exercises. Generative systems, particle physics, noise fields, shader effects, kinetic typography — composed with intentional color palettes, layered composition, and visual hierarchy.
+
+## Modes
+
+| Mode | Input | Output |
+|------|-------|--------|
+| **Generative art** | Seed / parameters | Procedural visual composition |
+| **Data visualization** | Dataset / API | Interactive charts, custom data displays |
+| **Interactive experience** | None (user drives) | Mouse/keyboard/touch-driven sketch |
+| **Animation / motion graphics** | Timeline / storyboard | Timed sequences, kinetic typography |
+| **3D scene** | Concept description | WebGL geometry, lighting, shaders |
+| **Image processing** | Image file(s) | Pixel manipulation, filters, pointillism |
+| **Audio-reactive** | Audio file / mic | Sound-driven generative visuals |
+
+## Export Formats
+
+| Format | Method |
+|--------|--------|
+| **HTML** | Self-contained file, opens in any browser |
+| **PNG** | `saveCanvas()` — press 's' to capture |
+| **GIF** | `saveGif()` — press 'g' to capture |
+| **MP4** | Frame sequence + ffmpeg via `scripts/render.sh` |
+| **SVG** | p5.js-svg renderer for vector output |
+
+## Prerequisites
+
+A modern browser. That's it for basic use.
+
+For headless export: Node.js, Puppeteer, ffmpeg.
+
+```bash
+bash skills/creative/p5js/scripts/setup.sh
+```
+
+## File Structure
+
+```
+├── SKILL.md                      # Modes, workflow, creative direction, critical notes
+├── README.md                     # This file
+├── references/
+│   ├── core-api.md              # Canvas, draw loop, transforms, offscreen buffers, math
+│   ├── shapes-and-geometry.md   # Primitives, vertices, curves, vectors, SDFs, clipping
+│   ├── visual-effects.md        # Noise, flow fields, particles, pixels, textures, feedback
+│   ├── animation.md             # Easing, springs, state machines, timelines, transitions
+│   ├── typography.md            # Fonts, textToPoints, kinetic text, text masks
+│   ├── color-systems.md         # HSB/RGB, palettes, gradients, blend modes, curated colors
+│   ├── webgl-and-3d.md          # 3D primitives, camera, lighting, shaders, framebuffers
+│   ├── interaction.md           # Mouse, keyboard, touch, DOM, audio, scroll
+│   ├── export-pipeline.md       # PNG, GIF, MP4, SVG, headless, tiling, batch export
+│   └── troubleshooting.md       # Performance, common mistakes, browser issues, debugging
+└── scripts/
+    ├── setup.sh                 # Dependency verification
+    ├── serve.sh                 # Local dev server (for loading local assets)
+    ├── render.sh                # Headless render pipeline (HTML → frames → MP4)
+    └── export-frames.js         # Puppeteer frame capture (Node.js)
+```
+

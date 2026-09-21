@@ -1,0 +1,340 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_picker_expensive_confirm.py ===
+from types import SimpleNamespace
+
+from hermes_cli.model_switch import ModelSwitchResult
+
+
+def _bound(fn, instance):
+    return fn.__get__(instance, type(instance))
+
+
+def test_prompt_toolkit_model_picker_defers_confirmation_off_key_handler(monkeypatch):
+    import cli as cli_mod
+
+    result = ModelSwitchResult(
+        success=True,
+        new_model="openai/gpt-5.5-pro",
+        target_provider="nous",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: result,
+    )
+
+    captured = {}
+
+    class _Thread:
+        def __init__(self, *, target, args, daemon):
+            captured["target"] = target
+            captured["args"] = args
+            captured["daemon"] = daemon
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(cli_mod.threading, "Thread", _Thread)
+
+    self_ = SimpleNamespace(
+        _app=object(),
+        _model_picker_state={
+            "stage": "model",
+            "provider_data": {"slug": "nous"},
+            "model_list": ["openai/gpt-5.5-pro"],
+            "selected": 0,
+            "user_provs": None,
+            "custom_provs": None,
+        },
+        provider="nous",
+        model="openai/gpt-5.5",
+        base_url="",
+        api_key="",
+        _restore_modal_input_snapshot=lambda: None,
+        _invalidate=lambda **_kwargs: None,
+    )
+    self_._close_model_picker = _bound(cli_mod.HermesCLI._close_model_picker, self_)
+    self_._commit_picker_result = _bound(cli_mod.HermesCLI._commit_picker_result, self_)
+    self_._confirm_and_apply_model_switch_result = (
+        lambda *_args: captured.setdefault("ran_inline", True)
+    )
+
+    # The key handler now resolves persistence via resolve_persist_behavior,
+    # which defaults to True (persist-by-default). Simulate that call.
+    _bound(cli_mod.HermesCLI._handle_model_picker_selection, self_)(persist_global=True)
+
+    # Picking a model opens the reasoning-effort step (no commit yet); "Keep current effort"
+    # (the last effort row) commits with the historical arity.
+    from hermes_cli.cli_model_switch_mixin import _picker_reasoning_rows
+    assert self_._model_picker_state["stage"] == "reasoning"
+    assert "started" not in captured
+    self_._model_picker_state["selected"] = len(_picker_reasoning_rows()) - 1
+    _bound(cli_mod.HermesCLI._handle_model_picker_selection, self_)(persist_global=True)
+
+    assert self_._model_picker_state is None
+    assert captured["started"] is True
+    assert captured["daemon"] is True
+    # Third arg is the fresh picker custom_providers snapshot (None here).
+    assert captured["args"] == (result, True, None)
+    assert "ran_inline" not in captured
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_picker_filter.py ===
+"""Tests for the /model picker fuzzy filter (C-01).
+
+The filter narrows a provider's concrete model list as the user types, but
+selection must still resolve to exactly ONE real model — never an ambiguous
+or fuzzy resolution (the "claude → claude-sonnet-3" footgun). These pin the
+index-preserving contract of ``_filter_model_picker_entries``.
+"""
+
+from cli import HermesCLI
+
+
+MODELS = [
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-haiku-4.5",
+    "openai/gpt-5.5",
+    "x-ai/grok-4.6",
+    "deepseek/deepseek-v4-flash",
+]
+
+
+def test_empty_query_returns_all_with_original_indices():
+    pairs = HermesCLI._filter_model_picker_entries(MODELS, "")
+    assert pairs == list(enumerate(MODELS))
+
+
+def test_filter_narrows_and_preserves_original_index():
+    pairs = HermesCLI._filter_model_picker_entries(MODELS, "grok")
+    # Only the grok row matches, and it carries its ORIGINAL index (4) so the
+    # selection handler resolves the exact concrete model.
+    assert pairs == [(4, "x-ai/grok-4.6")]
+    idx, label = pairs[0]
+    assert MODELS[idx] == label  # index maps back to the real entry
+
+
+def test_subsequence_match_case_insensitive():
+    # "cs46" is a subsequence of "anthropic/claude-sonnet-4.6"
+    pairs = HermesCLI._filter_model_picker_entries(MODELS, "CS46")
+    assert ("anthropic/claude-sonnet-4.6") in [e for _i, e in pairs]
+
+
+def test_no_match_returns_empty():
+    assert HermesCLI._filter_model_picker_entries(MODELS, "zzzznope") == []
+
+
+def test_filter_does_not_reorder_or_pick_a_default():
+    # Typing "claude" narrows to the three claude rows in ORIGINAL order — it
+    # never silently resolves to one (the anti-ambiguity guarantee). The user
+    # still explicitly selects among the concrete matches.
+    pairs = HermesCLI._filter_model_picker_entries(MODELS, "claude")
+    labels = [e for _i, e in pairs]
+    assert labels == [
+        "anthropic/claude-opus-4.8",
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-haiku-4.5",
+    ]
+    # indices are the originals, in order
+    assert [i for i, _e in pairs] == [0, 1, 2]
+
+
+def test_whitespace_query_is_treated_as_empty():
+    assert HermesCLI._filter_model_picker_entries(MODELS, "   ") == list(enumerate(MODELS))
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_picker_secret_scope.py ===
+"""The /model picker must read provider keys through the per-profile scope.
+
+854007d1c ("route remaining main-agent fallback key reads through
+secret_scope") swept the fallback/auxiliary key reads. ``key_env`` lookups in
+``list_authenticated_providers`` — which the gateway's ``/model`` handler calls
+directly — were not covered, so under ``multiplex_profiles`` one profile's
+picker resolved another profile's key from the process environment.
+"""
+
+import os
+
+from agent import secret_scope
+from hermes_cli.model_switch import _scoped_key_env
+
+
+class TestPickerKeyEnvScope:
+    def test_unscoped_read_matches_the_process_environment(self, monkeypatch):
+        """Single-profile deployments must behave exactly as before."""
+        monkeypatch.setenv("ACME_KEY", "from-environment")
+
+        assert _scoped_key_env("ACME_KEY") == "from-environment"
+
+    def test_installed_scope_wins_over_the_process_environment(self, monkeypatch):
+        """The multiplexed gateway installs a scope per turn; the picker must
+        read that profile's credential, not whatever the process inherited."""
+        monkeypatch.setenv("ACME_KEY", "other-profile-key")
+        token = secret_scope.set_secret_scope({"ACME_KEY": "this-profile-key"})
+        try:
+            assert _scoped_key_env("ACME_KEY") == "this-profile-key"
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+        assert _scoped_key_env("ACME_KEY") == "other-profile-key"
+
+    def test_absent_key_and_empty_name_resolve_empty(self, monkeypatch):
+        monkeypatch.delenv("ACME_KEY", raising=False)
+
+        assert _scoped_key_env("ACME_KEY") == ""
+        assert _scoped_key_env("") == ""
+
+    def test_value_is_stripped(self, monkeypatch):
+        monkeypatch.setenv("ACME_KEY", "  padded  ")
+
+        assert _scoped_key_env("ACME_KEY") == "padded"
+
+
+class TestSwitchModelKeyEnvScope:
+    """switch_model's user-provider credential reads (the ${VAR} api_key
+    expansion and the key_env fallback) must go through the same scope —
+    these feed resolve_runtime_provider as explicit_api_key, so a raw
+    environ read here leaks another profile's key into the actual switch,
+    not just the picker listing."""
+
+    def _run_switch(self, monkeypatch, user_cfg):
+        import hermes_cli.model_switch as ms
+
+        captured = {}
+
+        def _fake_runtime(requested, explicit_api_key=None,
+                          explicit_base_url=None, target_model=None, **kw):
+            captured["key"] = explicit_api_key
+            return {"api_key": explicit_api_key or "", "base_url": explicit_base_url, "api_mode": ""}
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", _fake_runtime
+        )
+        monkeypatch.setattr(ms, "resolve_alias", lambda *a, **k: None)
+        result = ms.switch_model(
+            "some-model",
+            current_provider="openrouter",
+            current_model="x",
+            explicit_provider="acme",
+            user_providers={"acme": user_cfg},
+        )
+        return captured, result
+
+    def test_key_env_read_honors_installed_scope(self, monkeypatch):
+        monkeypatch.setenv("ACME_KEY", "other-profile-key")
+        token = secret_scope.set_secret_scope({"ACME_KEY": "this-profile-key"})
+        try:
+            captured, _ = self._run_switch(
+                monkeypatch,
+                {"base_url": "https://api.acme.test/v1", "key_env": "ACME_KEY"},
+            )
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert captured["key"] == "this-profile-key"
+
+    def test_dollar_var_expansion_honors_installed_scope(self, monkeypatch):
+        monkeypatch.setenv("ACME_KEY", "other-profile-key")
+        token = secret_scope.set_secret_scope({"ACME_KEY": "this-profile-key"})
+        try:
+            captured, _ = self._run_switch(
+                monkeypatch,
+                {"base_url": "https://api.acme.test/v1", "api_key": "${ACME_KEY}"},
+            )
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert captured["key"] == "this-profile-key"
+
+
+class TestPickerKeyEnvDotenv:
+    """``key_env`` must resolve through the chat path's chain (``get_env_prefer_dotenv``): a key
+    that lives only in ``$HERMES_HOME/.env`` authenticates the ``/model`` verification probe, and
+    a scoped multiplex read never borrows the ``.env``/process value of another profile."""
+
+    def _dotenv(self, monkeypatch, tmp_path, value):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text(f"ACME_RELAY_KEY={value}\n", encoding="utf-8")
+        from hermes_cli.config import invalidate_env_cache
+        invalidate_env_cache()
+
+    def test_switch_probe_uses_dotenv_key_over_stale_process_env(self, monkeypatch, tmp_path):
+        self._dotenv(monkeypatch, tmp_path, "fresh-dotenv")
+        monkeypatch.setenv("ACME_RELAY_KEY", "stale-process")
+        import hermes_cli.model_switch as ms
+        import hermes_cli.models_validate as mv
+
+        captured = {}
+
+        def _fake_runtime(requested, explicit_api_key=None, explicit_base_url=None, target_model=None, **kw):
+            return {"api_key": explicit_api_key or "", "base_url": explicit_base_url, "api_mode": ""}
+
+        def _fake_validate(model, provider, api_key=None, base_url=None, api_mode=None, headers=None, **kw):
+            captured["api_key"] = api_key
+            return {"accepted": True, "persist": True, "recognized": True, "message": ""}
+
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _fake_runtime)
+        monkeypatch.setattr(ms, "resolve_alias", lambda *a, **k: None)
+        monkeypatch.setattr(mv, "validate_requested_model", _fake_validate)
+
+        ms.switch_model(
+            "some-model", current_provider="openrouter", current_model="x", explicit_provider="acme",
+            user_providers={"acme": {"base_url": "https://api.acme.test/v1", "key_env": "ACME_RELAY_KEY"}},
+        )
+
+        assert captured["api_key"] == "fresh-dotenv"
+
+    def test_multiplex_scoped_miss_never_borrows_dotenv_or_process_env(self, monkeypatch, tmp_path):
+        self._dotenv(monkeypatch, tmp_path, "default-profile-key")
+        monkeypatch.setenv("ACME_RELAY_KEY", "other-profile-key")
+        secret_scope.set_multiplex_active(True)
+        try:
+            assert _scoped_key_env("ACME_RELAY_KEY") == ""  # no scope installed: fail closed
+            token = secret_scope.set_secret_scope({"OTHER": "x"})
+            try:
+                assert _scoped_key_env("ACME_RELAY_KEY") == ""  # scoped miss: no fallthrough
+            finally:
+                secret_scope.reset_secret_scope(token)
+        finally:
+            secret_scope.set_multiplex_active(False)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_picker_viewport.py ===
+"""Tests for the prompt_toolkit /model picker scroll viewport.
+
+Regression for: when a provider exposes many models (e.g. Ollama Cloud's
+36+), the picker rendered every choice into a Window with no max height,
+clipping the bottom border and any items past the terminal's last row.
+The viewport helper now caps visible items and slides the offset to keep
+the cursor on screen.
+"""
+from cli import HermesCLI
+
+
+_compute = HermesCLI._compute_model_picker_viewport
+
+
+class TestPickerViewport:
+    def test_short_list_no_scroll(self):
+        offset, visible = _compute(selected=0, scroll_offset=0, n=5, term_rows=30)
+        assert offset == 0
+        assert visible == 5
+
+
+    def test_offset_recovers_after_stage_switch(self):
+        # When the user backs out of the model stage and re-enters with
+        # selected=0, a stale offset from the previous stage must collapse.
+        offset, visible = _compute(selected=0, scroll_offset=25, n=36, term_rows=30)
+        assert offset == 0
+        assert 0 in range(offset, offset + visible)
+
+    def test_full_navigation_keeps_cursor_visible(self):
+        offset = 0
+        for cursor in list(range(36)) + list(range(35, -1, -1)):
+            offset, visible = _compute(cursor, offset, n=36, term_rows=30)
+            assert cursor in range(offset, offset + visible), (
+                f"cursor={cursor} out of view: offset={offset} visible={visible}"
+            )
+

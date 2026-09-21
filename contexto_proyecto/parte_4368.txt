@@ -1,0 +1,313 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_openai_config.py ===
+"""tts.openai.api_key / base_url from config.yaml drive the OpenAI audio client.
+
+Regression coverage for issue #26175: the resolver was env-only
+(VOICE_TOOLS_OPENAI_KEY / OPENAI_API_KEY) and always returned the default
+OpenAI base URL, ignoring the tts.openai config block. Resolution order now
+mirrors the STT resolver: config -> env (still honoring config base_url) ->
+managed gateway.
+"""
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from tools import tts_tool, tts_tool_openai
+
+
+class TestResolveOpenaiAudioClientConfig:
+    def test_prefers_tts_config_credentials_and_base_url(self):
+        config = {
+            "provider": "openai",
+            "openai": {
+                "api_key": "cfg-key",
+                "base_url": "http://localhost:4003/v1",
+            },
+        }
+
+        with patch.object(tts_tool, "_load_tts_config", return_value=config), \
+             patch.object(tts_tool_openai, "read_selection", return_value="openai"), \
+             patch.object(tts_tool_openai, "resolve_openai_audio_api_key", return_value="env-key"), \
+             patch.object(tts_tool_openai, "resolve_managed_tool_gateway", return_value=None):
+            assert tts_tool_openai._resolve_openai_audio_client_config() == (
+                "cfg-key",
+                "http://localhost:4003/v1",
+                False,
+            )
+
+    def test_config_without_base_url_falls_back_to_default_openai_base(self):
+        config = {"openai": {"api_key": "cfg-key"}}
+
+        with patch.object(tts_tool, "_load_tts_config", return_value=config), \
+             patch.object(tts_tool_openai, "read_selection", return_value=None):
+            assert tts_tool_openai._resolve_openai_audio_client_config() == (
+                "cfg-key",
+                tts_tool_openai.DEFAULT_OPENAI_BASE_URL,
+                False,
+            )
+
+
+    def test_nous_selection_overrides_config_credentials(self):
+        """A stored 'nous' selection (or legacy use_gateway: true) routes
+        managed even when direct credentials are present."""
+        config = {"openai": {"api_key": "cfg-key", "base_url": "http://localhost:4003/v1"}}
+        managed = SimpleNamespace(
+            nous_user_token="managed-token",
+            gateway_origin="https://openai-audio-gateway.nousresearch.com",
+        )
+
+        with patch.object(tts_tool, "_load_tts_config", return_value=config), \
+             patch.object(tts_tool_openai, "read_selection", return_value="nous"), \
+             patch.object(tts_tool_openai, "resolve_openai_audio_api_key", return_value="env-key"), \
+             patch.object(tts_tool_openai, "resolve_managed_tool_gateway", return_value=managed):
+            assert tts_tool_openai._resolve_openai_audio_client_config() == (
+                "managed-token",
+                "https://openai-audio-gateway.nousresearch.com/v1",
+                True,
+            )
+
+    def test_nous_selection_unentitled_raises_selection_error(self):
+        """Selected managed route + unavailable gateway = honest error naming
+        the selection, never a silent fall back to direct credentials."""
+        config = {"openai": {"api_key": "cfg-key"}}
+        with patch.object(tts_tool, "_load_tts_config", return_value=config), \
+             patch.object(tts_tool_openai, "read_selection", return_value="nous"), \
+             patch.object(tts_tool_openai, "resolve_openai_audio_api_key", return_value="env-key"), \
+             patch.object(tts_tool_openai, "resolve_managed_tool_gateway", return_value=None):
+            with pytest.raises(ValueError) as exc:
+                tts_tool_openai._resolve_openai_audio_client_config()
+        assert "nous" in str(exc.value)
+        assert "hermes tools" in str(exc.value)
+
+    def test_vendor_selection_missing_key_raises_selection_error(self):
+        """A stored vendor selection with no credentials errors by name —
+        NO managed gateway call is attempted."""
+        with patch.object(tts_tool, "_load_tts_config", return_value={"provider": "openai"}), \
+             patch.object(tts_tool_openai, "read_selection", return_value="openai"), \
+             patch.object(tts_tool_openai, "resolve_openai_audio_api_key", return_value=""), \
+             patch.object(tts_tool_openai, "resolve_managed_tool_gateway") as gateway_mock:
+            with pytest.raises(ValueError) as exc:
+                tts_tool_openai._resolve_openai_audio_client_config()
+        gateway_mock.assert_not_called()
+        assert "openai" in str(exc.value)
+        assert "hermes tools" in str(exc.value)
+
+    def test_missing_config_and_env_raises_updated_error(self):
+        with patch.object(tts_tool, "_load_tts_config", return_value={}), \
+             patch.object(tts_tool_openai, "read_selection", return_value=None), \
+             patch.object(tts_tool_openai, "resolve_openai_audio_api_key", return_value=""), \
+             patch.object(tts_tool_openai, "resolve_managed_tool_gateway", return_value=None), \
+             patch.object(tts_tool_openai, "managed_nous_tools_enabled", return_value=False):
+            with pytest.raises(ValueError) as exc:
+                tts_tool_openai._resolve_openai_audio_client_config()
+
+        assert (
+            str(exc.value)
+            == "Neither tts.openai.api_key in config nor VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
+        )
+
+    def test_config_api_key_counts_as_available_backend(self):
+        config = {"openai": {"api_key": "cfg-key"}}
+        with patch.object(tts_tool, "_load_tts_config", return_value=config):
+            assert tts_tool_openai._has_openai_audio_backend() is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_opus_routing.py ===
+import json
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+from gateway.session_context import _UNSET, _VAR_MAP
+from tools import tts_tool
+
+
+def _reset_session_context() -> None:
+    for var in _VAR_MAP.values():
+        var.set(_UNSET)
+
+
+@pytest.fixture(autouse=True)
+def _clean_session_platform(monkeypatch):
+    _reset_session_context()
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    yield
+    _reset_session_context()
+
+
+async def _write_edge_output(_text: str, output_path: str, _tts_config: dict) -> str:
+    Path(output_path).write_bytes(b"mp3")
+    return output_path
+
+
+def test_edge_cli_preserves_native_mp3(tmp_path, monkeypatch):
+    out = tmp_path / "speech.mp3"
+    convert = Mock()
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts", _write_edge_output)
+    monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
+
+    result = json.loads(tts_tool.text_to_speech_tool("hello", output_path=str(out)))
+
+    assert result["success"] is True
+    assert result["file_path"] == str(out)
+    assert result["voice_compatible"] is False
+    assert result["media_tag"] == f"MEDIA:{out}"
+    convert.assert_not_called()
+
+
+def test_edge_telegram_converts_to_opus_voice(tmp_path, monkeypatch):
+    out = tmp_path / "speech.mp3"
+    opus = tmp_path / "speech.ogg"
+
+    def fake_convert(path: str) -> str:
+        assert path == str(out)
+        opus.write_bytes(b"ogg")
+        return str(opus)
+
+    convert = Mock(side_effect=fake_convert)
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts", _write_edge_output)
+    monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
+
+    result = json.loads(tts_tool.text_to_speech_tool("hello", output_path=str(out)))
+
+    assert result["success"] is True
+    assert result["file_path"] == str(opus)
+    assert result["voice_compatible"] is True
+    assert result["media_tag"] == f"[[audio_as_voice]]\nMEDIA:{opus}"
+    convert.assert_called_once_with(str(out))
+
+
+def test_edge_matrix_converts_to_opus_voice(tmp_path, monkeypatch):
+    """Matrix voice bubbles need Ogg/Opus too (MSC3245, issue #14841)."""
+    out = tmp_path / "speech.mp3"
+    opus = tmp_path / "speech.ogg"
+
+    def fake_convert(path: str) -> str:
+        assert path == str(out)
+        opus.write_bytes(b"ogg")
+        return str(opus)
+
+    convert = Mock(side_effect=fake_convert)
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "matrix")
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts", _write_edge_output)
+    monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
+
+    result = json.loads(tts_tool.text_to_speech_tool("hello", output_path=str(out)))
+
+    assert result["success"] is True
+    assert result["file_path"] == str(opus)
+    assert result["voice_compatible"] is True
+    assert result["media_tag"] == f"[[audio_as_voice]]\nMEDIA:{opus}"
+    convert.assert_called_once_with(str(out))
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_output_dir_profile_scope.py ===
+"""Regression tests for profile-scoped TTS default output dir (#98749).
+
+``DEFAULT_OUTPUT_DIR`` was resolved once at import time, so long-lived
+multi-profile runtimes (dashboard console, TUI/Desktop backend, cron, kanban
+workers) kept writing synthesized audio into the launch profile's
+``cache/audio`` even while the request was scoped to a different profile via
+``HERMES_HOME`` or ``set_hermes_home_override()``. The call-time accessor
+``_default_output_dir()`` re-resolves from the live profile-scoped home;
+these pins keep the synthesis paths from re-freezing the launch profile.
+"""
+
+import importlib
+from pathlib import Path
+
+
+def _reload_tts_tool(import_home: Path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(import_home))
+    import tools.tts_tool as tts_tool
+
+    return importlib.reload(tts_tool)
+
+
+def test_default_output_dir_follows_contextvar_profile_override(tmp_path, monkeypatch):
+    """The web server scopes profiles via set_hermes_home_override() rather
+    than mutating the process env; the accessor must follow that override."""
+    default_home = tmp_path / "default-home"
+    profile_home = tmp_path / "profiles" / "ramona"
+    default_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+
+    tts_tool = _reload_tts_tool(default_home, monkeypatch)
+
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        assert tts_tool._default_output_dir() == str(
+            profile_home / "cache" / "audio"
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    # Outside the override scope the launch home applies again.
+    assert tts_tool._default_output_dir() == str(default_home / "cache" / "audio")
+
+
+def test_explicit_default_output_dir_monkeypatch_still_wins(tmp_path, monkeypatch):
+    """Existing tests and external patchers can still override
+    tools.tts_tool.DEFAULT_OUTPUT_DIR directly."""
+    default_home = tmp_path / "default-home"
+    default_home.mkdir(parents=True)
+
+    tts_tool = _reload_tts_tool(default_home, monkeypatch)
+
+    monkeypatch.setattr(tts_tool, "DEFAULT_OUTPUT_DIR", "/custom/audio")
+
+    assert tts_tool._default_output_dir() == "/custom/audio"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_output_timestamp.py ===
+"""Regression test for salvaged PR #43911 — microsecond TTS output timestamps.
+
+Default output paths used second-resolution ``%Y%m%d_%H%M%S`` timestamps, so
+two text_to_speech_tool calls landing in the same wall-clock second produced
+the same filename and the second synthesis overwrote the first. The format
+now appends ``%f`` (microseconds).
+"""
+
+import datetime
+import re
+
+
+class TestDefaultOutputTimestampResolution:
+    def test_default_output_path_uses_microsecond_timestamp(self):
+        """The source must build default filenames with a %f component."""
+        import inspect
+
+        from tools import tts_tool
+
+        src = inspect.getsource(tts_tool._resolve_output_base)
+        assert "%Y%m%d_%H%M%S_%f" in src, (
+            "default TTS output timestamp lost its microsecond component — "
+            "concurrent calls in the same second would collide again (#43911)"
+        )
+
+
+    def test_timestamp_component_is_filename_safe(self):
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        assert re.fullmatch(r"\d{8}_\d{6}_\d{6}", stamp)
+

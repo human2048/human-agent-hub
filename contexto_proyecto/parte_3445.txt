@@ -1,0 +1,369 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_plugins_hub_perf_guard.py ===
+from __future__ import annotations
+
+import asyncio
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+from hermes_cli import web_server
+import hermes_cli.config as _cfg_mod
+import hermes_cli.web_routers.dashboard_ui as _rt_dashboard_ui
+import hermes_cli.web_server_dashboard as _web_server_dashboard
+import hermes_cli.web_server_memory as _web_server_memory
+from hermes_cli import plugins_cmd
+from hermes_cli import plugin_catalog
+from hermes_cli import plugins_cmd_catalog
+from tools import registry as tools_registry
+
+
+_PLUGIN_ROW = [("demo", "1.0.0", "demo plugin", "user", "/tmp/demo-plugin", "demo")]
+
+
+def _patch_minimal_hub_dependencies(monkeypatch, *, check_fn, discover_all_plugins=None):
+    monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda force_rescan=False: [])
+    monkeypatch.setattr(_web_server_memory, "_discover_memory_provider_statuses", lambda: [])
+    monkeypatch.setattr(_cfg_mod, "get_hermes_home", lambda: Path("/tmp/hermes-home"))
+    monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"dashboard": {"hidden_plugins": []}})
+
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_all_plugins",
+        discover_all_plugins or (lambda: list(_PLUGIN_ROW)),
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_current_context_engine", lambda: "compressor")
+    monkeypatch.setattr(plugins_cmd, "_get_current_memory_provider", lambda: "")
+    monkeypatch.setattr(plugins_cmd, "_discover_context_engines", lambda: [])
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"demo"})
+    monkeypatch.setattr(plugins_cmd, "_read_manifest", lambda _path: {"provides_tools": ["demo_tool"]})
+
+    monkeypatch.setattr(
+        tools_registry.registry,
+        "get_entry",
+        lambda _name: SimpleNamespace(check_fn=check_fn),
+    )
+
+
+
+def test_plugins_hub_does_not_probe_cold_check_fns(monkeypatch):
+    tools_registry.invalidate_check_fn_cache()
+    _web_server_dashboard._invalidate_plugins_hub_cache()
+
+    calls = {"count": 0, "threads": set()}
+
+    def check_fn():
+        calls["count"] += 1
+        calls["threads"].add(threading.current_thread())
+        return False
+
+    _patch_minimal_hub_dependencies(monkeypatch, check_fn=check_fn)
+
+    payload = _web_server_dashboard._merged_plugins_hub(force_refresh=True)
+
+    # The request path itself must never execute the probe: the cold verdict
+    # is unknown, so the payload reports no auth requirement. Any probing
+    # happens on a background warmer thread, never inline.
+    assert payload["plugins"][0]["auth_required"] is False
+    assert payload["plugins"][0]["auth_command"] == ""
+    assert threading.current_thread() not in calls["threads"]
+
+
+def test_plugins_hub_cold_cache_schedules_background_probe(monkeypatch):
+    tools_registry.invalidate_check_fn_cache()
+    _web_server_dashboard._invalidate_plugins_hub_cache()
+
+    probe_ran = threading.Event()
+
+    def check_fn():
+        probe_ran.set()
+        return False
+
+    _patch_minimal_hub_dependencies(monkeypatch, check_fn=check_fn)
+
+    scheduled: list = []
+    real_schedule = _web_server_dashboard._schedule_check_fn_probe
+
+    def tracking_schedule(fn):
+        thread = real_schedule(fn)
+        scheduled.append(thread)
+        return thread
+
+    monkeypatch.setattr(_web_server_dashboard, "_schedule_check_fn_probe", tracking_schedule)
+
+    # Cold cache → the fetch schedules a background probe and reports the
+    # verdict as unknown (auth_required stays False for now).
+    payload = _web_server_dashboard._merged_plugins_hub(force_refresh=True)
+    assert payload["plugins"][0]["auth_required"] is False
+    assert scheduled and scheduled[0] is not None
+
+    scheduled[0].join(timeout=5)
+    assert probe_ran.wait(timeout=5)
+
+    # Once the TTL cache refreshes, the probed False verdict surfaces as an
+    # auth requirement.
+    refreshed = _web_server_dashboard._merged_plugins_hub(force_refresh=True)
+    assert refreshed["plugins"][0]["auth_required"] is True
+    assert refreshed["plugins"][0]["auth_command"] == "hermes auth demo"
+
+
+
+def test_plugins_hub_uses_cached_failed_check_fn_verdict(monkeypatch):
+    tools_registry.invalidate_check_fn_cache()
+    _web_server_dashboard._invalidate_plugins_hub_cache()
+
+    def check_fn():
+        return False
+
+    assert tools_registry._check_fn_cached(check_fn) is False
+    _patch_minimal_hub_dependencies(monkeypatch, check_fn=check_fn)
+
+    payload = _web_server_dashboard._merged_plugins_hub(force_refresh=True)
+
+    assert payload["plugins"][0]["auth_required"] is True
+    assert payload["plugins"][0]["auth_command"] == "hermes auth demo"
+
+
+
+def test_plugins_hub_short_ttl_cache_collapses_duplicate_fetches(monkeypatch):
+    tools_registry.invalidate_check_fn_cache()
+    _web_server_dashboard._invalidate_plugins_hub_cache()
+
+    calls = {"discover": 0}
+
+    def discover_all_plugins():
+        calls["discover"] += 1
+        return list(_PLUGIN_ROW)
+
+    _patch_minimal_hub_dependencies(
+        monkeypatch,
+        check_fn=lambda: True,
+        discover_all_plugins=discover_all_plugins,
+    )
+
+    first = _web_server_dashboard._merged_plugins_hub(force_refresh=True)
+    second = _web_server_dashboard._merged_plugins_hub()
+
+    assert calls["discover"] == 1
+    assert first is second
+
+
+def test_plugins_hub_route_builds_catalog_annotations_off_event_loop(monkeypatch):
+    """The synchronous catalog lookup must run in the route's worker thread."""
+    tools_registry.invalidate_check_fn_cache()
+    _web_server_dashboard._invalidate_plugins_hub_cache()
+    event_loop_thread = threading.current_thread()
+    annotation_threads: list[threading.Thread] = []
+
+    _patch_minimal_hub_dependencies(monkeypatch, check_fn=lambda: True)
+    monkeypatch.setattr(web_server, "_require_token", lambda _request: None)
+
+    def removed_annotation(name, _dir_path, _removed_entries):
+        annotation_threads.append(threading.current_thread())
+        return "withdrawn by catalog" if name == "demo" else None
+
+    monkeypatch.setattr(plugins_cmd_catalog, "removed_annotation", removed_annotation)
+    monkeypatch.setattr(plugin_catalog, "resolved_removed_entries", lambda: [])
+
+    payload = asyncio.run(_rt_dashboard_ui.get_plugins_hub(object()))
+
+    assert payload["plugins"][0]["removed_reason"] == "withdrawn by catalog"
+    assert annotation_threads == [annotation_threads[0]]
+    assert annotation_threads[0] is not event_loop_thread
+
+
+def test_plugin_install_endpoint_invalidates_hub_cache(monkeypatch):
+    import asyncio
+
+    from hermes_cli.web_models import _AgentPluginInstallBody
+
+    tools_registry.invalidate_check_fn_cache()
+    _web_server_dashboard._invalidate_plugins_hub_cache()
+
+    calls = {"discover": 0}
+
+    def discover_all_plugins():
+        calls["discover"] += 1
+        return list(_PLUGIN_ROW)
+
+    _patch_minimal_hub_dependencies(
+        monkeypatch,
+        check_fn=lambda: True,
+        discover_all_plugins=discover_all_plugins,
+    )
+
+    # Prime the TTL cache; a plain fetch must be served from it.
+    _web_server_dashboard._merged_plugins_hub(force_refresh=True)
+    _web_server_dashboard._merged_plugins_hub()
+    assert calls["discover"] == 1
+
+    # Simulate a successful install through the endpoint; its invalidation
+    # hook must drop the memoized payload so the next fetch rebuilds.
+    monkeypatch.setattr(web_server, "_require_token", lambda _request: None)
+    monkeypatch.setattr(
+        plugins_cmd, "dashboard_install_plugin", lambda *a, **k: {"ok": True}
+    )
+
+    asyncio.run(
+        _rt_dashboard_ui.post_agent_plugin_install(
+            object(), _AgentPluginInstallBody(identifier="demo")
+        )
+    )
+
+    _web_server_dashboard._merged_plugins_hub()
+    assert calls["discover"] == 2
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_plugins_transcription_registration.py ===
+"""Tests for PluginContext.register_transcription_provider().
+
+Exercises the plugin context hook end-to-end: drops a fake plugin into
+``$HERMES_HOME/plugins/``, runs ``PluginManager().discover_and_load()``,
+and asserts the registration result.
+
+Mirrors the shape of ``test_plugins_tts_registration.py`` (companion
+TTS hook from issue #30398).
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Dict
+
+import yaml
+
+
+def _write_plugin(
+    root: Path,
+    name: str,
+    *,
+    manifest_extra: Dict[str, Any] | None = None,
+    register_body: str = "pass",
+) -> Path:
+    plugin_dir = root / name
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "name": name,
+        "version": "0.1.0",
+        "description": f"Test plugin {name}",
+    }
+    if manifest_extra:
+        manifest.update(manifest_extra)
+    (plugin_dir / "plugin.yaml").write_text(yaml.dump(manifest))
+    (plugin_dir / "__init__.py").write_text(
+        f"def register(ctx):\n    {register_body}\n"
+    )
+    return plugin_dir
+
+
+def _enable(hermes_home: Path, name: str) -> None:
+    cfg_path = hermes_home / "config.yaml"
+    cfg: dict = {}
+    if cfg_path.exists():
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        except Exception:
+            cfg = {}
+    plugins_cfg = cfg.setdefault("plugins", {})
+    enabled = plugins_cfg.setdefault("enabled", [])
+    if isinstance(enabled, list) and name not in enabled:
+        enabled.append(name)
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+
+class TestRegisterTranscriptionProvider:
+    def test_accepts_valid_provider(self):
+        from hermes_cli.plugins import PluginManager
+
+        from agent import transcription_registry
+        transcription_registry._reset_for_tests()
+
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        _write_plugin(
+            hermes_home / "plugins",
+            "my-stt-plugin",
+            register_body=(
+                "from agent.transcription_provider import TranscriptionProvider\n"
+                "    class P(TranscriptionProvider):\n"
+                "        @property\n"
+                "        def name(self): return 'fake-stt'\n"
+                "        def transcribe(self, file_path, **kw):\n"
+                "            return {'success': True, 'transcript': 'hi', 'provider': 'fake-stt'}\n"
+                "    ctx.register_transcription_provider(P())"
+            ),
+        )
+        _enable(hermes_home, "my-stt-plugin")
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["my-stt-plugin"].enabled is True, (
+            f"Plugin failed to load: {mgr._plugins['my-stt-plugin'].error}"
+        )
+        assert transcription_registry.get_provider("fake-stt") is not None
+
+        transcription_registry._reset_for_tests()
+
+    def test_rejects_non_provider(self, caplog):
+        from hermes_cli.plugins import PluginManager
+
+        from agent import transcription_registry
+        transcription_registry._reset_for_tests()
+
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        _write_plugin(
+            hermes_home / "plugins",
+            "bad-stt-plugin",
+            register_body="ctx.register_transcription_provider('not a provider')",
+        )
+        _enable(hermes_home, "bad-stt-plugin")
+
+        with caplog.at_level("WARNING"):
+            mgr = PluginManager()
+            mgr.discover_and_load()
+
+        assert mgr._plugins["bad-stt-plugin"].enabled is True
+        assert transcription_registry.get_provider("not a provider") is None
+        assert transcription_registry.list_providers() == []
+        assert "does not inherit from TranscriptionProvider" in caplog.text
+
+        transcription_registry._reset_for_tests()
+
+    def test_rejects_builtin_shadow(self, caplog):
+        from hermes_cli.plugins import PluginManager
+
+        from agent import transcription_registry
+        transcription_registry._reset_for_tests()
+
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        _write_plugin(
+            hermes_home / "plugins",
+            "shadow-stt-plugin",
+            register_body=(
+                "from agent.transcription_provider import TranscriptionProvider\n"
+                "    class P(TranscriptionProvider):\n"
+                "        @property\n"
+                "        def name(self): return 'openai'\n"
+                "        def transcribe(self, file_path, **kw):\n"
+                "            return {'success': True, 'transcript': 'hi'}\n"
+                "    ctx.register_transcription_provider(P())"
+            ),
+        )
+        _enable(hermes_home, "shadow-stt-plugin")
+
+        with caplog.at_level("WARNING"):
+            mgr = PluginManager()
+            mgr.discover_and_load()
+
+        # Plugin still loaded normally — built-in shadowing is a warning,
+        # not an exception. The registry rejects the entry though.
+        assert mgr._plugins["shadow-stt-plugin"].enabled is True
+        assert transcription_registry.get_provider("openai") is None
+        assert "shadows a built-in name" in caplog.text
+
+        transcription_registry._reset_for_tests()
+

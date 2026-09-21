@@ -1,0 +1,419 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_chat_query_file.py ===
+"""--query-file: single-query text arrives verbatim, never shell-interpreted.
+
+Regression tests for the Bot Mode DM injection fix: the DM protocol used to
+tell agents to interpolate message bodies into a double-quoted shell command,
+so quotes truncated the message and $(...) executed on the sender's machine.
+The transport is now a file (--query-file) / stdin, and the protocol text
+must never regress to inlining the body into -q.
+"""
+
+
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+
+HOSTILE = 'hi "there" $(touch /tmp/pwned_by_dm_test) `id` \\ and a\nsecond line'
+
+
+def _parse(argv):
+    sys.path.insert(0, str(REPO))
+    try:
+        from hermes_cli._parser import build_top_level_parser
+
+        built = build_top_level_parser()
+        parser = built[0] if isinstance(built, tuple) else built
+        return parser.parse_args(argv)
+    finally:
+        sys.path.remove(str(REPO))
+
+
+def test_chat_parser_accepts_query_file():
+    args = _parse(["chat", "--query-file", "/tmp/x.txt"])
+    assert args.query_file == "/tmp/x.txt"
+    assert args.query is None
+
+
+def test_query_file_reads_hostile_text_verbatim(tmp_path, monkeypatch):
+    """The file body must reach args.query byte-identical — no shell pass."""
+    f = tmp_path / "dm.txt"
+    f.write_text(HOSTILE, encoding="utf-8")
+
+    # Exercise the exact resolution block in hermes_cli.main by simulating it:
+    # the block reads the file into args.query before dispatch.
+    args = _parse(["chat", "--query-file", str(f)])
+    assert args.query_file is not None
+    body = Path(args.query_file).read_text(encoding="utf-8")
+    assert body == HOSTILE
+    assert "$(touch" in body  # preserved, not executed
+    assert not Path("/tmp/pwned_by_dm_test").exists()
+
+
+def test_query_and_query_file_mutually_exclusive(tmp_path):
+    """argparse rejects -q + --query-file at parse time (exit 2), no env needed."""
+    import pytest
+
+    f = tmp_path / "dm.txt"
+    f.write_text("hello", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        _parse(["chat", "-q", "x", "--query-file", str(f)])
+    assert exc.value.code == 2
+
+
+def test_bot_mode_protocol_never_inlines_message_into_shell():
+    """The DM transport must use --query-file / stdin, not -q "…" inlining.
+
+    The transport moved from prompt-injected instructions (bot_mode_probe)
+    to the message_agent tool (bot_mode_dm) in Aug 2026 — the invariant now
+    holds on the tool's command builder, and the probe must no longer teach
+    any shellout at all.
+    """
+    sys.path.insert(0, str(REPO))
+    try:
+        import importlib
+
+        dm = importlib.import_module("tools.bot_mode_dm")
+        src = Path(dm.__file__).read_text(encoding="utf-8")
+        probe = importlib.import_module("tools.bot_mode_probe")
+        probe_src = Path(probe.__file__).read_text(encoding="utf-8")
+    finally:
+        sys.path.remove(str(REPO))
+    assert "--query-file" in src
+    assert '-q "Message from' not in src
+    assert 'dm <peer>/<agent-name> "Message from' not in src
+    # The protocol section teaches the tool, never a hand-rolled shellout.
+    assert "message_agent" in probe_src
+    assert "--query-file /tmp/dm.txt" not in probe_src
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_chat_q_exit_clear.py ===
+"""Regression tests for #53009: chat -q final response erased by exit-summary clear."""
+
+from types import SimpleNamespace
+
+import pytest
+
+import cli as cli_mod
+
+
+# ── A3.1 Test-First: verify _clear_terminal_on_exit gating ──────────────────
+
+def test_print_exit_summary_clears_screen_by_default(monkeypatch):
+    """Default behavior: _print_exit_summary() calls _clear_terminal_on_exit()."""
+    calls = []
+
+    class FakeCLI:
+        conversation_history = []
+        session_start = None
+
+        def _clear_terminal_on_exit(self):
+            calls.append("clear")
+
+    monkeypatch.setattr(cli_mod, "datetime", SimpleNamespace(
+        now=lambda: SimpleNamespace(
+            __sub__=lambda self, other: SimpleNamespace(
+                total_seconds=lambda: 0
+            )
+        )
+    ))
+
+    fake = FakeCLI()
+    cli_mod.HermesCLI._print_exit_summary(fake)  # default clear_screen=True
+
+    assert "clear" in calls, "_clear_terminal_on_exit should be called by default"
+
+
+def test_print_exit_summary_skips_clear_when_clear_screen_false(monkeypatch):
+    """With clear_screen=False, _print_exit_summary() does NOT clear."""
+    calls = []
+
+    class FakeCLI:
+        conversation_history = []
+        session_start = None
+
+        def _clear_terminal_on_exit(self):
+            calls.append("clear")
+
+    monkeypatch.setattr(cli_mod, "datetime", SimpleNamespace(
+        now=lambda: SimpleNamespace(
+            __sub__=lambda self, other: SimpleNamespace(
+                total_seconds=lambda: 0
+            )
+        )
+    ))
+
+    fake = FakeCLI()
+    cli_mod.HermesCLI._print_exit_summary(fake, clear_screen=False)
+
+    assert "clear" not in calls, (
+        "_clear_terminal_on_exit should NOT be called when clear_screen=False"
+    )
+
+
+# ── Production-path test: single-query -q path skips the clear ──────────────
+
+def test_single_query_main_skips_clear_on_exit_summary(monkeypatch):
+    """The single-query (-q) path calls _print_exit_summary without clearing."""
+    calls = []
+    clear_calls = []
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = SimpleNamespace(print=lambda *_a, **_kw: calls.append("query-label"))
+            self.session_id = "sq-test"
+            self.agent = SimpleNamespace(
+                session_id="sq-test",
+                platform="cli",
+            )
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            calls.append(("claim", surface, stderr))
+            return True
+
+        def _show_security_advisories(self):
+            calls.append("advisories")
+
+        def chat(self, query, images=None):
+            calls.append(("chat", query, images))
+            self._last_turn_result = {"final_response": "done", "completed": True}
+            return "done"
+
+        def _print_exit_summary(self, clear_screen=True):
+            calls.append(("summary", clear_screen))
+            if clear_screen:
+                clear_calls.append("CLEARED")  # should NOT happen
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:  # the one-shot path exits with the turn's outcome
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    assert exc_info.value.code == 0
+    assert calls == [
+        ("claim", "cli", False),
+        "query-label",
+        "advisories",
+        ("chat", "hello", None),
+        ("summary", False),  # <-- clear_screen=False for single-query
+        ("finalize", "sq-test"),
+    ]
+    assert len(clear_calls) == 0, (
+        "_clear_terminal_on_exit must NOT be called in single-query mode"
+    )
+
+
+# ── Verify interactive mode still clears ────────────────────────────────────
+
+def test_print_exit_summary_still_clears_in_interactive_path(monkeypatch):
+    """Interactive mode should still clear the screen (preserving #38928)."""
+    from datetime import datetime as real_datetime
+
+    calls = []
+
+    class FakeCLI:
+        conversation_history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        session_start = real_datetime(2026, 1, 1, 12, 0, 0)
+        session_id = "test-session"
+        _session_db = None
+        agent = None
+
+        def _clear_terminal_on_exit(self):
+            calls.append("clear")
+
+    monkeypatch.setattr(cli_mod, "datetime", SimpleNamespace(
+        now=lambda: real_datetime(2026, 1, 1, 12, 1, 0)  # 1 min elapsed
+    ))
+
+    fake = FakeCLI()
+    cli_mod.HermesCLI._print_exit_summary(fake)  # default clear_screen=True
+
+    assert "clear" in calls, (
+        "Interactive mode should still clear the screen (regression test for #38928)"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_chat_skills_flag.py ===
+import sys
+
+
+def test_top_level_skills_flag_defaults_to_chat(monkeypatch):
+    import hermes_cli.main as main_mod
+
+    captured = {}
+
+    def fake_cmd_chat(args):
+        captured["skills"] = args.skills
+        captured["command"] = args.command
+
+    monkeypatch.setattr(main_mod, "cmd_chat", fake_cmd_chat)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "-s", "hermes-agent-dev,github-auth"],
+    )
+
+    main_mod.main()
+
+    assert captured == {
+        "skills": ["hermes-agent-dev,github-auth"],
+        "command": None,
+    }
+
+
+def test_continue_worktree_and_skills_flags_work_together(monkeypatch):
+    import hermes_cli.main as main_mod
+
+    captured = {}
+
+    def fake_cmd_chat(args):
+        captured["continue_last"] = args.continue_last
+        captured["worktree"] = args.worktree
+        captured["skills"] = args.skills
+        captured["command"] = args.command
+
+    monkeypatch.setattr(main_mod, "cmd_chat", fake_cmd_chat)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "-c", "-w", "-s", "hermes-agent-dev"],
+    )
+
+    main_mod.main()
+
+    assert captured == {
+        "continue_last": True,
+        "worktree": True,
+        "skills": ["hermes-agent-dev"],
+        "command": "chat",
+    }
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_checkout_mutation_guards.py ===
+"""The test suite must never mutate the LIVE checkout or its venv.
+
+Regression tests for the pytest-guards on the checkout-root mutation paths.
+Before the guards, tests that drove ``cmd_update``/recovery without
+sandboxing ``PROJECT_ROOT`` left ``.lazy-refresh-incomplete`` at the real
+repo root (observed after full-suite runs), and — on a venv with genuinely
+broken packages — test-spawned subprocesses importing ``hermes_cli.main``
+ran a REAL ``ensurepip`` + ``pip install --force-reinstall`` against the
+developer's executing environment mid-suite.
+
+The guard predicate requires BOTH conditions (under pytest AND the target is
+this checkout itself), so every tmp_path-sandboxed test keeps exercising the
+real code paths unchanged.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import hermes_cli.main as main_mod
+import hermes_cli.main_install_repair as hermes_cli_main_install_repair
+from hermes_cli import main_install_repair
+from hermes_cli import update_cmd
+from hermes_cli import _early_recovery as er
+
+CHECKOUT_ROOT = Path(er.__file__).resolve().parent.parent
+
+
+class TestPredicate:
+    def test_true_for_live_checkout_under_pytest(self):
+        # PYTEST_CURRENT_TEST is set by pytest itself right now.
+        assert er._pytest_owns_live_checkout(CHECKOUT_ROOT) is True
+        assert main_mod._pytest_owns_live_checkout(CHECKOUT_ROOT) is True
+
+    def test_false_for_sandboxed_root(self, tmp_path):
+        assert er._pytest_owns_live_checkout(tmp_path) is False
+        assert main_mod._pytest_owns_live_checkout(tmp_path) is False
+
+    def test_false_outside_pytest(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        assert er._pytest_owns_live_checkout(CHECKOUT_ROOT) is False
+        assert main_mod._pytest_owns_live_checkout(CHECKOUT_ROOT) is False
+
+
+class TestMarkerWrites:
+    def test_refuses_breadcrumb_at_live_repo_root(self):
+        target = CHECKOUT_ROOT / ".lazy-refresh-incomplete"
+        # The marker may legitimately pre-exist: upstream currently TRACKS a
+        # littered copy in git (the exact pollution this guard prevents), so
+        # the contract is content-unchanged, not never-exists.
+        before = target.read_text(encoding="utf-8") if target.exists() else None
+        try:
+            update_cmd._write_marker_file(target, label="lazy-refresh-incomplete")
+            after = (
+                target.read_text(encoding="utf-8") if target.exists() else None
+            )
+            assert after == before, (
+                "marker breadcrumb written into the LIVE checkout from a test"
+            )
+        finally:
+            # If the guard is broken (RED state), restore the pre-test state —
+            # leaving pollution behind is exactly the bug being pinned.
+            if before is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_text(before, encoding="utf-8")
+
+    def test_still_writes_sandboxed(self, tmp_path):
+        target = tmp_path / ".lazy-refresh-incomplete"
+        update_cmd._write_marker_file(target, label="lazy-refresh-incomplete")
+        assert target.exists()
+        assert "pid=" in target.read_text(encoding="utf-8")
+
+
+class TestEarlyRecovery:
+    def test_skips_live_checkout_before_any_probe_or_lock(self, monkeypatch):
+        # A probe call would mean recovery is proceeding against the live
+        # checkout; the guard must return before ANY side-effectful step.
+        def _boom():
+            raise AssertionError("probe ran against the live checkout")
+
+        monkeypatch.setattr(er, "_probe_broken_packages", _boom)
+        monkeypatch.setattr(er, "_run_repair_install", lambda *a, **k: _boom())
+        er.recover_if_needed(project_root=CHECKOUT_ROOT, argv=[])
+
+    def test_sandboxed_root_still_recovers(self, tmp_path, monkeypatch):
+        # The guard must not disable recovery for sandboxed roots: with a
+        # marker present and a broken probe, the repair path still runs.
+        (tmp_path / ".lazy-refresh-incomplete").write_text("started=1\npid=1\n")
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        monkeypatch.setattr(er, "_probe_broken_packages", lambda: ["PyYAML"])
+        monkeypatch.setattr(er, "_pinned_specs", lambda broken, root: broken)
+        installs = []
+        monkeypatch.setattr(
+            er, "_run_repair_install", lambda specs, root: installs.append(specs) or True
+        )
+        er.recover_if_needed(project_root=tmp_path, argv=[])
+        assert installs, "sandboxed recovery was wrongly disabled by the guard"
+
+
+class TestLaunchRecovery:
+    def test_recover_from_interrupted_install_noops_on_live_checkout(
+        self, monkeypatch
+    ):
+        # PROJECT_ROOT is the live checkout in-suite; the launch-time
+        # recovery must return before touching markers or spawning installs.
+        def _boom(*a, **k):
+            raise AssertionError("launch recovery ran against the live checkout")
+
+        monkeypatch.setattr(main_mod, "_update_marker_path", _boom)
+        monkeypatch.setattr(hermes_cli_main_install_repair, "_update_marker_path", _boom)
+        main_mod._recover_from_interrupted_install()
+

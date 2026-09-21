@@ -1,0 +1,348 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\package.json ===
+{
+  "name": "website",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "docusaurus": "docusaurus",
+    "prestart": "node scripts/prebuild.mjs",
+    "start": "docusaurus start",
+    "prebuild": "node scripts/prebuild.mjs",
+    "build": "docusaurus build",
+    "build:fast": "docusaurus build --locale en",
+    "swizzle": "docusaurus swizzle",
+    "deploy": "docusaurus deploy",
+    "clear": "docusaurus clear",
+    "serve": "docusaurus serve",
+    "write-translations": "docusaurus write-translations",
+    "write-heading-ids": "docusaurus write-heading-ids",
+    "typecheck": "tsc -p . --noEmit",
+    "lint:diagrams": "ascii-guard lint --exclude-code-blocks docs"
+  },
+  "dependencies": {
+    "@docusaurus/core": "3.10.2",
+    "@docusaurus/plugin-client-redirects": "3.10.2",
+    "@docusaurus/preset-classic": "3.10.2",
+    "@docusaurus/theme-mermaid": "3.10.2",
+    "@mdx-js/react": "3.1.1",
+    "clsx": "2.1.1",
+    "prism-react-renderer": "2.3.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@docusaurus/module-type-aliases": "3.10.2",
+    "@docusaurus/tsconfig": "3.10.2",
+    "@docusaurus/types": "3.10.2",
+    "typescript": "6.0.3"
+  },
+  "overrides": {
+    "serialize-javascript": "7.0.7",
+    "uuid": "14.0.1",
+    "minimatch": "10.2.6",
+    "nanoid": "3.3.17",
+    "js-yaml": "4.3.1",
+    "dompurify": "3.4.13",
+    "mermaid": "11.16.1",
+    "image-size": "npm:@nous-research/image-size@2.0.3",
+    "tar": "7.5.22"
+  },
+  "browserslist": {
+    "production": [
+      ">0.5%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 3 chrome version",
+      "last 3 firefox version",
+      "last 5 safari version"
+    ]
+  },
+  "engines": {
+    "node": ">=20.0",
+    "npm": ">=11.17.0"
+  },
+  "allowScripts": {
+    "core-js@3.49.0": true,
+    "fsevents@2.3.3": true
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\website\README.md ===
+# Website
+
+This website is built using [Docusaurus](https://docusaurus.io/), a modern static website generator.
+
+> **Reading the docs on GitHub?** The Markdown under `docs/` is authored for the rendered site at
+> <https://hermes-agent.nousresearch.com/docs/>. Cross-page links are relative Markdown paths, so they
+> follow through on GitHub's file viewer too. Every page on the site has an **Edit this page** link
+> that opens the source file here.
+
+## Authoring links in `docs/`
+
+- Link to another page with a relative Markdown path, anchors included:
+  `[Profiles](../user-guide/profiles.md)`, `[Bundles](../user-guide/features/skills.md#skill-bundles)`.
+  Docusaurus turns the file path into the page route; GitHub follows the same path. Site routes
+  (`/user-guide/profiles`, `/docs/user-guide/profiles`) only work on the rendered site — GitHub
+  resolves them as repository paths and 404s, and the `/docs/` form also emits
+  `/docs/zh-Hans/docs/...` 404s in the zh-Hans build because `baseUrl` is already `/docs/`.
+- `python3 website/scripts/check_doc_links.py` fails on any route-style link in hand-authored pages
+  (EN and the zh-Hans mirror); `--fix` rewrites them. It runs in the `Docs Site Checks` workflow.
+  Generated pages (`user-guide/skills/{bundled,optional}`, `reference/*skills-catalog.md`) are
+  produced by `scripts/generate-skill-docs.py`, which emits the same relative form.
+- Pin `{#anchor}` on cross-linked headings so the zh-Hans mirror keeps the same id.
+
+## Installation
+
+```bash
+yarn
+```
+
+## Local Development
+
+```bash
+yarn start
+```
+
+This command starts a local development server and opens up a browser window. Most changes are reflected live without having to restart the server.
+
+## Build
+
+```bash
+yarn build
+```
+
+This command generates static content into the `build` directory and can be served using any static contents hosting service.
+
+## Deployment
+
+Using SSH:
+
+```bash
+USE_SSH=true yarn deploy
+```
+
+Not using SSH:
+
+```bash
+GIT_USER=<Your GitHub username> yarn deploy
+```
+
+If you are using GitHub pages for hosting, this command is a convenient way to build the website and push to the `gh-pages` branch.
+
+## Diagram Linting
+
+CI runs `ascii-guard` to lint docs for ASCII box diagrams. Use Mermaid (````mermaid`) or plain lists/tables instead of ASCII boxes to avoid CI failures.
+
+
+
+=== ARCHIVO: .\hermes-agent\website\tsconfig.json ===
+{
+  // This file is not used in compilation. It is here just for a nice editor experience.
+  "extends": "@docusaurus/tsconfig",
+  "exclude": [".docusaurus", "build"]
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\developer-guide\acp-internals.md ===
+---
+sidebar_position: 2
+title: "ACP Internals"
+description: "How the ACP adapter works: lifecycle, sessions, event bridge, approvals, and tool rendering"
+---
+
+# ACP Internals
+
+The ACP adapter wraps Hermes' synchronous `AIAgent` in an async JSON-RPC stdio server.
+
+Key implementation files:
+
+- `acp_adapter/entry.py`
+- `acp_adapter/server.py`
+- `acp_adapter/session.py`
+- `acp_adapter/events.py`
+- `acp_adapter/permissions.py`
+- `acp_adapter/tools.py`
+- `acp_adapter/auth.py`
+
+## Boot flow
+
+```text
+hermes acp / hermes-acp / python -m acp_adapter
+  -> acp_adapter.entry.main()
+  -> parse --version / --check / --setup before server startup
+  -> load ~/.hermes/.env
+  -> configure stderr logging
+  -> construct HermesACPAgent
+  -> acp.run_agent(agent, use_unstable_protocol=True)
+```
+
+Stdout is reserved for ACP JSON-RPC transport. Human-readable logs go to stderr.
+
+## Major components
+
+### `HermesACPAgent`
+
+`acp_adapter/server.py` implements the ACP agent protocol.
+
+Responsibilities:
+
+- initialize / authenticate
+- new/load/resume/fork/list/cancel session methods
+- prompt execution
+- session model switching
+- wiring sync AIAgent callbacks into ACP async notifications
+
+### `SessionManager`
+
+`acp_adapter/session.py` tracks live ACP sessions.
+
+Each session stores:
+
+- `session_id`
+- `agent`
+- `cwd`
+- `model`
+- `history`
+- `cancel_event`
+
+The manager is thread-safe and supports:
+
+- create
+- get
+- remove
+- fork
+- list
+- cleanup
+- cwd updates
+
+### Event bridge
+
+`acp_adapter/events.py` converts AIAgent callbacks into ACP `session_update` events.
+
+Bridged callbacks:
+
+- `tool_progress_callback`
+- `thinking_callback` (currently set to `None` in the ACP bridge — reasoning is forwarded through `step_callback` instead)
+- `step_callback`
+
+Every ACP tool call reaches a terminal status: `tool.completed` closes the call with its own
+result (`completed` / `failed`), the `step_callback` `prev_tools` pass is only a fallback for
+runtimes that never project a completion, and anything still open when the turn ends —
+a denied or blocked call, an interrupted one — is marked `failed` before the response is
+returned.
+
+Because `AIAgent` runs in a worker thread while ACP I/O lives on the main event loop, the bridge uses:
+
+```python
+asyncio.run_coroutine_threadsafe(...)
+```
+
+### Permission bridge
+
+`acp_adapter/permissions.py` adapts dangerous terminal approval prompts into ACP permission requests.
+
+Mapping:
+
+- `allow_once` -> Hermes `once`
+- `allow_always` -> Hermes `always`
+- reject options -> Hermes `deny`
+
+Timeouts and bridge failures deny by default.
+
+### Tool rendering helpers
+
+`acp_adapter/tools.py` maps Hermes tools to ACP tool kinds and builds editor-facing content.
+
+Examples:
+
+- `patch` / `write_file` -> file diffs
+- `terminal` -> shell command text
+- `read_file` / `search_files` -> text previews
+- large results -> truncated text blocks for UI safety
+
+## Session lifecycle
+
+```text
+new_session(cwd)
+  -> create SessionState
+  -> create AIAgent(platform="acp", enabled_toolsets=["hermes-acp"])
+  -> bind task_id/session_id to cwd override
+
+prompt(..., session_id)
+  -> extract text from ACP content blocks
+  -> reset cancel event
+  -> install callbacks + approval bridge
+  -> run AIAgent in ThreadPoolExecutor
+  -> update session history
+  -> emit final agent message chunk
+```
+
+A turn that ends in a terminal failure (provider refusal, non-retryable error, exhausted
+retries, interrupt before any reply) is closed by the core loop with a Hermes-authored
+assistant row ("Your request was not processed…" / "This turn did not complete…") so the
+durable transcript never ends on an open `user` row. Without it the next prompt would be
+merged into the failed request and replayed. Context-overflow failures are exempt: their
+repair is session rotation, not another row.
+
+### Cancelation
+
+`cancel(session_id)`:
+
+- sets the session cancel event
+- calls `agent.interrupt()` when available
+- causes the prompt response to return `stop_reason="cancelled"`
+
+### Forking
+
+`fork_session()` deep-copies message history into a new live session, preserving conversation state while giving the fork its own session ID and cwd.
+
+## Provider/auth behavior
+
+ACP does not implement its own auth store.
+
+Instead it reuses Hermes' runtime resolver:
+
+- `acp_adapter/auth.py`
+- `hermes_cli/runtime_provider.py`
+
+So ACP advertises and uses the currently configured Hermes provider/credentials. It also always advertises a terminal setup auth method (`hermes-setup`, args `--setup`) so first-run ACP clients can open Hermes' interactive model/provider configuration before starting a normal ACP session.
+
+## Working directory binding
+
+ACP sessions carry an editor cwd.
+
+The session manager binds that cwd to the ACP session ID via task-scoped terminal/file overrides, so file and terminal tools operate relative to the editor workspace.
+
+## Duplicate same-name tool calls
+
+The event bridge tracks tool IDs FIFO per tool name, not just one ID per name. This is important for:
+
+- parallel same-name calls
+- repeated same-name calls in one step
+
+Without FIFO queues, completion events would attach to the wrong tool invocation.
+
+## Approval callback restoration
+
+ACP temporarily installs an approval callback on the terminal tool during prompt execution, then restores the previous callback afterward. This avoids leaving ACP session-specific approval handlers installed globally forever.
+
+## Current limitations
+
+- ACP sessions are persisted to the shared `~/.hermes/state.db` (SessionDB) and transparently restored across process restarts; they appear in `session_search`
+- non-text prompt blocks are currently ignored for request text extraction
+- editor-specific UX varies by ACP client implementation
+
+## Related files
+
+- `tests/acp_adapter/` — ACP test suite
+- `toolsets.py` — `hermes-acp` toolset definition
+- `hermes_cli/main.py` — `hermes acp` CLI subcommand
+- `pyproject.toml` — `[acp]` optional dependency + `hermes-acp` script
+

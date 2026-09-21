@@ -1,0 +1,200 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\mono-color\design-system\colors.json ===
+{
+  "schema_version": 1,
+  "substrates": [
+    {"id": "substrate_neutral_white", "name": "Neutral White", "hex": "#FAFAF7", "role": "substrate", "counts_as_ink": false, "use_for": ["contemporary editorial", "culture", "events", "social", "image-led color"]},
+    {"id": "substrate_cool_gray", "name": "Cool Gray", "hex": "#E9E9E5", "role": "substrate", "counts_as_ink": false, "use_for": ["architecture", "technology", "charcoal-led systems", "restrained branding"]},
+    {"id": "substrate_pale_beige", "name": "Pale Beige", "hex": "#F5F1E8", "role": "substrate", "counts_as_ink": false, "use_for": ["tactile", "food", "travel", "intimate", "archive", "explicit nostalgia"]}
+  ],
+  "defaults": {
+    "substrate_id": "substrate_neutral_white",
+    "style_direction": "contemporary editorial",
+    "palette_id": "palette_cobalt_terracotta",
+    "mode": "controlled two-ink",
+    "dominant_percent": [70, 85],
+    "accent_percent": [15, 30],
+    "one_ink_when": ["explicit one-ink request", "explicit monochrome request", "one named ink without a second color"]
+  },
+  "inks": [
+    {"id": "ink_cobalt", "name": "Cobalt", "hex": "#2148B8", "moods": ["knowledge", "city", "music", "culture"]},
+    {"id": "ink_royal_blue", "name": "Royal Blue", "hex": "#2058D4", "moods": ["youth", "fashion", "movement"]},
+    {"id": "ink_botanical_green", "name": "Botanical Green", "hex": "#008A4B", "moods": ["botanical", "ecology", "archive"]},
+    {"id": "ink_mint_green", "name": "Mint Green", "hex": "#5EB783", "moods": ["observation", "nature", "quiet"]},
+    {"id": "ink_terracotta", "name": "Terracotta Orange", "hex": "#C65F38", "moods": ["travel", "summer", "food", "tactile"]},
+    {"id": "ink_signal_red", "name": "Signal Red", "hex": "#C83232", "moods": ["declaration", "music", "event", "civic"]},
+    {"id": "ink_aubergine", "name": "Aubergine", "hex": "#63365F", "moods": ["literature", "cinema", "night", "intimate"]},
+    {"id": "ink_charcoal", "name": "Charcoal", "hex": "#30343A", "moods": ["architecture", "photography", "research"]},
+    {"id": "ink_powder_blue", "name": "Powder Blue", "hex": "#9EB8D3", "moods": ["guide", "information"]},
+    {"id": "ink_oxblood", "name": "Oxblood", "hex": "#8F3434", "moods": ["bookstore", "archive", "natural wine"]},
+    {"id": "ink_electric_blue", "name": "Electric Blue", "hex": "#173AE3", "moods": ["culture", "contrast"]},
+    {"id": "ink_carbon", "name": "Carbon", "hex": "#242321", "moods": ["culture", "image-led"]},
+    {"id": "ink_mint_charcoal", "name": "Warm Charcoal", "hex": "#302D2E", "moods": ["journal", "essay"]},
+    {"id": "ink_ultramarine", "name": "Ultramarine", "hex": "#263E99", "moods": ["movement", "urban", "youth"]},
+    {"id": "ink_safety_orange", "name": "Safety Orange", "hex": "#E55D2B", "moods": ["movement", "object", "urban"]},
+    {"id": "ink_cyan", "name": "Cyan", "hex": "#159DDA", "moods": ["product", "playful", "exhibition"]},
+    {"id": "ink_brick_red", "name": "Brick Red", "hex": "#B64032", "moods": ["product", "playful", "exhibition"]},
+    {"id": "ink_tangerine", "name": "Tangerine", "hex": "#E46C2D", "moods": ["market", "festival", "notice"]},
+    {"id": "ink_slate_blue", "name": "Slate Blue", "hex": "#4773A5", "moods": ["market", "festival", "notice"]}
+  ],
+  "palettes": [
+    {"id": "palette_cobalt", "mode": "pure one-ink", "ink_ids": ["ink_cobalt"]},
+    {"id": "palette_terracotta", "mode": "pure one-ink", "ink_ids": ["ink_terracotta"]},
+    {"id": "palette_signal_red", "mode": "pure one-ink", "ink_ids": ["ink_signal_red"]},
+    {"id": "palette_aubergine", "mode": "pure one-ink", "ink_ids": ["ink_aubergine"]},
+    {"id": "palette_charcoal_signal_red", "mode": "chromatic + black", "ink_ids": ["ink_charcoal", "ink_signal_red"]},
+    {"id": "palette_cobalt_terracotta", "mode": "complementary duotone", "ink_ids": ["ink_cobalt", "ink_terracotta"]},
+    {"id": "palette_ultramarine_safety_orange", "mode": "overprint duotone", "ink_ids": ["ink_ultramarine", "ink_safety_orange"]},
+    {"id": "palette_botanical_oxblood", "mode": "complementary duotone", "ink_ids": ["ink_botanical_green", "ink_oxblood"]},
+    {"id": "palette_cyan_brick_red", "mode": "overprint duotone", "ink_ids": ["ink_cyan", "ink_brick_red"]},
+    {"id": "palette_mint_charcoal", "mode": "chromatic + black", "ink_ids": ["ink_mint_green", "ink_mint_charcoal"]}
+  ]
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\mono-color\design-system\compositions.json ===
+{
+  "schema_version": 1,
+  "compositions": [
+    {"id": "composition_image_field", "layout": "image field", "dominant_subject_percent": [60, 80], "empty_paper_percent": [20, 40], "anchors": ["bottom", "side"], "title_relation": "crosses or is cut by the image", "manual_gesture_limit": 1},
+    {"id": "composition_specimen_annotation", "layout": "specimen annotation", "dominant_subject_percent": [45, 65], "empty_paper_percent": [35, 55], "anchors": ["center", "bottom"], "title_relation": "labels orbit one isolated specimen", "manual_gesture_limit": 1},
+    {"id": "composition_type_declaration", "layout": "type-led declaration", "dominant_subject_percent": [55, 80], "empty_paper_percent": [20, 45], "anchors": ["left", "top"], "title_relation": "type is the dominant object", "manual_gesture_limit": 1},
+    {"id": "composition_ruled_information", "layout": "ruled information poster", "dominant_subject_percent": [45, 65], "empty_paper_percent": [35, 55], "anchors": ["top", "left"], "title_relation": "headline and facts share one rule", "manual_gesture_limit": 1},
+    {"id": "composition_archival_plate", "layout": "archival plate", "dominant_subject_percent": [45, 60], "empty_paper_percent": [40, 55], "anchors": ["center", "bottom"], "title_relation": "small title indexes the plate", "manual_gesture_limit": 1},
+    {"id": "composition_editorial_cover", "layout": "editorial cover", "dominant_subject_percent": [55, 75], "empty_paper_percent": [25, 45], "anchors": ["bottom", "right"], "title_relation": "headline crosses the dominant crop", "manual_gesture_limit": 1},
+    {"id": "composition_object_field", "layout": "object field", "dominant_subject_percent": [50, 75], "empty_paper_percent": [25, 50], "anchors": ["center", "edge"], "title_relation": "title locks to repeated objects", "manual_gesture_limit": 1},
+    {"id": "composition_overprint_collage", "layout": "overprint collage", "dominant_subject_percent": [60, 80], "empty_paper_percent": [20, 40], "anchors": ["diagonal", "edge"], "title_relation": "title participates in one visible overprint collision", "manual_gesture_limit": 1},
+    {"id": "composition_editorial_journal", "layout": "editorial journal", "dominant_subject_percent": [45, 65], "empty_paper_percent": [35, 55], "anchors": ["top", "side"], "title_relation": "title sits inside the reading rhythm", "manual_gesture_limit": 1}
+  ]
+}
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\mono-color\design-system\imperfections.json ===
+{
+  "schema_version": 1,
+  "selection": {
+    "contemporary_effect_count": [0, 2],
+    "material_effect_count": [2, 3],
+    "seed_strategy": "stable hash of subject, exact text, palette, and layout",
+    "preserve_across_retries": true
+  },
+  "effects": [
+    {
+      "id": "imperfection_ink_density",
+      "name": "Uneven ink density",
+      "range_percent": [6, 12],
+      "applies_to": ["image plate", "large display type", "solid shape"]
+    },
+    {
+      "id": "imperfection_dry_edge",
+      "name": "Dry-ink edge breakup",
+      "range_percent": [1, 4],
+      "applies_to": ["large display type", "image silhouette", "solid shape"]
+    },
+    {
+      "id": "imperfection_halftone_drift",
+      "name": "Halftone density drift",
+      "range_percent": [5, 10],
+      "applies_to": ["screened image", "halftone field"]
+    },
+    {
+      "id": "imperfection_registration_drift",
+      "name": "Registration drift",
+      "range_mm": [1, 3],
+      "applies_to": ["two-ink plate", "one-ink second impression"]
+    },
+    {
+      "id": "imperfection_broken_gesture",
+      "name": "Broken manual gesture",
+      "gap_percent": [4, 12],
+      "applies_to": ["loop", "underline", "arrow", "ruled gesture"]
+    }
+  ],
+  "guardrails": [
+    "Never alter supplied wording or factual information.",
+    "Never move the dominant object, headline anchor, or core grid.",
+    "Never reduce display-text readability below thumbnail scale.",
+    "Never create an additional ink color.",
+    "Apply registration drift only to image or display plates, never microcopy."
+  ]
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\mono-color\design-system\rhythm.json ===
+{
+  "schema_version": 1,
+  "default_profile": "tension_relaxed",
+  "focal_events": [
+    "oversized type",
+    "extreme subject crop",
+    "giant object or identifying detail",
+    "concentrated overprint collision",
+    "abnormal scale relationship"
+  ],
+  "release_devices": [
+    "open paper",
+    "pale halftone field",
+    "sparse support type",
+    "quiet alignment",
+    "low-detail image fade"
+  ],
+  "optional_unresolved_edges": [
+    "image fade before frame",
+    "inferable cropped word",
+    "broken alignment",
+    "open contour"
+  ],
+  "profiles": [
+    {
+      "id": "tension_relaxed",
+      "name": "Relaxed",
+      "empty_paper_percent": [25, 55],
+      "focal_event_count": 1,
+      "release_zone_count": 1,
+      "unresolved_edge": "optional",
+      "default_for": ["reflection", "travel", "summer", "leisure", "lifestyle", "unspecified cultural subject"],
+      "energy_distribution": "one audacious event, broad release, sparse support",
+      "subject_behavior": ["partial editorial crop", "ordinary in-between gesture", "identifying fragments", "indirect gaze or incomplete figure"]
+    },
+    {
+      "id": "tension_balanced",
+      "name": "Balanced",
+      "empty_paper_percent": [25, 50],
+      "focal_event_count": 1,
+      "release_zone_count": 1,
+      "unresolved_edge": "optional",
+      "default_for": ["event", "journal", "observation", "editorial information"],
+      "energy_distribution": "one clear event, structured support, readable release",
+      "subject_behavior": ["clear action", "controlled crop", "one dominant relationship"]
+    },
+    {
+      "id": "tension_assertive",
+      "name": "Assertive",
+      "empty_paper_percent": [20, 45],
+      "focal_event_count": 1,
+      "release_zone_count": 1,
+      "unresolved_edge": "optional",
+      "default_for": ["forceful declaration", "phrase-led subject", "high-contrast cultural event"],
+      "energy_distribution": "one dominant public gesture, compressed but subordinate support",
+      "subject_behavior": ["decisive crop", "public-facing gesture", "strong type-image collision"]
+    }
+  ],
+  "failure_signals": [
+    "safe headline-left complete-photo-right split",
+    "complete stock-photo person without a source image",
+    "equal emphasis across all elements",
+    "empty space filled with decorative microcopy",
+    "no focal event readable at thumbnail size"
+  ],
+  "guardrails": [
+    "Choose exactly one focal event and let every energetic secondary element extend it.",
+    "Keep one release zone visibly quieter than the focal event.",
+    "Do not confuse relaxed with uniformly small, pale, sparse, or low contrast.",
+    "Use an unresolved edge only when it strengthens the focal event or release zone.",
+    "Preserve the selected focal event and release zone across retries."
+  ]
+}
+

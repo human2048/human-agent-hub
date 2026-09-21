@@ -1,0 +1,285 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\gui.py ===
+"""``hermes gui`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
+    """Attach the ``gui`` subcommand to ``subparsers``."""
+    gui_parser = subparsers.add_parser(
+        "desktop", aliases=["gui"], help="Build and launch the native desktop app",
+        description="Launch the Hermes Electron desktop app. By default this installs "
+            "workspace Node dependencies, builds the current OS's unpacked "
+            "Electron app, then launches that packaged artifact.")
+    gui_parser.add_argument(
+        "--source", action="store_true",
+        help="Launch via `electron .` against apps/desktop/dist instead of the packaged app")
+    gui_parser.add_argument(
+        "--build-only", action="store_true",
+        help="Build the desktop app but do not launch it (used by the installer's --update flow)")
+    gui_parser.add_argument(
+        "--fake-boot", action="store_true",
+        help="Enable deterministic desktop boot delays for validating startup UI")
+    gui_parser.add_argument(
+        "--ignore-existing", action="store_true",
+        help="Force Desktop to ignore any hermes CLI already on PATH during backend resolution")
+    gui_parser.add_argument(
+        "--hermes-root",
+        help="Override the Hermes source root used by Desktop (sets HERMES_DESKTOP_HERMES_ROOT)")
+    gui_parser.add_argument(
+        "--cwd",
+        help="Initial project directory for Desktop chat sessions (sets HERMES_DESKTOP_CWD)")
+    gui_parser.add_argument(
+        "--skip-build", action="store_true",
+        help="Skip npm install/package and launch the existing unpacked app from apps/desktop/release",
+    )
+    gui_parser.add_argument(
+        "--local", action="store_true",
+        help="Show the local-models UI in the desktop app (models pane, quickstart, picker rows)")
+    gui_parser.add_argument(
+        "--force-build", action="store_true",
+        help="Force a full rebuild even if the content stamp matches")
+    gui_parser.add_argument(
+        "--setup-tcc-identity", action="store_true",
+        help="macOS only: create/import a self-signed code-signing certificate "
+            "in the login keychain and point desktop.macos_signing_identity at "
+            "it, then re-sign the packaged app. Makes macOS TCC grants (Full "
+            "Disk Access, Accessibility, Files and Folders, microphone) survive "
+            "rebuilds with a certificate-anchored identity. Idempotent — safe "
+            "to re-run after updates.")
+    gui_parser.add_argument(
+        "--identity", default="Hermes Local Signing",
+        help="Certificate name to create/use for --setup-tcc-identity (default: Hermes Local Signing)",
+    )
+    gui_parser.set_defaults(func=cmd_gui)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\hooks.py ===
+"""``hermes hooks`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_hooks_parser(subparsers, *, cmd_hooks: Callable) -> None:
+    """Attach the ``hooks`` subcommand to ``subparsers``."""
+    hooks_parser = subparsers.add_parser(
+        "hooks", help="Inspect and manage shell-script hooks",
+        description="Inspect shell-script hooks declared in ~/.hermes/config.yaml, "
+            "test them against synthetic payloads, and manage the first-use "
+            "consent allowlist at ~/.hermes/shell-hooks-allowlist.json.")
+    hooks_subparsers = hooks_parser.add_subparsers(dest="hooks_action")
+
+    hooks_subparsers.add_parser(
+        "list", aliases=["ls"],
+        help="List configured hooks with matcher, timeout, and consent status")
+
+    _hk_test = hooks_subparsers.add_parser(
+        "test", help="Fire every hook matching <event> against a synthetic payload")
+    _hk_test.add_argument(
+        "event", help="Hook event name (e.g. pre_tool_call, pre_llm_call, subagent_stop)")
+    _hk_test.add_argument(
+        "--for-tool", dest="for_tool", default=None,
+        help="Only fire hooks whose matcher matches this tool name "
+            "(used for pre_tool_call / post_tool_call)")
+    _hk_test.add_argument(
+        "--payload-file", dest="payload_file", default=None,
+        help="Path to a JSON file whose contents are merged into the "
+            "synthetic payload before execution")
+
+    _hk_revoke = hooks_subparsers.add_parser(
+        "revoke", aliases=["remove", "rm"],
+        help="Remove a command's allowlist entries (takes effect on next restart)")
+    _hk_revoke.add_argument(
+        "command", help="The exact command string to revoke (as declared in config.yaml)")
+
+    hooks_subparsers.add_parser(
+        "doctor",
+        help="Check each configured hook: exec bit, allowlist, mtime drift, "
+            "JSON validity, and synthetic run timing")
+
+    hooks_parser.set_defaults(func=cmd_hooks)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\import_agent.py ===
+"""``hermes import-agent`` subcommand parser (logic lives in ``hermes_cli/agent_import.py``)."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from hermes_cli.subcommands._shared import add_yes_flag
+
+
+def build_import_agent_parser(subparsers, *, cmd_import_agent: Callable) -> None:
+    """Attach the ``import-agent`` subcommand to ``subparsers``."""
+    parser = subparsers.add_parser(
+        "import-agent", help="Import a Claude Code or Codex CLI setup into Hermes",
+        description="One-command import of another coding agent's setup into Hermes. "
+            "Maps CLAUDE.md/AGENTS.md instructions, permission allowlists, MCP "
+            "servers, skills, and memories into their Hermes equivalents. "
+            "Always shows a preview before making changes. API keys and "
+            "credentials are never imported — run 'hermes setup' for those.")
+    parser.add_argument(
+        "agent", nargs="?", choices=["claude-code", "codex"],
+        help="Which agent to import from (default: auto-detect ~/.claude or ~/.codex)")
+    parser.add_argument(
+        "--source", help="Path to the agent's config directory (default: ~/.claude or ~/.codex)")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview only — stop after showing what would be imported")
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Overwrite existing Hermes items on name conflicts (default: skip)")
+    add_yes_flag(parser, "Skip confirmation prompts")
+    parser.add_argument(
+        "--sync", action="store_true",
+        help="Re-import every previously imported source whose files changed since the last "
+             "import (registered in HERMES_HOME/import-sync.json). Runs without prompts; "
+             "combine with --dry-run to preview.")
+    parser.set_defaults(func=cmd_import_agent)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\import_cmd.py ===
+"""``hermes import`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_import_cmd_parser(subparsers, *, cmd_import: Callable) -> None:
+    """Attach the ``import`` subcommand to ``subparsers``."""
+    import_parser = subparsers.add_parser(
+        "import", help="Restore a Hermes backup from a zip file",
+        description="Extract a previously created Hermes backup into your "
+        "Hermes home directory, restoring configuration, skills, "
+        "sessions, and data")
+    import_parser.add_argument("zipfile", help="Path to the backup zip file")
+    import_parser.add_argument(
+        "--force", "-f", action="store_true", help="Overwrite existing files without confirmation")
+    import_parser.set_defaults(func=cmd_import)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\insights.py ===
+"""``hermes insights`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_insights_parser(subparsers, *, cmd_insights: Callable) -> None:
+    """Attach the ``insights`` subcommand to ``subparsers``."""
+    insights_parser = subparsers.add_parser(
+        "insights", help="Show usage insights and analytics",
+        description="Analyze session history to show token usage, costs, tool patterns, and activity trends",
+    )
+    insights_parser.add_argument(
+        "--days", type=int, default=30, help="Number of days to analyze (default: 30)")
+    insights_parser.add_argument(
+        "--source", help="Filter by platform (cli, telegram, discord, etc.)")
+    insights_parser.set_defaults(func=cmd_insights)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\journey.py ===
+"""``hermes journey`` subcommand parser."""
+
+from __future__ import annotations
+
+import logging
+
+
+def build_journey_parser(subparsers) -> None:
+    """Attach the ``journey`` subcommand to ``subparsers``."""
+    journey_parser = subparsers.add_parser(
+        "journey", aliases=["learning", "memory-graph"],
+        help="Timeline of learned skills + memories over time",
+        description="A terminal rendition of the desktop Star Map / Memory Graph: a "
+            "timeline bar chart of learned skills and memories over time "
+            "(oldest at top, newest at bottom) plus a playable constellation "
+            "scrubber. Mirrors the TUI `/journey` overlay and the desktop panel.")
+    try:
+        from hermes_cli.journey import register_cli as _register_journey_cli
+
+        _register_journey_cli(journey_parser)
+    except Exception as _exc:
+        logging.getLogger("hermes_cli.main").debug("journey CLI wiring failed: %s", _exc)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\login.py ===
+"""``hermes login`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_login_parser(subparsers, *, cmd_login: Callable) -> None:
+    """Attach the deprecated ``login`` subcommand (handler only prints a deprecation notice).
+
+    Kept registered so old scripts get the actionable message instead of argparse's
+    ``invalid choice``. Registered WITHOUT ``help=`` so it is omitted from ``hermes --help``
+    (``help=SUPPRESS`` leaks ``==SUPPRESS==`` for top-level subparsers on 3.12+). ``--provider``
+    takes ANY value (no ``choices=``) so the handler is reached rather than argparse erroring.
+
+    This hides a command that no longer works (#24756) without the ``help=argparse.SUPPRESS``
+    ``==SUPPRESS==`` leak that argparse emits for a top-level subparser on Python 3.12+.
+    """
+    login_parser = subparsers.add_parser(
+        "login",
+        description="Deprecated. Use `hermes auth` to manage credentials, "
+            "`hermes model` to select a provider, or `hermes setup` for full setup.")
+    # No ``choices=`` on purpose — the handler is a deprecation notice that
+    # ignores the value, and a restrictive list would reject providers the user
+    # legitimately wants (e.g. ``anthropic``) with an argparse error before the
+    # friendly redirect message is ever printed.
+    login_parser.add_argument(
+        "--provider", default=None, help="(deprecated) Provider name; ignored — see `hermes model`")
+    login_parser.add_argument("--portal-url", help="Portal base URL (default: production portal)")
+    login_parser.add_argument(
+        "--inference-url", help="Inference API base URL (default: production inference API)")
+    login_parser.add_argument(
+        "--client-id", default=None, help="OAuth client id to use (default: hermes-cli)")
+    login_parser.add_argument("--scope", default=None, help="OAuth scope to request")
+    login_parser.add_argument(
+        "--no-browser", action="store_true",
+        help="Do not attempt to open the browser automatically")
+    login_parser.add_argument(
+        "--timeout", type=float, default=15.0, help="HTTP request timeout in seconds (default: 15)")
+    login_parser.add_argument("--ca-bundle", help="Path to CA bundle PEM file for TLS verification")
+    login_parser.add_argument(
+        "--insecure", action="store_true", help="Disable TLS verification (testing only)")
+    login_parser.set_defaults(func=cmd_login)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\logout.py ===
+"""``hermes logout`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_logout_parser(subparsers, *, cmd_logout: Callable) -> None:
+    """Attach the ``logout`` subcommand to ``subparsers``."""
+    logout_parser = subparsers.add_parser(
+        "logout", help="Clear authentication for an inference provider",
+        description="Remove stored credentials and reset provider config")
+    logout_parser.add_argument(
+        "--provider", choices=["nous", "openai-codex", "xai-oauth", "spotify"], default=None,
+        help="Provider to log out from (default: active provider)")
+    logout_parser.set_defaults(func=cmd_logout)
+

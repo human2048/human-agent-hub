@@ -1,0 +1,221 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_quarantine_forensic_logging.py ===
+"""Redaction-safe forensic logging at the Nous OAuth quarantine path.
+
+A NAS-hosted Fly agent's Nous bootstrap session can take a terminal
+``invalid_grant`` and get quarantined (dead tokens cleared from auth.json).
+Historically this was completely silent — no WARNING+ record at the terminal
+rejection, only a downstream "No access token found" warning once the pool was
+already empty. The Fly log drain is WARNING-only, so nothing about the terminal
+death reached centralized logging. These tests lock in that
+``_quarantine_nous_oauth_state`` now emits a WARNING+ forensic record, and — the
+load-bearing assertion — that the raw refresh token never appears in that output.
+"""
+
+import hashlib
+import logging
+
+from hermes_cli.auth import AuthError, _quarantine_nous_oauth_state
+
+
+# A distinctive, obviously-fake refresh token so the redaction assertion is
+# unambiguous if it ever leaks.
+_FAKE_RT = "nous_rt_LEAK_CANARY_do_not_log_raw_0123456789abcdef"
+_EXPECTED_FP = hashlib.sha256(_FAKE_RT.encode("utf-8")).hexdigest()[:12]
+
+
+def _make_state(**overrides):
+    state = {
+        "portal_base_url": "https://portal.example.com",
+        "client_id": "test-client-id",
+        "access_token": "nous_at_SECRET_access_token_material",
+        "refresh_token": _FAKE_RT,
+        "agent_key": "nous_agent_key_SECRET_material",
+        "agent_key_id": "ak-12345",
+        "expires_at": "2020-01-01T00:00:00+00:00",  # in the past
+        "obtained_at": "2019-12-31T00:00:00+00:00",
+    }
+    state.update(overrides)
+    return state
+
+
+def _error():
+    return AuthError(
+        "invalid_grant: token expired or revoked",
+        provider="nous",
+        code="invalid_grant",
+        relogin_required=True,
+    )
+
+
+def test_quarantine_emits_warning(caplog):
+    state = _make_state()
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
+        _quarantine_nous_oauth_state(state, _error(), reason="unit_test_quarantine")
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "expected at least one WARNING+ record from quarantine"
+    assert any("quarantined" in r.getMessage() for r in warnings)
+
+
+
+
+def test_raw_refresh_token_never_logged(caplog):
+    """Load-bearing redaction-safety test: the raw secret must never appear."""
+    state = _make_state()
+    with caplog.at_level(logging.DEBUG, logger="hermes_cli.auth"):
+        _quarantine_nous_oauth_state(state, _error(), reason="unit_test_quarantine")
+
+    text = caplog.text
+    assert _FAKE_RT not in text, "RAW refresh token leaked into log output!"
+    # Belt-and-suspenders: the access token and agent key must not leak either.
+    assert "nous_at_SECRET_access_token_material" not in text
+    assert "nous_agent_key_SECRET_material" not in text
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_quarantine_noop_restore.py ===
+"""Regression tests for the quarantine no-op restore gap (#75584).
+
+On Windows, ``_run_quarantined_install`` / ``_run_install_cmd`` rename live
+``hermes*.exe`` shims aside (``hermes.exe.old.<ms>``) before invoking the
+installer so uv/pip can write fresh replacements. When the install SUCCEEDS
+but never rewrites entry points (uv audits an already-satisfied editable
+install as a no-op), the old code only restored the shims on FAILURE — the
+quarantined shims stayed renamed aside and ``hermes`` vanished from PATH
+after a green install.
+
+These tests exercise both wrapper sites with a fake installer and assert the
+shims come back on every path:
+  - success + installer rewrote shims  → fresh shims kept, .old garbage left
+  - success + installer wrote nothing  → original shims renamed back (the bug)
+  - failure                            → original shims renamed back (as before)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli import _install_repair as ir
+from hermes_cli import main_install_repair
+
+
+def _make_scripts_dir(tmp_path: Path) -> Path:
+    scripts = tmp_path / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    for name in ("hermes", "hermes-agent", "hermes-acp", "hermes-gateway"):
+        (scripts / f"{name}.exe").write_bytes(b"MZ-old-" + name.encode())
+    return scripts
+
+
+def _shim_names(scripts: Path) -> set[str]:
+    return {p.name for p in scripts.iterdir()}
+
+
+# ---------------------------------------------------------------------------
+# main_install_repair._run_quarantined_install
+# ---------------------------------------------------------------------------
+
+
+def test_main_noop_success_restores_shims(tmp_path):
+    """A successful install that writes no entry points must restore shims."""
+    scripts = _make_scripts_dir(tmp_path)
+
+    with patch.object(main_install_repair, "_is_windows", lambda: True), patch.object(main_install_repair, "_run_install_with_heartbeat", lambda cmd, env=None: None
+    ):
+        main_install_repair._run_quarantined_install(["fake"], scripts_dir=scripts)
+
+    names = _shim_names(scripts)
+    assert "hermes.exe" in names, "hermes.exe must be restored after a no-op install"
+    assert "hermes-acp.exe" in names
+    assert "hermes-gateway.exe" in names
+    assert (scripts / "hermes.exe").read_bytes() == b"MZ-old-hermes"
+
+
+def test_main_rewriting_success_keeps_fresh_shims(tmp_path):
+    """When the installer writes fresh shims, restore must NOT clobber them."""
+    scripts = _make_scripts_dir(tmp_path)
+
+    def fake_install(cmd, env=None):
+        for name in ("hermes", "hermes-agent", "hermes-acp", "hermes-gateway"):
+            (scripts / f"{name}.exe").write_bytes(b"MZ-new-" + name.encode())
+
+    with patch.object(main_install_repair, "_is_windows", lambda: True), patch.object(main_install_repair, "_run_install_with_heartbeat", fake_install
+    ):
+        main_install_repair._run_quarantined_install(["fake"], scripts_dir=scripts)
+
+    assert (scripts / "hermes.exe").read_bytes() == b"MZ-new-hermes"
+
+
+def test_main_failure_restores_shims_and_reraises(tmp_path):
+    scripts = _make_scripts_dir(tmp_path)
+
+    def boom(cmd, env=None):
+        raise RuntimeError("install died")
+
+    with patch.object(main_install_repair, "_is_windows", lambda: True), patch.object(main_install_repair, "_run_install_with_heartbeat", boom
+    ):
+        with pytest.raises(RuntimeError, match="install died"):
+            main_install_repair._run_quarantined_install(["fake"], scripts_dir=scripts)
+
+    assert (scripts / "hermes.exe").read_bytes() == b"MZ-old-hermes"
+
+
+# ---------------------------------------------------------------------------
+# hermes_cli._install_repair._run_install_cmd (the deferred-recovery path)
+# ---------------------------------------------------------------------------
+
+
+def _patch_repair_windows(scripts: Path):
+    """Force the repair module down the Windows quarantine path."""
+    return (
+        patch.object(ir, "_is_windows", lambda: True),
+        patch.object(ir, "_venv_scripts_dir", lambda root: scripts),
+    )
+
+
+def test_repair_noop_success_restores_shims(tmp_path):
+    """The early-recovery install path (the #75584 report) must restore too."""
+    scripts = _make_scripts_dir(tmp_path)
+    win, vdir = _patch_repair_windows(scripts)
+
+    with win, vdir, patch.object(ir.subprocess, "run", lambda *a, **k: None):
+        ir._run_install_cmd(["fake"], env=None, root=tmp_path)
+
+    names = _shim_names(scripts)
+    assert "hermes.exe" in names, "hermes.exe must be restored after a no-op recovery install"
+    assert (scripts / "hermes.exe").read_bytes() == b"MZ-old-hermes"
+
+
+def test_repair_rewriting_success_keeps_fresh_shims(tmp_path):
+    scripts = _make_scripts_dir(tmp_path)
+    win, vdir = _patch_repair_windows(scripts)
+
+    def fake_run(cmd, cwd=None, check=None, env=None):
+        (scripts / "hermes.exe").write_bytes(b"MZ-new-hermes")
+
+    with win, vdir, patch.object(ir.subprocess, "run", fake_run):
+        ir._run_install_cmd(["fake"], env=None, root=tmp_path)
+
+    assert (scripts / "hermes.exe").read_bytes() == b"MZ-new-hermes"
+
+
+def test_repair_failure_restores_shims_and_reraises(tmp_path):
+    scripts = _make_scripts_dir(tmp_path)
+    win, vdir = _patch_repair_windows(scripts)
+
+    def fake_run(cmd, cwd=None, check=None, env=None):
+        raise ir.subprocess.CalledProcessError(1, cmd)
+
+    with win, vdir, patch.object(ir.subprocess, "run", fake_run):
+        with pytest.raises(ir.subprocess.CalledProcessError):
+            ir._run_install_cmd(["fake"], env=None, root=tmp_path)
+
+    assert (scripts / "hermes.exe").read_bytes() == b"MZ-old-hermes"
+

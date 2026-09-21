@@ -1,0 +1,453 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\user-guide\messaging\sms.md ===
+---
+sidebar_position: 8
+sidebar_label: "SMS (Twilio)"
+title: "SMS (Twilio)"
+description: "Set up Hermes Agent as an SMS chatbot via Twilio"
+---
+
+# SMS Setup (Twilio)
+
+Hermes connects to SMS through the [Twilio](https://www.twilio.com/) API. People text your Twilio phone number and get AI responses back — same conversational experience as Telegram or Discord, but over standard text messages.
+
+:::info Shared Credentials
+The SMS gateway shares credentials with the optional [telephony skill](../../reference/skills-catalog.md). If you've already set up Twilio for voice calls or one-off SMS, the gateway works with the same `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_PHONE_NUMBER`.
+:::
+
+---
+
+## Prerequisites
+
+- **Twilio account** — [Sign up at twilio.com](https://www.twilio.com/try-twilio) (free trial available)
+- **A Twilio phone number** with SMS capability
+- **A publicly accessible server** — Twilio sends webhooks to your server when SMS arrives
+- **aiohttp** — `cd ~/.hermes/hermes-agent && uv pip install -e ".[sms]"`
+
+---
+
+## Step 1: Get Your Twilio Credentials
+
+1. Go to the [Twilio Console](https://console.twilio.com/)
+2. Copy your **Account SID** and **Auth Token** from the dashboard
+3. Go to **Phone Numbers → Manage → Active Numbers** — note your phone number in E.164 format (e.g., `+15551234567`)
+
+---
+
+## Step 2: Configure Hermes
+
+### Interactive setup (recommended)
+
+```bash
+hermes gateway setup
+```
+
+Select **SMS (Twilio)** from the platform list. The wizard will prompt for your credentials.
+
+### Manual setup
+
+Add to `~/.hermes/.env`:
+
+```bash
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=your_auth_token_here
+TWILIO_PHONE_NUMBER=+15551234567
+
+# Security: restrict to specific phone numbers (recommended)
+SMS_ALLOWED_USERS=+15559876543,+15551112222
+
+# Optional: set a home channel for cron job delivery
+SMS_HOME_CHANNEL=+15559876543
+```
+
+---
+
+## Step 3: Configure Twilio Webhook
+
+Twilio needs to know where to send incoming messages. In the [Twilio Console](https://console.twilio.com/):
+
+1. Go to **Phone Numbers → Manage → Active Numbers**
+2. Click your phone number
+3. Under **Messaging → A MESSAGE COMES IN**, set:
+   - **Webhook**: `https://your-server:8080/webhooks/twilio`
+   - **HTTP Method**: `POST`
+
+:::tip Exposing Your Webhook
+If you're running Hermes locally, use a tunnel to expose the webhook:
+
+```bash
+# Using cloudflared
+cloudflared tunnel --url http://localhost:8080
+
+# Using ngrok
+ngrok http 8080
+```
+
+Set the resulting public URL as your Twilio webhook.
+:::
+
+**Set `SMS_WEBHOOK_URL` to the same URL you configured in Twilio.** This is required for Twilio signature validation — the adapter will refuse to start without it:
+
+```bash
+# Must match the webhook URL in your Twilio Console
+SMS_WEBHOOK_URL=https://your-server:8080/webhooks/twilio
+```
+
+The webhook port defaults to `8080`. Override with:
+
+```bash
+SMS_WEBHOOK_PORT=3000
+```
+
+---
+
+## Step 4: Start the Gateway
+
+```bash
+hermes gateway
+```
+
+You should see:
+
+```
+[sms] Twilio webhook server listening on 127.0.0.1:8080, from: +1555***4567
+```
+
+If you see `Refusing to start: SMS_WEBHOOK_URL is required`, set `SMS_WEBHOOK_URL` to the public URL configured in your Twilio Console (see Step 3).
+
+Text your Twilio number — Hermes will respond via SMS.
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TWILIO_ACCOUNT_SID` | Yes | Twilio Account SID (starts with `AC`) |
+| `TWILIO_AUTH_TOKEN` | Yes | Twilio Auth Token (also used for webhook signature validation) |
+| `TWILIO_PHONE_NUMBER` | Yes | Your Twilio phone number (E.164 format) |
+| `SMS_WEBHOOK_URL` | Yes | Public URL for Twilio signature validation — must match the webhook URL in your Twilio Console |
+| `SMS_WEBHOOK_PORT` | No | Webhook listener port (default: `8080`) |
+| `SMS_WEBHOOK_HOST` | No | Webhook bind address (default: `127.0.0.1`) |
+| `SMS_INSECURE_NO_SIGNATURE` | No | Set to `true` to disable signature validation (local dev only — **not for production**) |
+| `SMS_ALLOWED_USERS` | No | Comma-separated E.164 phone numbers allowed to chat |
+| `SMS_ALLOW_ALL_USERS` | No | Set to `true` to allow anyone (not recommended) |
+| `SMS_HOME_CHANNEL` | No | Phone number for cron job / notification delivery |
+| `SMS_HOME_CHANNEL_NAME` | No | Display name for the home channel (default: `Home`) |
+
+---
+
+## SMS-Specific Behavior
+
+- **Plain text only** — Markdown is automatically stripped since SMS renders it as literal characters
+- **1600 character limit** — Longer responses are split across multiple messages at natural boundaries (newlines, then spaces)
+- **Echo prevention** — Messages from your own Twilio number are ignored to prevent loops
+- **Phone number redaction** — Phone numbers are redacted in logs for privacy
+
+---
+
+## Security
+
+### Webhook signature validation
+
+Hermes validates that inbound webhooks genuinely originate from Twilio by verifying the `X-Twilio-Signature` header (HMAC-SHA1). This prevents attackers from injecting forged messages.
+
+**`SMS_WEBHOOK_URL` is required.** Set it to the public URL configured in your Twilio Console. The adapter will refuse to start without it.
+
+For local development without a public URL, you can disable validation:
+
+```bash
+# Local dev only — NOT for production
+SMS_INSECURE_NO_SIGNATURE=true
+```
+
+### User allowlists
+
+**The gateway denies all users by default.** Configure an allowlist:
+
+```bash
+# Recommended: restrict to specific phone numbers
+SMS_ALLOWED_USERS=+15559876543,+15551112222
+
+# Or allow all (NOT recommended for bots with terminal access)
+SMS_ALLOW_ALL_USERS=true
+```
+
+:::warning
+SMS has no built-in encryption. Don't use SMS for sensitive operations unless you understand the security implications. For sensitive use cases, prefer Signal or Telegram.
+:::
+
+---
+
+## Troubleshooting
+
+### Messages not arriving
+
+1. Check your Twilio webhook URL is correct and publicly accessible
+2. Verify `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` are correct
+3. Check the Twilio Console → **Monitor → Logs → Messaging** for delivery errors
+4. Ensure your phone number is in `SMS_ALLOWED_USERS` (or `SMS_ALLOW_ALL_USERS=true`)
+
+### Replies not sending
+
+1. Check `TWILIO_PHONE_NUMBER` is set correctly (E.164 format with `+`)
+2. Verify your Twilio account has SMS-capable numbers
+3. Check Hermes gateway logs for Twilio API errors
+
+### Webhook port conflicts
+
+If port 8080 is already in use, change it:
+
+```bash
+SMS_WEBHOOK_PORT=3001
+```
+
+Update the webhook URL in Twilio Console to match.
+
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\user-guide\messaging\teams-meetings.md ===
+---
+sidebar_position: 6
+title: "Teams Meetings"
+description: "Set up the Microsoft Teams meeting summary pipeline with Microsoft Graph webhooks"
+---
+
+# Microsoft Teams Meetings
+
+Use the Teams meeting pipeline when you want Hermes to ingest Microsoft Graph meeting events, fetch transcripts first, fall back to recordings plus STT when needed, and deliver a structured summary to downstream sinks.
+
+Prerequisites: see [Microsoft Teams](./teams.md) for the underlying bot/credential setup.
+
+> Run `hermes gateway setup` and pick **Teams Meetings** for a guided walk-through.
+
+This page focuses on setup and enablement:
+- Graph credentials
+- webhook listener configuration
+- Teams delivery modes
+- pipeline config shape
+
+For day-2 operations, go-live checks, and the operator worksheet, use the dedicated guide: [Operate the Teams Meeting Pipeline](../../guides/operate-teams-meeting-pipeline.md).
+
+## What This Feature Does
+
+The pipeline:
+1. receives Microsoft Graph webhook events
+2. resolves the meeting and prefers transcript artifacts first
+3. falls back to recording download plus STT when no usable transcript is available
+4. stores durable job state and sink records locally
+5. can write summaries to Notion, Linear, and Microsoft Teams
+
+Operator actions stay in the CLI (the `teams-pipeline` subcommand is registered by the `teams_pipeline` plugin — enable it via `hermes plugins enable teams_pipeline` or set `plugins.enabled: [teams_pipeline]` in `config.yaml`):
+
+```bash
+hermes teams-pipeline validate
+hermes teams-pipeline list
+hermes teams-pipeline maintain-subscriptions
+```
+
+## Prerequisites
+
+Before enabling the meetings pipeline, make sure you have:
+
+- a working Hermes install
+- the existing [Microsoft Teams bot setup](./teams.md) if you want Teams outbound delivery
+- Microsoft Graph application credentials with the permissions required for the meeting resources you plan to subscribe to
+- a public HTTPS URL that Microsoft Graph can call for webhook delivery
+- `ffmpeg` installed if you want recording-plus-STT fallback
+
+## Step 1: Add Microsoft Graph Credentials
+
+Add Graph app-only credentials to `~/.hermes/.env`:
+
+```bash
+MSGRAPH_TENANT_ID=<tenant-id>
+MSGRAPH_CLIENT_ID=<client-id>
+MSGRAPH_CLIENT_SECRET=<client-secret>
+```
+
+These credentials are used by:
+- the Graph client foundation
+- subscription maintenance commands
+- meeting resolution and artifact fetches
+- Graph-based Teams outbound delivery when you do not provide a dedicated Teams access token
+
+## Step 2: Enable the Graph Webhook Listener
+
+The webhook listener is a gateway platform named `msgraph_webhook`. At minimum, enable it and set a client state value:
+
+```bash
+MSGRAPH_WEBHOOK_ENABLED=true
+MSGRAPH_WEBHOOK_PORT=8646
+MSGRAPH_WEBHOOK_CLIENT_STATE=<random-shared-secret>
+MSGRAPH_WEBHOOK_ACCEPTED_RESOURCES=communications/onlineMeetings
+```
+
+The bind host is read from the platform's `extra.host` in `config.yaml` (there is no `MSGRAPH_WEBHOOK_HOST` env var — see the [webhook listener reference](msgraph-webhook.md)).
+
+The listener exposes:
+- `/msgraph/webhook` for Graph notifications
+- `/health` for a simple health check
+
+You need to route your public HTTPS endpoint to that listener. For example, if your public domain is `https://ops.example.com`, your Graph notification URL would typically be:
+
+```text
+https://ops.example.com/msgraph/webhook
+```
+
+## Step 3: Configure Teams Delivery and Pipeline Behavior
+
+The meeting pipeline reads its runtime config from the existing `teams` platform entry. Pipeline-specific knobs live under `teams.extra.meeting_pipeline`. Teams outbound delivery stays on the normal Teams platform config surface.
+
+Example `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  msgraph_webhook:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8646
+      client_state: "replace-me"
+      accepted_resources:
+        - "communications/onlineMeetings"
+
+  teams:
+    enabled: true
+    extra:
+      client_id: "your-teams-client-id"
+      client_secret: "your-teams-client-secret"
+      tenant_id: "your-teams-tenant-id"
+
+      # outbound summary delivery
+      delivery_mode: "graph" # or incoming_webhook
+      team_id: "team-id"
+      channel_id: "channel-id"
+      # incoming_webhook_url: "https://..."
+
+      meeting_pipeline:
+        transcript_min_chars: 80
+        transcript_required: false
+        transcription_fallback: true
+        ffmpeg_extract_audio: true
+        notion:
+          enabled: false
+        linear:
+          enabled: false
+```
+
+If you bind the listener to a non-loopback host such as `0.0.0.0`, you must also set `allowed_source_cidrs` to Microsoft's webhook egress ranges. Loopback binds (`127.0.0.1` / `::1`) are the intended dev-tunnel and local reverse-proxy setup.
+
+## Teams Delivery Modes
+
+The pipeline supports two Teams summary-delivery modes inside the existing Teams plugin.
+
+### `incoming_webhook`
+
+Use this when you want a simple webhook post into Teams without channel-message creation through Graph.
+
+Required config:
+
+```yaml
+platforms:
+  teams:
+    enabled: true
+    extra:
+      delivery_mode: "incoming_webhook"
+      incoming_webhook_url: "https://..."
+```
+
+### `graph`
+
+Use this when you want Hermes to post the summary through Microsoft Graph into a Teams chat or channel.
+
+Supported targets:
+- `chat_id`
+- `team_id` + `channel_id`
+- `team_id` + `home_channel` fallback for the existing Teams platform
+
+Example:
+
+```yaml
+platforms:
+  teams:
+    enabled: true
+    extra:
+      delivery_mode: "graph"
+      team_id: "team-id"
+      channel_id: "channel-id"
+```
+
+## Step 4: Start the Gateway
+
+Start Hermes normally after updating config:
+
+```bash
+hermes gateway run
+```
+
+Or, if you run Hermes in Docker, start the gateway the same way you already do for your deployment.
+
+Check the listener:
+
+```bash
+curl http://localhost:8646/health
+```
+
+## Step 5: Create Graph Subscriptions
+
+Use the plugin CLI to create and inspect subscriptions.
+
+Examples:
+
+```bash
+hermes teams-pipeline subscribe \
+  --resource communications/onlineMeetings/getAllTranscripts \
+  --notification-url https://ops.example.com/msgraph/webhook \
+  --client-state "$MSGRAPH_WEBHOOK_CLIENT_STATE"
+
+hermes teams-pipeline subscribe \
+  --resource communications/onlineMeetings/getAllRecordings \
+  --notification-url https://ops.example.com/msgraph/webhook \
+  --client-state "$MSGRAPH_WEBHOOK_CLIENT_STATE"
+```
+
+:::warning Graph subscriptions expire in 72 hours
+
+Microsoft Graph caps webhook subscriptions at 72 hours and will not auto-renew them. You MUST schedule `hermes teams-pipeline maintain-subscriptions` before going live, or notifications will silently stop three days after any manual subscription creation. See [Automating subscription renewal](../../guides/operate-teams-meeting-pipeline.md#automating-subscription-renewal-required-for-production) in the operator runbook — three options (Hermes cron, systemd timer, plain crontab).
+
+:::
+
+For subscription maintenance and day-2 operator flows, continue with the guide: [Operate the Teams Meeting Pipeline](../../guides/operate-teams-meeting-pipeline.md).
+
+## Validation
+
+Run the built-in validation snapshot:
+
+```bash
+hermes teams-pipeline validate
+```
+
+Useful companion checks:
+
+```bash
+hermes teams-pipeline token-health
+hermes teams-pipeline subscriptions
+```
+
+## Troubleshooting
+
+| Problem | What to check |
+|---------|---------------|
+| Graph webhook validation fails | Confirm the public URL is correct and reachable, and that Graph is calling the exact `/msgraph/webhook` path |
+| Jobs do not appear in `hermes teams-pipeline list` | Confirm `msgraph_webhook` is enabled and that subscriptions point at the right notification URL |
+| Transcript-first never succeeds | Check Graph permissions for transcript resources and whether the transcript artifact exists for that meeting |
+| Recording fallback fails | Confirm `ffmpeg` is installed and the Graph app can access recording artifacts |
+| Teams summary delivery fails | Re-check `delivery_mode`, target IDs, and Teams auth config |
+
+## Related Docs
+
+- [Microsoft Teams bot setup](./teams.md)
+- [Operate the Teams Meeting Pipeline](../../guides/operate-teams-meeting-pipeline.md)
+

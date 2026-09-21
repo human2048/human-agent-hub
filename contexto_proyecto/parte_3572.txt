@@ -1,0 +1,386 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sqlite_runtime.py ===
+"""Behavioral tests for exact-interpreter SQLite runtime inspection."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sqlite3
+import sys
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.sqlite_runtime import (
+    is_sqlite_wal_reset_vulnerable,
+    probe_sqlite_runtime,
+)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ((3, 6, 23), False),
+        ((3, 7, 0), True),
+        ((3, 44, 5), True),
+        ((3, 44, 6), False),
+        ((3, 45, 0), True),
+        ((3, 50, 6), True),
+        ((3, 50, 7), False),
+        ((3, 51, 2), True),
+        ((3, 51, 3), False),
+        ((3, 53, 1), False),
+    ],
+)
+def test_wal_reset_vulnerability_matrix(
+    version: tuple[int, ...],
+    expected: bool,
+) -> None:
+    assert is_sqlite_wal_reset_vulnerable(version) is expected
+
+
+def test_probe_reports_the_requested_interpreters_linked_sqlite() -> None:
+    info = probe_sqlite_runtime(sys.executable)
+
+    assert info is not None
+    assert info.executable.resolve() == Path(sys.executable).resolve()
+    assert info.base_prefix.resolve() == Path(sys.base_prefix).resolve()
+    assert info.python_version == sys.version_info[:3]
+    assert info.sqlite_version == sqlite3.sqlite_version_info
+    assert info.sqlite_version_string == sqlite3.sqlite_version
+
+    with sqlite3.connect(":memory:") as conn:
+        source_id = conn.execute("SELECT sqlite_source_id()").fetchone()[0]
+    assert info.sqlite_source_id == source_id
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX executable probe stub")
+def test_probe_uses_child_payload_and_sanitizes_python_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_python = tmp_path / "reported-python"
+    payload = {
+        "base_prefix": str(tmp_path / "reported-base"),
+        "executable": str(fake_python),
+        "python_version": [3, 11, 15],
+        "sqlite_version": [9, 8, 7],
+        "sqlite_version_string": "9.8.7-child",
+        "sqlite_source_id": "child-source-id",
+    }
+    fake_python.write_text(
+        "\n".join([
+            "#!/bin/sh",
+            '[ "$1" = "-I" ] && [ "$2" = "-c" ] || exit 10',
+            '[ -z "${PYTHONHOME+x}" ] || exit 11',
+            '[ -z "${PYTHONPATH+x}" ] || exit 12',
+            f"printf '%s\\n' {shlex.quote(json.dumps(payload))}",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "poison-home"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "poison-path"))
+
+    info = probe_sqlite_runtime(fake_python)
+
+    assert info is not None
+    assert info.executable == fake_python
+    assert info.base_prefix == tmp_path / "reported-base"
+    assert info.sqlite_version == (9, 8, 7)
+    assert info.sqlite_version_string == "9.8.7-child"
+    assert info.sqlite_source_id == "child-source-id"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sqlite_util_canonical.py ===
+"""Invariants for the canonical SQLite connect/transaction layer (``hermes_cli/sqlite_util.py``).
+
+Every small store used to carry its own connect + PRAGMA + ``with conn:`` stack, so the #69567 fd-leak
+fix and the WAL fallback rules had to be re-pasted per module (and at least one copy missed each).
+These tests pin the contract: one opener, one closer, and every store routed through them.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from hermes_cli import sqlite_util
+
+
+def test_transaction_closes_the_connection_even_when_the_body_raises(tmp_path):
+    db = tmp_path / "t.db"
+    conn = sqlite_util.open_db(db, db_label="t.db", wal=False)
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+
+    with pytest.raises(RuntimeError):
+        with sqlite_util.transaction(conn) as c:
+            c.execute("INSERT INTO t VALUES (1)")
+            raise RuntimeError("mid-transaction")
+
+    # Rolled back AND closed: a closed connection refuses every statement.
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+    with sqlite3.connect(db) as check:
+        assert check.execute("SELECT count(*) FROM t").fetchone()[0] == 0
+
+    # The success path closes too.
+    conn = sqlite_util.open_db(db, db_label="t.db", wal=False)
+    with sqlite_util.transaction(conn) as c:
+        c.execute("INSERT INTO t VALUES (2)")
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_open_db_closes_the_half_open_connection_when_initialize_raises(monkeypatch, tmp_path):
+    opened = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite_util.sqlite3, "connect", tracking_connect)
+
+    def broken(conn):
+        raise sqlite3.OperationalError("boom")
+
+    with pytest.raises(sqlite3.OperationalError):
+        sqlite_util.open_db(tmp_path / "x.db", db_label="x.db", wal=False, initialize=broken)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+
+
+# Every store that opens its own SQLite file (path -> module attribute holding the opener).
+_STORE_OPENERS = (
+    ("agent.verification_evidence", "_connect"),
+    ("cron.executions", "_connect"),
+    ("cron.incidents", "_connect"),
+    ("cron.notepad", "_connect"),
+    ("cron.delivery_queue", "_connect"),
+    ("gateway.delivery_ledger", "_connect"),
+    ("tools.async_delegation", "_connect"),
+    ("hermes_cli.projects_db", "connect"),
+    ("gateway.hosted_rooms_common", "open_sqlite"),
+)
+
+
+@pytest.mark.parametrize("module_name, attr", _STORE_OPENERS)
+def test_every_store_opens_through_the_canonical_open_db(monkeypatch, tmp_path, module_name, attr):
+    import importlib
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    module = importlib.import_module(module_name)
+    for name in ("EXECUTIONS_FILE", "NOTEPAD_FILE", "DELIVERY_DB"):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, tmp_path / f"{name.lower()}.db")
+    if module_name == "cron.incidents":
+        monkeypatch.setattr(module._executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    if module_name == "agent.verification_evidence":
+        monkeypatch.setattr(module, "_db_path", lambda: tmp_path / "ve.db")
+    if module_name in ("gateway.delivery_ledger", "tools.async_delegation"):
+        monkeypatch.setattr(module, "_db_path", lambda: tmp_path / "state.db")
+
+    calls = []
+    real_open_db = sqlite_util.open_db
+
+    def spy(path, **kwargs):
+        calls.append(kwargs)
+        return real_open_db(path, **kwargs)
+
+    # Patch where production reads: a module-level ``from sqlite_util import open_db`` binds its own name.
+    monkeypatch.setattr(sqlite_util, "open_db", spy)
+    if getattr(module, "open_db", None) is real_open_db:
+        monkeypatch.setattr(module, "open_db", spy)
+    opener = getattr(module, attr)
+    args = (tmp_path / "opened.db",) if module_name == "gateway.hosted_rooms_common" else ()
+    if module_name == "hermes_cli.projects_db":
+        args = (tmp_path / "projects.db",)
+    conn = opener(*args)
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] > 0
+    finally:
+        conn.close()
+    assert len(calls) == 1 and calls[0]["db_label"], module_name
+
+
+def test_plugin_db_wal_goes_through_the_shared_fallback(monkeypatch, tmp_path):
+    """A raw ``PRAGMA journal_mode=WAL`` bypasses the network-FS fallback and the WAL-reset-bug gate;
+    plugin databases must obey the same rules as every core store."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_state_wal
+    from plugins import plugin_storage
+
+    seen = []
+    real = hermes_state_wal.apply_wal_with_fallback
+
+    def spy(conn, **kwargs):
+        seen.append(kwargs["db_label"])
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(hermes_state_wal, "apply_wal_with_fallback", spy)
+    conn = plugin_storage.plugin_db("board")
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert seen == ["plugin-data/board/data.db"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sse_done.py ===
+"""Unit tests for SSE [DONE] sentinel tracking (issue #90848)."""
+
+from __future__ import annotations
+
+import json
+
+from hermes_cli.proxy.sse_done import DONE_SSE_FRAME, SseDoneTracker, content_type_is_sse
+
+
+def _data_line(obj) -> bytes:
+    if isinstance(obj, (bytes, bytearray)):
+        return b"data: " + bytes(obj) + b"\n\n"
+    if obj == "[DONE]":
+        return b"data: [DONE]\n\n"
+    return f"data: {json.dumps(obj)}\n\n".encode("utf-8")
+
+
+def test_complete_stream_without_done_appends():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {"content": "LONGCAT_OK"}}]}))
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    tracker.feed(
+        _data_line(
+            {
+                "choices": [],
+                "lastOne": True,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+        )
+    )
+    assert tracker.should_append_done() is True
+    assert tracker.saw_done is False
+    assert DONE_SSE_FRAME.startswith(b"data: [DONE]")
+
+
+def test_finish_reason_alone_is_enough_without_last_one():
+    """Solar-shaped stream: finish_reason present, no lastOne, no [DONE]."""
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {"content": "SOLAR_OK"}}]}))
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    assert tracker.should_append_done() is True
+
+
+def test_last_one_alone_is_enough_without_finish_reason():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {"content": "x"}}]}))
+    tracker.feed(_data_line({"choices": [], "lastOne": True}))
+    assert tracker.should_append_done() is True
+
+
+def test_existing_done_is_not_duplicated():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    tracker.feed(_data_line("[DONE]"))
+    assert tracker.should_append_done() is False
+    assert tracker.saw_done is True
+
+
+def test_error_event_blocks_done_synthesis():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {"content": "partial"}}]}))
+    tracker.feed(_data_line({"error": {"message": "upstream failed", "type": "api_error"}}))
+    assert tracker.should_append_done() is False
+
+
+def test_error_finish_reason_blocks_done_synthesis():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "error"}]}))
+    assert tracker.should_append_done() is False
+
+
+def test_malformed_event_blocks_done_synthesis():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    tracker.feed(b'data: {"choices": [MALFORMED]}\n\n')
+    assert tracker.should_append_done() is False
+
+
+def test_truncated_trailing_event_blocks_done_synthesis():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    tracker.feed(b'data: {"choices": [{"delta": {"content": "tail"}}]')
+    assert tracker.should_append_done() is False
+
+
+def test_interrupted_stream_never_appends_done():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    tracker.mark_interrupted()
+    assert tracker.should_append_done() is False
+
+
+def test_incomplete_stream_without_terminal_marker_does_not_append():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [{"delta": {"content": "mid"}}]}))
+    assert tracker.should_append_done() is False
+
+
+def test_feed_preserves_chunk_boundaries_across_split_lines():
+    """A finish_reason frame split across TCP chunks must still be detected."""
+    tracker = SseDoneTracker()
+    payload = _data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    mid = len(payload) // 2
+    tracker.feed(payload[:mid])
+    tracker.feed(payload[mid:])
+    assert tracker.should_append_done() is True
+
+
+def test_content_type_is_sse():
+    assert content_type_is_sse({"Content-Type": "text/event-stream"}) is True
+    assert content_type_is_sse({"content-type": "text/event-stream; charset=utf-8"}) is True
+    assert content_type_is_sse({"Content-Type": "application/json"}) is False
+
+
+def test_multiline_data_event_joins_per_sse_spec():
+    """One JSON event split across consecutive data: lines (spec-legal) must
+    parse as a single event, not two malformed fragments."""
+    tracker = SseDoneTracker()
+    tracker.feed(
+        b'data: {"choices":[{"delta":{},\n'
+        b'data: "finish_reason":"stop"}]}\n'
+        b"\n"
+    )
+    assert tracker.saw_malformed_event is False
+    assert tracker.should_append_done() is True
+
+
+def test_multiline_malformed_event_still_disables_synthesis():
+    tracker = SseDoneTracker()
+    tracker.feed(b"data: {broken\ndata: json!\n\n")
+    tracker.feed(_data_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    assert tracker.should_append_done() is False
+
+
+def test_truthy_integer_last_one_counts_as_terminal():
+    tracker = SseDoneTracker()
+    tracker.feed(_data_line({"choices": [], "lastOne": 1, "usage": {}}))
+    assert tracker.should_append_done() is True
+
+
+def test_final_event_without_trailing_blank_line_still_dispatches():
+    """Clean EOF right after the last data: line (no blank-line boundary)."""
+    tracker = SseDoneTracker()
+    tracker.feed(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n')
+    assert tracker.should_append_done() is True
+

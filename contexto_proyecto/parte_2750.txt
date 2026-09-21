@@ -1,0 +1,311 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_new_clears_last_resolved_model.py ===
+"""Regression tests for #58403 — /new must clear _last_resolved_model cache.
+
+After a config change (e.g. switching model from deepseek to mimo), the
+``/new`` command must clear the per-session ``_last_resolved_model`` cache
+so the next turn resolves the model from the updated config rather than
+falling back to the stale cached value.
+
+Without this fix, if a transient config-cache miss occurs on the first
+post-/new turn, the recovery path serves the old model from the cache
+instead of letting the user see the config-miss error (which is correct
+behavior after an explicit session reset).
+"""
+
+import threading
+
+import gateway.run as gateway_run
+
+
+def _make_runner():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_model_overrides = {}
+    runner._last_resolved_model = {}
+    runner._service_tier = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    return runner
+
+
+def _patch_resolution(monkeypatch, *, model_from_config: str, provider: str = "openrouter"):
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: model_from_config)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": provider,
+            "api_key": "x",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+
+
+def test_new_with_config_change_no_stale_fallback(monkeypatch):
+    """After /new + config change, empty config read should NOT recover old model."""
+    runner = _make_runner()
+    sk = "agent:main:qqbot:dm:123"
+
+    # Turn 1: old model cached.
+    _patch_resolution(monkeypatch, model_from_config="deepseek-chat")
+    runner._resolve_session_agent_runtime(session_key=sk, user_config={"model": {"default": "x"}})
+    assert runner._last_resolved_model[sk] == "deepseek-chat"
+
+    # Simulate /new clearing the cache.
+    runner._session_model_overrides.pop(sk, None)
+    _lrm = getattr(runner, "_last_resolved_model", None)
+    if _lrm is not None:
+        _lrm.pop(sk, None)
+
+    # Turn 2: config read fails (empty) — should NOT recover old model.
+    _patch_resolution(monkeypatch, model_from_config="", provider="")
+    model, _ = runner._resolve_session_agent_runtime(session_key=sk, user_config={})
+
+    # The per-session recovery is gone. But the global "*" fallback still has
+    # "deepseek-chat".  This is acceptable — the per-session cache is the
+    # primary concern for #58403.  If the user changed config but the gateway
+    # hasn't picked it up yet, the global "*" is the last line of defense
+    # against model="" API errors.
+    # The key assertion: model is NOT resolved from the per-session cache.
+    assert model != "" or "*" not in runner._last_resolved_model
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_normalize_empty_agent_response.py ===
+"""Unit tests for persistence-failure-aware messaging in
+``_normalize_empty_agent_response``.
+
+When a turn is stopped because session persistence failed (SQLite lock
+contention, disk exhaustion, ...), the user must NOT be told to /reset —
+that destroys their conversation context and does nothing to fix storage.
+They must also never see 'The request failed: None' when the gateway result
+dict carries an explicit ``error: None``.
+"""
+
+import pytest
+
+from gateway.run import _normalize_empty_agent_response
+
+
+class TestPersistenceFailureRecoveryMessage:
+    """Failed turns whose failure_reason marks a session-persistence
+    failure get a dedicated recovery message: reassure the user their
+    history is protected, tell them to resend — never suggest /reset."""
+
+    def test_locked_persistence_failure_gets_recovery_message(self):
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "session_persistence_failed:locked",
+            "error": "session storage was locked by another writer",
+            "api_calls": 2,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "send it again" in response.lower()
+        assert "/reset" not in response
+        assert "unknown error" not in response.lower()
+
+    def test_disk_persistence_failure_mentions_disk(self):
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "session_persistence_failed:disk",
+            "error": "session storage write failed: disk full",
+            "api_calls": 1,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "disk" in response.lower()
+        assert "/reset" not in response
+        assert "unknown error" not in response.lower()
+
+    def test_unknown_cause_persistence_failure_still_avoids_reset(self):
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "session_persistence_failed:unknown",
+            "error": "session storage failure",
+            "api_calls": 1,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "/reset" not in response
+        assert "send it again" in response.lower()
+
+    def test_legacy_shape_error_text_mentioning_session_storage(self):
+        """Legacy failed results carry no failure_reason but an error text
+        naming session storage — they must get the same recovery message."""
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "error": "turn stopped: session storage unavailable",
+            "api_calls": 1,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "/reset" not in response
+        assert "send it again" in response.lower()
+
+
+class TestExplicitNoneErrorIsNoneSafe:
+    """The gateway result dict is built with ``'error': holder.get('error')``
+    and can carry an EXPLICIT None, which bypasses dict.get defaults."""
+
+    def test_explicit_none_error_never_renders_none(self):
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "error": None,
+            "api_calls": 1,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "None" not in response
+        # The generic failure copy names the recovery commands; the detail stays in the log.
+        assert "/retry" in response and "/new" in response
+
+
+class TestGenericFailureRegression:
+    """Non-persistence failures get a plain reply that names /retry and /new; the raw exception
+    text never reaches the chat (it goes to the gateway log)."""
+
+    def test_provider_error_hides_raw_detail_and_names_retry(self):
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "error": "ValueError: provider exploded {\"code\": 502}",
+            "api_calls": 1,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "provider exploded" not in response and "ValueError" not in response
+        assert "/retry" in response and "/new" in response
+        assert "hermes logs" in response
+
+    def test_partial_turn_hides_provider_envelope_and_names_retry(self):
+        raw = "API call failed after 3 retries: HTTP 500 internal server error"
+        agent_result = {"final_response": "", "partial": True, "error": raw, "api_calls": 2}
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "HTTP 500" not in response
+        assert "/retry" in response and "/compress" in response
+
+    def test_partial_turn_keeps_curated_loop_text(self):
+        curated = "Response truncated due to output length limit"
+        agent_result = {"final_response": "", "partial": True, "error": curated, "api_calls": 2}
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert curated in response and "/retry" in response
+
+    def test_context_failure_branch_unchanged(self):
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "error": "prompt exceeds context window",
+            "api_calls": 1,
+        }
+
+        response = _normalize_empty_agent_response(agent_result, "", history_len=60)
+
+        assert "too long" in response
+        assert "/compress" in response and "/new" in response
+
+
+class TestNonempty400EnvelopeOverflowReply:
+    """Failed turns that already carry the HTTP 400 envelope as ``final_response`` must still get
+    the session-too-large rewrite (chat sanitizers would otherwise turn the envelope into a generic
+    'provider failed' reply); every other failure with text keeps that text."""
+
+    _ENVELOPE = 'HTTP 400: {"object":"error","model":"deepseek-v4-flash"}'
+
+    def _failed(self, text):
+        return {"final_response": text, "failed": True, "error": text, "api_calls": 1}
+
+    def test_long_history_rewrites_envelope_to_session_too_large(self):
+        response = _normalize_empty_agent_response(
+            self._failed(self._ENVELOPE), self._ENVELOPE, history_len=138,
+        )
+        assert "too long" in response.lower()
+        assert "/compress" in response
+        assert self._ENVELOPE not in response
+
+    @pytest.mark.parametrize("text", [
+        "Billing or credits exhausted: HTTP 429: You exceeded your current quota",
+        "API call failed after 3 retries: HTTP 429 rate limit exceeded",
+        "HTTP 401: invalid authentication token",
+    ])
+    def test_non_overflow_failure_keeps_its_own_text(self, text):
+        assert _normalize_empty_agent_response(self._failed(text), text, history_len=138) == text
+
+    def test_curated_overflow_text_from_the_agent_survives(self):
+        text = "Context compression timed out without reducing this conversation. No messages were dropped."
+        result = {**self._failed(text), "compression_exhausted": True}
+        assert _normalize_empty_agent_response(result, text, history_len=138) == text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_notice_delivery.py ===
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import SendResult
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        user_id="U123",
+        thread_id="111.222",
+    )
+
+
+def _make_runner(extra=None):
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.SLACK: PlatformConfig(enabled=True, token="***", extra=extra or {})
+        }
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="public-1"))
+    adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="private-1"))
+    runner.adapters = {Platform.SLACK: adapter}
+    return runner, adapter
+
+
+@pytest.mark.asyncio
+async def test_deliver_platform_notice_uses_private_delivery_when_configured():
+    runner, adapter = _make_runner(extra={"notice_delivery": "private"})
+
+    await runner._deliver_platform_notice(_make_source(), "hello")
+
+    adapter.send_private_notice.assert_awaited_once_with(
+        "C123",
+        "U123",
+        "hello",
+        # user_id rides along since the R3-5 per-turn identity stamp (Slack
+        # sources carry their author in thread metadata for the connector's
+        # chat.startStream recipient fields). Additive and harmless here.
+        metadata={"thread_id": "111.222", "user_id": "U123"},
+    )
+    adapter.send.assert_not_awaited()
+
+
+

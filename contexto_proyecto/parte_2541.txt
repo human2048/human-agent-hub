@@ -1,0 +1,383 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_cached_agent_history_guard.py ===
+"""Regression tests for cached gateway transcript selection."""
+
+from gateway.run import _build_gateway_agent_history, _select_cached_agent_history
+
+
+def test_select_cached_history_keeps_expected_replay_cleanup():
+    """A durable read-only tool tail removed by stock replay cleanup stays removed."""
+    live = [
+        {"role": "user", "content": "check status", "_db_persisted": True},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+            "_db_persisted": True,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "[Command interrupted]",
+            "_db_persisted": True,
+        },
+    ]
+
+    persisted, observed = _build_gateway_agent_history(live)
+
+    assert observed is None
+    assert len(persisted) < len(live)
+    assert persisted == [{"role": "user", "content": "check status"}]
+    assert _select_cached_agent_history(persisted, live) is persisted
+
+
+def test_select_cached_history_preserves_live_when_a_real_row_is_unpersisted():
+    persisted = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+    ]
+    live = [
+        {"role": "user", "content": "hello", "_db_persisted": True},
+        {"role": "assistant", "content": "hi", "_db_persisted": True},
+        {"role": "user", "content": "not written"},
+    ]
+
+    selected = _select_cached_agent_history(persisted, live)
+
+    assert selected is not persisted
+    assert selected == live
+
+
+def test_select_cached_history_ignores_unmarked_ephemeral_scaffolding():
+    """Internal retry nudges are deliberately unpersisted, not evidence of DB lag."""
+    persisted = [{"role": "user", "content": "ship the fix"}]
+    live = [
+        {"role": "user", "content": "ship the fix", "_db_persisted": True},
+        {
+            "role": "user",
+            "content": "Verify your work before stopping.",
+            "_pre_verify_synthetic": True,
+        },
+    ]
+
+    assert _select_cached_agent_history(persisted, live) is persisted
+
+
+def test_persistent_transcript_lag_escalates_to_error(caplog):
+    """The 'Persisted transcript lagged live cached history' line repeated at WARNING for 11 days in
+    #114266. A per-session streak of lagging turns escalates it to ERROR; a turn whose disk copy
+    caught up resets the streak."""
+    import logging
+    from types import SimpleNamespace
+
+    from gateway.run_turn_runner import _TRANSCRIPT_LAG_ESCALATION_TURNS, TurnRunner
+
+    persisted = [{"role": "user", "content": "hello"}]
+    live = [{"role": "user", "content": "hello", "_db_persisted": True},
+            {"role": "assistant", "content": "not written"}]
+    runner = SimpleNamespace()
+    ctx = SimpleNamespace(history=persisted, channel_prompt=None, user_config=None,
+                          session_id="sid-1", session_key="agent:main:telegram:dm:1")
+    turn = TurnRunner(runner, ctx)
+    agent = SimpleNamespace(session_id="sid-1", _session_messages=live)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        for _ in range(_TRANSCRIPT_LAG_ESCALATION_TURNS):
+            history, _observed, _media = turn._load_turn_history(agent, reused_cached_agent=True)
+    assert len(history) == len(live)  # live context still preserved
+    levels = [r.levelno for r in caplog.records if "lagged live cached history" in r.getMessage()]
+    assert levels == [logging.WARNING] * (_TRANSCRIPT_LAG_ESCALATION_TURNS - 1) + [logging.ERROR]
+    assert "consecutive_turns=%d" % _TRANSCRIPT_LAG_ESCALATION_TURNS in caplog.records[-1].getMessage()
+
+    # Disk caught up: the streak resets, so the next lag starts again at WARNING.
+    agent._session_messages = [dict(persisted[0], _db_persisted=True)]
+    turn._load_turn_history(agent, reused_cached_agent=True)
+    assert ctx.session_key not in runner._transcript_lag_streaks
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_cached_agent_max_iterations.py ===
+"""Regression tests for PR #48127: cached agent max_iterations refresh.
+
+When a long-lived gateway reuses an agent from its cache, the agent must run
+the *current* configured iteration budget — not the budget it was constructed
+with on the first turn of that session. Two pieces make that true:
+
+1. ``GatewayRunner._init_cached_agent_for_turn`` must NOT reset
+   ``max_iterations`` itself (the gateway refreshes it explicitly right after,
+   from current config). If this helper ever started clobbering it, the
+   gateway's refresh would be silently undone.
+2. The per-turn budget object is rebuilt from ``agent.max_iterations`` at the
+   start of every turn (``agent/turn_context.py`` -> ``IterationBudget``), so
+   refreshing ``max_iterations`` on the cached agent is sufficient to change
+   the operative cap the agent loop checks.
+
+These tests exercise the real code paths rather than asserting a plain
+assignment, so they fail if either contract regresses.
+"""
+
+import time
+from types import SimpleNamespace
+
+from agent.iteration_budget import IterationBudget
+from agent.session_activity import ActivityProvenance
+
+
+def _make_cached_agent(max_iterations: int) -> SimpleNamespace:
+    """A minimal stand-in cached agent with the attributes the helpers touch."""
+    # The turn loop checks both api_call_count >= max_iterations AND
+    # iteration_budget.remaining <= 0 (turn_finalizer.py), so the budget must
+    # also reflect the new cap. Seed it with the stale value to prove the
+    # refresh propagates.
+    return SimpleNamespace(
+        _last_activity_ts=time.time() - 1000,
+        _last_activity_desc="previous turn",
+        _last_activity_provenance=ActivityProvenance.AGENT_COMPRESSION,
+        _api_call_count=42,
+        _last_flushed_db_idx=5,
+        max_iterations=max_iterations,
+        iteration_budget=IterationBudget(max_iterations),
+    )
+
+
+def test_init_cached_agent_for_turn_does_not_touch_max_iterations():
+    """The per-turn reset helper must leave max_iterations untouched.
+
+    The gateway refreshes max_iterations explicitly right after calling this
+    helper; if the helper ever reset it, that refresh would be undone.
+    """
+    from gateway.run import GatewayRunner
+
+    agent = _make_cached_agent(90)
+    GatewayRunner._init_cached_agent_for_turn(agent, interrupt_depth=0)
+
+    # Per-turn state was reset...
+    assert agent._api_call_count == 0
+    assert agent._last_activity_desc == "starting new turn (cached)"
+    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+    assert agent._last_flushed_db_idx == 0
+    # ...but the iteration budget was NOT changed by the helper itself.
+    assert agent.max_iterations == 90
+
+
+def test_init_cached_agent_preserves_max_iterations_on_interrupt_depth():
+    """Interrupt-recursive turns must also leave max_iterations alone."""
+    from gateway.run import GatewayRunner
+
+    agent = _make_cached_agent(200)
+    GatewayRunner._init_cached_agent_for_turn(agent, interrupt_depth=1)
+
+    # Activity timestamps preserved for the inactivity watchdog (#15654)...
+    assert agent._last_activity_desc == "previous turn"
+    assert agent._last_activity_provenance is ActivityProvenance.AGENT_COMPRESSION
+    # ...and max_iterations untouched.
+    assert agent.max_iterations == 200
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_cancel_background_drain.py ===
+"""Regression test: cancel_background_tasks must drain late-arrival tasks.
+
+During gateway shutdown, a message arriving while
+cancel_background_tasks is mid-await can spawn a fresh
+_process_message_background task via handle_message, which is added
+to self._background_tasks.  Without the re-drain loop, the subsequent
+_background_tasks.clear() drops the reference; the task runs
+untracked against a disconnecting adapter.
+"""
+
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource, build_session_key
+
+
+class _StubAdapter(BasePlatformAdapter):
+    async def connect(self, *, is_reconnect: bool = False):
+        pass
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, text, **kwargs):
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+
+def _make_adapter():
+    adapter = _StubAdapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    adapter._send_with_retry = AsyncMock(return_value=None)
+    return adapter
+
+
+def _event(text, cid="42"):
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id=cid, chat_type="dm"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_drains_late_arrivals():
+    """A message that arrives during the gather window must be picked
+    up by the re-drain loop, not leaked as an untracked task."""
+    adapter = _make_adapter()
+    sk = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm")
+    )
+
+    m1_started = asyncio.Event()
+    m1_cleanup_running = asyncio.Event()
+    m2_started = asyncio.Event()
+    m2_cancelled = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "M1":
+            m1_started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                m1_cleanup_running.set()
+                # Widen the gather window with a shielded cleanup
+                # delay so M2 can get injected during it.
+                await asyncio.shield(asyncio.sleep(0.2))
+                raise
+        else:  # M2 — the late arrival
+            m2_started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                m2_cancelled.set()
+                raise
+
+    adapter._message_handler = handler
+
+    # Spawn M1.
+    await adapter.handle_message(_event("M1"))
+    await asyncio.wait_for(m1_started.wait(), timeout=1.0)
+
+    # Kick off shutdown.  This will cancel M1 and await its cleanup.
+    cancel_task = asyncio.create_task(adapter.cancel_background_tasks())
+
+    # Wait until M1's cleanup is running (inside the shielded sleep).
+    # This is the race window: cancel_task is awaiting gather, M1 is
+    # shielded in cleanup, the _active_sessions entry has been cleared
+    # by M1's own finally.
+    await asyncio.wait_for(m1_cleanup_running.wait(), timeout=1.0)
+
+    # Clear the active-session entry (M1's finally hasn't fully run yet,
+    # but in production the platform dispatcher would deliver a new
+    # message that takes the no-active-session spawn path).  For this
+    # repro, make it deterministic.
+    adapter._active_sessions.pop(sk, None)
+
+    # Inject late arrival — spawns a fresh _process_message_background
+    # task and adds it to _background_tasks while cancel_task is still
+    # in gather.
+    await adapter.handle_message(_event("M2"))
+    await asyncio.wait_for(m2_started.wait(), timeout=1.0)
+
+    # Let cancel_task finish.  Round 1's gather completes when M1's
+    # shielded cleanup finishes.  Round 2 should pick up M2.
+    await asyncio.wait_for(cancel_task, timeout=5.0)
+
+    # Assert M2 was drained, not leaked.
+    assert m2_cancelled.is_set(), (
+        "Late-arrival M2 was NOT cancelled by cancel_background_tasks — "
+        "the re-drain loop is missing and the task leaked"
+    )
+    assert adapter._background_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_handles_no_tasks():
+    """Regression guard: no tasks, no hang, no error."""
+    adapter = _make_adapter()
+    await adapter.cancel_background_tasks()
+    assert adapter._background_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_bounded_rounds():
+    """Regression guard: the drain loop is bounded — it does not spin
+    forever even if late-arrival tasks keep getting spawned."""
+    adapter = _make_adapter()
+
+    # Single well-behaved task that cancels cleanly — baseline check
+    # that the loop terminates in one round.
+    async def quick():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+
+    task = asyncio.create_task(quick())
+    adapter._background_tasks.add(task)
+
+    await adapter.cancel_background_tasks()
+    assert task.done()
+    assert adapter._background_tasks == set()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_cgroup_cleanup.py ===
+"""Tests for the systemd ExecStopPost cgroup reaper (issue #37454)."""
+
+from __future__ import annotations
+
+import os
+import signal
+from pathlib import Path
+
+import pytest
+
+from gateway import cgroup_cleanup
+
+
+class TestOwnCgroupPath:
+    def test_parses_v2_cgroup_path(self, tmp_path, monkeypatch):
+        proc_self = tmp_path / "cgroup"
+        proc_self.write_text("0::/user.slice/user-1000.slice/hermes-gateway.service\n")
+        monkeypatch.setattr(
+            cgroup_cleanup,
+            "Path",
+            lambda p: proc_self if p == "/proc/self/cgroup" else Path(p),
+        )
+
+        assert cgroup_cleanup._own_cgroup_path() == "/user.slice/user-1000.slice/hermes-gateway.service"
+
+
+class TestReapCgroup:
+
+
+    def test_noop_when_procs_file_missing(self, tmp_path, monkeypatch):
+        cgroup_path = "/missing.slice/hermes-gateway.service"
+        monkeypatch.setattr(
+            cgroup_cleanup,
+            "Path",
+            lambda p: tmp_path / "does-not-exist" if "cgroup.procs" in p else Path(p),
+        )
+
+        def _explode(*_a, **_kw):
+            pytest.fail("os.kill must not be called when cgroup.procs is unreadable")
+
+        monkeypatch.setattr(cgroup_cleanup.os, "kill", _explode)
+        assert cgroup_cleanup.reap_cgroup(cgroup_path) == 0
+

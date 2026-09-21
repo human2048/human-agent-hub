@@ -1,0 +1,286 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_async_delegation_fd_leak.py ===
+"""Regression: the async-delegation ledger must close every SQLite connection.
+
+Sibling of the cron execution-ledger leak (#69567 / PR #69594). The durable
+delegation ledger used ``with _connect() as conn:`` where the connection
+context manager commits/rolls back but never closes, leaking the db/-wal/-shm
+file descriptors on every dispatch, completion, and delivery-claim. These tests
+fail if the deterministic ``close()`` is ever removed again.
+"""
+
+import queue
+import sqlite3
+
+import pytest
+
+from tools import async_delegation as ad
+
+
+class _TrackingConnection:
+    """Delegates to a real sqlite3.Connection while recording close() calls.
+
+    sqlite3.Connection is a static C type: it has no per-instance __dict__ and
+    its methods can't be monkeypatched, so open/close tracking is done via a
+    delegating wrapper returned in place of the real connection.
+    """
+
+    def __init__(self, real, closed_ids):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_closed_ids", closed_ids)
+
+    def close(self):
+        self._closed_ids.append(id(self._real))
+        self._real.close()
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._real.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._real, name, value)
+
+
+def _point_ledger(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    return ad
+
+
+def _track_connections(monkeypatch):
+    opened, closed = [], []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(id(conn))
+        return _TrackingConnection(conn, closed)
+
+    monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
+    return opened, closed
+
+
+def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
+    """Public durable-ledger reads/writes must close every connection opened."""
+    _point_ledger(monkeypatch, tmp_path)
+    opened, closed = _track_connections(monkeypatch)
+
+    ad.get_durable_delegation("nope")
+    ad.recover_abandoned_delegations()
+    ad.restore_undelivered_completions(queue.Queue())
+    ad.mark_completion_delivered("nope")
+    ad.claim_completion_delivery("nope", "claim-1")
+
+    assert opened, "expected at least one connection to be opened"
+    assert len(opened) == len(closed)
+    assert set(opened) == set(closed)
+
+
+def _fail_large_schema_replay(self, script):
+    # The schema initializer replays the full canonical schema as one
+    # large multi-statement script (single durable-shape authority,
+    # #94691). Simulate the DDL failure on that path so the
+    # connect-close-on-init-failure contract stays pinned.
+    if len(script) > 1000:
+        raise sqlite3.OperationalError("simulated schema init failure")
+    return self._real.executescript(script)
+
+
+def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
+    """A PRAGMA/DDL failure after connect() must still close the connection."""
+    _point_ledger(monkeypatch, tmp_path)
+    opened, closed = [], []
+    real_connect = sqlite3.connect
+
+    class _FailingSchemaConnection(_TrackingConnection):
+        def execute(self, sql, *args, **kwargs):
+            if "CREATE TABLE" in sql:
+                raise sqlite3.OperationalError("simulated schema init failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(id(conn))
+        return _FailingSchemaConnection(conn, closed)
+
+    monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
+
+    _FailingSchemaConnection.executescript = _fail_large_schema_replay
+
+    with pytest.raises(sqlite3.OperationalError):
+        with ad._transaction():
+            pass
+
+    assert len(opened) == 1
+    assert len(closed) == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_async_delegation_retirement.py ===
+"""Background delegations cannot outlive the admission proof used to retire their process."""
+
+import threading
+
+
+def test_async_delegations_hold_busy_accounting_through_finalization(tmp_path, monkeypatch):
+    from hermes_cli import backend_retirement
+    from hermes_cli.web_server_idle_proof import idle_proof
+    from tools import async_delegation
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    entered, release = threading.Event(), threading.Event()
+
+    def runner():
+        entered.set()
+        assert release.wait(10)
+        return {"summary": "test done"}
+
+    def dispatch():
+        return async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None,
+            session_key="test", runner=runner)
+
+    token = fence.prepare()["token"]
+    try:
+        assert dispatch()["status"] == "rejected"
+        assert not entered.is_set()
+        assert fence.cancel(token) == {"ok": True}
+        handle = dispatch()
+        assert handle["status"] == "dispatched"
+        assert entered.wait(10)
+        assert async_delegation.active_count() > 0
+        assert idle_proof()["idle"] is False
+        assert fence.prepare() == {"ok": False, "idle": False}
+        # A stalled record may be force-finalized before its stuck runner really unwinds.
+        async_delegation._finalize(handle["delegation_id"], {"error": "test stall"}, "stalled")
+        assert async_delegation.active_count() == 0
+        assert fence.prepare() == {"ok": False, "idle": False}
+    finally:
+        release.set()
+        if async_delegation._executor is not None:
+            async_delegation._executor.shutdown(wait=True)
+    assert fence.prepare()["ok"] is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_async_delegation_stale_profile_scope.py ===
+"""Profile-scope regression for async-delegation stale finalization."""
+
+import sqlite3
+import threading
+import time
+
+import pytest
+
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from tools import async_delegation as ad
+from tools.process_registry import process_registry
+
+
+@pytest.fixture(autouse=True)
+def _clean_async_delegation_state():
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    yield
+    ad._monitor_stop.set()
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+
+def _delegation_state(db_path, delegation_id):
+    if not db_path.exists():
+        return None
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+def test_stale_monitor_force_finalize_updates_origin_profile_ledger(tmp_path, monkeypatch):
+    """A bare monitor thread must settle the profile that dispatched the unit.
+
+    Normal async workers carry the dispatching ContextVars via
+    ``propagate_context_to_thread``.  The single stale-monitor thread does not:
+    Python starts it with an empty Context, so a forced finalization must not
+    re-resolve ``get_hermes_home()`` to the process launch profile.
+    """
+    launch_home = tmp_path / "launch"
+    profile_home = launch_home / "profiles" / "secondary"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    # We drive the production monitor loop ourselves below so the test controls
+    # exactly when the record becomes expired.
+    monkeypatch.setattr(ad, "_ensure_stale_monitor", lambda: None)
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(ad, "_STALL_GRACE_SECONDS", 0.0)
+
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=30)
+        return {"status": "completed", "summary": "late runner result"}
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        handle = ad.dispatch_async_delegation(
+            goal="profile-owned stalled task",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="test-model",
+            session_key="secondary-session",
+            runner=runner,
+            max_async_children=1,
+            progress_fn=lambda: ("frozen", False),
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    delegation_id = handle["delegation_id"]
+    profile_db = profile_home / "state.db"
+    launch_db = launch_home / "state.db"
+    assert _delegation_state(profile_db, delegation_id) == "running"
+
+    # Put the live record exactly at the monitor's force-finalize boundary.
+    with ad._records_lock:
+        record = ad._records[delegation_id]
+        record.update(
+            status="stalling",
+            _started=True,
+            _interrupted_at=time.time() - 1,
+            _stall_quiet_seconds=1.0,
+            _stall_threshold_seconds=0.5,
+            _stall_in_tool=False,
+        )
+
+    # This is the production ownership shape: one daemon monitor thread serves
+    # every profile and therefore starts without the dispatching ContextVars.
+    ad._monitor_stop.clear()
+    monitor = threading.Thread(target=ad._stale_monitor_loop, daemon=True)
+    monitor.start()
+    monitor.join(timeout=2)
+    assert not monitor.is_alive()
+
+    try:
+        assert _delegation_state(profile_db, delegation_id) == "stalled"
+        assert _delegation_state(launch_db, delegation_id) is None
+    finally:
+        # The real runner can return after the forced stall; _finalize must then
+        # be a no-op for the already-terminal record.
+        gate.set()
+

@@ -1,0 +1,319 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_warning_callback_conservation.py ===
+"""Real callback and queue boundaries; renderer preference never hides operator logs."""
+import logging
+import queue
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+from agent.status_output import StatusOutputMixin
+from tui_gateway import server
+from tests.tui_gateway.test_auto_continue import turn_env, marker_home, _session
+
+
+class Agent(StatusOutputMixin):
+    log_prefix = ""
+    suppress_status_output = True
+    platform = "tui"
+    _print_fn = None
+
+    def _touch_activity(self, *args):
+        pass
+
+
+@pytest.mark.parametrize("setting", [None, False, True])
+def test_real_tui_callbacks_filter_only_diagnostics_at_owner_sink(tmp_path, monkeypatch, setting):
+    launch, owner = tmp_path / "launch", tmp_path / "owner"
+    launch.mkdir()
+    owner.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    (launch / "config.yaml").write_text(yaml.safe_dump({"display": {"suppress_warning_notifications": setting is not True}}))
+    (owner / "config.yaml").write_text(yaml.safe_dump({} if setting is None else {"display": {"suppress_warning_notifications": setting}}))
+    frames = []
+    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
+    for home, muted in [(owner, setting is True), (launch, setting is not True), (owner, setting is True)]:
+        session = _session(profile_home=str(home))
+        monkeypatch.setitem(server._sessions, "warning-callback", session)
+        agent = Agent()
+        for key, callback in server._agent_cbs("warning-callback").items():
+            setattr(agent, key, callback)
+        # Intentionally invoke outside the owning context, like a callback worker.
+        frames.clear()
+        agent._emit_warning("unfamiliar warning wording")
+        agent._emit_diagnostic_status("unfamiliar fallback wording")
+        agent._emit_diagnostic_wait("unfamiliar retry wording")
+        agent._emit_notice(SimpleNamespace(level="error", text="notice detail", kind="custom", ttl_ms=0, key="custom", id="n"))
+        diagnostic_frames = list(frames)
+        agent._emit_status("⚠ user-requested progress with warning punctuation")
+        assert bool(diagnostic_frames) is not muted
+        assert len(diagnostic_frames) == (0 if muted else 4)
+        assert frames[-1]["params"]["payload"]["text"] == "⚠ user-requested progress with warning punctuation"
+
+
+@pytest.mark.parametrize("setting", [None, False, True])
+def test_post_turn_drain_uses_owner_and_preserves_real_clarify(turn_env, marker_home, monkeypatch, setting, caplog):
+    from tools.process_registry import process_registry
+    from tui_gateway import server_requests
+    owner = marker_home / "owner"
+    owner.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(marker_home))
+    (marker_home / "config.yaml").write_text(yaml.safe_dump({"display": {"suppress_warning_notifications": setting is not True}}))
+    (owner / "config.yaml").write_text(yaml.safe_dump({} if setting is None else {"display": {"suppress_warning_notifications": setting}}))
+    frames, work, controls = [], [], []
+    def wire(frame):
+        frames.append(frame)
+        if frame.get("method") == "clarify":
+            assert server_requests.resolve_response({"id": frame["id"], "result": {"answer": "yes"}})
+        return True
+    monkeypatch.setattr(server, "write_json", wire)
+    monkeypatch.setattr(server_requests, "_write", wire)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (server.threading.Event(), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
+    agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None)
+    agent.clarify_callback = server._agent_cbs("drain-owner")["clarify_callback"]
+    def run(message, **kwargs):
+        work.append(message)
+        controls.append(agent.clarify_callback("Continue recovery?", ["yes", "no"]))
+        logging.getLogger("operator").warning("watch diagnostic retained")
+        return {"final_response": "diagnostic final", "messages": []}
+    agent.run_conversation = run
+    session = _session(agent=agent, profile_home=str(owner))
+    monkeypatch.setitem(server._sessions, "drain-owner", session)
+    process_registry.completion_queue.put({"type": "watch_disabled", "session_id": "proc", "session_key": "session-key",
+        "origin_ui_session_id": "drain-owner", "message": "watch diagnostic"})
+    with caplog.at_level(logging.WARNING, logger="operator"):
+        server._run_post_turn_followups("request", "drain-owner", session, {}, None)
+    assert len(work) == 1
+    assert controls == ["yes"]
+    assert process_registry.completion_queue.empty()
+    assert "watch diagnostic retained" in caplog.text
+    presentation = [f for f in frames if f.get("params", {}).get("type") in {"status.update", "message.complete", "message.start", "error"}]
+    assert bool(presentation) is not (setting is True)
+    assert len([f for f in frames if f.get("method") == "clarify"]) == 1
+
+
+@pytest.mark.parametrize("setting", [None, False, True])
+def test_diagnostic_turn_callbacks_from_real_worker_keep_controls_and_logs(turn_env, marker_home, monkeypatch, setting, caplog):
+    from tui_gateway import server_requests
+    monkeypatch.setenv("HERMES_HOME", str(marker_home))
+    (marker_home / "config.yaml").write_text(yaml.safe_dump(
+        {} if setting is None else {"display": {"suppress_warning_notifications": setting}}))
+    frames, controls, failures = [], [], []
+    def wire(frame):
+        frames.append(frame)
+        if frame.get("method") == "clarify":
+            assert server_requests.resolve_response({"id": frame["id"], "result": {"answer": "yes"}})
+        return True
+    monkeypatch.setattr(server, "write_json", wire)
+    monkeypatch.setattr(server_requests, "_write", wire)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (server.threading.Event(), SimpleNamespace(join=lambda: None)))
+    # The normal worker starts after the submitter releases _sessions_lock.
+    # The shared inline-thread fixture instead holds that lock while joining
+    # this real callback thread, creating a fixture-only deadlock.
+    monkeypatch.setattr(server.threading, "Thread", server._RealThread)
+    agent = Agent()
+    agent.session_id = "session-key"
+    agent.clear_interrupt = lambda: None
+    session = _session(agent=agent, profile_home=str(marker_home), running=True)
+    monkeypatch.setitem(server._sessions, "thread-owner", session)
+    for key, callback in server._agent_cbs("thread-owner").items():
+        setattr(agent, key, callback)
+    def run(message, **kwargs):
+        def worker():
+            try:
+                # Concrete callbacks can be retained by provider/helper workers.
+                agent._emit_status("plain wake progress")
+                agent._emit_wait_notice("plain wake thinking")
+                agent._emit_notice(SimpleNamespace(level="info", text="wake notice", kind="custom", ttl_ms=0, key="custom", id="n"))
+                kwargs["stream_callback"]("wake stream")
+                controls.append(agent.clarify_callback("Continue recovery?", ["yes", "no"]))
+                logging.getLogger("operator").warning("worker diagnostic retained")
+            except BaseException as exc:
+                failures.append(exc)
+        thread = server._RealThread(target=worker)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        return {"final_response": "wake result", "messages": []}
+    agent.run_conversation = run
+    with caplog.at_level(logging.WARNING, logger="operator"):
+        server._run_prompt_submit("request", "thread-owner", session, "engine failure",
+            display_metadata={"notification_category": "diagnostic"})
+        session["_run_thread"].join(timeout=10)
+        assert not session["_run_thread"].is_alive()
+    assert not failures
+    assert controls == ["yes"]
+    assert "worker diagnostic retained" in caplog.text
+    presentation = [f for f in frames if f.get("params", {}).get("type") in
+                    {"status.update", "thinking.delta", "notification.show", "message.delta", "message.complete"}]
+    assert len(presentation) == (0 if setting is True else 5)
+    # Once the turn completes, the same sink must present the next requested progress.
+    agent._emit_status("next requested progress")
+    assert frames[-1]["params"]["payload"]["text"] == "next requested progress"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_ws_keepalive.py ===
+"""Regression tests for WebSocket dead-peer detection via TCP keepalive.
+
+Without SO_KEEPALIVE a silently-dropped client (SSH tunnel reset, laptop
+sleep, NAT timeout) leaves the TCP leg half-open forever: ``receive_text()``
+blocks indefinitely and the disconnect teardown (detach, orphan reap, resume
+replay) never runs.  ``_disable_nagle`` already reaches the raw socket, so
+keepalive is enabled there too.
+"""
+
+from __future__ import annotations
+
+import socket
+
+from tui_gateway.ws import _disable_nagle
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int]] = []
+
+    def setsockopt(self, level: int, optname: int, value: int) -> None:
+        self.calls.append((level, optname, value))
+
+
+class _FakeTransport:
+    def __init__(self, sock: _FakeSocket) -> None:
+        self._sock = sock
+
+    def get_extra_info(self, name: str):
+        return self._sock if name == "socket" else None
+
+
+class _FakeWS:
+    def __init__(self, sock: _FakeSocket) -> None:
+        self.scope = {"extensions": {"transport": _FakeTransport(sock)}}
+
+
+def test_ws_socket_enables_keepalive() -> None:
+    sock = _FakeSocket()
+    _disable_nagle(_FakeWS(sock))
+
+    opts = {(level, optname): value for level, optname, value in sock.calls}
+    # Nagle still disabled (pre-existing behavior preserved).
+    assert opts[(socket.IPPROTO_TCP, socket.TCP_NODELAY)] == 1
+    # Keepalive always on.
+    assert opts[(socket.SOL_SOCKET, socket.SO_KEEPALIVE)] == 1
+    # Idle/interval/count tuning is platform-specific: Linux exposes
+    # TCP_KEEPIDLE/INTVL/CNT, macOS only TCP_KEEPALIVE (idle seconds).
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        assert opts[(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE)] == 30
+        assert opts[(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL)] == 10
+        assert opts[(socket.IPPROTO_TCP, socket.TCP_KEEPCNT)] == 3
+    elif hasattr(socket, "TCP_KEEPALIVE"):
+        assert opts[(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE)] == 30
+
+
+def test_ws_socket_unreachable_is_silent() -> None:
+    """No transport / no socket must not raise (best-effort tuning)."""
+
+    class _BareWS:
+        scope: dict = {}
+
+    _disable_nagle(_BareWS())  # no exception
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_ws_keepalive_config.py ===
+"""Config propagation tests for the WS keepalive + orphan-reap grace knobs (#79635)."""
+
+import textwrap
+
+import pytest
+
+
+@pytest.fixture()
+def _temp_home(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_TUI_WS_ORPHAN_REAP_GRACE_S", raising=False)
+    return home
+
+
+def _write_config(home, body: str) -> None:
+    (home / "config.yaml").write_text(textwrap.dedent(body))
+
+
+def test_dashboard_ws_defaults_present(_temp_home):
+    from hermes_cli.config import load_config
+
+    _write_config(_temp_home, "model:\n  default: test-model\n")
+    cfg = load_config()
+    dash = cfg.get("dashboard") or {}
+    assert dash.get("ws_ping_interval") == 20.0
+    assert dash.get("ws_ping_timeout") == 20.0
+    assert dash.get("ws_orphan_reap_grace_s") == 20.0
+
+
+def test_dashboard_ws_values_propagate_from_yaml(_temp_home):
+    from hermes_cli.config import load_config
+
+    _write_config(
+        _temp_home,
+        """
+        dashboard:
+          ws_ping_interval: 45.5
+          ws_ping_timeout: 10
+          ws_orphan_reap_grace_s: 90
+        """,
+    )
+    cfg = load_config()
+    dash = cfg["dashboard"]
+    assert dash["ws_ping_interval"] == 45.5
+    assert dash["ws_ping_timeout"] == 10
+    assert dash["ws_orphan_reap_grace_s"] == 90
+    # Deep-merge: sibling defaults survive a partial user section.
+    assert dash.get("theme") == "default"
+
+
+def test_ws_orphan_reap_grace_reads_config(_temp_home):
+    from tui_gateway import server
+
+    _write_config(
+        _temp_home,
+        """
+        dashboard:
+          ws_orphan_reap_grace_s: 33
+        """,
+    )
+    assert server._resolve_ws_orphan_reap_grace() == 33.0
+
+
+def test_ws_orphan_reap_grace_env_var_overrides_config(_temp_home, monkeypatch):
+    from tui_gateway import server
+
+    _write_config(
+        _temp_home,
+        """
+        dashboard:
+          ws_orphan_reap_grace_s: 33
+        """,
+    )
+    monkeypatch.setenv("HERMES_TUI_WS_ORPHAN_REAP_GRACE_S", "7")
+    assert server._resolve_ws_orphan_reap_grace() == 7.0
+
+
+def test_ws_orphan_reap_grace_invalid_values_fall_back(_temp_home, monkeypatch):
+    from tui_gateway import server
+
+    _write_config(
+        _temp_home,
+        """
+        dashboard:
+          ws_orphan_reap_grace_s: not-a-number
+        """,
+    )
+    assert server._resolve_ws_orphan_reap_grace() == 20.0
+    monkeypatch.setenv("HERMES_TUI_WS_ORPHAN_REAP_GRACE_S", "-5")
+    assert server._resolve_ws_orphan_reap_grace() == 0.0
+

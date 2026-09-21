@@ -1,0 +1,341 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\conftest.py ===
+"""Shared fixtures for tests/tools/ web-provider tests.
+
+Per-file subprocess isolation means each test file gets a fresh interpreter,
+so module-level state (like the web-search-provider registry) is empty when
+a file starts.  The ``web_registry_populated`` fixture registers all bundled
+providers before each test and resets the registry afterwards — tests that
+depend on the registry being populated should use it explicitly or via
+``@pytest.mark.usefixtures("web_registry_populated")``.
+"""
+
+from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_host_browser_use_cli():
+    """Keep the host's browser-use/uvx install out of tests.
+
+    Browser Use mode is default-on when the CLI is runnable, so a developer
+    machine with uvx on PATH would silently flip every built-in-browser test
+    into CLI mode. Pin discovery to "not installed"; tests that exercise the
+    CLI path monkeypatch ``bu_cli._find_cli`` themselves.
+    """
+    try:
+        import tools.browser_use_cli as bu_cli
+    except Exception:
+        yield
+        return
+    # Keep a handle to the real discovery function so TestFindCli (and any
+    # test that wants genuine PATH probing) can restore it explicitly.
+    if not hasattr(bu_cli, "_find_cli_unpatched"):
+        bu_cli._find_cli_unpatched = bu_cli._find_cli
+    with patch.object(bu_cli, "_find_cli", lambda: None):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _materialize_mcp_sdk_symbols():
+    """Materialize the lazily-imported MCP SDK before each tools test.
+
+    ``tools/mcp_tool.py`` defers the ~260ms ``mcp`` SDK import until first
+    real use (CLI startup perf). Tests in this directory patch SDK symbols
+    (``ClientSession``, ``stdio_client``, ``_MCP_HTTP_AVAILABLE``, ...) on
+    the module and expect the pre-lazy eager-import world: symbols bound,
+    availability flags reflecting the installed SDK. Ensure that state up
+    front so ``mock.patch`` sees real originals and ``_ensure_mcp_sdk()``
+    can never clobber a patched flag mid-test (it no-ops once attempted).
+    """
+    try:
+        from tools import mcp_tool
+        mcp_tool._ensure_mcp_sdk()
+    except Exception:
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_web_result_cache():
+    """Reset the web_search TTL memo between tests.
+
+    The memo is module-global state in tools/web_result_cache.py; without
+    this, a test that exercised web_search_tool leaves a cached response
+    that a later test with the same query would receive instead of its own
+    mocked provider result.
+    """
+    from tools.web_result_cache import search_memo
+    search_memo.clear()
+    yield
+    search_memo.clear()
+
+
+def register_all_web_providers():
+    """Register all bundled web-search providers into the global registry.
+
+    This is the single source of truth for the provider list used by
+    test classes that need the registry populated for dispatch checks.
+    """
+    from agent.web_search_registry import register_provider, _reset_for_tests
+    from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
+    from plugins.web.ddgs.provider import DDGSWebSearchProvider
+    from plugins.web.exa.provider import ExaWebSearchProvider
+    from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
+    from plugins.web.parallel.provider import ParallelWebSearchProvider
+    from plugins.web.keenable.provider import KeenableWebSearchProvider
+    from plugins.web.tavily.provider import TavilyWebSearchProvider
+    from plugins.web.perplexity.provider import PerplexityWebSearchProvider
+    from plugins.web.searxng.provider import SearXNGWebSearchProvider
+    from plugins.web.xai.provider import XAIWebSearchProvider
+
+    _reset_for_tests()
+    for cls in (
+        BraveFreeWebSearchProvider,
+        DDGSWebSearchProvider,
+        ExaWebSearchProvider,
+        FirecrawlWebSearchProvider,
+        ParallelWebSearchProvider,
+        KeenableWebSearchProvider,
+        TavilyWebSearchProvider,
+        PerplexityWebSearchProvider,
+        SearXNGWebSearchProvider,
+        XAIWebSearchProvider,
+    ):
+        register_provider(cls())
+
+
+@pytest.fixture
+def grant_computer_use_approvals(monkeypatch):
+    """Answer every computer_use approval prompt with "once" through the shared gate.
+
+    computer_use fails CLOSED when nobody can answer (no interactive user, no
+    gateway), so dispatch tests that only care about routing must present an
+    interactive CLI with a granting callback. "once" persists nothing, so no
+    grant leaks into ``tools.approval``'s session/permanent stores.
+    """
+    from tools.computer_use import tool as cu_tool
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    cu_tool.set_approval_callback(lambda command, description, **kw: "once")
+    yield
+    cu_tool.set_approval_callback(None)
+
+
+@pytest.fixture
+def web_registry_populated():
+    """Populate the web-search-provider registry for one test, then reset."""
+    register_all_web_providers()
+    yield
+    from agent.web_search_registry import _reset_for_tests
+    _reset_for_tests()
+
+
+@pytest.fixture
+def disable_lazy_stt_install():
+    """Disarm the runtime lazy-install probe so static ``_HAS_FASTER_WHISPER``
+    patches accurately simulate 'faster-whisper not installed'.
+
+    Without this, ``_try_lazy_install_stt()`` calls
+    ``importlib.util.find_spec("faster_whisper")``, which returns truthy
+    whenever the package is installed in the dev / CI environment —
+    defeating the test's ``_HAS_FASTER_WHISPER=False`` patch.
+
+    Opt in at module scope with
+    ``pytestmark = pytest.mark.usefixtures("disable_lazy_stt_install")``.
+    """
+    with patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
+        yield
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\file_ops_fakes.py ===
+"""Fakes for ``ShellFileOperations``' compound shell probes.
+
+``read_file`` and ``write_file`` ask the shell everything in ONE command
+whose stdout is split on a per-call random sentinel line. Test doubles that
+script ``env.execute`` / ``_exec`` need to answer that command with exactly
+the stream the shell would produce; these helpers build it. Match the
+sentinel out of the command first (it is random), then compose:
+
+    m = READ_SENTINEL_RE.search(command)
+    if m:
+        return {"output": compound_read_output(m.group(0), size=5, sample=b"hello",
+                                               content="hello\\n", total_lines=1),
+                "returncode": 0}
+"""
+
+import base64
+import re
+from typing import Optional
+
+READ_SENTINEL_RE = re.compile(r"__HERMES_RF_[0-9a-f]{32}__")
+WRITE_SENTINEL_RE = re.compile(r"__HERMES_WF_[0-9a-f]{32}__")
+
+
+def compound_read_output(
+    sentinel: str,
+    *,
+    size: int,
+    sample: Optional[bytes],
+    content: str,
+    total_lines: int,
+    trailing_newline: bool = True,
+    sample_rc: int = 0,
+    read_rc: int = 0,
+) -> str:
+    """Stdout of ``_read_probe_cmd`` for a regular file.
+
+    ``content`` is the ``sed | cut`` page exactly as the shell prints it:
+    every line newline-terminated (``cut`` always adds one), or ``""`` for a
+    page past EOF. ``sample`` is the raw first-1000-bytes slice (``None``
+    emits an empty base64 segment, e.g. a shell without ``base64``).
+    """
+    sample_seg = base64.b64encode(sample).decode() + "\n" if sample else ""
+    return (
+        f"{size}\n{sentinel}\n"
+        f"{sample_seg}{sentinel}\n"
+        f"{content}{sentinel}\n"
+        f"{total_lines}\n{sentinel}\n"
+        f"{1 if trailing_newline else 0}\n{sentinel}\n"
+        f"{sample_rc} {read_rc}\n"
+    )
+
+
+def compound_write_probe_output(sentinel: str, *, head3: bytes, body: str) -> str:
+    """Stdout of ``_write_probe_cmd`` for an existing file.
+
+    ``head3`` is the first three bytes on disk (BOM detection); ``body`` is
+    the second segment: the whole file when pre-content was wanted, else
+    the 4 KB line-ending sample.
+    """
+    head_seg = base64.b64encode(head3).decode() + "\n" if head3 else ""
+    return f"{head_seg}{sentinel}\n{body}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_a2a_reason_roundtrip.py ===
+"""Tests: typed reason codes survive the A2A relay roundtrip (#93091).
+
+The sending agent must receive the machine-readable failure code, not just
+provider prose: bot_relay.deliver ships `reason` in JSON-RPC error.data
+(pinned in test_bot_retry_policy), the Desktop forwards it to bot_relay.reply,
+write_reply persists it, and the waiter script prints it. This file pins the
+persist + waiter surfaces.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+
+import pytest
+
+from tools import bot_failure_reasons as bfr
+from tools import bot_relay
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    h = tmp_path / ".hermes"
+    h.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(h))
+    return h
+
+
+def _reply_file(home, envelope_id):
+    return bot_relay.relay_root(home) / bot_relay.REPLIES_DIR / f"{envelope_id}.json"
+
+
+def test_write_reply_persists_forwarded_reason(home):
+    """A reason forwarded by the Desktop drain loop lands in the reply file."""
+    envelope_id = "a" * 32
+    bot_relay.write_reply(
+        home,
+        envelope_id,
+        error="delivery turn failed: Error code: 429",
+        reason=bfr.PROVIDER_RATE_LIMIT,
+    )
+    data = json.loads(_reply_file(home, envelope_id).read_text(encoding="utf-8"))
+    assert data["reason"] == bfr.PROVIDER_RATE_LIMIT
+
+
+def test_write_reply_classifies_when_reason_omitted(home):
+    """Old senders that never forward a reason still get a classified code."""
+    envelope_id = "b" * 32
+    bot_relay.write_reply(
+        home,
+        envelope_id,
+        error="Error code: 401 - Your API key is invalid, blocked or out of funds",
+    )
+    data = json.loads(_reply_file(home, envelope_id).read_text(encoding="utf-8"))
+    assert data["reason"] == bfr.PROVIDER_AUTH_OR_ACCESS
+
+
+def _run_waiter(home, envelope):
+    cmd = bot_relay.waiter_command(home, envelope)
+    return subprocess.run(
+        ["bash", "-c", cmd], capture_output=True, text=True, timeout=30
+    )
+
+
+def _envelope(home):
+    target = {
+        "profile": "scout",
+        "handle": "scout",
+        "connection_id": "cloud-1",
+        "connection_label": "",
+        "title": "",
+        "description": "",
+    }
+    return bot_relay.enqueue_envelope(
+        home,
+        target=target,
+        message="ping",
+        sender_profile="default",
+        sender_handle="hermes",
+    )
+
+
+def test_waiter_surfaces_reason_tag_to_sending_agent(home, monkeypatch):
+    """The waiter's stdout — the sending agent's completion notification —
+    carries the typed reason so the agent can branch without parsing prose."""
+    monkeypatch.setattr(bot_relay, "_target_liveness", lambda *a, **k: True)
+    env = _envelope(home)
+    bot_relay.write_reply(
+        home,
+        env["id"],
+        error="delivery turn failed: rate limit exceeded",
+        reason=bfr.PROVIDER_RATE_LIMIT,
+    )
+    proc = _run_waiter(home, env)
+    assert proc.returncode == 1
+    assert f"[reason: {bfr.PROVIDER_RATE_LIMIT}]" in proc.stdout
+
+
+def test_waiter_healthy_reply_has_no_reason_tag(home, monkeypatch):
+    """Success path unchanged: no reason tag noise on good replies."""
+    monkeypatch.setattr(bot_relay, "_target_liveness", lambda *a, **k: True)
+    env = _envelope(home)
+    bot_relay.write_reply(home, env["id"], reply="pong")
+    proc = _run_waiter(home, env)
+    assert proc.returncode == 0
+    assert "pong" in proc.stdout
+    assert "[reason:" not in proc.stdout
+
+
+def test_waiter_reasonless_error_prints_plain(home, monkeypatch):
+    """A reply file with error text whose classification is unknown still
+    prints cleanly — the unknown code is a valid tag, never a crash."""
+    monkeypatch.setattr(bot_relay, "_target_liveness", lambda *a, **k: True)
+    env = _envelope(home)
+    bot_relay.write_reply(home, env["id"], error="something odd happened")
+    proc = _run_waiter(home, env)
+    assert proc.returncode == 1
+    assert "failed" in proc.stdout
+    # classify_agent_error("something odd happened") == unknown → tagged
+    assert f"[reason: {bfr.UNKNOWN}]" in proc.stdout
+

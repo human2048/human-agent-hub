@@ -1,0 +1,301 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\upstage\__init__.py ===
+"""Upstage Solar provider profile: top-level ``reasoning_effort`` (low|medium|high).
+
+Solar's server default is ``minimal`` (reasoning off) — wrong for agentic work —
+so an unset reasoning_config defaults reasoning ON at ``medium``, matching the
+"medium (default)" the /reasoning panel shows. Explicit settings always win.
+"""
+
+import re
+from typing import Any
+
+from agent.reasoning_effort import EFFORT_LADDER, SOLAR_EFFORTS, clamp_effort
+from providers import register_provider
+from providers.base import ProviderProfile
+
+# Deny-list on purpose: new Solar models are assumed reasoning-capable; only these known
+# non-reasoning families ignore reasoning_effort. ``solar-mini`` covers its dated ids
+# (solar-mini-250422) but not later mini generations (solar-mini4), which do reason.
+_NON_REASONING_MODEL_RE = re.compile(r"solar-mini(?:[-:.@]|$)|syn-pro")
+
+
+class UpstageProfile(ProviderProfile):
+    """Upstage Solar — top-level ``reasoning_effort`` control (no reasoning_content echo needed)."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        m = (model or "").strip().lower()
+        if _NON_REASONING_MODEL_RE.search(m):
+            return {}, {}
+        if not reasoning_config or not isinstance(reasoning_config, dict):
+            return {}, {"reasoning_effort": "medium"}  # unset -> reasoning ON for agents
+        if reasoning_config.get("enabled") is False:
+            return {}, {}  # explicitly disabled -> Solar's own default (minimal = off)
+        # Map Hermes' effort vocabulary onto Solar's accepted set via the shared clamp
+        # (agent.reasoning_effort). minimal → omit (Solar's minimal means off); unknown-but-enabled bespoke
+        # levels collapse to high rather than silently downgrading (#62650 precedent).
+        effort = (reasoning_config.get("effort") or "").strip().lower()
+        if not effort:
+            return {}, {"reasoning_effort": "medium"}
+        if effort == "minimal":
+            return {}, {}
+        mapped = clamp_effort(effort, SOLAR_EFFORTS)
+        if mapped not in SOLAR_EFFORTS:
+            # Bespoke level outside the ladder runs at full strength rather than quietly
+            # falling to the default; ladder levels that still don't map are omitted.
+            mapped = "high" if effort not in EFFORT_LADDER else None
+        return {}, {"reasoning_effort": mapped} if mapped else {}
+
+
+upstage = UpstageProfile(
+    name="upstage", aliases=("solar",), display_name="Upstage Solar", description="Upstage (Solar API)",
+    signup_url="https://console.upstage.ai/api-keys", env_vars=("UPSTAGE_API_KEY", "UPSTAGE_BASE_URL"),
+    base_url="https://api.upstage.ai/v1", auth_type="api_key",
+    # No default_aux_model: auxiliary tasks use the main model. [0] is the setup default.
+    fallback_models=("solar-pro3",),
+)
+
+register_provider(upstage)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\vertex\__init__.py ===
+"""Google Vertex AI provider profile: Gemini via Google Cloud's OpenAI-compatible endpoint.
+
+Auth is OAuth2 (service-account JSON or ADC), not a static key: ``agent/vertex_adapter.py``
+mints ``(token, base_url)`` and the token is passed as ``api_key``. ``auth_type="vertex"``
+keeps it out of the api_key provider path so a credentials-file path is never mistaken for a key.
+"""
+
+from typing import Any
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class VertexProfile(ProviderProfile):
+    """Vertex AI — reuse Gemini's thinking_config translation for extra_body."""
+
+    def build_extra_body(self, *, session_id: str | None = None, **context: Any) -> dict[str, Any]:
+        """Emit ``extra_body.google.thinking_config`` like the ``gemini`` provider's OpenAI-compat subpath."""
+        from agent.transports.chat_completions import _build_gemini_thinking_config, _snake_case_gemini_thinking_config
+
+        raw = _build_gemini_thinking_config(context.get("model") or "", context.get("reasoning_config"))
+        thinking_config = _snake_case_gemini_thinking_config(raw) if raw else None
+        return {"extra_body": {"google": {"thinking_config": thinking_config}}} if thinking_config else {}
+
+
+vertex = VertexProfile(
+    name="vertex", aliases=("google-vertex", "vertex-ai", "gcp-vertex", "vertexai"), api_mode="chat_completions",
+    env_vars=(),  # OAuth2 via service account / ADC — not a static key env var
+    base_url="https://aiplatform.googleapis.com",  # real base_url computed at runtime
+    auth_type="vertex", default_aux_model="google/gemini-3.6-flash",
+    supports_model_listing=False,  # no /models route on the OpenAI-compat endpoint; setup ships a curated list
+)
+
+register_provider(vertex)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\xai\__init__.py ===
+"""xAI (Grok) provider profile."""
+
+from hermes_cli import __version__ as _HERMES_VERSION
+from providers import register_provider
+from providers.base import ProviderProfile
+
+xai = ProviderProfile(
+    name="xai", aliases=("grok", "x-ai", "x.ai"), api_mode="codex_responses", env_vars=("XAI_API_KEY",),
+    base_url="https://api.x.ai/v1", auth_type="api_key",
+    default_headers={"User-Agent": f"Hermes-Agent/{_HERMES_VERSION}"},
+)
+
+register_provider(xai)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\xiaomi\__init__.py ===
+"""Xiaomi MiMo provider profile."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+xiaomi = ProviderProfile(
+    name="xiaomi", aliases=("mimo", "xiaomi-mimo"), env_vars=("XIAOMI_API_KEY",),
+    base_url="https://api.xiaomimimo.com/v1",
+    supports_health_check=False,  # /v1/models returns 401 even with valid key
+    supports_vision=True,  # mimo-v2-omni is vision-capable
+    supports_vision_tool_messages=False,  # rejects list-type tool content (400 "text is not set")
+)
+
+register_provider(xiaomi)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\zai\__init__.py ===
+"""ZAI / GLM provider profile.
+
+GLM-4.5+ defaults to thinking ON, so ``reasoning_config`` is translated to
+``extra_body.thinking``; GLM-5.2/5.3 also take a native ``reasoning_effort``.
+"""
+
+import re
+from typing import Any
+
+from agent import reasoning_effort as re_
+from providers import register_provider
+from providers.base import ProviderProfile
+
+_GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
+# Alias spellings seen on relays (Fireworks ``glm-5p2``, ``zai-org-glm-5-2``…).
+_GLM_5_3_TOKENS = ("glm-5.3", "glm-5-3", "glm-5p3")
+_GLM_5_2_TOKENS = ("glm-5.2", "glm-5-2", "glm-5p2") + _GLM_5_3_TOKENS
+
+
+def _model_supports_thinking(model: str | None) -> bool:
+    """GLM thinking-capable model families: glm-4.5 and later (4.5, 4.6, 5…)."""
+    match = _GLM_VERSION_RE.match((model or "").strip().lower())
+    return bool(match) and (int(match.group(1)), int(match.group(2) or 0)) >= (4, 5)
+
+
+def _has_token(model: str | None, tokens: tuple[str, ...]) -> bool:
+    m = (model or "").strip().lower()
+    return any(token in m for token in tokens)
+
+
+def _glm_5_2_reasoning_effort(reasoning_config: dict | None, *, model: str | None = None) -> str | None:
+    """Hermes effort -> GLM vocabulary (5.2: high/max; 5.3: low..max). Below-floor
+    efforts clamp to the floor; disabled/unset leaves the server default."""
+    effort = re_.requested_effort(reasoning_config)
+    if effort is None or effort == "none":
+        return None
+    if _has_token(model, _GLM_5_3_TOKENS):
+        efforts, overrides, floor = re_.GLM53_EFFORTS, re_.GLM53_OVERRIDES, "low"
+    else:
+        efforts, overrides, floor = re_.GLM52_EFFORTS, re_.GLM52_OVERRIDES, "high"
+    clamped = re_.clamp_effort(effort, efforts, overrides)
+    return clamped if clamped in efforts else floor
+
+
+class ZaiProfile(ProviderProfile):
+    """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        extra_body: dict[str, Any] = {}
+        top_level: dict[str, Any] = {}
+        is_5_2 = _has_token(model, _GLM_5_2_TOKENS)
+        if not _model_supports_thinking(model) and not is_5_2:
+            return extra_body, top_level
+        # Only emit when the user expressed a preference (server default = enabled).
+        if isinstance(reasoning_config, dict):
+            enabled = reasoning_config.get("enabled") is not False
+            extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+        if is_5_2:
+            effort = _glm_5_2_reasoning_effort(reasoning_config, model=model)
+            if effort is not None:
+                top_level["reasoning_effort"] = effort
+        return extra_body, top_level
+
+
+zai = ZaiProfile(
+    name="zai", aliases=("glm", "z-ai", "z.ai", "zhipu"),
+    env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"), display_name="Z.AI (GLM)",
+    description="Z.AI / GLM — Zhipu AI models", signup_url="https://z.ai/",
+    fallback_models=("glm-5.2", "glm-5", "glm-4-9b"), base_url="https://api.z.ai/api/paas/v4",
+    default_aux_model="glm-4.5-flash",
+)
+
+register_provider(zai)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\observability\langfuse\README.md ===
+# Langfuse Observability Plugin
+
+This plugin ships bundled with Hermes but is **opt-in** — it only loads when
+you explicitly enable it.
+
+## Enable
+
+Pick one:
+
+```bash
+# Interactive: walks you through credentials + SDK install + enable
+hermes tools  # → Langfuse Observability
+
+# Manual
+pip install langfuse
+hermes plugins enable observability/langfuse
+```
+
+## Required credentials
+
+Set these in `~/.hermes/.env` (or via `hermes tools`):
+
+```bash
+HERMES_LANGFUSE_PUBLIC_KEY=pk-lf-...
+HERMES_LANGFUSE_SECRET_KEY=sk-lf-...
+HERMES_LANGFUSE_BASE_URL=https://cloud.langfuse.com   # or your self-hosted URL
+```
+
+Without the SDK or credentials the hooks no-op silently — the plugin fails
+open.
+
+## Verify
+
+```bash
+hermes plugins list                 # observability/langfuse should show "enabled"
+hermes chat -q "hello"              # then check Langfuse for a "Hermes turn" trace
+```
+
+Generation observations include the Hermes system prompt when the provider
+uses a separate `system` param (Anthropic Messages API). Open an **LLM call**
+child span to inspect `role: system` (truncated via `HERMES_LANGFUSE_MAX_CHARS`).
+
+## Optional tuning
+
+```bash
+HERMES_LANGFUSE_ENV=production       # environment tag
+HERMES_LANGFUSE_RELEASE=v1.0.0       # release tag
+HERMES_LANGFUSE_SAMPLE_RATE=0.5      # sample 50% of traces
+HERMES_LANGFUSE_MAX_CHARS=12000      # max chars per field (default: 12000)
+HERMES_LANGFUSE_CAPTURE=sanitized    # content capture mode (see below)
+HERMES_LANGFUSE_DEBUG=true           # verbose plugin logging
+```
+
+## Capture modes
+
+`HERMES_LANGFUSE_CAPTURE` controls how much *content* (prompts, responses,
+tool arguments/results) is exported. Structural metadata — IDs, roles, tool
+names, token usage, cost, timing — is always captured in every mode.
+
+| mode | behavior |
+|------|----------|
+| `metadata` | No content. Each content field is replaced by a shape/size stub (`{"omitted": true, "type": "text", "chars": N}`). |
+| `sanitized` | **(default)** Content is exported after secret-pattern redaction (API keys, tokens, JWTs, private keys, `password=`-style assignments) and truncation. Redaction runs *before* truncation. |
+| `full` | Raw content, truncated only. Explicit opt-in — traces will contain whatever passed through the conversation, including injected memory and file contents. |
+
+The active mode is recorded on every trace as `metadata.capture_mode`.
+
+Note: `sanitized` is pattern-based defense in depth, not a DLP guarantee.
+For personal sessions or shared Langfuse projects, prefer `metadata`.
+
+## Error + shutdown coverage
+
+- Failed model requests (`api_request_error` hook) close their generation
+  with `level=ERROR`, status code, retry counters, and a capture-mode-scrubbed
+  error message. Non-retryable failures also finish the turn trace.
+- Session end/finalize closes any still-open traces for that session and
+  flushes queued events, so interrupted or tool-only turns don't dangle.
+
+## Disable
+
+```bash
+hermes plugins disable observability/langfuse
+```
+

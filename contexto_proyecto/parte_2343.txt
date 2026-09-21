@@ -1,0 +1,389 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\lsp\test_shell_linter_lsp_skip.py ===
+"""Skip the per-file shell linter when LSP will handle the same file.
+
+The per-file ``npx tsc --noEmit FILE.ts`` shell linter cannot see
+``tsconfig.json`` (a documented ``tsc`` quirk: explicit file args bypass
+the project config), so it defaults to no-lib / ES5 and floods the
+agent's lint field with phantom "Cannot find 'Promise' / 'Map' / 'Set' /
+'ReadonlySet' / 'Iterable' / 'imul' / …" errors on every edit — up to
+25K tokens per patch.  The LSP tier (``tsserver`` via
+typescript-language-server) reads tsconfig correctly and surfaces real
+diagnostics in the ``lsp_diagnostics`` field of the WriteResult /
+PatchResult.
+
+These tests pin the contract:
+
+  - When LSP is active AND ``enabled_for(path)`` for a ``.ts`` / ``.go``
+    / ``.rs`` file, ``_check_lint`` returns ``skipped`` without invoking
+    the shell linter at all.
+  - When LSP is inactive or disabled-for-path, the shell linter runs
+    exactly as before (regression guard for the default config).
+  - The skip only applies to extensions in
+    ``_SHELL_LINTER_LSP_REDUNDANT`` — Python ``py_compile`` and
+    ``node --check`` keep running unconditionally because they're fast,
+    file-local, and correct.
+  - ``.tsx`` is intentionally NOT in either ``LINTERS`` or
+    ``_SHELL_LINTER_LSP_REDUNDANT``: it had no ``LINTERS`` entry
+    pre-PR (so it was already implicitly ``skipped`` via the
+    ``ext not in LINTERS`` branch) and adding one would have inherited
+    ``.ts``'s broken ``tsc --noEmit FILE`` invocation for LSP-disabled
+    users.  When LSP IS enabled, ``.tsx`` is still covered by
+    typescript-language-server via ``_maybe_lsp_diagnostics`` — the
+    diagnostics show up on ``lsp_diagnostics``, not ``lint``.
+"""
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+def _make_fops():
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+    return ShellFileOperations(LocalEnvironment())
+
+
+@pytest.mark.parametrize("ext", [".ts", ".go", ".rs"])
+def test_shell_linter_skipped_when_lsp_will_handle(ext, tmp_path):
+    """When LSP is active and enabled_for(path), shell linter is skipped.
+
+    The shell linter's _exec must NOT be called — that's the whole
+    point.  We assert by patching ``_exec`` to raise, so any accidental
+    invocation surfaces as a test failure.
+    """
+    fops = _make_fops()
+    src = tmp_path / f"bad{ext}"
+    src.write_text("intentionally invalid content\n")
+
+    def _exec_must_not_run(*args, **kwargs):  # pragma: no cover
+        raise AssertionError(
+            "shell linter was invoked despite LSP claiming the file"
+        )
+
+    with patch.object(fops, "_lsp_will_handle", return_value=True), \
+         patch.object(fops, "_exec", side_effect=_exec_must_not_run), \
+         patch.object(fops, "_has_command", return_value=True):
+        result = fops._check_lint(str(src))
+
+    assert result.skipped is True
+    assert "LSP" in (result.message or "")
+
+
+
+
+
+
+
+
+
+
+def test_lsp_will_handle_swallows_enabled_for_exception(tmp_path):
+    """A flaky LSP service must never break the shell-linter fallback —
+    if ``enabled_for`` raises, we treat the file as "not handled" so the
+    shell linter still runs."""
+    fops = _make_fops()
+    src = tmp_path / "foo.ts"
+    src.write_text("const x = 1\n")
+
+    fake_svc = MagicMock()
+    fake_svc.enabled_for.side_effect = RuntimeError("server crashed")
+
+    with patch.object(fops, "_lsp_local_only", return_value=True), \
+         patch("agent.lsp.get_service", return_value=fake_svc):
+        assert fops._lsp_will_handle(str(src)) is False
+
+
+
+
+def test_tsx_default_check_lint_returns_skipped(tmp_path):
+    """End-to-end: ``.tsx`` files get ``LintResult(skipped=True)`` from
+    ``_check_lint`` regardless of LSP status — this is the no-regression
+    contract that addresses Copilot review #3271017282."""
+    fops = _make_fops()
+    src = tmp_path / "foo.tsx"
+    src.write_text("export const X = () => <div/>\n")
+
+    # Even with LSP claiming the file, no shell linter runs for .tsx
+    # because there's no LINTERS entry — the ``ext not in LINTERS``
+    # branch fires before the LSP short-circuit is consulted.
+    with patch.object(fops, "_lsp_will_handle", return_value=True), \
+         patch.object(fops, "_exec") as exec_mock:
+        result = fops._check_lint(str(src))
+
+    assert result.skipped is True
+    assert not exec_mock.called, "no shell linter should run for .tsx"
+
+
+def test_ts_shell_linter_skipped_when_ancestor_tsconfig_present(tmp_path):
+    """A .ts file under a dir tree containing tsconfig.json skips the per-file
+    shell tsc EVEN WHEN LSP is inactive — single-file tsc can't read the
+    project config, so its diagnostics are pure noise. This closes the
+    LSP-disabled gap (the common default).
+
+    _exec is patched to raise so any accidental shell-linter invocation fails
+    the test.
+    """
+    fops = _make_fops()
+    (tmp_path / "tsconfig.json").write_text('{"compilerOptions":{}}\n')
+    sub = tmp_path / "src" / "app"
+    sub.mkdir(parents=True)
+    src = sub / "thing.ts"
+    src.write_text("import { x } from '@/store'\nexport const y = x\n")
+
+    def _exec_must_not_run(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("shell tsc ran despite an ancestor tsconfig.json")
+
+    with patch.object(fops, "_lsp_local_only", return_value=True), \
+         patch.object(fops, "_lsp_will_handle", return_value=False), \
+         patch.object(fops, "_exec", side_effect=_exec_must_not_run), \
+         patch.object(fops, "_has_command", return_value=True):
+        result = fops._check_lint(str(src))
+
+    assert result.skipped is True
+    assert "tsconfig.json" in (result.message or "")
+
+
+def test_ts_shell_linter_runs_when_no_ancestor_tsconfig(tmp_path):
+    """Without any ancestor tsconfig.json (a standalone .ts file), the shell
+    tsc still runs — the ancestor-skip must not suppress lint for non-project
+    files. We assert _exec IS reached (LSP inactive)."""
+    fops = _make_fops()
+    src = tmp_path / "loose.ts"
+    src.write_text("const x: number = 'nope'\n")
+
+    exec_result = MagicMock()
+    exec_result.exit_code = 2
+    exec_result.stdout = "loose.ts(1,7): error TS2322: Type 'string' ...\n"
+
+    with patch.object(fops, "_lsp_local_only", return_value=True), \
+         patch.object(fops, "_lsp_will_handle", return_value=False), \
+         patch.object(fops, "_has_command", return_value=True), \
+         patch.object(fops, "_exec", return_value=exec_result) as exec_mock:
+        fops._check_lint(str(src))
+
+    assert exec_mock.called, "shell tsc should run when there's no project tsconfig"
+
+
+if __name__ == "__main__":  # pragma: no cover
+    pytest.main([__file__, "-v"])
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\lsp\test_stale_diagnostics.py ===
+"""Regression tests for the "ghost diagnostics" staleness bug.
+
+Scenario: the agent edits a TypeScript file, tsserver takes a long
+time to re-check it, and the old diagnostics (for the PRE-edit
+content) were reported as if they were current — the agent then
+chases errors it already fixed.
+
+The contract under test:
+
+- ``wait_for_diagnostics`` must NOT be satisfied by diagnostics left
+  over from a previous edit cycle; it returns True only when fresh
+  (post-didChange) data arrived, False on timeout.
+- ``diagnostics_for(fresh_only=True)`` must exclude stale stores.
+- ``LSPService.get_diagnostics_sync`` must return [] ("no data")
+  rather than the stale diagnostics when the server never re-checks
+  within the wait budget, and must NOT mark the server broken.
+- A slow-but-eventually-correct server ("slow_push") is waited on,
+  honouring the configured ``lsp.wait_timeout``.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+from agent.lsp.client import LSPClient
+
+
+MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
+
+
+def _client(workspace: Path, script: str, **env_extra: str) -> LSPClient:
+    env = {
+        "MOCK_LSP_SCRIPT": script,
+        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        **env_extra,
+    }
+    return LSPClient(
+        server_id=f"mock-{script}",
+        workspace_root=str(workspace),
+        command=[sys.executable, MOCK_SERVER],
+        env=env,
+        cwd=str(workspace),
+    )
+
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_slow_push_is_waited_for(tmp_path: Path):
+    """A server that re-checks slowly (but within budget) gets waited on,
+    and the fresh (clean) result replaces the old error."""
+    f = tmp_path / "x.py"
+    f.write_text("bad code\n")
+
+    client = _client(tmp_path, "slow_push", MOCK_LSP_PUSH_DELAY="0.8")
+    await client.start()
+    try:
+        v0 = await client.open_file(str(f), language_id="python")
+        assert await client.wait_for_diagnostics(str(f), v0, mode="document", timeout=2.0)
+        assert len(client.diagnostics_for(str(f), fresh_only=True)) == 1
+
+        f.write_text("good code\n")
+        v1 = await client.open_file(str(f), language_id="python")
+        fresh = await client.wait_for_diagnostics(str(f), v1, mode="document", timeout=5.0)
+        assert fresh is True, "slow push within budget must satisfy the wait"
+        assert client.diagnostics_for(str(f), fresh_only=True) == []
+    finally:
+        await client.shutdown()
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Service-level: stale data must surface as "no data", never as errors
+# ---------------------------------------------------------------------------
+
+
+def _install_mock_server(script: str, server_id: str = "pyright"):
+    """Replace one registered server with a wrapper spawning the mock.
+
+    Mirrors the helper in test_service.py — reuse pyright so .py files
+    route to the mock without a real toolchain.
+    """
+    from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
+
+    target_index = next(i for i, s in enumerate(SERVERS) if s.server_id == server_id)
+    original = SERVERS[target_index]
+
+    def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
+        return SpawnSpec(
+            command=[sys.executable, MOCK_SERVER],
+            workspace_root=root,
+            cwd=root,
+            env={"MOCK_LSP_SCRIPT": script},
+            initialization_options={},
+        )
+
+    SERVERS[target_index] = ServerDef(
+        server_id=server_id,
+        extensions=original.extensions,
+        resolve_root=lambda fp, ws: ws,
+        build_spawn=_spawn,
+        seed_first_push=False,
+        description="mock " + server_id,
+    )
+    return target_index, original
+
+
+@pytest.fixture
+def stale_repo(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    monkeypatch.chdir(str(repo))
+    idx, original = _install_mock_server("stale")
+    yield repo
+    from agent.lsp.servers import SERVERS
+
+    SERVERS[idx] = original
+
+
+def test_service_reports_no_data_not_stale_errors(stale_repo):
+    """When the server never re-checks the edited content in budget,
+    get_diagnostics_sync must return [] and keep the server usable."""
+    from agent.lsp.manager import LSPService
+
+    f = stale_repo / "x.py"
+    f.write_text("bad code\n")
+
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+    )
+    try:
+        # First contact: didOpen gets the (real) pre-edit error push.
+        first = svc.get_diagnostics_sync(str(f), delta=False)
+        assert len(first) == 1
+
+        # Edit the file — mock never re-publishes (slow tsserver model).
+        f.write_text("good code\n")
+        ghost = svc.get_diagnostics_sync(str(f), delta=False)
+        assert ghost == [], "stale pre-edit error must not be reported as current"
+
+        # Not marked broken: slow is not dead.
+        assert svc.enabled_for(str(f))
+        status = svc.get_status()
+        assert status["broken"] == []
+    finally:
+        svc.shutdown()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\lsp\test_versionless_push_during_send.py ===
+"""A versionless publishDiagnostics read while didChange is still being written must count as fresh.
+
+``open_or_change`` used to bump ``_DocState.version`` only after awaiting the send.  Servers that omit
+``version`` are credited with ``doc.version`` at receipt, so a reply that landed during that await was
+tagged with the OLD version and then rejected as stale once the send resumed.  The mock replies
+versionless; the paused send wrapper holds the await open until its reply has been read.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+from agent.lsp.client import LSPClient
+
+MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
+
+
+@pytest.mark.asyncio
+async def test_versionless_push_read_during_didchange_send_is_fresh(tmp_path, monkeypatch):
+    src = tmp_path / "x.py"
+    src.write_text("bad\n", encoding="utf-8")
+    client = LSPClient(
+        server_id="mock-versionless", workspace_root=str(tmp_path),
+        command=[sys.executable, MOCK_SERVER], cwd=str(tmp_path),
+        env={"MOCK_LSP_SCRIPT": "versionless", "PYTHONPATH": os.environ.get("PYTHONPATH", "")},
+    )
+    await client.start()
+    try:
+        first = await client.open_file(str(src), language_id="python")
+        assert await client.wait_for_diagnostics(str(src), first, timeout=5)
+        real_send = client._send_notification
+
+        async def send_and_let_reply_land(method, params):
+            seen = client._push_counter
+            await real_send(method, params)
+            if method == "textDocument/didChange":
+                while client._push_counter == seen:
+                    await asyncio.sleep(0.001)
+
+        monkeypatch.setattr(client, "_send_notification", send_and_let_reply_land)
+        src.write_text("clean\n", encoding="utf-8")
+        version = await client.open_file(str(src), language_id="python")
+        assert await client.wait_for_diagnostics(str(src), version, timeout=1)
+        assert client.diagnostics_for(str(src), fresh_only=True) == []
+    finally:
+        await client.shutdown()
+

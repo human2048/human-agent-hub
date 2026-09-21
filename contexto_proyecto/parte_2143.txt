@@ -1,0 +1,420 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nonretryable_result_carries_verdict.py ===
+"""A non-retryable 4xx (rejected OAuth token, bad key) must reach UI clients with the
+classifier's verdict: without ``failure_reason`` the desktop error card read a 401 as a
+retryable "Provider error" and offered Retry instead of a re-login."""
+from __future__ import annotations
+
+from agent.error_classifier import classify_api_error
+from agent.error_surface import LAYER_AUTH, build_error_surface_from_result
+from agent.turn_recovery import nonretryable_client_error_result
+
+
+class _Rejected(Exception):
+    status_code = 401
+
+    def __init__(self) -> None:
+        super().__init__("HTTP 401: User not found.")
+
+
+class _Agent:
+    log_prefix = ""
+    verbose = False
+
+    def _summarize_api_error(self, error):
+        return str(error)
+
+    def __getattr__(self, name):  # status/persist/print helpers the terminal path calls
+        return lambda *args, **kwargs: None
+
+
+def test_nonretryable_401_result_classifies_as_auth_for_the_ui():
+    error = _Rejected()
+    classified = classify_api_error(error, provider="nous", model="m")
+    result = nonretryable_client_error_result(
+        _Agent(), error, classified, status_code=401, api_kwargs=None, api_messages=[], messages=[],
+        conversation_history=None, api_call_count=1, approx_tokens=10, provider="nous",
+        base_url="https://inference-api.nousresearch.com/v1", model="m",
+    )
+    assert result["failure_reason"] == classified.reason.value
+    assert result["failure_retryable"] is classified.retryable is False
+
+    surface = build_error_surface_from_result(result, provider="nous", model="m")
+    assert surface["layer"] == LAYER_AUTH
+    assert surface["retryable"] is False
+    assert surface["auth_kind"] == "oauth"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nonstream_wait_notice.py ===
+"""Wait status describes request-local silence, never active generation."""
+
+from types import SimpleNamespace
+import threading
+
+import pytest
+
+from agent import chat_completion_helpers as h
+from agent.chat_completion_nonstream import _NonStreamRequest
+
+
+def _request():
+    request = _NonStreamRequest.__new__(_NonStreamRequest)
+    notices, touches = [], []
+    request.agent = SimpleNamespace(
+        _emit_wait_notice=notices.append,
+        _touch_activity=touches.append,
+        _interrupt_requested=False,
+        _codex_stream_last_event_ts=9999.0,  # Another request cannot hide this one's stall.
+    )
+    request.api_kwargs = {"model": "test-model"}
+    request.call_start = 1000.0
+    request.wd = SimpleNamespace(
+        codex=True, stale_timeout=600.0, ttfb_enabled=True, ttfb_timeout=120.0,
+        idle_enabled=True, idle_timeout=180.0, idle_requires_progress=False,
+    )
+    request.codex_watchdog_state = SimpleNamespace(
+        lock=threading.Lock(), last_event_ts=None, last_progress_ts=None,
+        retry_started_ts=None,
+    )
+    request.wait_notice_started_ts = None
+    request.result = {"error": None, "response": None}
+    return request, notices, touches
+
+
+@pytest.mark.parametrize(
+    "event,progress,retry,expected",
+    [
+        (59.0, 59.0, None, None),  # Reasoning/text/tool arguments still arriving.
+        (59.0, None, None, None),  # Lifecycle traffic is not transport silence either.
+        (0.0, 0.0, None, "60s with no stream events"),
+        (0.0, None, None, "60s with no stream events"),
+        (1.0, None, None, None),  # 59 seconds of silence is still quiet.
+        (None, None, None, "60s with no response yet"),
+        (10.0, 10.0, 59.0, None),  # Internal reconnect gets a fresh first-event wait.
+        (0.0, 0.0, 0.0, "60s with no response after reconnect"),
+        (0.0, 0.0, 1.0, None),
+    ],
+)
+def test_wait_notice_tracks_current_attempt_silence(event, progress, retry, expected):
+    request, notices, touches = _request()
+    state = request.codex_watchdog_state
+    state.last_event_ts = None if event is None else request.call_start + event
+    state.last_progress_ts = None if progress is None else request.call_start + progress
+    state.retry_started_ts = None if retry is None else request.call_start + retry
+    request._emit_wait_notice(30.0)
+    request._emit_wait_notice(59.0)
+    assert notices == []
+    assert touches
+    if event is None and retry is None:
+        assert "receiving" not in touches[-1]
+    request._emit_wait_notice(60.0)
+    if expected is None:
+        assert notices == []
+        assert touches, "Quiet heartbeat must survive suppressing a visible warning"
+    else:
+        assert len(notices) == 1
+        assert expected in notices[0]
+        assert "auto-reconnect at" in notices[0]
+
+
+def test_resumed_events_clear_only_this_requests_wait_notice(monkeypatch):
+    request, notices, _ = _request()
+    sentinel = object()
+    ticks = [0]
+
+    class Worker:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return ticks[0] < 204
+
+        def join(self, timeout):
+            ticks[0] += 1
+            if ticks[0] >= 201:
+                request.codex_watchdog_state.last_event_ts = 1000.0 + ticks[0] * 0.3
+            if ticks[0] == 204:
+                request.result["response"] = sentinel
+
+    monkeypatch.setattr(h.threading, "Thread", Worker)
+    monkeypatch.setattr(h.time, "time", lambda: 1000.0 + ticks[0] * 0.3)
+    assert request.run() is sentinel
+    assert len(notices) == 2
+    assert "no response yet" in notices[0]
+    # Nonempty thinking.delta payloads enter TUI reasoning history.
+    assert notices[1] == ""
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_non_stream_stale_timeout.py ===
+"""Tests for the non-stream stale-call detector context estimator.
+
+Covers:
+- ``estimate_request_context_tokens`` for Chat Completions, Responses API,
+  bare lists, and mixed-shape dicts.
+- ``AIAgent._compute_non_stream_stale_timeout`` with both legacy ``messages``
+  list and full ``api_kwargs`` dicts.
+- The May 2026 default-base change (300s -> 90s) and the lowered
+  context-tier ceilings (450/600 -> 150/240).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+
+def _write_config(tmp_path: Path, body: str) -> None:
+    hermes_home = tmp_path
+    (hermes_home / "config.yaml").write_text(body or "{}\n", encoding="utf-8")
+
+
+def _make_agent(tmp_path: Path, **overrides):
+    from run_agent import AIAgent
+    kwargs = dict(
+        model="gpt-5.5",
+        provider="openai-codex",
+        api_key="sk-dummy",
+        base_url="https://chatgpt.com/backend-api/codex",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    kwargs.update(overrides)
+    return AIAgent(**kwargs)
+
+
+# ── estimator ──────────────────────────────────────────────────────────────
+
+
+
+
+def test_estimator_responses_api_input():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+    payload = {
+        "model": "gpt-5.5",
+        "instructions": "i" * 1000,
+        "input": "x" * 4000,
+        "tools": [{"name": "t", "description": "d" * 200}],
+    }
+    # input(4000) + instructions(1000) + tools (~stringified) -> well over 1000 tokens
+    tokens = estimate_request_context_tokens(payload)
+    assert tokens >= 1200, f"Responses API estimator returned {tokens}"
+
+
+
+
+
+
+def test_estimator_empty_inputs():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+    assert estimate_request_context_tokens({}) == 0
+    assert estimate_request_context_tokens([]) == 0
+    assert estimate_request_context_tokens(None) == 0
+
+
+
+
+# ── default base + tier scaling ────────────────────────────────────────────
+
+
+def test_default_base_is_90s(monkeypatch, tmp_path):
+    """Default base stale timeout dropped from 300s to 90s (May 2026)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    agent = _make_agent(tmp_path)
+    base, implicit = agent._resolved_api_call_stale_timeout_base()
+    assert base == 90.0
+    assert implicit is True
+
+
+
+
+
+
+
+
+
+
+def test_explicit_user_config_overrides_default(monkeypatch, tmp_path):
+    """If the user explicitly sets a stale_timeout, the new defaults don't apply."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+providers:
+  openai-codex:
+    stale_timeout_seconds: 1800
+""")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+
+    import importlib
+    from hermes_cli import timeouts as to_mod
+    importlib.reload(to_mod)
+
+    agent = _make_agent(tmp_path)
+    assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 1800.0
+
+
+# ── openai-codex gateway-scale stale floor ────────────────────────────────
+
+
+
+
+def test_openai_codex_stale_floor_tiers():
+    from agent.chat_completion_helpers import openai_codex_stale_timeout_floor
+
+    assert openai_codex_stale_timeout_floor(55_000) == 900.0
+    assert openai_codex_stale_timeout_floor(120_000) == 1200.0
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_notice_spine.py ===
+"""Regression tests for the notice-spine (AgentNotice + emitter callbacks).
+
+Covers:
+  A. _emit_notice / _emit_notice_clear emitter behaviour (bare AIAgent via
+     object.__new__ — same pattern as test_steer.py and test_file_mutation_verifier.py).
+  B. Constructor / init_agent signature threading.
+  C. TUI _agent_cbs notice binding — mirrors the status_callback tests already
+     in tests/tui_gateway/test_tui_gateway_server.py.
+"""
+from __future__ import annotations
+
+import inspect
+from unittest.mock import patch
+
+import pytest
+
+from agent.credits_tracker import AgentNotice
+from run_agent import AIAgent
+
+
+# ── A. Emitter behaviour ─────────────────────────────────────────────────────
+
+
+def _bare_agent() -> AIAgent:
+    """Build an AIAgent without running __init__ (no heavy init required).
+
+    Only the two callback slots used by _emit_notice / _emit_notice_clear are
+    installed — mirrors the pattern in test_steer.py.
+    """
+    agent = object.__new__(AIAgent)
+    agent.notice_callback = None
+    agent.notice_clear_callback = None
+    return agent
+
+
+class TestEmitNotice:
+    def test_emit_notice_calls_callback_with_exact_notice(self):
+        agent = _bare_agent()
+        received = []
+        notice = AgentNotice(
+            text="credits 90% used",
+            level="warn",
+            kind="sticky",
+            ttl_ms=None,
+            key="credits.warn90",
+            id="n1",
+        )
+        agent.notice_callback = received.append
+        agent._emit_notice(notice)
+        assert received == [notice]
+
+
+
+
+
+
+
+# ── B. Constructor / init_agent signature threading ─────────────────────────
+
+
+class TestSignatureThreading:
+    def test_agent_init_exposes_notice_callback(self):
+        sig = inspect.signature(AIAgent.__init__)
+        assert "notice_callback" in sig.parameters
+
+
+
+
+
+# ── C. TUI _agent_cbs binding ────────────────────────────────────────────────
+
+
+class TestAgentCbsNoticeBinding:
+    """Mirror test_status_callback_emits_kind_and_text from test_tui_gateway_server.py."""
+
+    def test_notice_callback_emits_notification_show(self):
+        from tui_gateway import server
+
+        with patch("tui_gateway.server._emit") as mock_emit:
+            cbs = server._agent_cbs("sid123")
+            notice = AgentNotice(
+                text="credits 90% used",
+                level="warn",
+                kind="sticky",
+                ttl_ms=None,
+                key="credits.warn90",
+                id="n1",
+            )
+            cbs["notice_callback"](notice)
+
+        mock_emit.assert_called_once_with(
+            "notification.show",
+            "sid123",
+            {
+                "text": "credits 90% used",
+                "level": "warn",
+                "kind": "sticky",
+                "ttl_ms": None,
+                "key": "credits.warn90",
+                "id": "n1",
+            },
+        )
+
+    def test_notice_callback_payload_is_full_snake_case_dict(self):
+        """All six snake_case fields must be present in the payload — no extras,
+        no camelCase variants."""
+        from tui_gateway import server
+
+        captured = []
+        with patch("tui_gateway.server._emit", side_effect=lambda *a: captured.append(a)):
+            cbs = server._agent_cbs("sid123")
+            cbs["notice_callback"](
+                AgentNotice(
+                    text="credits 90% used",
+                    level="warn",
+                    kind="sticky",
+                    ttl_ms=None,
+                    key="credits.warn90",
+                    id="n1",
+                )
+            )
+
+        assert len(captured) == 1
+        _event_type, _sid, payload = captured[0]
+        assert set(payload.keys()) == {"text", "level", "kind", "ttl_ms", "key", "id"}
+
+
+
+    def test_notice_clear_callback_event_type_is_notification_clear(self):
+        from tui_gateway import server
+
+        captured = []
+        with patch("tui_gateway.server._emit", side_effect=lambda *a: captured.append(a)):
+            cbs = server._agent_cbs("sid123")
+            cbs["notice_clear_callback"]("some.key")
+
+        assert captured[0][0] == "notification.clear"
+        assert captured[0][1] == "sid123"
+        assert captured[0][2] == {"key": "some.key"}
+

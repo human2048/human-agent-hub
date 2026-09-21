@@ -1,0 +1,396 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_local_shell_init.py ===
+"""Tests for terminal.shell_init_files / terminal.auto_source_bashrc.
+
+A bash ``-l -c`` invocation does NOT source ``~/.bashrc``, so tools that
+register themselves there (nvm, asdf, pyenv) stay invisible to the
+environment snapshot built by ``LocalEnvironment.init_session``.  These
+tests verify the config-driven prelude that fixes that.
+"""
+
+import os
+from unittest.mock import patch
+
+import pytest
+
+from tools.environments.local import (
+    LocalEnvironment,
+    _prepend_shell_init,
+    _resolve_shell_init_files,
+)
+
+
+class TestResolveShellInitFiles:
+    def test_auto_sources_bashrc_when_present(self, tmp_path, monkeypatch):
+        bashrc = tmp_path / ".bashrc"
+        bashrc.write_text('export MARKER=seen\n')
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        # Default config: auto_source_bashrc on, no explicit list.
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], True),
+        ):
+            resolved = _resolve_shell_init_files()
+
+        assert resolved == [str(bashrc)]
+
+    def test_auto_sources_profile_when_present(self, tmp_path, monkeypatch):
+        """~/.profile is where ``n`` / ``nvm`` installers typically write
+        their PATH export on Debian/Ubuntu, and it has no interactivity
+        guard so a non-interactive source actually runs it.
+        """
+        profile = tmp_path / ".profile"
+        profile.write_text('export PATH="$HOME/n/bin:$PATH"\n')
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], True),
+        ):
+            resolved = _resolve_shell_init_files()
+
+        assert resolved == [str(profile)]
+
+
+    def test_auto_sources_profile_before_bashrc(self, tmp_path, monkeypatch):
+        """Both files present: profile runs first so PATH exports in
+        profile take effect even if bashrc short-circuits on the
+        non-interactive ``case $- in *i*) ;; *) return;; esac`` guard.
+        """
+        profile = tmp_path / ".profile"
+        profile.write_text('export FROM_PROFILE=1\n')
+        bash_profile = tmp_path / ".bash_profile"
+        bash_profile.write_text('export FROM_BASH_PROFILE=1\n')
+        bashrc = tmp_path / ".bashrc"
+        bashrc.write_text('export FROM_BASHRC=1\n')
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], True),
+        ):
+            resolved = _resolve_shell_init_files()
+
+        assert resolved == [str(profile), str(bash_profile), str(bashrc)]
+
+    def test_skips_bashrc_when_missing(self, tmp_path, monkeypatch):
+        # No rc files written.
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], True),
+        ):
+            resolved = _resolve_shell_init_files()
+
+        assert resolved == []
+
+
+    def test_missing_explicit_files_are_skipped_silently(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(tmp_path / "does-not-exist.sh")], False),
+        ):
+            resolved = _resolve_shell_init_files()
+
+        assert resolved == []
+
+
+class TestPrependShellInit:
+    def test_empty_list_returns_command_unchanged(self):
+        assert _prepend_shell_init("echo hi", []) == "echo hi"
+
+    def test_prepends_guarded_source_lines(self):
+        wrapped = _prepend_shell_init("echo hi", ["/tmp/a.sh", "/tmp/b.sh"])
+        assert "echo hi" in wrapped
+        # Each file is sourced through a guarded [ -r … ] && . '…' || true
+        # pattern so a missing/broken rc can't abort the bootstrap.
+        assert "/tmp/a.sh" in wrapped
+        assert "/tmp/b.sh" in wrapped
+        assert "|| true" in wrapped
+        assert "set +e" in wrapped
+
+    def test_escapes_single_quotes(self):
+        wrapped = _prepend_shell_init("echo hi", ["/tmp/o'malley.sh"])
+        # The path must survive as the shell receives it; embedded single
+        # quote is escaped as '\'' rather than breaking the outer quoting.
+        assert "o'\\''malley" in wrapped
+
+
+@pytest.mark.skipif(
+    os.environ.get("CI") == "true" and not os.path.isfile("/bin/bash"),
+    reason="Requires bash; CI sandbox may strip it.",
+)
+class TestSnapshotEndToEnd:
+    """Spin up a real LocalEnvironment and confirm the snapshot sources
+    extra init files."""
+
+    def test_exported_env_changes_persist_between_commands(self, tmp_path):
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        try:
+            first = env.execute(
+                'export HERMES_STICKY_ENV_PROBE="sticky"; '
+                'export PATH="/tmp/hermes-session-bin:$PATH"; '
+                'echo "first=$HERMES_STICKY_ENV_PROBE"'
+            )
+            second = env.execute(
+                'echo "second=$HERMES_STICKY_ENV_PROBE"; echo "PATH=$PATH"'
+            )
+        finally:
+            env.cleanup()
+
+        assert first["returncode"] == 0
+        assert second["returncode"] == 0
+        assert "first=sticky" in first.get("output", "")
+        output = second.get("output", "")
+        assert "second=sticky" in output
+        assert "/tmp/hermes-session-bin" in output
+
+
+    def test_snapshot_picks_up_init_file_exports(self, tmp_path, monkeypatch):
+        init_file = tmp_path / "custom-init.sh"
+        init_file.write_text(
+            'export HERMES_SHELL_INIT_PROBE="probe-ok"\n'
+            'export PATH="/opt/shell-init-probe/bin:$PATH"\n'
+        )
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(init_file)], False),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute(
+                    'echo "PROBE=$HERMES_SHELL_INIT_PROBE"; echo "PATH=$PATH"'
+                )
+            finally:
+                env.cleanup()
+
+        output = result.get("output", "")
+        assert "PROBE=probe-ok" in output
+        assert "/opt/shell-init-probe/bin" in output
+
+    def test_profile_path_export_survives_bashrc_interactive_guard(
+        self, tmp_path, monkeypatch
+    ):
+        """Reproduces the Debian/Ubuntu + ``n``/``nvm`` case.
+
+        Setup:
+          - ``~/.bashrc`` starts with ``case $- in *i*) ;; *) return;; esac``
+            (the default on Debian/Ubuntu) and would happily export a PATH
+            entry below that guard — but never gets there because a
+            non-interactive source short-circuits.
+          - ``~/.profile`` exports ``$HOME/fake-n/bin`` onto PATH, no guard.
+
+        Expectation: auto-sourced rc list picks up ``~/.profile`` before
+        ``~/.bashrc``, so the snapshot ends up with ``fake-n/bin`` on PATH
+        even though the bashrc export is silently skipped.
+        """
+        fake_n_bin = tmp_path / "fake-n" / "bin"
+        fake_n_bin.mkdir(parents=True)
+
+        profile = tmp_path / ".profile"
+        profile.write_text(
+            f'export PATH="{fake_n_bin}:$PATH"\n'
+            'export FROM_PROFILE=profile-ok\n'
+        )
+        bashrc = tmp_path / ".bashrc"
+        bashrc.write_text(
+            'case $- in\n'
+            '    *i*) ;;\n'
+            '      *) return;;\n'
+            'esac\n'
+            'export FROM_BASHRC=bashrc-should-not-appear\n'
+        )
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], True),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute(
+                    'echo "PATH=$PATH"; '
+                    'echo "FROM_PROFILE=$FROM_PROFILE"; '
+                    'echo "FROM_BASHRC=$FROM_BASHRC"'
+                )
+            finally:
+                env.cleanup()
+
+        output = result.get("output", "")
+        assert "FROM_PROFILE=profile-ok" in output
+        assert str(fake_n_bin) in output
+        # bashrc short-circuited on the interactive guard — its export never ran
+        assert "FROM_BASHRC=bashrc-should-not-appear" not in output
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_local_tempdir.py ===
+from unittest.mock import patch
+
+from tools.environments.local import LocalEnvironment
+
+
+class TestLocalTempDir:
+    def test_uses_os_tmpdir_for_session_artifacts(self, monkeypatch):
+        monkeypatch.setenv("TMPDIR", "/data/data/com.termux/files/usr/tmp")
+        monkeypatch.delenv("TMP", raising=False)
+        monkeypatch.delenv("TEMP", raising=False)
+
+        with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
+            env = LocalEnvironment(cwd=".", timeout=10)
+
+        assert env.get_temp_dir() == "/data/data/com.termux/files/usr/tmp"
+        assert env._snapshot_path == f"/data/data/com.termux/files/usr/tmp/hermes-snap-{env._session_id}.sh"
+        assert env._cwd_file == f"/data/data/com.termux/files/usr/tmp/hermes-cwd-{env._session_id}.txt"
+
+
+    def test_falls_back_to_tempfile_when_tmp_missing(self, monkeypatch):
+        monkeypatch.delenv("TMPDIR", raising=False)
+        monkeypatch.delenv("TMP", raising=False)
+        monkeypatch.delenv("TEMP", raising=False)
+
+        with patch("tools.environments.local.os.path.isdir", return_value=False), \
+             patch("tools.environments.local.os.access", return_value=False), \
+             patch("tools.environments.local.tempfile.gettempdir", return_value="/cache/tmp"), \
+             patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
+            env = LocalEnvironment(cwd=".", timeout=10)
+            assert env.get_temp_dir() == "/cache/tmp"
+            assert env._snapshot_path == f"/cache/tmp/hermes-snap-{env._session_id}.sh"
+            assert env._cwd_file == f"/cache/tmp/hermes-cwd-{env._session_id}.txt"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_local_temp_dir.py ===
+"""Tests for ``LocalEnvironment.get_temp_dir`` temp-dir redirect.
+
+Hermes exposes ``terminal.temp_dir`` (mirrored to ``TERMINAL_TEMP_DIR``) so
+users on RAM-based tmpfs ``/tmp`` can point session temp files (background
+logs/pid/exit files, code-execution sandboxes) at real storage.
+"""
+
+import os
+import sys
+
+import pytest
+
+from tools.environments.local import LocalEnvironment
+
+
+def _make_local_env(env: dict) -> LocalEnvironment:
+    """Construct a LocalEnvironment without running init_session (no bash)."""
+    obj = LocalEnvironment.__new__(LocalEnvironment)
+    obj.env = dict(env)
+    return obj
+
+
+def test_temp_dir_override_honored(tmp_path):
+    target = str(tmp_path)
+    env = _make_local_env({"TERMINAL_TEMP_DIR": target})
+    assert env.get_temp_dir() == target
+
+
+def test_temp_dir_from_process_env(tmp_path):
+    target = str(tmp_path)
+    env = _make_local_env({})
+    prev = os.environ.get("TERMINAL_TEMP_DIR")
+    os.environ["TERMINAL_TEMP_DIR"] = target
+    try:
+        assert env.get_temp_dir() == target
+    finally:
+        if prev is None:
+            os.environ.pop("TERMINAL_TEMP_DIR", None)
+        else:
+            os.environ["TERMINAL_TEMP_DIR"] = prev
+
+
+def test_temp_dir_non_existent_falls_through(tmp_path):
+    """A configured path that does not exist must not be used."""
+    missing = str(tmp_path / "does-not-exist")
+    env = _make_local_env({"TERMINAL_TEMP_DIR": missing})
+    # Should fall through to the standard TMPDIR//tmp//gettempdir chain, not
+    # return the missing path.
+    assert env.get_temp_dir() != missing
+
+
+def test_temp_dir_empty_falls_through(tmp_path, monkeypatch):
+    """An empty/relative terminal.temp_dir must not redirect."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    env = _make_local_env({"TERMINAL_TEMP_DIR": ""})
+    assert env.get_temp_dir() == str(tmp_path)
+
+
+def test_default_is_hermes_cache_not_tmp(tmp_path, monkeypatch):
+    """With no overrides at all, the default temp root is real storage under
+    HERMES_HOME (cache/terminal), NOT tmpfs /tmp."""
+    import hermes_constants  # noqa: F401 — resolves HERMES_HOME per call
+
+    for var in ("TERMINAL_TEMP_DIR", "TMPDIR", "TMP", "TEMP"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    env = _make_local_env({})
+    result = env.get_temp_dir()
+    assert result == str(tmp_path / ".hermes" / "cache" / "terminal")
+    assert os.path.isdir(result)
+
+
+def test_tmpdir_still_beats_default(tmp_path, monkeypatch):
+    """An explicit TMPDIR keeps winning over the managed default."""
+    monkeypatch.delenv("TERMINAL_TEMP_DIR", raising=False)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    env = _make_local_env({})
+    assert env.get_temp_dir() == str(tmp_path)
+
+
+def test_cleanup_terminal_temp_cache(tmp_path, monkeypatch):
+    """Old artifacts are pruned; fresh ones and live bg groups survive."""
+    import time
+
+    from tools.environments import local as local_mod
+
+    root = tmp_path / "cache" / "terminal"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(local_mod, "_default_terminal_temp_dir", lambda: root)
+
+    old = time.time() - 100 * 3600
+    fresh = time.time()
+
+    # Stale loose artifact — pruned.
+    stale = root / "hermes-snap-deadbeef.sh"
+    stale.write_text("x")
+    os.utime(stale, (old, old))
+
+    # Fresh artifact — kept.
+    keep = root / "hermes-snap-cafef00d.sh"
+    keep.write_text("x")
+
+    # Live bg group: stale .pid but fresh .log — WHOLE group kept.
+    live_pid = root / "hermes_bg_live1.pid"
+    live_pid.write_text("123")
+    os.utime(live_pid, (old, old))
+    live_log = root / "hermes_bg_live1.log"
+    live_log.write_text("running")
+    os.utime(live_log, (fresh, fresh))
+
+    # Dead bg group: everything stale — pruned.
+    for suffix in ("log", "pid", "exit"):
+        f = root / f"hermes_bg_dead1.{suffix}"
+        f.write_text("x")
+        os.utime(f, (old, old))
+
+    removed = local_mod.cleanup_terminal_temp_cache(max_age_hours=72)
+    assert removed == 4  # stale snap + 3 dead-group files
+    assert keep.exists()
+    assert live_pid.exists() and live_log.exists()
+    assert not stale.exists()
+    assert not (root / "hermes_bg_dead1.log").exists()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))
+

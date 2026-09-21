@@ -14,19 +14,18 @@ class TelegramAgent:
     Sostiene la notificación en tiempo real de eventos, alertas del sistema y métricas contables.
     """
     def __init__(self, bot_token: str = None, chat_id: str = None):
-        self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "mock_telegram_token")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "mock_chat_id")
+        self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+        if not self.bot_token:
+            raise RuntimeError("Falta TELEGRAM_BOT_TOKEN para enviar mensajes reales.")
+        if not self.chat_id:
+            raise RuntimeError("Falta TELEGRAM_CHAT_ID para enviar mensajes reales.")
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
 
     def send_message(self, text: str, target_chat_id: str = None) -> Dict[str, Any]:
         """Envía un mensaje formateado con Markdown a un Chat ID o al canal del CEO."""
         chat_id = target_chat_id or self.chat_id
         
-        # Modo de prueba simulado si no se ha configurado un Token real en .env
-        if "mock" in self.bot_token or not self.bot_token:
-            print(f"📲 [TelegramAgent - Mock Mode] Para Chat ID {chat_id}:\n{text}\n")
-            return {"status": "SUCCESS_MOCK", "recipient": chat_id}
-
         url = f"{self.base_url}/sendMessage"
         payload = {
             "chat_id": chat_id,

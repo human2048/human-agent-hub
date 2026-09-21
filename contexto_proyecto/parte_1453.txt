@@ -1,0 +1,288 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\deepinfra\__init__.py ===
+"""DeepInfra provider profile (chat surface; image-gen/TTS/STT are wired via
+their own plugin subsystems)."""
+
+from typing import Any
+
+from agent.reasoning_effort import OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort, requested_effort
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class _DeepInfraProfile(ProviderProfile):
+    """DeepInfra profile with live vision-default discovery, so shared vision
+    resolution in ``agent/auxiliary_client.py`` stays provider-agnostic."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, **context: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Map Hermes reasoning controls to DeepInfra's top-level ``reasoning_effort``.
+
+        DeepInfra applies a per-model default when the field is absent (DeepSeek-V4.x off,
+        GLM/Qwen-Thinking on), so ``none`` is the only working off switch and an unset effort
+        is omitted rather than guessed. The core ``_supports_reasoning_extra_body`` allowlist
+        does not know this host, so the transport always passes ``supports_reasoning=False``
+        here — gating on it would make the method a permanent no-op (#111872).
+        """
+        if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False:
+            return {}, {"reasoning_effort": "none"}
+        effort = requested_effort(reasoning_config)
+        clamped = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
+        return ({}, {"reasoning_effort": clamped}) if clamped in OPENAI_COMPAT_WIRE_EFFORTS else ({}, {})
+
+    def default_vision_model(self):  # type: ignore[override]
+        """First vision-capable *chat* model from the live catalog, or None. Key-gated so a box
+        without DEEPINFRA_API_KEY never pays the round-trip; requires the ``chat`` surface tag so
+        an image-gen model carrying a ``vision`` tag can't be picked as a chat vision backend."""
+        from agent.secret_scope import get_secret
+
+        if not (get_secret("DEEPINFRA_API_KEY") or "").strip():
+            return None
+        try:
+            from hermes_cli.models import _fetch_deepinfra_models_by_tag
+            items = _fetch_deepinfra_models_by_tag("chat")
+        except Exception:
+            return None
+        for item in items or []:
+            metadata = item.get("metadata") or {}
+            tags = metadata.get("tags") if isinstance(metadata, dict) else None
+            if isinstance(tags, list) and "vision" in tags and item.get("id"):
+                return item["id"]
+        return None
+
+
+deepinfra = _DeepInfraProfile(
+    name="deepinfra", aliases=("deep-infra", "deepinfra-ai"), display_name="DeepInfra",
+    description="DeepInfra — 100+ open models, pay-per-use", signup_url="https://deepinfra.com/dash/api_keys",
+    env_vars=("DEEPINFRA_API_KEY", "DEEPINFRA_BASE_URL"), base_url="https://api.deepinfra.com/v1/openai",
+    auth_type="api_key",
+    default_max_tokens=None,  # DeepInfra applies its documented per-model limit
+    # The only hardcoded DeepInfra model: aux resolution is synchronous, so it
+    # can't wait on a catalog round-trip. Everything else is discovered live.
+    default_aux_model="deepseek-ai/DeepSeek-V4-Flash",
+    # Empty on purpose: the live catalog is the source of truth; an empty picker
+    # beats silently routing to a retired model.
+    fallback_models=(),
+)
+
+register_provider(deepinfra)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\deepseek\__init__.py ===
+"""DeepSeek provider profile.
+
+V4 defaults to thinking ON when ``extra_body.thinking`` is unset, and then
+requires ``reasoning_content`` to be echoed back on later turns (HTTP 400 after
+the first tool call otherwise). This profile sets ``thinking`` explicitly and
+maps effort onto DeepSeek's ``reasoning_effort``; V3 models are left untouched.
+Retired ``deepseek-chat``/``deepseek-reasoner`` IDs are remapped in
+``hermes_cli.model_normalize`` before reaching here.
+"""
+
+from typing import Any
+
+from agent.reasoning_effort import DEEPSEEK_V4_EFFORTS, DEEPSEEK_V4_OVERRIDES, thinking_toggle_extras
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+# Version-less canonical ids for thinking-capable DeepSeek models. The 2026-09 Flash
+# refresh dropped the ``v<N>`` marker from the public id: ``GET /v1/models`` reports
+# ``deepseek-flash`` and the API accepts it directly, so the generation check in
+# ``build_api_kwargs_extras`` cannot recognise it.
+_THINKING_CAPABLE_IDS: frozenset[str] = frozenset({"deepseek-flash"})
+
+
+class DeepSeekProfile(ProviderProfile):
+    """DeepSeek — extra_body.thinking + top-level reasoning_effort."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        m = (model or "").strip().lower()
+        # v4+ only; v3 excluded. Version-less canonicals (``deepseek-flash``) carry the
+        # same thinking-mode contract but no ``v<N>`` prefix, so consult the id set too —
+        # missing them makes Hermes omit ``thinking``, so the server defaults to on and
+        # the user's thinking toggle / effort setting is silently ignored.
+        versioned_v4_plus = m.startswith("deepseek-v") and not m.startswith("deepseek-v3")
+        if not versioned_v4_plus and m not in _THINKING_CAPABLE_IDS:
+            return {}, {}
+        # Always set thinking explicitly (default enabled, matching the API default)
+        # to avoid the reasoning_content echo trap on subsequent turns.
+        return thinking_toggle_extras(
+            reasoning_config, DEEPSEEK_V4_EFFORTS, DEEPSEEK_V4_OVERRIDES, always_emit_toggle=True
+        )
+
+
+deepseek = DeepSeekProfile(
+    name="deepseek", aliases=("deepseek-chat", "deep-seek"), env_vars=("DEEPSEEK_API_KEY",), display_name="DeepSeek",
+    description="DeepSeek — native DeepSeek API", signup_url="https://platform.deepseek.com/",
+    fallback_models=("deepseek-v4-pro", "deepseek-flash"), base_url="https://api.deepseek.com/v1",
+    default_aux_model="deepseek-flash",
+    # Native API implements only ``json_object`` (https://api-docs.deepseek.com/guides/json_mode);
+    # ``json_schema`` is a guaranteed HTTP 400 "This response_format type is unavailable now".
+    unsupported_response_formats=("json_schema",),
+)
+
+register_provider(deepseek)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\fireworks\__init__.py ===
+"""Fireworks AI provider profile. Models are addressed by full catalog ID
+(``accounts/fireworks/models/<slug>``), tracking fw-ai/fireconnect ``setup-cli``."""
+
+from typing import Any
+
+from hermes_cli import __version__ as _HERMES_VERSION
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class FireworksProfile(ProviderProfile):
+    """Map Hermes reasoning controls onto Fireworks' OpenAI-compatible wire."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, **context: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        # Fireworks rejects the nested ``extra_body.reasoning`` fallback some OpenAI-compatible
+        # gateways accept (#109774); its documented control is top-level ``reasoning_effort``
+        # (``none`` disables thinking). Overriding here marks the profile reasoning-aware, so the
+        # transport never sends the generic fallback on this route.
+        if not isinstance(reasoning_config, dict):
+            return {}, {}
+        if reasoning_config.get("enabled") is False:
+            return {}, {"reasoning_effort": "none"}
+        effort = reasoning_config.get("effort")
+        return {}, ({"reasoning_effort": effort} if effort else {})
+
+
+fireworks = FireworksProfile(
+    name="fireworks", aliases=("fireworks-ai", "fw"), display_name="Fireworks AI",
+    description="Fireworks AI — OpenAI-compatible direct model API",
+    signup_url="https://app.fireworks.ai/settings/users/api-keys", env_vars=("FIREWORKS_API_KEY",),
+    base_url="https://api.fireworks.ai/inference/v1", auth_type="api_key",
+    # Attribution headers (canonical Hermes set); via default_headers so they
+    # survive switch_model and credential rotation.
+    default_headers={
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+    },
+    default_aux_model="accounts/fireworks/models/glm-5p2",
+    # Picker safety net when the live catalog fetch fails.
+    fallback_models=(
+        "accounts/fireworks/models/kimi-k2p6", "accounts/fireworks/models/glm-5p2",
+        "accounts/fireworks/models/kimi-k2p7-code",
+    ),
+)
+
+register_provider(fireworks)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\gemini\__init__.py ===
+"""Google Gemini (AI Studio) provider profile.
+
+Reports api_mode="chat_completions" but runs on GeminiNativeClient; this
+profile carries auth/endpoint metadata and the thinking_config translation hook.
+"""
+
+from typing import Any
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class GeminiProfile(ProviderProfile):
+    """Gemini — translate reasoning_config to thinking_config in extra_body."""
+
+    def build_extra_body(self, *, session_id: str | None = None, **context: Any) -> dict[str, Any]:
+        """Native: ``thinking_config``; OpenAI-compat /openai subpath:
+        ``extra_body.google.thinking_config`` (snake_case)."""
+        from agent.transports.chat_completions import (
+            _build_gemini_thinking_config,
+            _is_gemini_openai_compat_base_url,
+            _snake_case_gemini_thinking_config,
+        )
+
+        raw = _build_gemini_thinking_config(context.get("model") or "", context.get("reasoning_config"))
+        if not raw:
+            return {}
+        if self.name == "gemini" and _is_gemini_openai_compat_base_url(context.get("base_url") or self.base_url):
+            thinking_config = _snake_case_gemini_thinking_config(raw)
+            return {"extra_body": {"google": {"thinking_config": thinking_config}}} if thinking_config else {}
+        return {"thinking_config": raw}
+
+
+gemini = GeminiProfile(
+    name="gemini", aliases=("google", "google-gemini", "google-ai-studio"), api_mode="chat_completions",
+    env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+    base_url="https://generativelanguage.googleapis.com/v1beta", auth_type="api_key",
+    default_aux_model="gemini-3.6-flash",
+)
+
+register_provider(gemini)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\gmi\__init__.py ===
+"""GMI Cloud provider profile."""
+
+from hermes_cli import __version__ as _HERMES_VERSION
+from providers import register_provider
+from providers.base import ProviderProfile
+
+gmi = ProviderProfile(
+    name="gmi", aliases=("gmi-cloud", "gmicloud"), display_name="GMI Cloud",
+    description="GMI Cloud — multi-model direct API (slash-form model IDs)",
+    signup_url="https://www.gmicloud.ai/", env_vars=("GMI_API_KEY", "GMI_BASE_URL"),
+    base_url="https://api.gmi-serving.com/v1", auth_type="api_key",
+    # Attribution so GMI can identify Hermes Agent traffic.
+    default_headers={"User-Agent": f"HermesAgent/{_HERMES_VERSION}"},
+    default_aux_model="google/gemini-3.1-flash-lite-preview",
+    fallback_models=(
+        "zai-org/GLM-5.1-FP8", "deepseek-ai/DeepSeek-V3.2", "moonshotai/Kimi-K2.5",
+        "google/gemini-3.1-flash-lite-preview", "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.4",
+    ),
+)
+
+register_provider(gmi)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\huggingface\__init__.py ===
+"""Hugging Face provider profile."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+huggingface = ProviderProfile(
+    name="huggingface", aliases=("hf", "hugging-face", "huggingface-hub"), env_vars=("HF_TOKEN",),
+    display_name="HuggingFace", description="HuggingFace Inference API",
+    signup_url="https://huggingface.co/settings/tokens",
+    fallback_models=("Qwen/Qwen3.5-72B-Instruct", "deepseek-ai/DeepSeek-V3.2"),
+    base_url="https://router.huggingface.co/v1",
+)
+
+register_provider(huggingface)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\kilocode\__init__.py ===
+"""Kilo Code provider profile."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+kilocode = ProviderProfile(
+    name="kilocode", aliases=("kilo-code", "kilo", "kilo-gateway"), env_vars=("KILOCODE_API_KEY",),
+    base_url="https://api.kilo.ai/api/gateway", default_aux_model="google/gemini-3.6-flash",
+)
+
+register_provider(kilocode)
+

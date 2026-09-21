@@ -1,0 +1,417 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_delete.py ===
+import sys
+
+import pytest
+
+
+def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    captured = {}
+
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            captured["resolved_from"] = session_id
+            return "20260315_092437_c9a6ff"
+
+        def get_session(self, session_id):
+            return {"id": session_id, "pinned": 0}
+
+        def delete_session(self, session_id, **kwargs):
+            captured["deleted"] = session_id
+            return True
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "sessions", "delete", "20260315_092437_c9a6", "--yes"],
+    )
+
+    main_mod.main()
+
+    output = capsys.readouterr().out
+    assert captured == {
+        "resolved_from": "20260315_092437_c9a6",
+        "deleted": "20260315_092437_c9a6ff",
+        "closed": True,
+    }
+    assert "Deleted session '20260315_092437_c9a6ff'." in output
+
+
+def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0):
+    """Run `hermes sessions prune <argv_tail>` against a FakeDB, capturing
+    the filter kwargs passed to list_prune_candidates. Auto-confirms."""
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    seen = {}
+    rows = candidates if candidates is not None else [
+        {
+            "id": "20260101_000000_aaaaaa",
+            "source": "cron",
+            "title": "oldest run",
+            "started_at": 1_600_000_000.0,
+            "last_active": 1_600_000_050.0,
+            "ended_at": 1_600_000_100.0,
+            "message_count": 2,
+            "archived": 0,
+        },
+        {
+            "id": "20260601_000000_bbbbbb",
+            "source": "cron",
+            "title": "newest run",
+            "started_at": 1_700_000_000.0,
+            "last_active": 1_700_000_050.0,
+            "ended_at": 1_700_000_100.0,
+            "message_count": 4,
+            "archived": 0,
+        },
+    ]
+
+    class FakeDB:
+        def list_prune_candidates(self, **kwargs):
+            seen.update(kwargs)
+            return rows
+
+        def count_open_prune_matches(self, **kwargs):
+            assert kwargs == seen
+            return skipped_open
+
+        def count_prune_matches(self, **kwargs):
+            return len(rows)
+
+        def prune_sessions(self, **kwargs):
+            return len(rows)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: FakeDB())
+    monkeypatch.setattr(
+        sys, "argv", ["hermes", "sessions", "prune", *argv_tail]
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+    main_mod.main()
+    return seen, capsys.readouterr().out
+
+
+def test_sessions_prune_bare_keeps_90_day_default(monkeypatch, capsys):
+    """A truly bare `hermes sessions prune` keeps the implicit 90-day cutoff."""
+    import time as _time
+
+    filters, _out = _run_prune(monkeypatch, capsys, [])
+    assert filters["last_active_before"] is not None
+    assert filters["last_active_before"] == pytest.approx(
+        _time.time() - 90 * 86400, abs=60
+    )
+
+
+def test_sessions_prune_preview_shows_oldest_newest(monkeypatch, capsys):
+    """Confirmation preview surfaces count + oldest/newest session times."""
+    from hermes_cli.session_filters import format_epoch
+
+    _filters, out = _run_prune(monkeypatch, capsys, ["--source", "cron"])
+    assert "2 session(s) match" in out
+    assert f"oldest activity {format_epoch(1_600_000_050.0)}" in out
+    assert f"newest activity {format_epoch(1_700_000_050.0)}" in out
+
+
+def test_sessions_prune_surfaces_matching_open_sessions(monkeypatch, capsys):
+    _filters, out = _run_prune(
+        monkeypatch,
+        capsys,
+        ["--source", "cron"],
+        candidates=[],
+        skipped_open=2,
+    )
+
+    assert "2 open sessions also match these filters" in out
+    assert "prune only deletes ended sessions" in out
+    assert "hermes sessions delete <id>" in out
+    assert "No sessions match" in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_error_exit_codes.py ===
+"""Regression tests: `hermes sessions` error paths return non-zero (SES-04).
+
+Before this, delete/rename not-found, prune bad-arg, blank rename, and import
+of a missing file all printed an error and returned exit 0 — a scripting/CI
+hazard (a script pinning a bad id failed loudly via `pin` but deleting a bad
+id "succeeded" silently). The subcommand dispatcher already maps an int
+handler return to the process exit code; these tests pin the returns.
+"""
+
+from argparse import Namespace
+
+import pytest
+
+import hermes_cli.sessions_cmd as sc
+
+
+def _args(action, **kw):
+    base = dict(
+        sessions_action=action,
+        session_id=None, title=None, yes=True, source=None, path=None,
+        from_source=None, dry_run=False, older_than=None, newer_than=None,
+        before=None, after=None, limit=50,
+    )
+    base.update(kw)
+    return Namespace(**base)
+
+
+def test_delete_missing_returns_1(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state import SessionDB
+    SessionDB(tmp_path / "state.db")  # initialize an empty store
+    rc = sc.cmd_sessions(_args("delete", session_id="nope_xyz"))
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "No session 'nope_xyz'" in out and "hermes sessions list" in out
+
+
+def test_rename_missing_returns_1(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state import SessionDB
+    SessionDB(tmp_path / "state.db")
+    rc = sc.cmd_sessions(_args("rename", session_id="nope_xyz", title=["New"]))
+    assert rc == 1
+
+
+def test_import_missing_file_returns_1(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    rc = sc.cmd_sessions(_args("import", path=str(tmp_path / "nope.jsonl")))
+    assert rc == 1
+    assert "file not found" in capsys.readouterr().out.lower()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_export_md_cli.py ===
+import sys
+
+
+def test_sessions_export_md_writes_single_session(monkeypatch, tmp_path, capsys):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    captured = {}
+
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            captured["resolved_from"] = session_id
+            return "20260706_123456_abcd1234"
+
+        def export_session(self, session_id):
+            captured["exported"] = session_id
+            return {
+                "id": session_id,
+                "title": "Export CLI Test",
+                "source": "cli",
+                "message_count": 1,
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+
+        def delete_session(self, *args, **kwargs):
+            raise AssertionError("markdown export must not delete sessions")
+
+        def prune_sessions(self, *args, **kwargs):
+            raise AssertionError("markdown export must not prune sessions")
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "sessions",
+            "export",
+            "--format",
+            "md",
+            "--session-id",
+            "20260706_123456",
+            str(tmp_path),
+        ],
+    )
+
+    main_mod.main()
+
+    output = capsys.readouterr().out
+    files = list(tmp_path.glob("*.md"))
+    assert len(files) == 1
+    text = files[0].read_text(encoding="utf-8")
+    assert "# Export CLI Test" in text
+    assert "hello" in text
+    assert captured == {
+        "resolved_from": "20260706_123456",
+        "exported": "20260706_123456_abcd1234",
+        "closed": True,
+    }
+    assert "Exported 1 session" in output
+    assert "1 message" in output
+    assert str(files[0]) in output
+
+
+def test_sessions_export_redact_scrubs_secrets(monkeypatch, tmp_path):
+    """--redact runs exported content through force-mode secret redaction."""
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    secret = "sk-proj-Zz12345678901234567890123456789012345678"
+
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            return "s1"
+
+        def export_session(self, session_id):
+            return {
+                "id": "s1",
+                "title": "Redact",
+                "messages": [
+                    {"role": "tool", "name": "terminal", "content": f"api key: {secret}"}
+                ],
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes", "sessions", "export", "--format", "md",
+            "--session-id", "s1", "--redact", str(tmp_path),
+        ],
+    )
+
+    main_mod.main()
+
+    text = next(tmp_path.glob("*.md")).read_text(encoding="utf-8")
+    assert secret not in text
+    assert "api key:" in text
+
+
+def _trace_fake_db(captured):
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            return "s1"
+
+        def get_session(self, session_id):
+            return {"id": session_id, "model": "test-model"}
+
+        def get_messages_as_conversation(self, session_id):
+            captured["conv"] = session_id
+            return [
+                {"role": "user", "content": "hello trace"},
+                {"role": "assistant", "content": "hi"},
+            ]
+
+        def close(self):
+            captured["closed"] = True
+
+    return FakeDB()
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_export_output_dir.py ===
+"""`hermes sessions export` single-file formats accept a directory as OUTPUT."""
+
+import json
+import sys
+
+import hermes_state
+import hermes_cli.main as main_mod
+
+
+class _FakeDB:
+    def resolve_session_id(self, session_id):
+        return "sess-123"
+
+    def export_session(self, session_id):
+        return {"id": "sess-123", "source": "cli", "messages": [{"role": "user", "content": "hi"}]}
+
+    def close(self):
+        pass
+
+
+def _export(monkeypatch, *argv):
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: _FakeDB())
+    monkeypatch.setattr(sys, "argv", ["hermes", "sessions", "export", "--session-id", "sess", *argv])
+    main_mod.main()
+
+
+def test_jsonl_export_into_directory_writes_default_named_file(monkeypatch, tmp_path):
+    out_dir = tmp_path / "saved"
+    out_dir.mkdir()
+
+    _export(monkeypatch, f"{out_dir}/")
+
+    written = out_dir / "hermes_session_sess-123.jsonl"
+    assert json.loads(written.read_text(encoding="utf-8"))["id"] == "sess-123"
+
+
+def test_jsonl_export_to_file_path_is_unchanged(monkeypatch, tmp_path):
+    target = tmp_path / "one.jsonl"
+
+    _export(monkeypatch, str(target))
+
+    assert json.loads(target.read_text(encoding="utf-8"))["id"] == "sess-123"
+    assert target.is_file() and not (tmp_path / "hermes_session_sess-123.jsonl").exists()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_list_truncation.py ===
+"""``hermes sessions list`` tells the user when ``--limit`` cut the listing (#111989).
+
+The cap is applied inside the SQL query, so the lister probes one row past it; the footer
+must appear only when that probe row exists.
+"""
+
+from argparse import Namespace
+
+import pytest
+
+from hermes_cli import sessions_cmd
+
+
+@pytest.fixture
+def db(tmp_path):
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    for i in range(6):
+        db.create_session(f"sess_{i}", "cli")
+        db.append_message(f"sess_{i}", "user", f"hello {i}")
+    yield db
+    db.close()
+
+
+def _list(db, limit, capsys):
+    sessions_cmd._cmd_list(db, Namespace(limit=limit, source=None, workspace=None))
+    return capsys.readouterr().out
+
+
+def test_footer_when_more_sessions_than_limit(db, capsys):
+    out = _list(db, 4, capsys)
+    ids = [line.split()[-1] for line in out.splitlines() if line.startswith("hello")]
+    assert len(ids) == 4  # the probe row is never rendered
+    assert "… more not shown (use --limit 8 to see more)" in out
+
+
+def test_no_footer_when_listing_fits(db, capsys):
+    assert "more" not in _list(db, 6, capsys)  # exactly the limit
+    assert "more" not in _list(db, 20, capsys)  # fewer than the limit
+

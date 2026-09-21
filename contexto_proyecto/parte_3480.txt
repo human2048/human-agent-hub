@@ -1,0 +1,303 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_prompt_api_key.py ===
+"""Tests for ``_prompt_api_key`` — the shared Keep/Replace/Clear menu used by
+``hermes setup`` / ``hermes model`` when an API key already exists in ``.env``.
+
+Regression coverage for #16394: the wizard used to silently skip the key prompt
+when any value was present (even malformed junk), leaving users stuck.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from hermes_cli import main_provider_setup
+
+
+@pytest.fixture
+def profile_env(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / ".env").write_text("")
+    return home
+
+
+def _pconfig(name="deepseek"):
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    return PROVIDER_REGISTRY[name]
+
+
+def _run_prompt(existing_key, choice, new_key="", provider_id="", pconfig_name="deepseek"):
+    """Invoke _prompt_api_key with mocked input()/getpass() responses."""
+    from hermes_cli import main as m
+
+    pconfig = _pconfig(pconfig_name)
+    with patch("builtins.input", return_value=choice), \
+         patch("hermes_cli.secret_prompt.masked_secret_prompt", return_value=new_key):
+        return main_provider_setup._prompt_api_key(pconfig, existing_key, provider_id=provider_id)
+
+
+def test_pool_only_key_does_not_offer_or_execute_clear(profile_env, monkeypatch, capsys):
+    from hermes_cli import main as m
+
+    pconfig = _pconfig("deepseek")
+    prompts = []
+
+    def choose_clear(prompt):
+        prompts.append(prompt)
+        return "c"
+
+    monkeypatch.setattr("builtins.input", choose_clear)
+    with patch("hermes_cli.config.save_env_value") as save_env:
+        key, abort = main_provider_setup._prompt_api_key(
+            pconfig,
+            "pool-secret",
+            provider_id="deepseek",
+            existing_source="credential_pool:deepseek",
+        )
+
+    assert key == "pool-secret"
+    assert abort is False
+    assert prompts and "[C]lear" not in prompts[0]
+    assert "[K]eep / [R]eplace" in prompts[0]
+    save_env.assert_not_called()
+    assert "API key cleared" not in capsys.readouterr().out
+
+
+# First-time entry ────────────────────────────────────────────────────────────
+
+
+
+# Already configured — K / R / C ───────────────────────────────────────────────
+
+
+
+
+
+
+
+def test_clear_wipes_env_and_aborts(profile_env):
+    from hermes_cli.config import get_env_value, save_env_value
+    save_env_value("DEEPSEEK_API_KEY", "sk-existing")
+    save_env_value("OTHER_VAR", "keep-me")
+
+    key, abort = _run_prompt(existing_key="sk-existing", choice="c")
+    assert key == ""
+    assert abort is True
+    # Cleared, but sibling entries untouched.
+    assert not get_env_value("DEEPSEEK_API_KEY")
+    assert get_env_value("OTHER_VAR") == "keep-me"
+
+
+
+
+# LM Studio no-auth placeholder ────────────────────────────────────────────────
+
+def test_lmstudio_first_time_empty_uses_placeholder(profile_env):
+    from hermes_cli.auth import LMSTUDIO_NOAUTH_PLACEHOLDER
+    from hermes_cli.config import get_env_value
+
+    key, abort = _run_prompt(
+        existing_key="", choice="", new_key="",
+        provider_id="lmstudio", pconfig_name="lmstudio",
+    )
+    assert key == LMSTUDIO_NOAUTH_PLACEHOLDER
+    assert abort is False
+    assert get_env_value("LM_API_KEY") == LMSTUDIO_NOAUTH_PLACEHOLDER
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_prompt_compose_command.py ===
+"""Tests for the CLI `/prompt` editor-compose command.
+
+`/prompt` opens `$VISUAL`/`$EDITOR` on a temp markdown file so the user can
+hand-edit a multi-line prompt, then queues the saved buffer as the next
+agent turn via the one-shot `_pending_agent_seed` (same path `/blueprint`
+uses). These drive a fake editor subprocess to verify read-back, header
+stripping, seeding, and the empty-buffer cancel path.
+"""
+
+import os
+import stat
+import tempfile
+
+import pytest
+
+from hermes_cli.cli_commands_mixin import CLICommandsMixin
+from hermes_cli.commands import resolve_command
+
+
+class _Stub(CLICommandsMixin):
+    def __init__(self):
+        self._pending_agent_seed = None
+
+
+def _fake_editor(body: str, mode: str = "append") -> str:
+    """Write a tiny shell 'editor' that mutates the file it is handed."""
+    f = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+    if mode == "append":
+        f.write("#!/usr/bin/env bash\n")
+        f.write(f"cat >> \"$1\" <<'EOF'\n{body}\nEOF\n")
+    else:  # clear
+        f.write("#!/usr/bin/env bash\n: > \"$1\"\n")
+    f.close()
+    os.chmod(f.name, os.stat(f.name).st_mode | stat.S_IEXEC)
+    return f.name
+
+
+@pytest.fixture(autouse=True)
+def _no_visual(monkeypatch):
+    monkeypatch.delenv("VISUAL", raising=False)
+
+
+def test_command_registered():
+    cd = resolve_command("prompt")
+    assert cd and cd.name == "prompt"
+    assert resolve_command("compose").name == "prompt"
+
+
+def test_compose_reads_and_strips_header(monkeypatch):
+    monkeypatch.setenv("EDITOR", _fake_editor("Refactor the auth module.\nUse pytest."))
+    out = _Stub()._compose_in_editor("")
+    assert "Refactor the auth module." in out
+    assert "Use pytest." in out
+    assert "#!" not in out  # the instructional header is stripped
+
+
+def test_empty_buffer_does_not_seed(monkeypatch):
+    monkeypatch.setenv("EDITOR", _fake_editor("", mode="clear"))
+    s = _Stub()
+    s._handle_prompt_compose_command("/prompt")
+    assert s._pending_agent_seed is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_prompt_size.py ===
+"""Tests for the ``hermes prompt-size`` diagnostic (issue #34667)."""
+
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_cli.prompt_size import (
+    _SKILLS_BLOCK_RE,
+    _build_inspection_agent,
+    _compute_skills_breakdown,
+    compute_prompt_breakdown,
+    render_breakdown,
+)
+
+
+def _seed_memory(hermes_home, memory_text="", user_text=""):
+    mem_dir = hermes_home / "memories"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    if memory_text:
+        (mem_dir / "MEMORY.md").write_text(memory_text, encoding="utf-8")
+    if user_text:
+        (mem_dir / "USER.md").write_text(user_text, encoding="utf-8")
+
+
+def _seed_skill(hermes_home, name, description):
+    skill_dir = hermes_home / "skills" / "demo" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n# {name}\nbody\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.chdir(tmp_path)  # avoid picking up the repo's AGENTS.md
+    return hermes_home
+
+
+
+
+def test_runs_offline_without_credentials(isolated_home, monkeypatch):
+    """No provider credentials configured → still produces a breakdown."""
+    for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "NOUS_API_KEY",
+                "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    data = compute_prompt_breakdown("cli")
+    assert data["system_prompt"]["bytes"] > 0
+
+
+
+
+
+
+
+
+
+
+
+
+def test_skills_breakdown_shape_sorted_and_attributed(isolated_home):
+    """Per-skill breakdown reports index-line + on-disk SKILL.md bytes.
+
+    Seeded before the first build (skills prompt is cached per-process).
+    """
+    _seed_skill(isolated_home, "small-skill", "short desc")
+    _seed_skill(isolated_home, "big-skill", "a much longer description " * 20)
+    data = compute_prompt_breakdown("cli")
+    skills = data["skills_breakdown"]
+    names = {s["name"] for s in skills}
+    assert {"small-skill", "big-skill"} <= names
+    for s in skills:
+        assert set(s) >= {"name", "index_line_bytes", "skill_md_bytes", "path"}
+        assert s["index_line_bytes"] > 0
+    # Sorted largest-first by on-disk SKILL.md size.
+    md_sizes = [s["skill_md_bytes"] or 0 for s in skills]
+    assert md_sizes == sorted(md_sizes, reverse=True)
+    # On-disk bytes match the real file; big-skill's SKILL.md is the larger.
+    by_name = {s["name"]: s for s in skills}
+    big = by_name["big-skill"]
+    assert big["path"] and Path(big["path"]).stat().st_size == big["skill_md_bytes"]
+    assert big["skill_md_bytes"] > by_name["small-skill"]["skill_md_bytes"]
+    # Per-skill index lines are a subset of the whole <available_skills> block,
+    # so they never exceed it (on-disk SKILL.md bytes are separate and don't).
+    assert sum(s["index_line_bytes"] for s in skills) <= data["skills_index"]["bytes"]
+
+
+def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home):
+    """A real posture-demoted category retains every skill in the breakdown."""
+    from agent.prompt_builder import build_skills_system_prompt
+
+    _seed_skill(isolated_home, "alpha-skill", "alpha description")
+    _seed_skill(isolated_home, "beta-skill", "beta description")
+    prompt = build_skills_system_prompt(compact_categories=frozenset({"demo"}))
+    skills_match = _SKILLS_BLOCK_RE.search(prompt)
+    assert skills_match is not None
+    skills_block = skills_match.group(0)
+    shared_line = next(
+        line for line in skills_block.splitlines() if "demo [names only]" in line
+    )
+
+    entries = _compute_skills_breakdown(skills_block)
+    by_name = {entry["name"]: entry for entry in entries}
+    assert set(by_name) == {"alpha-skill", "beta-skill"}
+
+    shared_line_bytes = len(shared_line.encode("utf-8"))
+    assert sum(entry["index_line_bytes"] for entry in entries) == shared_line_bytes
+    for entry in entries:
+        assert entry["index_line_total_bytes"] == shared_line_bytes
+        assert entry["index_line_shared_bytes"] > 0
+        assert entry["index_line_skill_count"] == 2
+
+
+
+
+

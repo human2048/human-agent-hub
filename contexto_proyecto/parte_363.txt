@@ -1,0 +1,256 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\core_tool_deferral\orchestrator.py ===
+#!/usr/bin/env python3
+"""Orchestrate the PR #97979 A/B battery. Resume-safe; per-run wall timeout.
+
+Usage: orchestrator.py <model_slug> <reps> [--tasks id1,id2] [--arms base,pr] [--parallel N]
+Results land in results/<model_short>/<arm>__<task>__rep<r>.json (override
+the results root with ABDEFER_RESULTS).
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+HARNESS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HARNESS)
+import tasks as taskmod
+
+MODEL = sys.argv[1]
+REPS = int(sys.argv[2])
+task_ids = [t["id"] for t in taskmod.TASKS]
+arms = ["base", "pr"]
+parallel = 4
+for a in sys.argv[3:]:
+    if a.startswith("--tasks="):
+        task_ids = a.split("=", 1)[1].split(",")
+    elif a.startswith("--arms="):
+        arms = a.split("=", 1)[1].split(",")
+    elif a.startswith("--parallel="):
+        parallel = int(a.split("=", 1)[1])
+
+short = MODEL.split("/")[-1]
+RESULTS = os.path.join(os.environ.get("ABDEFER_RESULTS", os.path.join(HARNESS, "results")), short)
+os.makedirs(RESULTS, exist_ok=True)
+PY = os.environ.get("ABDEFER_PYTHON", sys.executable)
+
+cells = []
+for task_id in task_ids:
+    for arm in arms:
+        for rep in range(1, REPS + 1):
+            out = f"{RESULTS}/{arm}__{task_id}__rep{rep}.json"
+            if os.path.exists(out):
+                try:
+                    with open(out, encoding="utf-8") as f:
+                        rec = json.load(f)
+                    if rec.get("error") is None or rec.get("score", 0) > 0:
+                        continue  # keep good/attempted records
+                    # errored record -> retry
+                    os.remove(out)
+                except Exception:
+                    os.remove(out)
+            cells.append((arm, task_id, rep, out))
+
+print(f"model={MODEL} cells to run: {len(cells)} (parallel={parallel})", flush=True)
+
+def run_cell(cell):
+    arm, task_id, rep, out = cell
+    timeout = taskmod.TASKS_BY_ID[task_id].get("timeout", 600)
+    cmd = [PY, os.path.join(HARNESS, "worker.py"), arm, MODEL, task_id, str(rep), out]
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 60,
+                           env=os.environ.copy())
+        if p.returncode == 3:
+            return (cell, "INFRA_ABORT", p.stderr[-500:])
+        if p.returncode != 0 and not os.path.exists(out):
+            rec = {"arm": arm, "model": MODEL, "task": task_id, "rep": rep,
+                   "score": 0.0, "error": f"worker exit {p.returncode}",
+                   "notes": [p.stderr[-400:]], "api_turns": None,
+                   "total_tokens": None, "wall_s": round(time.time() - t0, 1),
+                   "bridge_calls": None, "tool_calls_total": None,
+                   "tool_counts": {}, "raw_xml_noise": False}
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(rec, f, indent=1)
+            return (cell, "WORKER_ERR", p.stderr[-300:])
+        return (cell, "OK", p.stdout.strip().splitlines()[-1] if p.stdout.strip() else "")
+    except subprocess.TimeoutExpired:
+        rec = {"arm": arm, "model": MODEL, "task": task_id, "rep": rep,
+               "score": 0.0, "error": "wall timeout", "notes": ["hard wall timeout"],
+               "api_turns": None, "total_tokens": None,
+               "wall_s": round(time.time() - t0, 1), "bridge_calls": None,
+               "tool_calls_total": None, "tool_counts": {}, "raw_xml_noise": False}
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(rec, f, indent=1)
+        return (cell, "TIMEOUT", "")
+
+done = 0
+infra_aborts = 0
+with ThreadPoolExecutor(max_workers=parallel) as ex:
+    futs = {ex.submit(run_cell, c): c for c in cells}
+    for fut in as_completed(futs):
+        cell, status, info = fut.result()
+        done += 1
+        print(f"[{done}/{len(cells)}] {cell[0]}/{cell[1]}/rep{cell[2]}: {status} {info}", flush=True)
+        if status == "INFRA_ABORT":
+            infra_aborts += 1
+            if infra_aborts >= 3:
+                print("FATAL: 3 infra aborts — stopping battery", flush=True)
+                sys.exit(3)
+print("BATTERY COMPLETE", flush=True)
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\core_tool_deferral\README.md ===
+# core_tool_deferral — live A/B harness for tool-visibility changes
+
+Built for the PR #97979 maintainer battery (core-tool deferral behind the
+tool_search bridge). Runs REAL in-process `AIAgent`s from two pinned
+checkouts and grades task outcomes programmatically — accuracy, api turns,
+tokens, wall, bridge-call counts — across any set of models.
+
+Original verdict + full numbers: `results/SUMMARY.md` and the PR #97979 body
+(288 runs; gpt-5.6-terra / glm-5.3-flash / qwen3.8-27b).
+
+## Layout
+
+- `tasks.py` — 14-task battery: one task per deferred tool, multistep
+  (todo discipline, GUI chains), long-range (session_search → backup →
+  cron → todo), a destructive-ambiguity clarify trap, an eager-only
+  control, and a false-discovery distractor. Each task carries fixtures,
+  a programmatic grader (0–1 partial credit), and scripted user replies.
+- `worker.py` — one (arm, model, task, rep) cell in an isolated
+  subprocess: temp HERMES_HOME + workspace, hermetic env (only
+  OPENROUTER_API_KEY survives), seeded session DB (targets + decoys),
+  deterministic desktop-surface stubs (desktop_ui emitter + agent
+  callbacks), computer_use/image_generate stubbed at the registry
+  handler. Terminal/files/cron/process/session-DB are REAL.
+  Exit 3 = infra/config error (never scored).
+- `orchestrator.py` — battery runner: resume-safe, per-task wall
+  timeouts, parallel cells, errored-record retry, 3-infra-abort fuse.
+- `report.py` — per-task table both arms (score spread, turns, tok, wall,
+  bridge calls), mean-of-task-means, noise/error accounting.
+
+## Running
+
+```bash
+# 1. Two plain checkouts pinned to the SHAs under test (never pip install -e)
+git worktree add /tmp/abdefer-base <baseline-sha>
+git worktree add /tmp/abdefer-pr   <pr-sha>
+
+export ABDEFER_BASE_TREE=/tmp/abdefer-base
+export ABDEFER_PR_TREE=/tmp/abdefer-pr
+export OPENROUTER_API_KEY=...   # the only key the worker keeps
+
+# 2. Smoke one cheap cell first
+python3 worker.py base openai/gpt-5.6-terra config_grep_distractor 1 /tmp/smoke.json
+
+# 3. Battery (per model; start with the STRONGEST model to validate variance)
+python3 orchestrator.py openai/gpt-5.6-terra 3 --parallel=5
+python3 orchestrator.py z-ai/glm-5.3-flash 3 --parallel=5
+python3 orchestrator.py qwen/qwen3.8-27b   3 --parallel=5
+
+# 4. Readout
+python3 report.py
+```
+
+`ABDEFER_PYTHON` overrides the worker interpreter (defaults to the
+orchestrator's own); `ABDEFER_RESULTS` overrides the results root.
+
+## Discipline (from the readtool/session_search harness lineage)
+
+- Verify model slugs against the live OpenRouter list before launching.
+- Interactive fairness: if the agent ends its turn with a plain-text
+  question, the worker sends the scripted reply (max 2, counted as
+  `user_roundtrips`) — without this, every clarify-shaped task scores 0
+  unfairly and the battery is poisoned (the first terra run was discarded
+  for exactly this).
+- Same-denominator rule: errored runs score 0 and STAY in the accuracy
+  denominator; they are excluded from efficiency means.
+- Extend contested cells (score spread at n=3) to n=6 before concluding.
+- For discovery-rate regressions, always check base-arm usage on the same
+  tasks first — a tool models skip even when visible is not a deferral
+  regression.
+- Audit anomalous cells from `*.transcript.json` before publishing.
+
+`results/` is gitignored except SUMMARY.md — rep JSONs are rebuildable,
+verdicts are the artifact.
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\core_tool_deferral\report.py ===
+#!/usr/bin/env python3
+"""Aggregate A/B results. Usage: report.py [model_short ...]"""
+import json
+import glob
+import os
+import statistics
+import sys
+
+BASE = os.environ.get("ABDEFER_RESULTS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"))
+models = sys.argv[1:] or sorted(
+    d for d in os.listdir(BASE) if os.path.isdir(os.path.join(BASE, d)) and d != "smoke")
+
+def load(model):
+    recs = []
+    for p in glob.glob(f"{BASE}/{model}/*.json"):
+        if p.endswith(".transcript.json"):
+            continue
+        with open(p, encoding="utf-8") as f:
+            recs.append(json.load(f))
+    return recs
+
+def fmt(v, nd=1):
+    return "-" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
+
+for model in models:
+    recs = load(model)
+    if not recs:
+        continue
+    tasks = sorted({r["task"] for r in recs})
+    print(f"\n{'='*100}\nMODEL: {model}   (runs: {len(recs)})\n{'='*100}")
+    hdr = f"{'task':<28} | {'arm':<4} | {'n':>1} | {'score':>10} | {'turns':>6} | {'tok(k)':>7} | {'wall':>6} | {'bridge':>6} | {'err':>3}"
+    print(hdr)
+    print("-" * len(hdr))
+    agg = {"base": {"s": [], "t": [], "k": [], "w": []}, "pr": {"s": [], "t": [], "k": [], "w": []}}
+    for task in tasks:
+        for arm in ("base", "pr"):
+            rs = [r for r in recs if r["task"] == task and r["arm"] == arm]
+            if not rs:
+                continue
+            scores = [r["score"] for r in rs]
+            ok = [r for r in rs if not r.get("error")]
+            turns = [r["api_turns"] for r in ok if r.get("api_turns")]
+            toks = [r["total_tokens"] for r in ok if r.get("total_tokens")]
+            walls = [r["wall_s"] for r in ok if r.get("wall_s")]
+            bridges = [r.get("bridge_calls") or 0 for r in ok]
+            nerr = sum(1 for r in rs if r.get("error"))
+            smean = statistics.mean(scores)
+            sspread = f"{smean:.2f} [{min(scores):.1f}-{max(scores):.1f}]"
+            print(f"{task:<28} | {arm:<4} | {len(rs)} | {sspread:>10} | "
+                  f"{fmt(statistics.mean(turns) if turns else None):>6} | "
+                  f"{fmt(statistics.mean(toks)/1000 if toks else None):>7} | "
+                  f"{fmt(statistics.mean(walls) if walls else None):>6} | "
+                  f"{fmt(statistics.mean(bridges) if bridges else None):>6} | {nerr:>3}")
+            agg[arm]["s"].append(smean)
+            if turns: agg[arm]["t"].append(statistics.mean(turns))
+            if toks: agg[arm]["k"].append(statistics.mean(toks))
+            if walls: agg[arm]["w"].append(statistics.mean(walls))
+    print("-" * len(hdr))
+    for arm in ("base", "pr"):
+        a = agg[arm]
+        if a["s"]:
+            print(f"{'MEAN-OF-TASK-MEANS':<28} | {arm:<4} |   | {statistics.mean(a['s']):>10.3f} | "
+                  f"{fmt(statistics.mean(a['t']) if a['t'] else None):>6} | "
+                  f"{fmt(statistics.mean(a['k'])/1000 if a['k'] else None):>7} | "
+                  f"{fmt(statistics.mean(a['w']) if a['w'] else None):>6} |")
+    noise = [r for r in recs if r.get("raw_xml_noise")]
+    errs = [r for r in recs if r.get("error")]
+    if noise:
+        print(f"raw-XML noise runs: {len(noise)} -> " + ", ".join(f"{r['arm']}/{r['task']}/r{r['rep']}" for r in noise))
+    if errs:
+        print(f"errored runs: {len(errs)} -> " + ", ".join(f"{r['arm']}/{r['task']}/r{r['rep']}: {r['error'][:60]}" for r in errs))
+

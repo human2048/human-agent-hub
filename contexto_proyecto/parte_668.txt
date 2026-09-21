@@ -1,0 +1,356 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\image_provenance.py ===
+"""Image-authored deployment provenance for immutable Hermes runtimes.
+
+The image bakes ``/etc/hermes/image-provenance.json`` outside ``$HERMES_HOME`` and the checkout, so a
+bind-mounted checkout cannot hide the build fact and env/config cannot forge it. Absence preserves every
+source/package install path. Presence fails closed: an unreadable, non-regular, or malformed marker still
+means image-managed — an integrity defect, never permission to mutate the image in place."""
+
+from __future__ import annotations
+
+import json
+import stat
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+IMAGE_PROVENANCE_PATH = Path("/etc/hermes/image-provenance.json")
+IMAGE_PROVENANCE_SCHEMA = 1
+
+
+@dataclass(frozen=True)
+class ImageProvenance:
+    """Validated provenance, or a fail-closed description of an invalid one."""
+
+    schema: int
+    deployment_kind: str
+    manager: str
+    image: Optional[str] = None
+    version: Optional[str] = None
+    revision: Optional[str] = None
+    marker_path: str = ""
+    valid: bool = True
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _invalid(path: Path, reason: str) -> ImageProvenance:
+    return ImageProvenance(IMAGE_PROVENANCE_SCHEMA, "image", "unknown", marker_path=str(path), valid=False, error=reason)
+
+
+def _optional_string(payload: dict, name: str) -> Optional[str]:
+    value = payload.get(name)
+    if value is not None and not isinstance(value, str):
+        raise TypeError(name)
+    return (value.strip() or None) if value is not None else None
+
+
+def read_image_provenance(marker_path: Optional[Path] = None) -> Optional[ImageProvenance]:
+    """Read the baked marker without consulting environment or config. Never raises.
+    ``marker_path`` is a dependency-injection seam for tests and alternate image builders."""
+    path = IMAGE_PROVENANCE_PATH
+    try:
+        path = Path(marker_path) if marker_path is not None else path
+    except BaseException as exc:
+        return _invalid(path, f"marker_presence_unreadable:{type(exc).__name__}")
+    try:
+        marker_stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    except BaseException as exc:  # permission errors and other lookup failures do not prove absence
+        return _invalid(path, f"marker_presence_unreadable:{type(exc).__name__}")
+    if not stat.S_ISREG(marker_stat.st_mode):
+        return _invalid(path, "marker_not_regular_file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # may vanish between lstat/read; it was observed present, so fail closed
+        return _invalid(path, f"marker_unreadable:{type(exc).__name__}")
+    if not isinstance(payload, dict):
+        return _invalid(path, "marker_not_object")
+    schema = payload.get("schema")
+    # ``bool`` subclasses ``int``: schema ``true`` must not be accepted as schema 1.
+    if type(schema) is not int or schema != IMAGE_PROVENANCE_SCHEMA:
+        return _invalid(path, "unsupported_marker_schema")
+    if payload.get("deployment_kind") != "image":
+        return _invalid(path, "invalid_deployment_kind")
+    manager = payload.get("manager")
+    if not isinstance(manager, str) or not manager.strip():
+        return _invalid(path, "missing_manager")
+    try:
+        optional = {name: _optional_string(payload, name) for name in ("image", "version", "revision")}
+    except TypeError as exc:
+        return _invalid(path, f"invalid_{exc.args[0]}")
+    return ImageProvenance(IMAGE_PROVENANCE_SCHEMA, "image", manager.strip(), marker_path=str(path), **optional)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\init_command.py ===
+"""``/init`` — build the prompt that asks the agent to generate or update a project AGENTS.md."""
+
+from __future__ import annotations
+
+import os
+
+# Embedded in every prompt so the generated file reads like a maintainer wrote it.
+_QUALITY_BAR = """\
+Quality bar for the file you write (this is what separates a useful AGENTS.md
+from noise):
+- CONCISE: target under 100 lines. Agents load this file every session — every
+  line costs context. No essays, no marketing prose, no filler.
+- Commands must be EXACT invocations you verified from the repo (package.json
+  scripts, Makefile targets, pyproject/tox/CI config, existing docs). Write
+  `npm run test:unit` or `scripts/run_tests.sh tests/foo`, never "run the
+  tests". NEVER invent a command you didn't see evidence for.
+- No generic advice. "Write tests for new code" and "follow best practices"
+  are banned — if a line would be true of any repo, cut it.
+- Conventions must be OBSERVED, not assumed: naming patterns, module layout,
+  error-handling style, commit-message format — only what the code actually
+  shows.
+- Include pitfalls that would genuinely trip up a newcomer or an agent
+  (required env vars, generated files not to hand-edit, slow test suites,
+  ports already in use), if you found any. Skip the section if you found none.
+- Markdown structure: a short title + one-paragraph overview, then focused
+  sections (e.g. "Dev environment", "Build & test", "Conventions",
+  "Pitfalls"). Flat and scannable — no deep nesting."""
+
+
+def build_init_prompt(cwd: str, existing_file: str | None = None, extra: str = "") -> str:
+    """Build the ``/init`` prompt; ``existing_file`` (current AGENTS.md) switches to merge discipline,
+    ``extra`` is the user's free text after ``/init``."""
+    extra = (extra or "").strip()
+    update = existing_file is not None
+    parts: list[str] = [
+        "[/init] The user wants you to "
+        + ("UPDATE the existing" if update else "generate an")
+        + f" AGENTS.md project-instructions file for the project at: {cwd}\n",
+        "AGENTS.md is the instruction file coding agents (Hermes included) "
+        "load as project context every session. It should teach an agent how "
+        "to work in THIS repo: what the project is, how to set up, the exact "
+        "build/test/lint commands, the conventions the code actually follows, "
+        "and the pitfalls that waste time.\n",
+        "Do this:\n"
+        "1. Inspect the project with your read-only tools (`read_file`, "
+        "`search_files`) — start with manifests and toolchain files "
+        "(package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, "
+        "CI workflow configs, lockfiles), then the directory layout, existing "
+        "README/docs, and test/lint configuration. Learn the real commands, "
+        "don't guess them.\n"
+        "2. Write the file to "
+        f"{cwd.rstrip('/')}/AGENTS.md with `write_file`"
+        + (" — but this is an UPDATE, so follow the merge discipline below." if update else ".")
+        + "\n"
+        "3. Confirm to the user the exact path you wrote and summarize in one "
+        "or two lines what the file covers.\n",
+    ]
+    if update:
+        parts.append(
+            "MERGE DISCIPLINE — an AGENTS.md already exists (its current "
+            "content is below). Do NOT overwrite or regenerate it from "
+            "scratch. Preserve the user's existing content — their wording, "
+            "their sections, their rules — and merge in only what is missing "
+            "or verifiably stale (e.g. a command that no longer exists in the "
+            "repo). When existing content conflicts with what you observed, "
+            "prefer minimal surgical edits over rewrites, and keep the "
+            "user's intent. The result must still meet the quality bar.\n\n"
+            "CURRENT AGENTS.md CONTENT:\n"
+            "<<<EXISTING_AGENTS_MD\n"
+            f"{existing_file}\n"
+            "EXISTING_AGENTS_MD\n"
+        )
+    parts.append(_QUALITY_BAR)
+    if extra:
+        parts.append(
+            "\nUSER NOTES — honor these while authoring (they override the "
+            f"defaults above where they conflict):\n{extra}"
+        )
+    return "\n".join(parts)
+
+
+def build_init_prompt_for_cwd(cwd: str | None = None, extra: str = "") -> str:
+    """Convenience wrapper used by the dispatch surfaces."""
+    resolved = os.path.abspath(cwd or os.getcwd())
+    existing: str | None = None
+    agents_path = os.path.join(resolved, "AGENTS.md")
+    try:
+        if os.path.isfile(agents_path):
+            with open(agents_path, encoding="utf-8", errors="replace") as fh:
+                existing = fh.read()
+    except OSError:
+        existing = None
+    return build_init_prompt(resolved, existing_file=existing, extra=extra)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\input_sanitize.py ===
+"""Sanitize user prompt text leaked from terminal / paste control sequences."""
+
+from __future__ import annotations
+
+import re
+
+# Degraded visible bracketed-paste forms, matched only at boundaries so embedded literals stay intact.
+_BOUNDARY_SUBS = (
+    (re.compile(r"(^|[\s\n>:\]\)])\[200~"), r"\1"),
+    (re.compile(r"\[201~(?=$|[\s\n<\[\(\):;.,!?])"), ""),
+    (re.compile(r"(^|[\s\n>:\]\)])00~"), r"\1"),
+    (re.compile(r"01~(?=$|[\s\n<\[\(\):;.,!?])"), ""),
+)
+
+# Corruption signature from desktop bracketed-paste leaks (#62557).
+_DESKTOP_PASTE_ARTIFACT = "~[[e"
+
+
+def strip_leaked_bracketed_paste_wrappers(text: str) -> str:
+    """Strip leaked bracketed-paste wrapper markers: canonical wrappers unconditionally, degraded visible forms
+    (``[200~`` / ``[201~`` and ``00~`` / ``01~``) only at boundaries so ``literal[200~tag`` stays intact."""
+    if not text:
+        return text
+    for wrapper in ("\x1b[200~", "\x1b[201~", "^[[200~", "^[[201~"):
+        text = text.replace(wrapper, "")
+    for pattern, repl in _BOUNDARY_SUBS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def collapse_repeated_input_artifacts(text: str, min_repeats: int = 4) -> str:
+    """Drop a trailing run of the desktop ~[[e corruption signature (#62557)."""
+    if not text:
+        return text
+    marker = _DESKTOP_PASTE_ARTIFACT
+    index = len(text)
+    repeat_count = 0
+    while index >= len(marker) and text[index - len(marker) : index] == marker:
+        repeat_count += 1
+        index -= len(marker)
+    if repeat_count < min_repeats:
+        return text
+    if index >= 2 and text[index - 2 : index] == "[e":
+        index -= 2
+    elif index >= 1 and text[index - 1] == "[":
+        index -= 1
+    return text[:index]
+
+
+def sanitize_user_prompt_text(text: str) -> str:
+    """Normalize user-authored prompt text before persistence or model input."""
+    if not isinstance(text, str) or not text:
+        return text
+    return collapse_repeated_input_artifacts(strip_leaked_bracketed_paste_wrappers(text))
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\install_identity.py ===
+"""Stable opaque identity shared by every profile in one Hermes install."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+from pathlib import Path
+import re
+import threading
+from typing import Optional
+import uuid
+
+from hermes_constants import get_default_hermes_root
+from utils import atomic_write_text
+
+_INSTALL_ID_FILENAME = "install_id"
+_INSTALL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_INSTALL_ID_CACHE: dict[str, Optional[str]] = {"root": None, "value": None}
+_INSTALL_ID_LOCK, _INSTALL_ID_PUBLICATION_LOCK = threading.Lock(), threading.Lock()
+
+
+@contextlib.contextmanager
+def _install_id_file_lock(root: Path):
+    """Serialize identity publication across processes on POSIX and Windows."""
+    fd = os.open(root / ".install_id.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    windows = os.name == "nt"
+    try:
+        if windows:
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+                os.fsync(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if windows:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _read_existing(path: Path) -> tuple[Optional[str], bool]:
+    """``(valid id or None, mint?)`` — mint on a missing or malformed file, never on a read failure."""
+    try:
+        existing = path.read_text(encoding="utf-8").strip().lower()
+    except FileNotFoundError:
+        return None, True
+    except (OSError, UnicodeDecodeError):
+        return None, False
+    return (existing, False) if _INSTALL_ID_RE.fullmatch(existing) else (None, True)
+
+
+def read_or_create_install_id(root: Path | None = None) -> Optional[str]:
+    """Read or atomically mint the opaque id for the physical install.
+
+    ``None`` = neither readable nor persistable; an ephemeral id would violate the authority/registry contract.
+    """
+    root = get_default_hermes_root() if root is None else root
+    path = root / _INSTALL_ID_FILENAME
+    existing, mint = _read_existing(path)
+    if not mint:
+        return existing
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(root)
+        # Windows byte-range locks can report a same-process conflict instead of waiting for another
+        # thread: serialize threads here, then keep the file lock as the cross-process publication fence.
+        with _INSTALL_ID_PUBLICATION_LOCK, _install_id_file_lock(root):
+            existing, mint = _read_existing(path)
+            if not mint:
+                return existing
+            atomic_write_text(path, uuid.uuid4().hex + "\n", tmp_prefix=".install_id-", fsync_dir=True, mode=0o600)
+            committed = path.read_text(encoding="utf-8").strip().lower()
+            return committed if _INSTALL_ID_RE.fullmatch(committed) else None
+    except OSError:
+        return None
+
+
+def get_install_id(*, cache: dict[str, Optional[str]] | None = None) -> Optional[str]:
+    """Return the process-cached stable id for the active Hermes root."""
+    root = get_default_hermes_root()
+    root_key = str(root)
+    target_cache = _INSTALL_ID_CACHE if cache is None else cache
+
+    def _cached() -> Optional[str]:
+        cached = target_cache.get("value")
+        return cached if cached and target_cache.get("root") in (None, root_key) else None
+
+    if value := _cached():
+        return value
+    with _INSTALL_ID_LOCK:
+        if value := _cached():
+            return value
+        value = read_or_create_install_id(root)
+        if value:
+            target_cache["root"] = root_key
+            target_cache["value"] = value
+        return value
+
+
+__all__ = ["get_install_id", "read_or_create_install_id"]
+

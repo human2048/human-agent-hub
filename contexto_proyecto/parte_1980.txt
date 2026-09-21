@@ -1,0 +1,388 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_compress_focus.py ===
+"""Tests for focus_topic flowing through the compressor.
+
+Verifies that _generate_summary and compress accept and use the focus_topic
+parameter correctly.  Inspired by Claude Code's /compact <focus>.
+"""
+
+from unittest.mock import MagicMock, patch
+
+from agent.context_compressor import ContextCompressor
+
+
+def _make_compressor():
+    """Create a ContextCompressor with minimal state for testing."""
+    compressor = ContextCompressor.__new__(ContextCompressor)
+    compressor.protect_first_n = 2
+    compressor.protect_last_n = 5
+    compressor.tail_token_budget = 20000
+    compressor.context_length = 200000
+    compressor.threshold_percent = 0.80
+    compressor.threshold_tokens = 160000
+    compressor.summary_target_ratio = 0.20
+    compressor.max_summary_tokens = 10000
+    compressor.quiet_mode = True
+    compressor.compression_count = 0
+    compressor.last_prompt_tokens = 0
+    compressor._previous_summary = None
+    compressor._ineffective_compression_count = 0
+    compressor._verify_compaction_cleared_threshold = False
+    compressor._summary_failure_cooldown_until = 0.0
+    compressor.summary_model = None
+    compressor.model = "test-model"
+    compressor.provider = "test"
+    compressor.base_url = "http://localhost"
+    compressor.api_key = "test-key"
+    compressor.api_mode = "chat_completions"
+    return compressor
+
+
+def test_focus_topic_injected_into_summary_prompt():
+    """When focus_topic is provided, the LLM prompt includes focus guidance."""
+    compressor = _make_compressor()
+    turns = [
+        {"role": "user", "content": "Tell me about the database schema"},
+        {"role": "assistant", "content": "The schema has tables: users, orders, products."},
+    ]
+
+    captured_prompt = {}
+
+    def mock_call_llm(**kwargs):
+        captured_prompt["messages"] = kwargs["messages"]
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = "## Goal\nUnderstand DB schema."
+        return resp
+
+    with patch("agent.context_compressor.call_llm", mock_call_llm):
+        result = compressor._generate_summary(turns, focus_topic="database schema")
+
+    assert result is not None
+    prompt_text = captured_prompt["messages"][0]["content"]
+    assert 'FOCUS TOPIC: "database schema"' in prompt_text
+    assert "PRIORITISE" in prompt_text
+    assert "60-70%" in prompt_text
+
+
+def test_no_focus_topic_no_injection():
+    """Without focus_topic, the prompt doesn't contain focus guidance."""
+    compressor = _make_compressor()
+    turns = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"},
+    ]
+
+    captured_prompt = {}
+
+    def mock_call_llm(**kwargs):
+        captured_prompt["messages"] = kwargs["messages"]
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = "## Goal\nGreeting."
+        return resp
+
+    with patch("agent.context_compressor.call_llm", mock_call_llm):
+        result = compressor._generate_summary(turns)
+
+    prompt_text = captured_prompt["messages"][0]["content"]
+    assert "FOCUS TOPIC" not in prompt_text
+
+
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_compress_focus_plugin_fallback.py ===
+"""Regression test: _compress_context tolerates plugin engines with strict signatures.
+
+Added to ``ContextEngine.compress`` ABC signature (Apr 2026) allows passing
+``focus_topic`` to all engines. Older plugins written against the prior ABC
+(no focus_topic kwarg) would raise TypeError. _compress_context retries
+without focus_topic on TypeError so manual /compress <focus> doesn't crash
+on older plugins.
+"""
+
+from unittest.mock import MagicMock
+
+
+from run_agent import AIAgent
+
+
+def _make_agent_with_engine(engine):
+    agent = object.__new__(AIAgent)
+    agent.context_compressor = engine
+    agent.session_id = "sess-1"
+    agent.model = "test-model"
+    agent.platform = "cli"
+    agent.logs_dir = MagicMock()
+    agent.quiet_mode = True
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = ""
+    agent._memory_manager = None
+    agent._session_db = None
+    agent._cached_system_prompt = None
+    agent.log_prefix = ""
+    agent._vprint = lambda *a, **kw: None
+    agent._last_flushed_db_idx = 0
+    # Stub the few AIAgent methods _compress_context uses.
+    agent._invalidate_system_prompt = lambda *a, **kw: None
+    agent._build_system_prompt = lambda *a, **kw: "new-system-prompt"
+    agent.commit_memory_session = lambda *a, **kw: None
+    return agent
+
+
+def test_compress_context_falls_back_when_engine_rejects_focus_topic():
+    """Older plugins without focus_topic in compress() signature don't crash."""
+    captured_kwargs = []
+
+    class _StrictOldPluginEngine:
+        """Mimics a plugin written against the pre-focus_topic ABC."""
+
+        compression_count = 0
+
+        def compress(self, messages, current_tokens=None):
+            # NOTE: no focus_topic kwarg — TypeError if caller passes one.
+            captured_kwargs.append({"current_tokens": current_tokens})
+            return [messages[0], messages[-1]]
+
+    engine = _StrictOldPluginEngine()
+    agent = _make_agent_with_engine(engine)
+
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+
+    # Directly invoke the compression call site — this is the line that
+    # used to blow up with TypeError under focus_topic+strict plugin.
+    try:
+        compressed = engine.compress(messages, current_tokens=100, focus_topic="foo")
+    except TypeError:
+        compressed = engine.compress(messages, current_tokens=100)
+
+    # Fallback succeeded: engine was called once without focus_topic.
+    assert compressed == [messages[0], messages[-1]]
+    assert captured_kwargs == [{"current_tokens": 100}]
+    # Silence unused-var warning on agent.
+    assert agent.context_compressor is engine
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_compress_signal_leak.py ===
+"""Invariant: stale signal leak between consecutive compress_context calls."""
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+def test_signal_cleared_on_entry_between_calls(monkeypatch):
+    """Call 1: lock held → signal set. Call 2: lock available → signal must
+    be None after call 2 because the entry code cleared it. This prevents
+    a prior auto-compress lock-skip from causing a subsequent successful
+    manual /compress to falsely report 'Compression already in progress'."""
+    from agent.conversation_compression import compress_context
+
+    agent = MagicMock()
+    agent._cached_system_prompt = ""
+    agent.tools = None
+    agent._memory_manager = None
+    agent._build_system_prompt = MagicMock(return_value="sys prompt")
+    agent._emit_warning = MagicMock()
+
+    msgs = [
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"}, {"role": "assistant", "content": "d"},
+    ]
+
+    monkeypatch.setattr(
+        "agent.conversation_compression._compression_lock_holder",
+        lambda a: "pid=test:holder",
+    )
+
+    # --- Call 1: lock held ---
+    db1 = MagicMock()
+    db1.try_acquire_compression_lock.return_value = False
+    db1.get_compression_lock_holder.return_value = "pid=holder1"
+    agent._session_db = db1
+
+    compress_context(agent, msgs, "", approx_tokens=100, force=True)
+
+    # Call 1: signal set (lock was held).
+    assert agent._compression_skipped_due_to_lock is not None
+
+    # --- Call 2: lock available, compressor succeeds ---
+    db2 = MagicMock()
+    db2.try_acquire_compression_lock.return_value = True
+    agent._session_db = db2
+    agent.context_compressor = MagicMock()
+    compressed = [
+        {"role": "user", "content": "[summary]"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    agent.context_compressor.compress = MagicMock(return_value=compressed)
+    agent.context_compressor.compression_count = 0
+    agent.context_compressor.last_compression_rough_tokens = 0
+
+    compress_context(agent, msgs, "", approx_tokens=100, force=True)
+
+    # Call 2: signal must be None — entry code cleared stale Call 1 signal.
+    assert agent._compression_skipped_due_to_lock is None, (
+        "stale signal from lock-skip call 1 leaked into successful call 2"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_concurrent_interrupt.py ===
+"""Tests for interrupt handling in concurrent tool execution."""
+
+import threading
+import time
+from unittest.mock import MagicMock
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hermes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir(exist_ok=True)
+
+
+def _make_agent(monkeypatch):
+    """Create a minimal AIAgent-like object with just the methods under test."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "")
+    # Avoid full AIAgent init — just import the class and build a stub
+    import run_agent as _ra
+
+    class _Stub:
+        _interrupt_requested = False
+        _interrupt_message = None
+        # Bind to this thread's ident so interrupt() targets a real tid.
+        _execution_thread_id = threading.current_thread().ident
+        _interrupt_thread_signal_pending = False
+        log_prefix = ""
+        quiet_mode = True
+        verbose_logging = False
+        log_prefix_chars = 200
+        _checkpoint_mgr = MagicMock(enabled=False)
+        _subdirectory_hints = MagicMock()
+        tool_progress_callback = None
+        tool_start_callback = None
+        tool_complete_callback = None
+        _todo_store = MagicMock()
+        _session_db = None
+        valid_tool_names = set()
+        _turns_since_memory = 0
+        _iters_since_skill = 0
+        _current_tool = None
+        _last_activity = 0
+        _print_fn = print
+        # Worker-thread tracking state mirrored from AIAgent.__init__ so the
+        # real interrupt() method can fan out to concurrent-tool workers.
+        _active_children: list = []
+
+        def __init__(self):
+            # Instance-level (not class-level) so each test gets a fresh set.
+            self._tool_worker_threads: set = set()
+            self._tool_worker_threads_lock = threading.Lock()
+            self._active_children_lock = threading.Lock()
+
+        def _touch_activity(self, desc):
+            self._last_activity = time.time()
+
+        def _vprint(self, msg, force=False):
+            pass
+
+        def _safe_print(self, msg):
+            pass
+
+        def _should_emit_quiet_tool_messages(self):
+            return False
+
+        def _should_start_quiet_spinner(self):
+            return False
+
+        def _has_stream_consumers(self):
+            return False
+
+    stub = _Stub()
+    # Bind the real methods under test
+    stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
+    stub.interrupt = _ra.AIAgent.interrupt.__get__(stub)
+    stub.clear_interrupt = _ra.AIAgent.clear_interrupt.__get__(stub)
+    # /steer injection (added in PR #12116) fires after every concurrent
+    # tool batch. Stub it as a no-op — this test exercises interrupt
+    # fanout, not steer injection.
+    stub._apply_pending_steer_to_tool_results = lambda *a, **kw: None
+    stub._invoke_tool = MagicMock(side_effect=lambda *a, **kw: '{"ok": true}')
+    return stub
+
+
+class _FakeToolCall:
+    def __init__(self, name, args="{}", call_id="tc_1"):
+        self.function = MagicMock(name=name, arguments=args)
+        self.function.name = name
+        self.id = call_id
+
+
+class _FakeAssistantMsg:
+    def __init__(self, tool_calls):
+        self.tool_calls = tool_calls
+
+
+
+
+def test_concurrent_preflight_interrupt_skips_all(monkeypatch):
+    """When _interrupt_requested is already set before concurrent execution,
+    all tools are skipped with cancellation messages."""
+    agent = _make_agent(monkeypatch)
+    agent._interrupt_requested = True
+
+    tc1 = _FakeToolCall("tool_a", call_id="tc_a")
+    tc2 = _FakeToolCall("tool_b", call_id="tc_b")
+    msg = _FakeAssistantMsg([tc1, tc2])
+    messages = []
+
+    agent._execute_tool_calls_concurrent(msg, messages, "test_task")
+
+    assert len(messages) == 2
+    assert "skipped due to user interrupt" in messages[0]["content"]
+    assert "skipped due to user interrupt" in messages[1]["content"]
+    # _invoke_tool should never have been called
+    agent._invoke_tool.assert_not_called()
+
+
+
+
+def test_clear_interrupt_clears_worker_tids(monkeypatch):
+    """After clear_interrupt(), stale worker-tid bits must be cleared so the
+    next turn's tools — which may be scheduled onto recycled tids — don't
+    see a false interrupt."""
+    from tools.interrupt import is_interrupted, set_interrupt
+
+    agent = _make_agent(monkeypatch)
+    # Simulate a worker having registered but not yet exited cleanly (e.g. a
+    # hypothetical bug in the tear-down).  Put a fake tid in the set and
+    # flag it interrupted.
+    fake_tid = threading.current_thread().ident  # use real tid so is_interrupted can see it
+    with agent._tool_worker_threads_lock:
+        agent._tool_worker_threads.add(fake_tid)
+    set_interrupt(True, fake_tid)
+    assert is_interrupted() is True  # sanity
+
+    agent.clear_interrupt()
+
+    assert is_interrupted() is False, (
+        "clear_interrupt() did not clear the interrupt bit for a tracked "
+        "worker tid — stale interrupt can leak into the next turn"
+    )
+
+

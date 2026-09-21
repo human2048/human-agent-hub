@@ -1,0 +1,397 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_shared_metrics_send_config.py ===
+"""Tests for shared-metrics send configuration resolution."""
+
+from __future__ import annotations
+
+import logging
+
+import pytest
+
+from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli.observability.shared_metrics_send_config import (
+    DEFAULT_ENDPOINT,
+    resolve_send_config,
+    reset_warning_latch_for_tests,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_latch():
+    reset_warning_latch_for_tests()
+    yield
+    reset_warning_latch_for_tests()
+
+
+def _config(**shared):
+    return {"telemetry": {"shared_metrics": shared}}
+
+
+class TestDefaults:
+    def test_send_is_registered_disabled_by_default(self):
+        shared = DEFAULT_CONFIG["telemetry"]["shared_metrics"]
+        assert shared["enabled"] is False
+        assert shared["send"] is False
+
+    def test_default_endpoint_is_production(self):
+        shared = DEFAULT_CONFIG["telemetry"]["shared_metrics"]
+        assert shared["endpoint"] == DEFAULT_ENDPOINT
+        assert DEFAULT_ENDPOINT.startswith("https://")
+
+    def test_empty_config_sends_nothing(self):
+        resolved = resolve_send_config({})
+        assert resolved.enabled is False
+        assert resolved.send is False
+
+    def test_none_config_is_tolerated(self):
+        assert resolve_send_config(None).send is False
+
+
+class TestSendRequiresCollection:
+    def test_collection_alone_does_not_send(self):
+        resolved = resolve_send_config(_config(enabled=True))
+        assert resolved.enabled is True
+        assert resolved.send is False
+
+    def test_send_with_collection_sends(self):
+        resolved = resolve_send_config(_config(enabled=True, send=True))
+        assert resolved.send is True
+
+    def test_send_without_collection_is_refused(self):
+        resolved = resolve_send_config(_config(enabled=False, send=True))
+        assert resolved.send is False
+        # send must never imply enabled
+        assert resolved.enabled is False
+
+    def test_send_without_collection_logs_an_error(self, caplog):
+        with caplog.at_level(logging.ERROR):
+            resolve_send_config(_config(enabled=False, send=True))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert "enabled is false" in errors[0].getMessage()
+
+    def test_the_error_is_logged_once_per_process(self, caplog):
+        with caplog.at_level(logging.ERROR):
+            for _ in range(5):
+                resolve_send_config(_config(enabled=False, send=True))
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, "misconfiguration must not spam every hook fire"
+
+
+class TestEndpointPrecedence:
+    def test_config_endpoint_overrides_default(self):
+        resolved = resolve_send_config(
+            _config(enabled=True, send=True, endpoint="https://example.test/v1")
+        )
+        assert resolved.endpoint == "https://example.test/v1"
+
+    def test_no_environment_variable_can_redirect_telemetry(self, monkeypatch):
+        """A consent hazard: an inherited env var must not silently retarget.
+
+        AGENTS.md also reserves HERMES_* for secrets, not behaviour.
+        """
+        for name in (
+            "HERMES_TELEMETRY_ENDPOINT",
+            "TELEMETRY_ENDPOINT",
+            "HERMES_SHARED_METRICS_ENDPOINT",
+        ):
+            monkeypatch.setenv(name, "https://attacker.test/v1")
+        resolved = resolve_send_config(_config(enabled=True, send=True))
+        assert resolved.endpoint == DEFAULT_ENDPOINT
+
+    def test_blank_endpoint_falls_back_to_production(self):
+        resolved = resolve_send_config(_config(enabled=True, send=True, endpoint="   "))
+        assert resolved.endpoint == DEFAULT_ENDPOINT
+
+    def test_endpoint_is_stripped(self):
+        resolved = resolve_send_config(
+            _config(enabled=True, send=True, endpoint="  https://staging.test/v1  ")
+        )
+        assert resolved.endpoint == "https://staging.test/v1"
+
+
+class TestTransportSafety:
+    def test_plaintext_endpoint_is_refused(self, caplog):
+        with caplog.at_level(logging.ERROR):
+            resolved = resolve_send_config(
+                _config(enabled=True, send=True, endpoint="http://example.test/v1")
+            )
+        assert resolved.send is False, "telemetry must not go out in clear text"
+        assert any("https" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "http://localhost:8099/v1/telemetry",
+            "http://127.0.0.1:8099/v1/telemetry",
+        ],
+    )
+    def test_loopback_http_is_allowed_for_testing(self, endpoint):
+        resolved = resolve_send_config(
+            _config(enabled=True, send=True, endpoint=endpoint)
+        )
+        assert resolved.send is True
+
+    def test_nonsense_scheme_is_refused(self):
+        resolved = resolve_send_config(
+            _config(enabled=True, send=True, endpoint="ftp://example.test/v1")
+        )
+        assert resolved.send is False
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "ftp://localhost/v1/telemetry",
+            "gopher://localhost/v1/telemetry",
+            "ws://127.0.0.1/v1/telemetry",
+        ],
+    )
+    def test_a_non_http_scheme_on_loopback_is_still_refused(self, endpoint):
+        """The scheme is allowlisted, not merely checked for plaintext http.
+
+        Gap found by mutation testing: replacing the `http` scheme test with
+        `if True` survived the whole suite, because every non-http scheme case
+        pointed at a REMOTE host, where the loopback branch rejects it anyway.
+        Only a non-http scheme aimed at loopback distinguishes an allowlist
+        from a plaintext-only check.
+        """
+        resolved = resolve_send_config(
+            _config(enabled=True, send=True, endpoint=endpoint)
+        )
+        assert resolved.send is False
+
+    def test_unsafe_endpoint_does_not_block_collection(self):
+        resolved = resolve_send_config(
+            _config(enabled=True, send=True, endpoint="http://example.test/v1")
+        )
+        assert resolved.enabled is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_shared_metrics_send_migration.py ===
+"""Tests for the additive send-state migration on ``package_outbox``.
+
+The store schema version must NOT move when these columns are added: the
+existing loader raises on any version it does not recognise, so bumping it
+would hard-fail an older Hermes (a second profile on an older build, or a
+rollback) against the same database file.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+
+import pytest
+
+from hermes_cli.observability.shared_metrics import SharedMetricsStore
+
+SEND_COLUMNS = {
+    "sent_at",
+    "send_state",
+    "send_attempts",
+    "next_attempt_at",
+    "last_error",
+    "sent_install_id",
+}
+
+
+def _columns(db_path):
+    connection = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in connection.execute("PRAGMA table_info(package_outbox)")}
+    finally:
+        connection.close()
+
+
+def _schema_version(db_path):
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT value FROM telemetry_state WHERE key = 'schema_version'"
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        connection.close()
+
+
+@pytest.fixture
+def store(tmp_path):
+    return SharedMetricsStore(
+        database_path=tmp_path / "metrics.sqlite3",
+        outbox_directory=tmp_path / "outbox",
+    )
+
+
+class TestFreshDatabase:
+    def test_send_columns_exist(self, store):
+        assert SEND_COLUMNS <= _columns(store.database_path)
+
+    def test_original_columns_survive(self, store):
+        assert {
+            "package_id",
+            "period_start",
+            "period_end",
+            "payload_json",
+            "created_at",
+            "exported_at",
+        } <= _columns(store.database_path)
+
+    def test_send_attempts_defaults_to_zero(self, store):
+        connection = sqlite3.connect(store.database_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO package_outbox(
+                    package_id, period_start, period_end, payload_json, created_at
+                ) VALUES ('p', '2026-01-01', '2026-01-02', '{}', '2026-01-01T00:00:00Z')
+                """
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT send_attempts, send_state, sent_install_id FROM package_outbox"
+            ).fetchone()
+        finally:
+            connection.close()
+        assert row[0] == 0
+        assert row[1] is None
+        assert row[2] is None
+
+
+class TestUpgradeFromPreSendDatabase:
+    """The real-world case: a database written before this feature existed."""
+
+    @pytest.fixture
+    def legacy_db(self, tmp_path):
+        path = tmp_path / "metrics.sqlite3"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE telemetry_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO telemetry_state(key, value) VALUES ('schema_version', '2')"
+            )
+            connection.execute(
+                """
+                CREATE TABLE package_outbox (
+                    package_id TEXT PRIMARY KEY,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    exported_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE counter_aggregates (
+                    period_start TEXT NOT NULL,
+                    metric_name TEXT NOT NULL,
+                    hermes_version TEXT NOT NULL,
+                    os_family TEXT NOT NULL,
+                    architecture TEXT NOT NULL,
+                    install_method TEXT NOT NULL,
+                    dimensions_json TEXT NOT NULL,
+                    value INTEGER NOT NULL,
+                    packaged_value INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        period_start, metric_name, hermes_version, os_family,
+                        architecture, install_method, dimensions_json
+                    )
+                )
+                """
+            )
+            for i in range(3):
+                connection.execute(
+                    """
+                    INSERT INTO package_outbox(
+                        package_id, period_start, period_end, payload_json,
+                        created_at, exported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"pkg-{i}",
+                        "2026-08-2%d" % i,
+                        "2026-08-2%d" % (i + 1),
+                        json.dumps({"package_id": f"pkg-{i}"}),
+                        "2026-08-2%dT00:00:00Z" % i,
+                        "2026-08-2%dT01:00:00Z" % i,
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        return path
+
+    def test_upgrade_preserves_every_row(self, legacy_db, tmp_path):
+        SharedMetricsStore(
+            database_path=legacy_db, outbox_directory=tmp_path / "outbox"
+        )
+        connection = sqlite3.connect(legacy_db)
+        try:
+            count = connection.execute("SELECT COUNT(*) FROM package_outbox").fetchone()[0]
+            payloads = connection.execute(
+                "SELECT package_id, payload_json FROM package_outbox ORDER BY package_id"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert count == 3
+        assert payloads == [
+            ("pkg-0", '{"package_id": "pkg-0"}'),
+            ("pkg-1", '{"package_id": "pkg-1"}'),
+            ("pkg-2", '{"package_id": "pkg-2"}'),
+        ]
+
+    def test_upgrade_adds_the_send_columns(self, legacy_db, tmp_path):
+        SharedMetricsStore(
+            database_path=legacy_db, outbox_directory=tmp_path / "outbox"
+        )
+        assert SEND_COLUMNS <= _columns(legacy_db)
+
+    def test_upgrade_does_not_move_the_schema_version(self, legacy_db, tmp_path):
+        """Bumping would make older builds refuse the same file."""
+        SharedMetricsStore(
+            database_path=legacy_db, outbox_directory=tmp_path / "outbox"
+        )
+        assert _schema_version(legacy_db) == "2"
+
+    def test_migration_is_idempotent(self, legacy_db, tmp_path):
+        for _ in range(3):
+            SharedMetricsStore(
+                database_path=legacy_db, outbox_directory=tmp_path / "outbox"
+            )
+        columns = [
+            row[1]
+            for row in sqlite3.connect(legacy_db).execute(
+                "PRAGMA table_info(package_outbox)"
+            )
+        ]
+        assert len(columns) == len(set(columns)), "columns were added more than once"
+
+    def test_queries_written_before_this_change_still_work(self, legacy_db, tmp_path):
+        """The shipped export query selects named columns; it must be unaffected."""
+        SharedMetricsStore(
+            database_path=legacy_db, outbox_directory=tmp_path / "outbox"
+        )
+        connection = sqlite3.connect(legacy_db)
+        try:
+            rows = connection.execute(
+                """
+                SELECT package_id, payload_json
+                FROM package_outbox
+                WHERE exported_at IS NULL
+                ORDER BY created_at, package_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        assert rows == []
+

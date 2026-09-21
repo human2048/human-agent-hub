@@ -1,0 +1,366 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\providers\test_provider_registry.py ===
+import pytest
+
+from providers.base import ProviderProfile
+import providers
+
+
+@pytest.fixture(autouse=True)
+def isolate_provider_registry():
+    registry = providers._REGISTRY.copy()
+    aliases = providers._ALIASES.copy()
+    provider_list_cache = (
+        None
+        if providers._PROVIDER_LIST_CACHE is None
+        else list(providers._PROVIDER_LIST_CACHE)
+    )
+    discovered = providers._discovered
+
+    yield
+
+    providers._REGISTRY.clear()
+    providers._REGISTRY.update(registry)
+    providers._ALIASES.clear()
+    providers._ALIASES.update(aliases)
+    providers._PROVIDER_LIST_CACHE = provider_list_cache
+    providers._discovered = discovered
+
+
+def _profile(name: str, *aliases: str) -> ProviderProfile:
+    return ProviderProfile(name=name, aliases=aliases)
+
+
+def _reset_registry() -> None:
+    providers._REGISTRY.clear()
+    providers._ALIASES.clear()
+    providers._PROVIDER_LIST_CACHE = None
+    providers._discovered = True
+
+
+def test_list_providers_reuses_cached_snapshot_until_registration_changes():
+    _reset_registry()
+    first = _profile("alpha")
+    providers.register_provider(first)
+
+    listed = providers.list_providers()
+    listed.clear()
+
+    assert providers.list_providers() == [first]
+
+    # Hit-path copy guard: mutating a CACHED return must not corrupt the
+    # module-level snapshot for later callers (aliasing bug class).
+    providers.list_providers().clear()
+    assert providers.list_providers() == [first]
+
+    second = _profile("beta")
+    providers.register_provider(second)
+
+    assert providers.list_providers() == [first, second]
+
+
+def test_list_providers_dedupes_aliases_in_cached_snapshot():
+    _reset_registry()
+    profile = _profile("kimi", "moonshot", "kimi-k2")
+    providers.register_provider(profile)
+
+    assert providers.get_provider_profile("moonshot") is profile
+    assert providers.list_providers() == [profile]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\providers\test_transport_parity.py ===
+"""Parity tests: pin the exact current transport behavior per provider.
+
+These tests document the flag-based contract between run_agent.py and
+ChatCompletionsTransport.build_kwargs(). When the next PR wires profiles
+to replace flags, every assertion here must still pass — any failure is
+a behavioral regression.
+"""
+
+import pytest
+from agent.transports.chat_completions import ChatCompletionsTransport
+from providers import get_provider_profile
+
+
+@pytest.fixture
+def transport():
+    return ChatCompletionsTransport()
+
+
+def _simple_messages():
+    return [{"role": "user", "content": "hello"}]
+
+
+def _max_tokens_fn(n):
+    return {"max_completion_tokens": n}
+
+
+class TestNvidiaParity:
+    """NVIDIA NIM: default max_tokens=16384."""
+
+
+    def test_user_max_tokens_overrides(self, transport):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("nvidia")
+        kw = transport.build_kwargs(
+            model="nvidia/llama-3.1-nemotron-70b-instruct",
+            messages=_simple_messages(),
+            tools=None,
+            max_tokens=4096,
+            max_tokens_param_fn=_max_tokens_fn,
+            provider_profile=profile,
+        )
+        assert kw["max_completion_tokens"] == 4096  # user overrides default
+
+
+class TestKimiParity:
+    """Kimi: OMIT temperature, max_tokens=32000, thinking + reasoning_effort."""
+
+    def test_temperature_omitted(self, transport):
+        kw = transport.build_kwargs(
+            model="kimi-k2",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("kimi-coding"),
+            omit_temperature=True,
+        )
+        assert "temperature" not in kw
+
+
+    def test_thinking_enabled(self, transport):
+        # xor contract (fix ce4e74b3): an explicit recognized effort sends
+        # reasoning_effort ONLY — never paired with extra_body.thinking.
+        kw = transport.build_kwargs(
+            model="kimi-k2",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("kimi-coding"),
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kw.get("reasoning_effort") == "high"
+        assert "thinking" not in kw.get("extra_body", {})
+
+
+
+    def test_reasoning_effort_top_level(self, transport):
+        """Kimi reasoning_effort is a TOP-LEVEL api_kwargs key, NOT in extra_body."""
+        kw = transport.build_kwargs(
+            model="kimi-k2",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("kimi-coding"),
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kw.get("reasoning_effort") == "high"
+        assert "reasoning_effort" not in kw.get("extra_body", {})
+
+
+
+class TestOpenRouterParity:
+    """OpenRouter: provider preferences, reasoning in extra_body."""
+
+    def test_provider_preferences(self, transport):
+        prefs = {"allow": ["anthropic"], "sort": "price"}
+        kw = transport.build_kwargs(
+            model="anthropic/claude-sonnet-4.6",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("openrouter"),
+            provider_preferences=prefs,
+        )
+        assert kw["extra_body"]["provider"] == prefs
+
+
+
+
+
+class TestNousParity:
+    """Nous: product tags, reasoning passthrough (disable included)."""
+
+    def test_tags(self, transport):
+        from agent.portal_tags import nous_portal_tags
+        kw = transport.build_kwargs(
+            model="hermes-3-llama-3.1-405b",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("nous"),
+        )
+        assert kw["extra_body"]["tags"] == nous_portal_tags()
+
+
+
+
+
+class TestQwenParity:
+    """Qwen: max_tokens=65536, vl_high_resolution, metadata top-level."""
+
+
+    def test_vl_high_resolution(self, transport):
+        kw = transport.build_kwargs(
+            model="qwen3.5-plus",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("qwen-oauth"),
+        )
+        assert kw["extra_body"]["vl_high_resolution_images"] is True
+
+    def test_metadata_top_level(self, transport):
+        """Qwen metadata goes to top-level api_kwargs, NOT extra_body."""
+        meta = {"sessionId": "s123", "promptId": "p456"}
+        kw = transport.build_kwargs(
+            model="qwen3.5-plus",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("qwen-oauth"),
+            qwen_session_metadata=meta,
+        )
+        assert kw["metadata"] == meta
+        assert "metadata" not in kw.get("extra_body", {})
+
+
+class TestCustomOllamaParity:
+    """Custom/Ollama: num_ctx, thinking controls — now tested via profile."""
+
+    def test_ollama_num_ctx(self, transport):
+        kw = transport.build_kwargs(
+            model="llama3.1",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            ollama_num_ctx=131072,
+        )
+        assert kw["extra_body"]["options"]["num_ctx"] == 131072
+
+    def test_think_false_when_disabled(self, transport):
+        kw = transport.build_kwargs(
+            model="qwen3:72b",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            reasoning_config={"enabled": False, "effort": "none"},
+            base_url="http://127.0.0.1:11434/v1",
+        )
+        assert kw["extra_body"]["think"] is False
+
+    def test_think_omitted_for_mistral_custom(self, transport):
+        kw = transport.build_kwargs(
+            model="mistral-small-latest",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            reasoning_config={"enabled": False, "effort": "none"},
+            base_url="https://api.mistral.ai/v1",
+        )
+        assert kw.get("extra_body", {}).get("think") is None
+        assert kw.get("reasoning_effort") == "none"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\providers\__init__.py ===
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\test_build_skills_index_health.py ===
+"""Invariants for scripts/build_skills_index.py's health-check guard.
+
+Regression context (June 2026): a GitHub API rate limit zeroed every
+api.github.com-backed source (github / well-known) at
+once during the docs deploy crawl. The build's health check fired and exited
+non-zero — but it had ALREADY written the degenerate index to disk, and
+deploy-site.yml swallowed the exit code with ``|| echo non-fatal``. The
+partial index (missing the OpenAI/Anthropic/HuggingFace/NVIDIA tabs) shipped
+to the live Skills Hub.
+
+These tests pin the two contracts that prevent a recurrence:
+  1. A degenerate crawl exits non-zero AND does NOT write the output file
+     (so extract-skills.py falls back instead of reading a broken index).
+  2. A healthy crawl exits zero AND writes the file with every source present.
+"""
+
+import os
+import sys
+import types
+
+import pytest
+
+import scripts.build_skills_index as build_mod
+
+
+def _meta(name, src):
+    return build_mod.SkillMeta(
+        name=name, description="d", source=src,
+        identifier=f"{src}/{name}", trust_level="community",
+    )
+
+
+class _FakeSource:
+    def __init__(self, src, n, rate_limited=False):
+        self._src = src
+        self._n = n
+        self.is_rate_limited = rate_limited
+
+    def search(self, query, limit=10):
+        return [_meta(f"{self._src}-{i}", self._src) for i in range(self._n)]
+
+    def enrich_owners(self, skills, max_workers=30, budget_seconds=None):
+        # No-op: fake source doesn't need owner enrichment.
+        return 0
+
+
+def _install_fake_sources(monkeypatch, *, github_count,
+                          well_known_count=10, github_rate_limited=False):
+    monkeypatch.setattr(build_mod, "SkillsShSource", lambda auth: _FakeSource("skills.sh", 15000))
+    monkeypatch.setattr(build_mod, "OptionalSkillSource", lambda: _FakeSource("official", 95))
+    monkeypatch.setattr(build_mod, "WellKnownSkillSource", lambda: _FakeSource("well-known", well_known_count))
+    monkeypatch.setattr(
+        build_mod, "GitHubSource",
+        lambda auth: _FakeSource("github", github_count, rate_limited=github_rate_limited),
+    )
+    monkeypatch.setattr(build_mod, "ClawHubSource", lambda: _FakeSource("clawhub", 69000))
+    monkeypatch.setattr(build_mod, "LobeHubSource", lambda: _FakeSource("lobehub", 500))
+    monkeypatch.setattr(build_mod, "BrowseShSource", lambda: _FakeSource("browse-sh", 380))
+    monkeypatch.setattr(
+        build_mod, "crawl_skills_sh",
+        lambda source: [build_mod._meta_to_dict(m) for m in source.search("", 0)],
+    )
+    monkeypatch.setattr(build_mod, "batch_resolve_paths", lambda skills, auth: skills)
+    monkeypatch.setattr(
+        build_mod, "GitHubAuth",
+        lambda: types.SimpleNamespace(auth_method=lambda: "token"),
+    )
+
+
+def test_degenerate_crawl_exits_nonzero_and_writes_no_file(tmp_path, monkeypatch):
+    """A collapsed GitHub crawl must fail loud and leave OUTPUT_PATH unwritten."""
+    out = tmp_path / "skills-index.json"
+    monkeypatch.setattr(build_mod, "OUTPUT_PATH", str(out))
+    _install_fake_sources(monkeypatch, github_count=0,
+                          well_known_count=0, github_rate_limited=True)
+
+    with pytest.raises(SystemExit) as exc:
+        build_mod.main()
+
+    assert exc.value.code != 0
+    # The degenerate index must NOT have been written — extract-skills.py
+    # relies on the file's absence to fall back instead of reading garbage.
+    assert not out.exists()
+
+
+def test_healthy_crawl_writes_index_with_all_sources(tmp_path, monkeypatch):
+    out = tmp_path / "skills-index.json"
+    monkeypatch.setattr(build_mod, "OUTPUT_PATH", str(out))
+    _install_fake_sources(monkeypatch, github_count=200)
+
+    build_mod.main()  # exit 0 (no SystemExit)
+
+    assert out.exists()
+    import json
+    data = json.loads(out.read_text())
+    sources = {s["source"] for s in data["skills"]}
+    # Every GitHub-API-backed source that vanished in the regression is present.
+    assert {"github", "well-known"} <= sources
+    assert data["skill_count"] == len(data["skills"])
+

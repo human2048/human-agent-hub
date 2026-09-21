@@ -1,0 +1,383 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-comic\references\character-template.md ===
+# Character Definition Template
+
+## Character Document Format
+
+Create `characters/characters.md` with the following structure:
+
+```markdown
+# Character Definitions - [Comic Title]
+
+**Style**: [selected style]
+**Art Direction**: [Ligne Claire / Manga / etc.]
+
+---
+
+## Character 1: [Name]
+
+**Role**: [Protagonist / Mentor / Antagonist / Narrator]
+**Age**: [approximate age or age range in story]
+
+**Appearance**:
+- Face shape: [oval/square/round]
+- Hair: [color, style, length]
+- Eyes: [color, shape, distinctive features]
+- Build: [height, body type]
+- Distinguishing features: [glasses, beard, scar, etc.]
+
+**Costume**:
+- Default outfit: [detailed description]
+- Color palette: [primary colors for this character]
+- Accessories: [hat, bag, tools, etc.]
+
+**Expression Range**:
+- Neutral: [description]
+- Happy/Excited: [description]
+- Thinking/Confused: [description]
+- Determined: [description]
+
+**Visual Reference Notes**:
+[Any specific artistic direction]
+
+---
+
+## Character 2: [Name]
+...
+```
+
+## Reference Sheet Image Prompt
+
+After character definitions, include a prompt for generating the reference sheet:
+
+```markdown
+## Reference Sheet Prompt
+
+Character reference sheet in [style] style, clean lines, flat colors:
+
+[ROW 1 - Character Name]:
+- Front view: [detailed description]
+- 3/4 view: [description]
+- Expression sheet: Neutral | Happy | Focused | Worried
+
+[ROW 2 - Character Name]:
+...
+
+COLOR PALETTE:
+- [Character 1]: [colors]
+- [Character 2]: [colors]
+
+White background, clear labels under each character.
+```
+
+## Example: Turing Biography
+
+```markdown
+# Character Definitions - The Imitation Game
+
+**Style**: classic (Ligne Claire)
+**Art Direction**: Clean lines, muted colors, period-accurate details
+
+---
+
+## Character 1: Alan Turing
+
+**Role**: Protagonist
+**Age**: 25-40 (varies across story)
+
+**Appearance**:
+- Face shape: Oval, slightly angular
+- Hair: Dark brown, wavy, slightly disheveled
+- Eyes: Deep-set, intense gaze
+- Build: Tall, lean, slightly awkward posture
+- Distinguishing features: Prominent brow, thoughtful expression
+
+**Costume**:
+- Default outfit: Tweed jacket with elbow patches, white shirt, no tie
+- Color palette: Muted browns, navy blue, cream
+- Accessories: Occasionally a pipe, papers/notebooks
+
+**Expression Range**:
+- Neutral: Thoughtful, slightly distant
+- Happy/Excited: Eureka moment, eyes bright, subtle smile
+- Thinking/Confused: Furrowed brow, looking at abstract space
+- Determined: Jaw set, focused eyes
+
+---
+
+## Character 2: The Bombe Machine
+
+**Role**: Supporting (anthropomorphized)
+**Appearance**:
+- Large brass and wood cabinet
+- Dial "eyes" that can express states
+- Paper tape "mouth"
+- Indicator lights for emotions
+
+**Expression Range**:
+- Processing: Spinning dials, humming
+- Success: Lights up warmly
+- Stuck: Smoke wisps, stuttering
+
+---
+
+## Reference Sheet Prompt
+
+Character reference sheet in Ligne Claire style, clean lines, flat colors:
+
+TOP ROW - Alan Turing:
+- Front view: Young man, 30s, short dark wavy hair, thoughtful expression, wearing tweed jacket with elbow patches, white shirt
+- 3/4 view: Same character, slight smile, showing profile of nose
+- Expression sheet: Neutral | Excited (eureka moment) | Focused (working) | Worried
+
+BOTTOM ROW - The Bombe Machine (anthropomorphized):
+- Bombe machine as character: Large, brass and wood, dial "eyes", paper tape "mouth"
+- Expressions: Processing (spinning dials) | Success (lights up) | Stuck (smoke wisps)
+
+COLOR PALETTE:
+- Turing: Muted browns (#8B7355), navy blue (#2C3E50), cream (#F5F5DC)
+- Machine: Brass (#B5A642), mahogany (#4E2728), emerald indicators (#2ECC71)
+
+White background, clear labels under each character.
+```
+
+## Handling Age Variants
+
+For biographies spanning many years, define age variants:
+
+```markdown
+## Alan Turing - Age Variants
+
+### Young (1920s, age 10-18)
+- Boyish features, round face
+- School uniform (Sherborne)
+- Curious, eager expression
+
+### Adult (1930s-40s, age 25-35)
+- Angular face, defined jaw
+- Tweed jacket, rumpled appearance
+- Intense, focused expression
+
+### Later (1950s, age 40+)
+- Slightly weathered
+- More casual dress
+- Thoughtful, sometimes melancholic
+```
+
+## Best Practices
+
+| Practice | Description |
+|----------|-------------|
+| Be specific | "Short dark wavy hair, parted left" not just "dark hair" |
+| Use distinguishing features | Glasses, scars, accessories that identify character |
+| Define color codes | Use specific color names or hex codes |
+| Include age markers | Wrinkles, posture, clothing style matching era |
+| Reference real people | For historical figures, note "based on 1940s photographs" |
+
+## Why Character Reference Matters
+
+Without unified character definition, AI generates inconsistent appearances. The reference sheet provides:
+1. Visual anchors for consistent features
+2. Color palettes for consistent coloring
+3. Expression documentation for emotional portrayals
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-comic\references\ohmsha-guide.md ===
+# Ohmsha Manga Guide Style
+
+Guidelines for educational manga comics using the `ohmsha` preset.
+
+## Character Setup
+
+| Role | Default | Traits |
+|------|---------|--------|
+| Student (Role A) | 大雄 | Confused, asks basic but crucial questions, represents reader |
+| Mentor (Role B) | 哆啦A梦 | Knowledgeable, patient, uses gadgets as technical metaphors |
+| Antagonist (Role C, optional) | 胖虎 | Represents misunderstanding, or "noise" in the data |
+
+Custom characters: ask the user for role → name mappings (e.g., `Student:小明, Mentor:教授, Antagonist:Bug怪`).
+
+## Character Reference Sheet Style
+
+For Ohmsha style, use manga/anime style with:
+- Exaggerated expressions for educational clarity
+- Simple, distinctive silhouettes
+- Bright, saturated color palettes
+- Chibi/SD (super-deformed) variants for comedic reactions
+
+## Outline Spec Block
+
+Every ohmsha outline must start with:
+
+```markdown
+【漫画规格单】
+- Language: [Same as input content]
+- Style: Ohmsha (Manga Guide), Full Color
+- Layout: Vertical Scrolling Comic (竖版条漫)
+- Characters: [List character names and roles]
+- Character Reference: characters/characters.png
+- Page Limit: ≤20 pages
+```
+
+## Visual Metaphor Rules (Critical)
+
+**NEVER** create "talking heads" panels. Every technical concept must become:
+
+1. **A tangible gadget/prop** - Something characters can hold, use, demonstrate
+2. **An action scene** - Characters doing something that illustrates the concept
+3. **A visual environment** - Stepping into a metaphorical space
+
+### Examples
+
+| Concept | Bad (Talking Heads) | Good (Visual Metaphor) |
+|---------|---------------------|------------------------|
+| Word embeddings | Characters discussing vectors | 哆啦A梦拿出"词向量压缩机"，把书本压缩成彩色小球 |
+| Gradient descent | Explaining math formula | 大雄在山谷地形上滚球，寻找最低点 |
+| Neural network | Diagram on whiteboard | 角色走进由发光节点组成的网络迷宫 |
+
+## Page Title Convention
+
+Avoid AI-style "Title: Subtitle" format. Use narrative descriptions:
+
+- ❌ "Page 3: Introduction to Neural Networks"
+- ✓ "Page 3: 大雄被海量单词淹没，哆啦A梦拿出'词向量压缩机'"
+
+## Ending Requirements
+
+- NO generic endings ("What will you choose?", "Thanks for reading")
+- End with: Technical summary moment OR character achieving a small goal
+- Final panel: Sense of accomplishment, not open-ended question
+
+### Good Endings
+
+- Student successfully applies learned concept
+- Visual callback to opening problem, now solved
+- Mentor gives summary while student demonstrates understanding
+
+### Bad Endings
+
+- "What do you think?" open questions
+- "Thanks for reading this tutorial"
+- Cliffhanger without resolution
+
+## Layout Preference
+
+Ohmsha style typically uses:
+- `webtoon` (vertical scrolling) - Primary choice
+- `dense` - For information-heavy sections
+- `mixed` - For varied pacing
+
+Avoid `cinematic` and `splash` for educational content.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-comic\references\partial-workflows.md ===
+# Partial Workflows
+
+Options to run specific parts of the workflow. Trigger these via natural language (e.g., "just the storyboard", "regenerate page 3").
+
+## Options Summary
+
+| Option | Steps Executed | Output |
+|--------|----------------|--------|
+| Storyboard only | 1-3 | `storyboard.md` + `characters/` |
+| Prompts only | 1-5 | + `prompts/*.md` |
+| Images only | 7-8 | + images |
+| Regenerate N | 7 (partial) | Specific page(s) |
+
+---
+
+## Storyboard-only
+
+Generate storyboard and characters without prompts or images.
+
+**User cue**: "storyboard only", "just the outline", "don't generate images yet".
+
+**Workflow**: Steps 1-3 only (stop after storyboard + characters)
+
+**Output**:
+- `analysis.md`
+- `storyboard.md`
+- `characters/characters.md`
+
+**Use case**: Review and edit the storyboard before generating images. Useful for:
+- Getting feedback on the narrative structure
+- Making manual adjustments to panel layouts
+- Defining custom characters
+
+---
+
+## Prompts-only
+
+Generate storyboard, characters, and prompts without images.
+
+**User cue**: "prompts only", "write the prompts but don't generate yet".
+
+**Workflow**: Steps 1-5 (generate prompts, skip images)
+
+**Output**:
+- `analysis.md`
+- `storyboard.md`
+- `characters/characters.md`
+- `prompts/*.md`
+
+**Use case**: Review and edit prompts before image generation. Useful for:
+- Fine-tuning image generation prompts
+- Ensuring visual consistency before committing to generation
+- Making style adjustments at the prompt level
+
+---
+
+## Images-only
+
+Generate images from existing prompts (starts at Step 7).
+
+**User cue**: "generate images from existing prompts", "run the images now" (pointing at an existing `comic/topic-slug/` directory).
+
+**Workflow**: Skip to Step 7, then 8
+
+**Prerequisites** (must exist in directory):
+- `prompts/` directory with page prompt files
+- `storyboard.md` with style information
+- `characters/characters.md` with character definitions
+
+**Output**:
+- `characters/characters.png` (if not exists)
+- `NN-{cover|page}-[slug].png` images
+
+**Use case**: Re-generate images after editing prompts. Useful for:
+- Recovering from failed image generation
+- Trying different image generation settings
+- Regenerating after manual prompt edits
+
+---
+
+## Regenerate
+
+Regenerate specific pages only.
+
+**User cue**: "regenerate page 3", "redo pages 2, 5, 8", "regenerate the cover".
+
+**Workflow**:
+1. Read existing prompts for specified pages
+2. Regenerate images only for those pages via `image_generate`
+3. Download each returned URL and overwrite the existing PNG
+
+**Prerequisites** (must exist):
+- `prompts/NN-{cover|page}-[slug].md` for specified pages
+- `characters/characters.md` (for agent-side consistency checks, if it was used originally)
+
+**Output**:
+- Regenerated `NN-{cover|page}-[slug].png` for specified pages
+
+**Use case**: Fix specific pages without regenerating entire comic. Useful for:
+- Fixing a single problematic page
+- Iterating on specific visuals
+- Regenerating pages after prompt edits
+
+**Page numbering**:
+- `0` = Cover page
+- `1-N` = Content pages
+

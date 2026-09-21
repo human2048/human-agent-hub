@@ -1,0 +1,214 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_conftest_wal_gate.py ===
+"""The conftest WAL gate must agree with hermes_state, and must not import it.
+
+``tests/conftest.py::_wal_is_usable`` duplicates the SQLite WAL-reset version
+predicate instead of importing ``hermes_state``. That is deliberate: importing
+``hermes_state`` during collection caches ``DEFAULT_DB_PATH`` from the real
+``~/.hermes`` before the per-test ``HERMES_HOME`` redirect, which makes tests
+read the developer's live production database.
+
+Duplication needs a guard, so these tests pin the two implementations in
+agreement across the documented upstream boundaries.
+"""
+
+import sqlite3
+
+import pytest
+
+from hermes_state_wal import is_sqlite_wal_reset_vulnerable
+from tests.conftest import _wal_is_usable
+
+
+@pytest.mark.parametrize(
+    "version_info",
+    [
+        (3, 6, 23),   # pre-WAL
+        (3, 7, 0),    # first WAL release — vulnerable
+        (3, 44, 5),   # below the 3.44 backport
+        (3, 44, 6),   # 3.44 backport — fixed
+        (3, 45, 0),   # next minor, back to vulnerable
+        (3, 50, 4),   # the version that exposed this (repo .venv)
+        (3, 50, 6),   # below the 3.50 backport
+        (3, 50, 7),   # 3.50 backport — fixed
+        (3, 51, 2),   # last vulnerable
+        (3, 51, 3),   # fixed upstream
+        (3, 53, 1),   # the managed runtime
+    ],
+)
+def test_conftest_gate_agrees_with_hermes_state(version_info, monkeypatch):
+    """``_wai_is_usable`` must be the exact inverse of the canonical predicate."""
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", version_info)
+    assert _wal_is_usable() is not is_sqlite_wal_reset_vulnerable(version_info), (
+        f"conftest gate and hermes_state disagree for SQLite {version_info}"
+    )
+
+
+def test_conftest_does_not_import_hermes_state_at_collection():
+    """The gate must stay import-free of hermes_state.
+
+    Importing it during collection caches DEFAULT_DB_PATH from the real
+    ~/.hermes, so tests read live production sessions instead of a tempdir.
+    Reading the source is not an option here (banned), so assert on behavior:
+    the gate must work with ``hermes_state`` absent from ``sys.modules`` and
+    blocked from being imported.
+    """
+    import builtins
+    import sys
+
+    real_import = builtins.__import__
+    blocked: list[str] = []
+
+    def guard(name, *args, **kwargs):
+        if name == "hermes_state" or name.startswith("hermes_state."):
+            blocked.append(name)
+            raise AssertionError(
+                "conftest._wal_is_usable imported hermes_state — this caches "
+                "DEFAULT_DB_PATH from the real ~/.hermes during collection"
+            )
+        return real_import(name, *args, **kwargs)
+
+    saved = sys.modules.pop("hermes_state", None)
+    builtins.__import__ = guard
+    try:
+        _wal_is_usable()  # must not raise
+    finally:
+        builtins.__import__ = real_import
+        if saved is not None:
+            sys.modules["hermes_state"] = saved
+    assert not blocked
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_conversation_root.py ===
+"""Tests for SessionDB.get_conversation_root — stable conversation id resolution.
+
+The conversation root is the Nous Portal ``conversation=`` tag value: one
+stable id per user-facing conversation, surviving context-compression
+session rotation and covering delegate subagent trees.
+"""
+import pytest
+
+from hermes_state import SessionDB
+
+
+@pytest.fixture
+def db(tmp_path):
+    return SessionDB(tmp_path / "state.db")
+
+
+def test_root_of_standalone_session_is_itself(db):
+    db.create_session("solo", source="cli")
+    assert db.get_conversation_root("solo") == "solo"
+
+
+
+
+
+
+def test_root_covers_delegate_child_sessions(db):
+    db.create_session("parent", source="cli")
+    db.create_session("child", source="delegate", parent_session_id="parent")
+    assert db.get_conversation_root("child") == "parent"
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_corrupt_row_robustness.py ===
+"""One corrupt timestamp row must degrade to one '?' cell, never kill a whole listing/export/report.
+
+Real SQLite fixtures: SQLite dynamic typing lets a TEXT cell or a garbage double sit in a REAL
+timestamp column (#102399, #102352, #99959). Never monkeypatch the coercion helper.
+"""
+
+import argparse
+import logging
+import sqlite3
+
+import pytest
+
+from agent.insights import InsightsEngine
+from hermes_cli.session_export import iter_user_prompt_records
+from hermes_cli.session_export_html import generate_multi_session_html_export
+from hermes_cli.session_export_md import _iso_timestamp
+from hermes_cli.sessions_cmd import _cmd_list
+from hermes_state import SessionDB
+
+
+@pytest.fixture
+def corrupt_db(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    for sid in ("good", "bad-text", "bad-huge"):
+        db.create_session(sid, "cli")
+        db.append_message(sid, "user", f"hello from {sid}")
+
+    def _corrupt(conn):
+        conn.execute("UPDATE sessions SET started_at='not-a-timestamp', last_activity_at='not-a-timestamp' "
+                     "WHERE id='bad-text'")
+        conn.execute("UPDATE messages SET timestamp='not-a-timestamp' WHERE session_id='bad-text'")
+        conn.execute("UPDATE sessions SET started_at=8.4e252 WHERE id='bad-huge'")
+        conn.execute("UPDATE messages SET timestamp=1e30 WHERE session_id='bad-huge'")
+
+    db._execute_write(_corrupt)
+    yield db
+    db.close()
+
+
+def test_list_export_and_insights_survive_corrupt_timestamp_rows(corrupt_db, capsys, caplog):
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.timefmt"):
+        _cmd_list(corrupt_db, argparse.Namespace(limit=20, source=None, all=False, workspace=None))
+        listing = capsys.readouterr().out
+        exported = corrupt_db.export_all()
+        records = list(iter_user_prompt_records(exported))
+        html = generate_multi_session_html_export(exported)
+        md_stamps = [_iso_timestamp(s["started_at"]) for s in exported]
+        report = InsightsEngine(corrupt_db).generate(days=365_000)
+
+    # Every session is still present on every surface; the bad cells degrade, the good one renders.
+    assert all(sid in listing for sid in ("good", "bad-text", "bad-huge")) and "?" in listing
+    assert {r["session_id"] for r in records} == {"good", "bad-text", "bad-huge"}
+    assert "not-a-timestamp" not in html and html.count("N/A") >= 2
+    assert md_stamps.count("not-a-timestamp") == 1 and any(stamp.endswith("Z") for stamp in md_stamps)
+    assert report["overview"]["total_sessions"] == 3
+    # The warning names the session so the corrupt row can be found.
+    assert any("bad-huge" in rec.getMessage() for rec in caplog.records)
+
+
+def test_writers_never_persist_an_out_of_window_timestamp(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s", "cli")
+        db.append_message("s", "user", "a", timestamp=8.4e252)
+        db.append_messages_batch("s", [{"role": "assistant", "content": "b", "timestamp": "not-a-timestamp"}])
+        stored = [row["timestamp"] for row in db.get_messages("s")]
+    finally:
+        db.close()
+    assert len(stored) == 2 and all(isinstance(ts, float) and 0 < ts < 4.2e9 for ts in stored)
+
+
+def test_bulk_delete_and_prune_stay_below_sqlite_variable_limit(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        old = 1_600_000_000.0
+        ids = [f"cron_job_{i}" for i in range(1200)]
+
+        def seed(conn):
+            conn.executemany("INSERT INTO sessions (id, source, started_at, ended_at, message_count) "
+                             "VALUES (?, 'cron', ?, ?, 1)", [(sid, old, old) for sid in ids])
+            conn.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'x', ?)",
+                             [(sid, old) for sid in ids])
+
+        db._execute_write(seed)
+        db._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)  # the legacy ceiling, deterministic
+        assert db.prune_sessions(older_than_days=14, source="cron") == 1200
+        db._execute_write(seed)
+        db._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        assert db.delete_sessions(ids) == 1200
+        assert db._read_one("SELECT COUNT(*) FROM messages WHERE session_id NOT IN (SELECT id FROM sessions)")[0] == 0
+    finally:
+        db.close()
+

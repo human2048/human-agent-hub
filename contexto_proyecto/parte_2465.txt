@@ -1,0 +1,371 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\docker\test_container_restart.py ===
+"""Container-restart survives per-profile gateway registrations.
+
+The s6 dynamic scandir at /run/service/ lives on tmpfs and is wiped
+on every container restart. Phase 4 Task 4.0's container_boot module
++ cont-init.d/02-reconcile-profiles regenerate the service slots from
+$HERMES_HOME/profiles/<name>/gateway_state.json on every boot and
+auto-start only those whose last state was `running`.
+
+These tests stand up a container with a named volume, create profiles
+inside it in various gateway states, restart the container, and
+assert the reconciler did the right thing.
+
+Every ``docker exec`` here runs as the unprivileged ``hermes`` user
+(via :func:`docker_exec` / :func:`docker_exec_sh` in conftest); see
+the conftest module docstring.
+"""
+from __future__ import annotations
+
+import subprocess
+import time
+
+import pytest
+
+from tests.docker.conftest import docker_exec, docker_exec_sh, wait_for_path, wait_for_log, wait_for_docker_logs, poll_container
+
+
+def _docker(*args: str, **kw) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", *args],
+        capture_output=True, text=True, timeout=kw.pop("timeout", 60),
+        **kw,
+    )
+
+
+
+
+
+def _wait_for_reconcile_log_mention(
+    container: str,
+    profile: str,
+    *,
+    deadline_s: float = 30.0,
+    interval_s: float = 0.25,
+) -> str:
+    """Poll until /opt/data/logs/container-boot.log mentions `profile`.
+    """
+    return wait_for_log(container, "/opt/data/logs/container-boot.log",  f"profile={profile}")
+
+
+@pytest.fixture
+def restart_container(request, built_image: str):
+    """A long-running container with a named volume so docker restart
+    preserves $HERMES_HOME/profiles/."""
+    safe = request.node.name.replace("[", "_").replace("]", "_")
+    name = f"hermes-restart-{safe}"
+    volume = f"hermes-restart-vol-{safe}"
+    _docker("rm", "-f", name)
+    _docker("volume", "rm", "-f", volume)
+    _docker("volume", "create", volume, timeout=10).check_returncode()
+    r = _docker(
+        "run", "-d", "--name", name,
+        "-v", f"{volume}:/opt/data",
+        built_image, "sleep", "infinity",
+        timeout=30,
+    )
+    r.check_returncode()
+    # Wait for s6 + stage2 + 02-reconcile to publish the boot log so
+    # the test can rely on the default slot being registered before
+    # it starts issuing commands. The reconciler always writes one
+    # 'default' line on every boot (PR #30136 item I1) — that's our
+    # readiness signal.
+    wait_for_log(name, "/opt/data/logs/container-boot.log", "profile=default")
+    yield name
+    _docker("rm", "-f", name)
+    _docker("volume", "rm", "-f", volume)
+
+
+
+
+def test_stopped_gateway_stays_stopped_after_restart(restart_container: str) -> None:
+    container = restart_container
+
+    docker_exec(container, "hermes", "profile", "create", "writer").check_returncode()
+
+    # Write 'stopped' directly so we don't have to race against the
+    # gateway's own state writes.
+    write_state = (
+        "import json, pathlib; "
+        "p = pathlib.Path('/opt/data/profiles/writer/gateway_state.json'); "
+        "p.write_text(json.dumps({'gateway_state': 'stopped', 'timestamp': 1}))"
+    )
+    docker_exec(container, "python3", "-c", write_state, timeout=10).check_returncode()
+
+    _docker("restart", container, timeout=60).check_returncode()
+    _wait_for_reconcile_log_mention(container, "writer", deadline_s=30.0)
+
+    # Slot exists.
+    assert wait_for_path(
+        container, "/run/service/gateway-writer", kind="d", deadline_s=10.0,
+    )
+
+    # Down marker present.
+    r = docker_exec_sh(container, "test -f /run/service/gateway-writer/down")
+    assert r.returncode == 0, "down marker missing despite prior_state=stopped"
+
+
+def test_stale_gateway_pid_cleaned_up_on_restart(restart_container: str) -> None:
+    """A dead container's gateway.pid + processes.json must NOT
+    survive the restart — a numerically-equal live PID in the new
+    container is a different process and would confuse the gateway
+    process-mismatch checks."""
+    container = restart_container
+
+    docker_exec(container, "hermes", "profile", "create", "ghost").check_returncode()
+
+    # Stamp stale runtime files alongside a 'running' state so the
+    # reconciler walks this profile.
+    stamp = (
+        "import json, pathlib; "
+        "p = pathlib.Path('/opt/data/profiles/ghost'); "
+        "(p / 'gateway_state.json').write_text(json.dumps({'gateway_state': 'stopped', 'timestamp': 1})); "
+        "(p / 'gateway.pid').write_text(json.dumps({'pid': 99999, 'host': 'old'})); "
+        "(p / 'processes.json').write_text('[]')"
+    )
+    docker_exec(container, "python3", "-c", stamp, timeout=10).check_returncode()
+
+    _docker("restart", container, timeout=60).check_returncode()
+    _wait_for_reconcile_log_mention(container, "ghost", deadline_s=30.0)
+
+    # Stale runtime files swept.
+    r = docker_exec_sh(container, "test -f /opt/data/profiles/ghost/gateway.pid")
+    assert r.returncode != 0, "stale gateway.pid survived restart"
+    r = docker_exec_sh(container, "test -f /opt/data/profiles/ghost/processes.json")
+    assert r.returncode != 0, "stale processes.json survived restart"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\docker\test_dashboard.py ===
+"""Harness: dashboard opt-in via HERMES_DASHBOARD.
+
+Today (tini): dashboard starts once when HERMES_DASHBOARD=1; if it crashes
+it stays dead. After Phase 2 (s6): dashboard starts once; if it crashes
+it is restarted under supervision. The restart-after-crash test lives in
+Phase 2 Task 2.5; this file only locks the opt-in surface (which must
+not change between tini and s6).
+
+Every ``docker exec`` here runs as the unprivileged ``hermes`` user
+(via :func:`docker_exec`/:func:`docker_exec_sh` in conftest), matching
+the realistic runtime context. See the conftest module docstring.
+"""
+from __future__ import annotations
+
+import json
+import time
+
+from tests.docker.conftest import docker_exec, docker_exec_sh, start_container, poll_container
+
+
+def test_dashboard_not_running_by_default(
+    built_image: str, container_name: str,
+) -> None:
+    """Without HERMES_DASHBOARD, no dashboard process should be running."""
+    start_container(built_image, container_name, cmd="sleep 60")
+    r = docker_exec(container_name, "pgrep", "-f", "hermes dashboard")
+    # pgrep exits non-zero when no match found
+    assert r.returncode != 0, (
+        "Dashboard should not be running without HERMES_DASHBOARD"
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# OAuth auth-gate behaviour — regression guard for the dashboard-insecure
+# auto-injection bug. Pre-fix, the s6 run script appended `--insecure`
+# whenever `HERMES_DASHBOARD_HOST` was non-loopback, silently disabling
+# the OAuth gate on every container-deployed dashboard. The matching
+# static-text guard lives in tests/test_docker_home_override_scripts.py;
+# this is the behavioural end-to-end check.
+# ---------------------------------------------------------------------------
+
+
+def _http_probe(
+    container: str,
+    path: str,
+    *,
+    deadline_s: float = 60.0,
+) -> tuple[int, str]:
+    """Poll ``http://127.0.0.1:9119<path>`` from inside the container.
+
+    Returns ``(status_code, body)`` as soon as the dashboard answers any
+    HTTP response — 200, 401, 503, anything. The image doesn't ship
+    ``curl`` but the venv's stdlib ``urllib`` is good enough; we use a
+    proper ``try``/``except`` to intercept ``HTTPError`` because
+    ``urlopen`` raises on 4xx/5xx, and we treat those as legitimate
+    responses (the OAuth gate's 401 IS the success signal for the
+    gate-engaged test).
+
+    Connection errors (uvicorn still starting, fail-closed exited) keep
+    the poll loop running until ``deadline_s`` elapses.
+
+    The probe Python program is fed over stdin (``python -``) rather
+    than ``python -c`` so we can use proper multi-line syntax with
+    ``try``/``except`` blocks without escaping hell.
+
+    Raises ``AssertionError`` on timeout.
+    """
+    py_program = f"""\
+import urllib.request, urllib.error
+req = urllib.request.Request("http://127.0.0.1:9119{path}")
+try:
+    r = urllib.request.urlopen(req, timeout=5)
+    print(r.status)
+    print(r.read().decode(), end="")
+except urllib.error.HTTPError as h:
+    print(h.code)
+    print(h.read().decode(), end="")
+"""
+    # Feed the program over stdin via a heredoc so docker_exec_sh's
+    # single bash string stays clean. The 'PY' delimiter is quoted to
+    # disable shell expansion inside the heredoc body.
+    probe = (
+        "/opt/hermes/.venv/bin/python - <<'PY'\n"
+        f"{py_program}"
+        "PY"
+    )
+    end = time.monotonic() + deadline_s
+    last_err = ""
+    while time.monotonic() < end:
+        r = docker_exec_sh(container, probe, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            lines = r.stdout.split("\n", 1)
+            try:
+                status = int(lines[0].strip())
+                body = lines[1] if len(lines) > 1 else ""
+                return status, body
+            except (ValueError, IndexError) as exc:
+                last_err = f"parse: {exc!r} / stdout={r.stdout!r}"
+        else:
+            last_err = f"rc={r.returncode} stderr={r.stderr!r}"
+        time.sleep(0.5)
+    raise AssertionError(
+        f"Probe of {path} never returned HTTP within {deadline_s}s; "
+        f"last error: {last_err}"
+    )
+
+
+def test_dashboard_oauth_gate_engages_on_non_loopback_bind(
+    built_image: str, container_name: str,
+) -> None:
+    """The s6 dashboard run script must NOT auto-add ``--insecure`` when the
+    dashboard binds to ``0.0.0.0``. The OAuth auth gate engages on its own
+    when a ``DashboardAuthProvider`` is registered (the bundled nous
+    provider activates whenever ``HERMES_DASHBOARD_OAUTH_CLIENT_ID`` is
+    set).
+
+    Regression guard for the wildcard-subdomain rollout where every
+    portal-provisioned agent binds ``0.0.0.0`` and relies on the OAuth
+    gate to authenticate browser callers. Before this fix, the run script
+    flipped ``--insecure`` on for any non-loopback bind, which routed
+    ``start_server`` straight back into the legacy ``allow_public=True``
+    branch and disabled the gate every time.
+
+    We verify two independent observable consequences of the gate being
+    on:
+
+    1. ``/api/auth/providers`` (publicly reachable through the gate so
+       the login page can bootstrap) returns 200 with ``nous`` in the
+       provider list — proves the bundled provider registered.
+    2. ``/api/sessions`` (a gated route under both the legacy
+       ``_SESSION_TOKEN`` middleware and the OAuth gate) returns 401
+       to an unauthenticated caller — proves the OAuth gate is actively
+       intercepting browser traffic. We deliberately probe a gated route
+       here rather than ``/api/status``: status sits in the shared
+       ``PUBLIC_API_PATHS`` allowlist (portal liveness probe target) and
+       responds 200 without a cookie under both gates, so it cannot
+       distinguish "gate on" from "gate off".
+    """
+    start_container(
+        built_image, container_name,
+        "HERMES_DASHBOARD=1",
+        "HERMES_DASHBOARD_HOST=0.0.0.0",
+        "HERMES_DASHBOARD_OAUTH_CLIENT_ID=agent:test-instance",
+        cmd="sleep 120",
+    )
+
+    # (1) Provider registry visible via the public bootstrap endpoint.
+    status_code, body = _http_probe(container_name, "/api/auth/providers")
+    assert status_code == 200, (
+        f"/api/auth/providers should return 200 when a provider is "
+        f"registered; got {status_code} body={body!r}"
+    )
+    payload = json.loads(body)
+    provider_names = [p.get("name") for p in payload.get("providers", [])]
+    assert "nous" in provider_names, (
+        "Bundled dashboard_auth/nous provider should register when "
+        f"HERMES_DASHBOARD_OAUTH_CLIENT_ID is set. Got: {payload!r}"
+    )
+
+    # (2) A gated route (``/api/sessions``) returns 401 to an
+    #     unauthenticated caller — the OAuth gate is intercepting.
+    status_code, body = _http_probe(container_name, "/api/sessions")
+    assert status_code == 401, (
+        "OAuth gate must intercept gated /api/* routes on 0.0.0.0 bind "
+        "when a provider is registered and HERMES_DASHBOARD_INSECURE "
+        f"is unset. Got: status={status_code} body={body!r}"
+    )
+
+    # (3) ``/api/status`` remains 200 under the gate — it's in the shared
+    #     ``PUBLIC_API_PATHS`` allowlist so NAS's wildcard-subdomain
+    #     liveness probe (``fly-provider.ts`` ``getInstanceRuntimeStatus``)
+    #     can reach it without a cookie. Regression guard: this allowlist
+    #     drifted once already and surfaced every healthy agent as
+    #     STARTING/down in the portal UI.
+    status_code, body = _http_probe(container_name, "/api/status")
+    assert status_code == 200, (
+        "/api/status must remain publicly reachable under the OAuth gate "
+        "— the portal uses it as the wildcard-subdomain liveness probe. "
+        f"Got: status={status_code} body={body!r}"
+    )
+    status = json.loads(body)
+    assert status.get("auth_required") is True, (
+        "/api/status must report auth_required=True when the OAuth gate "
+        f"is engaged so the SPA/portal can distinguish modes. Got: {status!r}"
+    )
+
+
+def test_dashboard_insecure_env_var_no_longer_bypasses_gate(
+    built_image: str, container_name: str,
+) -> None:
+    """``HERMES_DASHBOARD_INSECURE=1`` NO LONGER disables the auth gate
+    (June 2026 hardening). With insecure set on a 0.0.0.0 bind and NO auth
+    provider registered, start_server fails closed — the dashboard never
+    binds, so ``/api/status`` is unreachable. This proves the unauthenticated
+    public-dashboard escape hatch is gone: there is no env that serves the
+    dashboard on a public bind without an auth provider.
+    """
+    start_container(
+        built_image, container_name,
+        "HERMES_DASHBOARD=1",
+        "HERMES_DASHBOARD_HOST=0.0.0.0",
+        "HERMES_DASHBOARD_INSECURE=1",
+        cmd="sleep 120",
+    )
+    # Fail-closed: the dashboard process must NOT successfully serve. Probe
+    # for a few seconds; /api/status should never become reachable because
+    # start_server raised SystemExit before binding.
+    ok, _ = poll_container(
+        container_name,
+        "curl -fsS -m 2 http://127.0.0.1:9119/api/status >/dev/null 2>&1",
+        deadline_s=12.0,
+    )
+    assert not ok, (
+        "Dashboard must NOT serve on a public bind with --insecure and no "
+        "auth provider — the gate fails closed. /api/status became reachable, "
+        "meaning the unauthenticated escape hatch is still open."
+    )
+

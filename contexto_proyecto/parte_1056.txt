@@ -1,0 +1,250 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\lateral-provocations.md ===
+# Lateral Provocations
+
+Edward de Bono, 1967–. The PO operator and five provocation moves for breaking pattern lock-in. PO is a linguistic marker that flags a statement as a deliberate provocation, not a claim — to be taken seriously even when implausible.
+
+## When to use
+
+- Idea is too safe / too obvious
+- Variations are all minor rephrasings of the same core
+- Suspect a hidden assumption is constraining the search
+- Group with low psychological safety needs permission to say wrong things
+
+## Don't use when
+
+- Disciplined development of an existing idea (provocations interrupt)
+- Engineering safety / legal / medical (provocations are exploratory)
+- Group will dismiss the provocation rather than engage
+
+## The five operators
+
+**1. Escape (negation).** Take something normally true of the system; negate it.
+- Po: restaurants do not serve food.
+- Po: code review does not happen before merge.
+- Po: the meeting has no agenda.
+
+**2. Reversal.** Reverse a relationship.
+- Po: the patient operates on the surgeon.
+- Po: the listener composes the song.
+- Po: the readers write the book.
+
+**3. Exaggeration.** Push a parameter to extreme.
+- Po: the meeting has 1000 attendees.
+- Po: the novel has one sentence.
+- Po: the company has one customer.
+
+**4. Distortion.** Change order, location, or relationship of components.
+- Po: customers pay before they're born.
+- Po: the recipe lists ingredients after the cooking instructions.
+- Po: revenue arrives the year before expenses.
+
+**5. Wishful thinking.** State an impossible outcome.
+- Po: the medication cures before the patient is sick.
+- Po: the software ships without bugs.
+- Po: the painting paints itself.
+
+## Random-word technique
+
+1. Pick a random noun (dictionary at random page; or list of 1000 nouns + random index).
+2. List 5 connections between the random word and your problem, however tenuous.
+3. Use the strongest.
+
+Example. Problem: my CLI is hard to discover. Random word: "lighthouse".
+- Lighthouses are visible from far; my CLI's affordances are not visible at all.
+- Lighthouses are lit at the right time; my CLI's help is always on, never contextual.
+- Lighthouses signal *danger*; my CLI doesn't signal when an action is irreversible. ← strongest
+- Lighthouse keepers signal back; mine has no two-way contact.
+- Lighthouses are passive; the ship approaches them.
+
+Result: the CLI should signal danger when about to do something irreversible. Concrete, useful, not obvious from inside the original frame.
+
+## Procedure
+
+### Single-PO session
+1. State the problem.
+2. Pick an operator.
+3. Generate a PO statement.
+4. List 5 consequences if the PO statement were true.
+5. Pick the strongest consequence.
+6. Translate into a real proposal.
+
+### Stacked operators
+Two operators on the same problem. Intersection often more interesting than either alone. Example: Escape ("po: meetings don't have agendas") + Reversal ("po: attendees set the agenda after the meeting") → an asynchronous "what we ended up discussing" doc, written collectively after the fact.
+
+## Anti-slop notes
+
+- Generic provocations ("po: things are different") are placeholders, not provocations. Specify what's changed and how.
+- Don't fake "random" word selection. "Innovation" or "synergy" defeats the operator. Use actual random.
+- Don't end at the provocation. The PO statement is means; an actionable proposal is the end.
+- Take the provocation seriously for at least 5 minutes. Dismissing it defeats the operation.
+- Pick the operator deliberately. Different operators surface different things: Escape → purpose; Reversal → relationship; Exaggeration → parameter; Distortion → sequencing; Wishful Thinking → constraint.
+
+Source: de Bono, *Lateral Thinking* (Harper, 1970); *Po: Beyond Yes and No* (Penguin, 1972).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\leverage-points.md ===
+# Leverage Points
+
+Donella Meadows, 1997/1999. 12 places to intervene in a system, in increasing order of effectiveness. Most policy interventions happen at the bottom of the list (parameters); the actually transformative ones happen at the top (paradigms) — and are the most resisted.
+
+## When to use
+
+- Civic / org / institutional change
+- Diagnosing why interventions fail (almost always at lower level than problem)
+- Strategic critique of policy proposals
+- "Where in this system should I push?"
+
+## Don't use when
+
+- Single-creator creative work (framework needs multi-actor systems with feedback loops)
+- Short-term tactical decisions
+- Team of <5 (use simpler tools)
+
+## The 12 levels (least → most powerful)
+
+**12. Constants, parameters, numbers** — subsidies, taxes, standards, prices. Most policy fights happen here. Rarely change behavior.
+
+**11. Sizes of buffers** — stabilizing stocks relative to flows. Big buffer = stable but inflexible.
+
+**10. Structure of stocks and flows** — transport networks, supply chains, age structures. Hard to change once built; high leverage in original design.
+
+**9. Lengths of delays** — relative to rate of system change. Delays usually can't be shortened; the leverage is in *slowing the system to match the delays*.
+
+**8. Strength of negative feedback loops** — relative to disturbance corrected against. Strengthen with: preventive medicine, pollution taxes, FOIA, whistleblower protection.
+
+**7. Gain around positive feedback loops** — *Reducing* gain on a positive loop is more leveraged than strengthening the negative loop counter-acting it. Progressive tax weakens "success-to-the-successful" loops directly.
+
+**6. Information flows** — who has access to what. Adding a feedback loop where one didn't exist. (Toxic Release Inventory: pure disclosure dropped emissions 40%.)
+
+**5. Rules** — incentives, punishments, constraints. Constitutions, laws, terms of service. *"If you want to understand the deepest malfunctions of systems, pay attention to the rules, and to who has power over them."*
+
+**4. Power to add, change, evolve, or self-organize** — biological evolution, technical advance, social revolution. Suppressing variety to maintain control is a system crime.
+
+**3. Goals of the system** — what is it *for*? Shareholder return vs employee welfare = different systems with same physical structure. *"Everything further down the list will be twisted to conform to that goal."*
+
+**2. Mindset / paradigm** — unstated assumptions that generate the goals. "Growth is good", "markets are efficient". Hard to change in cultures (generations); change in individuals all at once (a click).
+
+**1. Power to transcend paradigms** — hold any paradigm lightly. The capacity to *switch*. Personal practice, not policy.
+
+## Procedure
+
+1. **Map the system.** Stocks, flows, feedback loops, rules, goals, paradigm.
+2. **Locate the problem at a level.** A symptom at level 12 (rising costs) often originates at level 5 (rules permit cost externalization), level 3 (short-term return goal), or level 2 (paradigm assumes infinite resource).
+3. **List candidate interventions at 3+ levels.** Be honest about which you can act on.
+4. **Order by leverage and feasibility.** The most leveraged intervention is rarely the most feasible.
+5. **Note direction risk.** A high-leverage intervention pushed wrong is worse than a low-leverage one pushed right. *"Time after time I've ... discovered that there's already a lot of attention to that point. Everyone is trying very hard to push it IN THE WRONG DIRECTION."*
+
+## Worked example
+
+**System**: 50-person tech company with chronic burnout despite generous benefits.
+- Level 12 (PTO): fine, no help.
+- Level 8 (negative feedback): weak — burnout invisible until people quit.
+- Level 6 (info flows): obscured — managers don't see workload signals.
+- Level 5 (rules): implicitly reward overwork.
+- Level 3 (goal): "ship features fast."
+- Level 2 (paradigm): "engineering output is linearly proportional to hours worked."
+
+Recommendation: combine level-8 (mandatory monthly burnout-explicit 1:1s — feasible) + level-3 (explicit goal change to "build sustainable engineering org" — slow but high-leverage). Skip level 12.
+
+## Anti-slop notes
+
+- Don't list all 12 levels every time. Identify the relevant 2–3 for this problem.
+- Don't claim every problem has a paradigm-level solution. Most have rule-level or parameter-level.
+- Don't recommend "change the paradigm" as if it were actionable. It usually isn't, on its own.
+
+Source: Meadows, *Places to Intervene in a System* (1997/1999); *Thinking in Systems* (Chelsea Green, 2008). donellameadows.org.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\oblique-strategies.md ===
+# Oblique Strategies
+
+Brian Eno + Peter Schmidt, 1975. A deck of ~110 gnomic cards for breaking studio deadlocks. Used on Bowie's *Berlin Trilogy*, *Music for Airports*, and dozens of other records.
+
+## When to use
+
+- Stuck mid-project; have material in front of you, lost contact with it
+- Recording-studio energy: tactical decisions inside a defined work
+- Group impasse: drawing a card breaks the loop without anyone needing to "be right"
+- Decision deadline: forces a move
+
+## Don't use when
+
+- Blank page (the cards assume material exists)
+- High-stakes structural decisions
+
+## Procedure
+
+1. Pick a card by random index (not by what feels appropriate — that defeats the operation).
+2. Apply it literally to the next decision in front of you. **The card is trusted even if its appropriateness is quite unclear** (Eno).
+3. Make the move it suggests.
+4. Don't over-explain. The card; what it means here; the move. Done.
+
+## The cards (working subset)
+
+### General provocations
+- Use an old idea.
+- State the problem in words as clearly as possible.
+- Only one element of each kind.
+- What would your closest friend do?
+- What to increase? What to reduce?
+- Are there sections? Consider transitions.
+- Try faking it.
+- Honour thy error as a hidden intention.
+- Ask your body.
+- Work at a different speed.
+- Repetition is a form of change.
+- Look closely at the most embarrassing details and amplify.
+- Not building a wall; making a brick.
+- Be dirty.
+- Take a break.
+- Just carry on.
+- Discard an axiom.
+- Towards the insignificant.
+- Give way to your worst impulse.
+- Once the search is in progress, something will be found.
+
+### On material
+- Use unqualified people.
+- Tape your mouth.
+- Disconnect from desire.
+- Distorting time.
+- Look at the order in which you do things.
+- Reverse.
+- Mute and continue.
+- Faced with a choice, do both.
+- Use fewer notes.
+- Make a sudden, destructive, unpredictable action; incorporate.
+- The most important thing is the thing most easily forgotten.
+
+### On process
+- Don't be afraid of things because they're easy to do.
+- Cluster analysis.
+- Emphasize differences.
+- Emphasize the flaws.
+- Emphasize repetitions.
+- Listen to the quiet voice.
+- Look at a very small object; look at its centre.
+- Lowest common denominator.
+- Make a blank valuable by putting it in an exquisite frame.
+- Question the heroic.
+- Remember those quiet evenings.
+- Remove specifics and convert to ambiguities.
+- The inconsistency principle.
+- The tape is now the music.
+- Use an unacceptable colour.
+- Voice your suspicions.
+- Water.
+- Where's the edge? Where does the frame start?
+
+## Anti-slop notes
+
+- Don't generate fake "Eno-style" cards. Use the real deck.
+- Don't pad. Card → meaning here → move. Three sentences max.
+- Don't apologize when the card lands strangely. The strangeness is the operation.
+
+Full deck and history: rtqe.net/ObliqueStrategies (Gregory Alan Taylor's archive).
+

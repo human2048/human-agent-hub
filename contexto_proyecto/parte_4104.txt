@@ -1,0 +1,226 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_sync_failure_echo_policy.py ===
+"""Salt R11-B1: synchronous child failure echo above the CLI spinner is an automatic diagnostic presentation
+and honors display.suppress_warning_notifications under the parent's turn snapshot; the child result and the
+relayed subagent.complete event are never gated."""
+import json
+import pytest
+
+
+def configure(home, setting, monkeypatch):
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    (home/'config.yaml').write_text(json.dumps({'display': {} if setting is None else {'suppress_warning_notifications':setting}}))
+
+
+
+def test_sync_failure_real_run_to_spinner_three_modes(tmp_path, monkeypatch):
+    from tools.delegate_tool import _run_single_child
+    from tools.delegate_tool_progress import _build_child_progress_callback
+    from agent.notification_presentation import notification_policy_snapshot
+    from tests.tools.test_delegate_output_schema import _StubChild, _StubParent
+    rows=[]
+    for setting in (None,False,True):
+        configure(tmp_path/f'sync-{setting}',setting,monkeypatch)
+        import io
+        from contextlib import redirect_stdout
+        from agent.display import KawaiiSpinner
+        from agent.notification_presentation import notification_config_snapshot
+        buffer=io.StringIO();events=[]
+        parent=_StubParent();parent.session_id='parent'
+        with redirect_stdout(buffer):parent._delegate_spinner=KawaiiSpinner('delegating')
+        parent.tool_progress_callback=lambda *a,**kw:events.append({'args':a,'kwargs':kw})
+        child=_StubChild([])
+        def fail(**kwargs):raise RuntimeError('SYNC_REAL_CHILD_CRASH')
+        child.run_conversation=fail
+        child.tool_progress_callback=_build_child_progress_callback(0,'actual failing child',parent)
+        config=notification_config_snapshot()
+        assert config['display'].get('suppress_warning_notifications') is setting
+        with notification_policy_snapshot(parent,'cli',config):
+            result=_run_single_child(0,'actual failing child',child,parent)
+        assert result['status'] in ('error','failed') and 'SYNC_REAL_CHILD_CRASH' in str(result)
+        rows.append({'setting':setting,'lines':buffer.getvalue().splitlines(),'events':events,'result':result})
+    # absent/false: legacy echo present; true: echo suppressed. Result and relayed event untouched in all modes.
+    assert any('SYNC_REAL_CHILD_CRASH' in s for s in rows[0]['lines']), rows[0]
+    assert any('SYNC_REAL_CHILD_CRASH' in s for s in rows[1]['lines']), rows[1]
+    assert not any('SYNC_REAL_CHILD_CRASH' in s for s in rows[2]['lines']), rows[2]
+    for row in rows:
+        assert any(e['args'][0] == 'subagent.complete' for e in row['events']), row['events']
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_timeout_cleanup.py ===
+"""Regression coverage for timed-out delegation teardown."""
+
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+
+from tools import delegate_tool
+
+
+class _SlowUnwindingChild:
+    def __init__(self) -> None:
+        self.tool_progress_callback = None
+        self._credential_pool = None
+        self._delegate_saved_tool_names = []
+        self._delegate_role = "leaf"
+        self._delegate_depth = 1
+        self._subagent_id = None
+        self.model = "test-model"
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+        self.session_cost_status = "unknown"
+        self.started = threading.Event()
+        self.interrupted = threading.Event()
+        self.unwinding = threading.Event()
+        self.allow_finish = threading.Event()
+        self.finished = threading.Event()
+        self.closed = threading.Event()
+        self.close_while_running = False
+
+    def run_conversation(self, **_kwargs):
+        self.started.set()
+        # Generous bounds: these gate on events the test sets promptly; a tight bound only
+        # turns a load-starved test thread into a spurious early exit that fires close().
+        assert self.interrupted.wait(timeout=10)
+        # Model the real child turn's finally path: it still performs session
+        # activity/SQLite cleanup after the parent requests interruption.
+        self.unwinding.set()
+        assert self.allow_finish.wait(timeout=10)
+        self.finished.set()
+        return {
+            "final_response": "",
+            "completed": False,
+            "interrupted": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+    def hard_interrupt(self, _reason=None):
+        self.interrupted.set()
+
+    def get_activity_summary(self):
+        return {"api_call_count": 1}
+
+    def close(self):
+        if not self.finished.is_set():
+            self.close_while_running = True
+        self.closed.set()
+
+
+def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
+    child = _SlowUnwindingChild()
+    parent = SimpleNamespace(
+        session_id="parent-timeout-test",
+        _current_task_id=None,
+        _active_children=[child],
+        _active_children_lock=threading.Lock(),
+    )
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
+
+    result = delegate_tool._run_single_child(
+        task_index=0,
+        goal="exercise timeout teardown",
+        child=child,
+        parent_agent=parent,
+    )
+
+    assert result["status"] == "timeout"
+    assert child.unwinding.wait(timeout=1)
+    try:
+        assert not child.closed.is_set(), (
+            "timed-out child.close() ran before its conversation thread unwound"
+        )
+    finally:
+        child.allow_finish.set()
+    assert child.finished.wait(timeout=1)
+    assert child.closed.wait(timeout=1)
+    assert not child.close_while_running, (
+        "timed-out child.close() raced its still-running conversation thread"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_toolset_scope.py ===
+"""Tests for delegate_tool toolset scoping.
+
+Verifies that subagents cannot gain tools that the parent does not have.
+The LLM controls the `toolsets` parameter — without intersection with the
+parent's enabled_toolsets, it can escalate privileges by requesting
+arbitrary toolsets.
+"""
+
+from types import SimpleNamespace
+
+from tools.delegate_tool import _strip_blocked_tools, _emit_parent_console
+
+
+class TestToolsetIntersection:
+    """Subagent toolsets must be a subset of parent's enabled_toolsets."""
+
+    def test_requested_toolsets_intersected_with_parent(self):
+        """LLM requests toolsets parent doesn't have — extras are dropped."""
+        parent = SimpleNamespace(enabled_toolsets=["terminal", "file"])
+
+        # Simulate the intersection logic from _build_child_agent
+        parent_toolsets = set(parent.enabled_toolsets)
+        requested = ["terminal", "file", "web", "browser", "rl"]
+        scoped = [t for t in requested if t in parent_toolsets]
+
+        assert sorted(scoped) == ["file", "terminal"]
+        assert "web" not in scoped
+        assert "browser" not in scoped
+        assert "rl" not in scoped
+
+
+    def test_strip_blocked_removes_delegation(self):
+        """Blocked toolsets (delegation, clarify, etc.) are always removed."""
+        child = _strip_blocked_tools(["terminal", "delegation", "clarify", "memory"])
+        assert "delegation" not in child
+        assert "clarify" not in child
+        assert "memory" not in child
+        assert "terminal" in child
+
+    def test_empty_intersection_yields_empty_toolsets(self):
+        """If parent has no overlap with requested, child gets nothing extra."""
+        parent = SimpleNamespace(enabled_toolsets=["terminal"])
+
+        parent_toolsets = set(parent.enabled_toolsets)
+        requested = ["web", "browser"]
+        scoped = [t for t in requested if t in parent_toolsets]
+
+        assert scoped == []
+
+
+class TestEmitParentConsole:
+    """Progress lines (e.g. ``✓ [N/M] …``) must route through the parent's
+    configured ``_safe_print`` in headless stdio hosts (ACP, gateway) so
+    they don't land on stdout and corrupt JSON-RPC frames. Regression for a
+    bug where delegate_task completion lines pushed to stdout caused
+    ``Failed to parse JSON message: ✓ [3/3] …`` errors in the ACP adapter."""
+
+    def test_routes_through_parent_safe_print_when_available(self, capsys):
+        captured_lines = []
+        parent = SimpleNamespace(_safe_print=lambda line: captured_lines.append(line))
+
+        _emit_parent_console(parent, "  ✓ [1/3] Research done  (11.55s)")
+
+        assert captured_lines == ["  ✓ [1/3] Research done  (11.55s)"]
+        stdout_stderr = capsys.readouterr()
+        assert stdout_stderr.out == ""
+        assert stdout_stderr.err == ""
+
+
+    def test_non_callable_safe_print_is_ignored(self, capsys):
+        """Defensive: if _safe_print is set but not callable, fall back."""
+        parent = SimpleNamespace(_safe_print="not-a-function")
+        _emit_parent_console(parent, "  ✓ [3/3] non-callable guard")
+        captured = capsys.readouterr()
+        assert "non-callable guard" in captured.out
+

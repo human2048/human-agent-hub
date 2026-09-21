@@ -1,0 +1,187 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\gateway_failure_ownership\README.md ===
+# Gateway failure-writer ownership
+
+Offline integration: `_handle_message` → session preparation and lease → production
+`_run_agent` / TurnRunner → real AIAgent → loopback HTTP/SSE → on-disk SQLite →
+gateway persistence/delivery → exception fallback.
+
+```sh
+.venv/bin/python evals/gateway_failure_ownership/probe.py "$PWD" /tmp/ownership.json
+scripts/run_tests.sh -j 1 tests/gateway/test_failure_writer_ownership.py
+```
+
+The first argument selects the production checkout, so the same fixture can A/B
+another checkout without editing it. The receipt records its temporary HERMES_HOME.
+Inherited credentials are cleared, tools are disabled, and socket connections are
+restricted to loopback. No live messaging account or paid provider is contacted.
+
+## Fault boundaries and controls
+
+- Real HTTP 400 from the loopback peer; successful replies use HTTP/SSE.
+- Controlled AIAgent constructor failure, or voice-policy failure after persistence.
+  The handler and exception writer remain production code.
+- Chat A succeeds with ID `100`; chat B resumes that session and fails construction
+  with a different input and the same ID. Both inputs must remain, with unmodified
+  platform IDs for quote/reply lookup.
+- A separate Python process commits an unrelated, nonobserved input during a keyless
+  constructor failure. Both writers' inputs must survive; the gateway lease is not
+  treated as universal writer authority.
+- Separately accepted identical keyed/keyless inputs, identical timestamps,
+  same-delivery pre-agent retry, provider failure/recovery, and healthy follow-up.
+- A normal history read fails closed before agent construction. There is no longer
+  a raw baseline to read or an extra keyless admission query.
+- 5,000 archived 4-KiB rows remain in SQLite. The complete keyless failure handler
+  must stay below 8 MiB traced peak allocation, with zero raw transcript scans.
+- Durable owner markers are unique across accepted inputs and absent from provider
+  wire messages. The foreign writer supplies its own independent marker.
+
+The second invariant uses real SQLite archives and a compression tree containing
+an earlier `ws_orphan_reap` sibling and a live successor. It checks both published
+reroutes and map-free restart routing; root/middle ancestors and successor writes
+can establish ownership, while reaped, undone, observed, foreign-marker, and
+unmarked rows cannot. These are storage-boundary checks, not provider-driven
+compaction.
+
+## Receipts
+
+The expanded full-handler matrix has 20 checkpoints (19 deliveries plus marker
+propagation). Base `869228cab4a8276d3b4c78da9d9939670c47bd0f`: **7/20**; reviewed
+intermediate `653cd72ef63b013798748774a2509f453b566a77`: **1/20**; fixed: **20/20**.
+All fault boundaries were reached. Base and fixed runs made 10 loopback requests
+and recorded zero external connection attempts. Counts are cumulative exact-row
+sequence checks, not independent defect counts.
+
+The reviewed intermediate lost chat B's input (1 row instead of 2), also lost the
+keyless input beside the independent writer, and allocated 28,034,300 bytes in
+the archived-history handler. The fixed run retained all 18 expected active user
+rows (including the independent writer) and used 107,679 bytes in that handler.
+The memory measurement excludes fixture seeding and receipt serialization.
+
+Exactly two invariant tests are retained. Eleven targeted files passed 63 tests;
+broader directory suites and CI are not claimed. No historical rows are rewritten.
+Existing rows without a marker cannot establish delivery ownership, so historical
+redelivery is not deduplicated by this mechanism. This is exception-path input
+arbitration, not global exactly-once delivery or content deduplication.
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\gateway_status_render\iteration_ceiling_ab.py ===
+"""A/B probe: what the three user-facing gateway status lines render for the iteration counter.
+
+Drives the REAL render paths (busy-ack, long-running heartbeat, inactivity-timeout diagnostic)
+with a REAL ``AIAgent`` constructed with its default (unlimited) ``max_iterations`` and a
+stub adapter that records the outbound text. Run on origin/main and on the fix branch:
+
+    HERMES_HOME=$(mktemp -d) python evals/gateway_status_render/iteration_ceiling_ab.py [--finite 250]
+
+Prints one JSON object per render site with the exact text a user would see.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+
+def _agent(max_iterations: int | None):
+    from run_agent import AIAgent
+
+    kwargs: dict[str, Any] = dict(base_url="http://127.0.0.1:9/v1", api_key="sk-dummy", model="dummy-model",
+                  quiet_mode=True, enabled_toolsets=[], disabled_toolsets=["*"])
+    if max_iterations is not None:
+        kwargs["max_iterations"] = max_iterations
+    agent = AIAgent(**kwargs)
+    agent._api_call_count = 3
+    agent._current_tool = "terminal"
+    agent._last_activity_desc = "terminal"
+    agent._last_activity_ts = time.time() - 42
+    return agent
+
+
+async def _busy_ack(agent) -> str:
+    import gateway.run as gr
+    from gateway.platforms.base import SessionSource, build_session_key
+    from gateway.platforms.event import MessageEvent, MessageType
+
+    gr._load_gateway_config = lambda: {"display": {"platforms": {"telegram": {"busy_ack_detail": True}}}}
+    runner = object.__new__(gr.GatewayRunner)
+    runner._running_agents, runner._running_agents_ts = {}, {}
+    runner._pending_messages, runner._busy_ack_ts, runner._queued_events = {}, {}, {}
+    runner._draining, runner._busy_text_mode, runner._busy_input_mode = False, "interrupt", "interrupt"
+    runner.adapters, runner.config, runner.session_store = {}, MagicMock(), None
+    runner.config.group_sessions_per_user, runner.config.thread_sessions_per_user = True, False
+    runner.hooks = MagicMock(); runner.hooks.emit = AsyncMock()
+    runner.pairing_store = MagicMock(); runner.pairing_store.is_approved.return_value = True
+    runner._is_user_authorized = lambda _s: True
+    source = SessionSource(platform=MagicMock(value="telegram"), chat_id="123", chat_type="private", user_id="u1")
+    event = MessageEvent(text="status?", message_type=MessageType.TEXT, source=source, message_id="m1")
+    sk = build_session_key(source)
+    adapter = MagicMock()
+    adapter._pending_messages, adapter._text_debounce, adapter._busy_text_debounce_seconds = {}, {}, 0.6
+    adapter._send_with_retry = AsyncMock()
+    adapter.config = MagicMock(); adapter.config.extra = {}
+    adapter.platform = MagicMock(value="telegram")
+    runner._running_agents[sk] = agent
+    runner._running_agents_ts[sk] = time.time() - 600
+    runner.adapters[source.platform] = adapter
+    await runner._handle_active_session_busy_message(event, sk)
+    return adapter._send_with_retry.call_args.kwargs.get("content", "")
+
+
+async def _heartbeat(agent) -> str:
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.turn_context import TurnContext
+
+    os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = "0.01"
+    mixin = GatewayTurnMixin()
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="hb1"))
+    mixin._adapter_for_source = MagicMock(return_value=adapter)
+    mixin._should_emit_long_running_notification = MagicMock(side_effect=[True, False])
+    disp = MagicMock()
+    disp._display_surface_mode.return_value = "on"
+    disp.resolve_display_setting.return_value = True
+    ctx = TurnContext(source=SimpleNamespace(chat_id="c1", platform="telegram"), session_key="s1", agent_holder=[agent])
+    await mixin._run_agent_notify_long_running(disp, ctx, [None])
+    return adapter.send.await_args.args[1]
+
+
+def _timeout(agent) -> str:
+    import gateway.run as gr
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.turn_context import TurnContext
+
+    gr.request_hard_interrupt = MagicMock()
+    ctx = TurnContext(session_key="s1", agent_holder=[agent])
+    return GatewayTurnMixin()._run_agent_timeout_result(SimpleNamespace(agent_timeout=1800.0), ctx)["final_response"]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--finite", type=int, default=None, help="use a finite max_iterations instead of the default")
+    args = ap.parse_args()
+    sys.path.insert(0, os.getcwd())
+    agent = _agent(args.finite)
+    out = {
+        "head": os.popen("git rev-parse --short HEAD").read().strip(),
+        "max_iterations": agent.max_iterations,
+        "busy_ack": asyncio.run(_busy_ack(agent)),
+        "heartbeat": asyncio.run(_heartbeat(agent)),
+        "timeout_diag": _timeout(agent),
+    }
+    out["sentinel_leaks"] = sum(str(sys.maxsize) in v for k, v in out.items() if k in ("busy_ack", "heartbeat", "timeout_diag"))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+

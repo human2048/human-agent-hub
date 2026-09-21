@@ -1,0 +1,325 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_child_cache_ttl.py ===
+"""Subagents never inherit the 1h prompt-cache tier: with ``prompt_caching.cache_ttl: 1h`` the parent
+keeps 1h, the child is built at 5m, and the child's wire markers carry no ``ttl``. A disabled cache
+stays disabled (the child is not re-enabled to 5m)."""
+from types import SimpleNamespace
+from agent.prompt_caching import apply_anthropic_cache_control
+from tools.delegate_tool import _apply_child_cache_ttl
+
+
+def _markers(messages):
+    out = []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            out += [b["cache_control"] for b in c if isinstance(b, dict) and "cache_control" in b]
+        if "cache_control" in m:
+            out.append(m["cache_control"])
+    return out
+
+
+def test_child_1h_becomes_5m_and_wire_markers_drop_ttl():
+    child = SimpleNamespace(_cache_ttl="1h")
+    _apply_child_cache_ttl(child)
+    assert child._cache_ttl == "5m"
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"}, {"role": "user", "content": "go"}]
+    wire = apply_anthropic_cache_control([dict(m) for m in msgs], cache_ttl=child._cache_ttl)
+    marks = _markers(wire)
+    assert marks and all("ttl" not in m for m in marks), marks
+    # and the parent's 1h layout really is different, so this is not a vacuous check
+    parent_marks = _markers(apply_anthropic_cache_control([dict(m) for m in msgs], cache_ttl="1h"))
+    assert any(m.get("ttl") == "1h" for m in parent_marks)
+
+
+def test_disabled_and_5m_are_left_alone():
+    for ttl in (None, "5m"):
+        child = SimpleNamespace(_cache_ttl=ttl)
+        _apply_child_cache_ttl(child)
+        assert child._cache_ttl == ttl
+
+
+def test_real_spawn_path_applies_it(tmp_path, monkeypatch):
+    """Through ``_build_child_agent`` with a real AIAgent: parent configured 1h, child ends at 5m, and the
+    parent is untouched."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "prompt_caching:\n  cache_ttl: 1h\nmodel:\n  default: anthropic/claude-sonnet-4.6\n", encoding="utf-8")
+    from run_agent import AIAgent
+    from tools import delegate_tool as dt
+    import tools.delegate_tool_config as dtc
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    monkeypatch.setattr(dtc, "_load_config", lambda: {})
+    kw = dict(api_key="k", base_url="https://openrouter.ai/api/v1", provider="openrouter",
+              api_mode="chat_completions", model="anthropic/claude-sonnet-4.6", platform="cli", quiet_mode=True,
+              skip_context_files=True, skip_memory=True, save_trajectories=False, enabled_toolsets=["file"])
+    parent = AIAgent(session_id="p", **kw)
+    assert parent._cache_ttl == "1h", "fixture: the operator's 1h must actually be in effect"
+    child = dt._build_child_agent(task_index=0, goal="goal", context=None, toolsets=["file"], model=None,
+                                  max_iterations=4, task_count=1, parent_agent=parent)
+    try:
+        assert child._cache_ttl == "5m"
+        assert parent._cache_ttl == "1h"
+    finally:
+        child.close()
+        parent.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_child_compression_cap.py ===
+"""``delegation.compression_threshold_tokens`` is an OPTIONAL absolute cap on a subagent's compaction
+trigger, off by default, and its value is validated rather than coerced.
+
+Default off: a 1M-window child compacts at the same 0.50 x window as its parent (500K). A replay of a
+1,393-agent run put 200K-400K caps within 5% of each other once cache prefixes are intact, and every
+compaction is a chance to lose detail, so the cap is opt-in. The validation matters because YAML
+``true`` coerces to int 1 (a one-token trigger) and ``"200k"`` would silently read as no cap.
+"""
+from types import SimpleNamespace
+
+from agent.context_compressor import ContextCompressor
+from tools.delegate_tool import _apply_child_compression_cap, _child_compression_cap_tokens
+
+
+def _child(window=1_000_000, threshold=0.50, cap=None):
+    cc = ContextCompressor(model="anthropic/claude-fable-5.1", threshold_percent=threshold,
+                           config_context_length=window, threshold_tokens_cap=cap)
+    return SimpleNamespace(context_compressor=cc)
+
+
+def test_default_is_no_cap_child_keeps_the_ratio_trigger():
+    child = _child()
+    _apply_child_compression_cap(child, {})
+    assert child.context_compressor.threshold_tokens == 500_000
+    _apply_child_compression_cap(child, {"compression_threshold_tokens": 0})
+    assert child.context_compressor.threshold_tokens == 500_000
+
+
+def test_explicit_cap_is_the_lower_of_delegation_and_global_and_never_raises():
+    child = _child()
+    _apply_child_compression_cap(child, {"compression_threshold_tokens": 300_000})
+    assert child.context_compressor.threshold_tokens == 300_000
+    child = _child(cap=150_000)
+    _apply_child_compression_cap(child, {"compression_threshold_tokens": 200_000})
+    assert child.context_compressor.threshold_tokens == 150_000
+    small = _child(window=128_000)
+    before = small.context_compressor.threshold_tokens
+    _apply_child_compression_cap(small, {"compression_threshold_tokens": 200_000})
+    assert small.context_compressor.threshold_tokens == before  # cap above the ratio trigger: no effect
+
+
+def test_config_values_are_validated_not_coerced():
+    """Independent-review witnesses: YAML ``true`` -> int 1 (a one-token trigger) and ``"200k"`` -> silently
+    disabled. Both are ignored with a warning; the child keeps the ratio trigger."""
+    for bad in (True, "200k", 5, 15_999, -1, 1.5):
+        assert _child_compression_cap_tokens(bad) is None, bad
+    for off in (None, 0, False):
+        assert _child_compression_cap_tokens(off) is None
+    assert _child_compression_cap_tokens(16_000) == 16_000
+    assert _child_compression_cap_tokens(300_000.0) == 300_000
+    child = _child()
+    _apply_child_compression_cap(child, {"compression_threshold_tokens": True})
+    assert child.context_compressor.threshold_tokens == 500_000
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_child_transcript_release.py ===
+"""Finished delegate children must not pin their transcripts in the parent heap.
+
+Profiled parent (1,320 children over 13h) reached 2.6 GB RSS: every closed
+child AIAgent stayed reachable, and each still owned a shallow copy of its
+full message list. Two retainers were proven with ``gc.get_referrers``:
+
+1. ``AIAgent.close()`` cleared ``_session_messages`` but not the
+   ``_db_flush_scan_prefix`` snapshot (``messages[:]``) or the streamed-text
+   accumulator, so every message dict stayed alive through the agent.
+2. ``bind_subagent_parent`` stored the agent (each child binds ITSELF for
+   its own turn) strongly in a ContextVar; asyncio Handles/Futures scheduled
+   during the turn snapshot that Context and live as long as the background
+   LSP / kernel loops do, so the child object itself was never collected.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import weakref
+from unittest.mock import MagicMock
+
+from agent.subagent_lifecycle import (
+    _ACTIVE_PARENT_AGENT,
+    bind_subagent_parent,
+    get_active_subagent_parent,
+)
+from run_agent import AIAgent
+
+
+def _bare_agent() -> AIAgent:
+    agent = AIAgent.__new__(AIAgent)
+    agent._active_children = []
+    import threading
+
+    agent._active_children_lock = threading.Lock()
+    agent._session_db = None
+    agent.session_id = "child-x"
+    return agent
+
+
+def test_close_releases_transcript_shadow_copies():
+    agent = _bare_agent()
+
+    class Payload(str):  # weakref-able stand-in for a message content string
+        pass
+
+    payload = Payload("x" * 50_000)
+    big = {"role": "tool", "content": payload}
+    agent._session_messages = [big]
+    agent._db_flush_scan_prefix = agent._session_messages[:]
+    agent._streamed_assistant_text_parts = ["y" * 10_000]
+    probe = weakref.ref(payload)
+
+    agent.close()
+
+    assert agent._session_messages == []
+    assert agent._db_flush_scan_prefix is None
+    assert agent._streamed_assistant_text_parts == []
+    del big, payload
+    gc.collect()
+    assert probe() is None, "closed agent still owns its message dicts"
+
+
+def test_bind_subagent_parent_does_not_pin_agent():
+    agent = _bare_agent()
+    probe = weakref.ref(agent)
+    snapshots = []
+    with bind_subagent_parent(agent):
+        assert get_active_subagent_parent() is agent
+        import contextvars
+
+        # An asyncio Handle scheduled inside the turn keeps this snapshot.
+        snapshots.append(contextvars.copy_context())
+    assert get_active_subagent_parent() is None
+    assert snapshots[0][_ACTIVE_PARENT_AGENT] is not agent
+    del agent
+    gc.collect()
+    assert probe() is None, "Context snapshot still pins the agent"
+
+
+def test_bind_subagent_parent_accepts_non_weakrefable_doubles():
+    class Slots:
+        __slots__ = ()
+
+    double = Slots()
+    with bind_subagent_parent(double):
+        assert get_active_subagent_parent() is double
+
+
+def _fake_child(messages):
+    child = MagicMock()
+    child._credential_pool = None
+    child._delegate_role = "leaf"
+    child.session_estimated_cost_usd = 0.0123
+    child.session_cost_status = "estimated"
+    child.session_id = "child-sess"
+    child.run_conversation.return_value = {
+        "final_response": "the summary",
+        "completed": True,
+        "interrupted": False,
+        "api_calls": 3,
+        "messages": messages,
+    }
+    return child
+
+
+def test_run_single_child_result_json_unchanged_by_transcript_release():
+    """Pin: the parent-visible result entry is byte-identical whether or not
+    the child released its transcript at close() (the entry never carried
+    ``messages``; only summary/tool_trace/tokens/cost derive from them)."""
+    from tests.tools.test_delegate import _make_mock_parent
+    from tools.delegate_tool import _run_single_child
+
+    messages = [
+        {"role": "user", "content": "goal"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "z" * 5000},
+        {"role": "assistant", "content": "the summary"},
+    ]
+    results = []
+    for _ in range(2):
+        child = _fake_child([dict(m) for m in messages])
+        entry = _run_single_child(
+            task_index=0, goal="goal", child=child, parent_agent=_make_mock_parent()
+        )
+        child.close.assert_called_once()
+        entry.pop("duration_seconds", None)
+        results.append(json.dumps(entry, sort_keys=True, default=str))
+    assert results[0] == results[1]
+    parsed = json.loads(results[0])
+    assert parsed["summary"] == "the summary"
+    assert parsed["tool_trace"][0]["tool"] == "read_file"
+    assert parsed["cost_usd"] == 0.0123
+    assert "messages" not in parsed
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_composite_toolsets.py ===
+"""Tests for composite toolset expansion in delegate_task intersection."""
+
+import unittest
+
+from tools.delegate_tool import _expand_parent_toolsets, _strip_blocked_tools
+
+
+class TestExpandParentToolsets(unittest.TestCase):
+    """Verify _expand_parent_toolsets recognises individual toolsets within composites."""
+
+    def test_composite_hermes_cli_expands_web(self):
+        """hermes-cli includes web_search/web_extract → 'web' should be in expansion."""
+        expanded = _expand_parent_toolsets({"hermes-cli"})
+        self.assertIn("web", expanded)
+        self.assertIn("terminal", expanded)
+        self.assertIn("browser", expanded)
+        # Original composite is preserved
+        self.assertIn("hermes-cli", expanded)
+
+
+    def test_intersection_with_expanded_composite(self):
+        """End-to-end: requesting ['web'] from parent with ['hermes-cli'] yields ['web']."""
+        parent_toolsets = {"hermes-cli"}
+        expanded = _expand_parent_toolsets(parent_toolsets)
+        toolsets = ["web"]
+        child_toolsets = [t for t in toolsets if t in expanded]
+        self.assertEqual(child_toolsets, ["web"])
+
+    def test_included_toolsets_of_composite_parent_are_grantable(self):
+        """A composite parent holds its ``includes`` too (#111700): ``debugging`` = terminal/process_manage +
+        includes web/file, so a child may request ``web``/``file`` — but never a toolset the parent lacks."""
+        expanded = _expand_parent_toolsets({"debugging"})
+        self.assertTrue({"debugging", "terminal", "web", "file"} <= expanded)
+        self.assertNotIn("browser", expanded)
+        self.assertNotIn("hermes-cli", expanded)
+
+    def test_composites_with_allowed_included_tools_are_not_stripped(self):
+        toolsets = ["safe", "hermes-gateway", "hermes-cli", "delegation", "kanban"]
+
+        self.assertEqual(
+            _strip_blocked_tools(toolsets),
+            ["safe", "hermes-gateway", "hermes-cli"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+

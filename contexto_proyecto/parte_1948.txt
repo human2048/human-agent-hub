@@ -1,0 +1,353 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_compression_attempt_telemetry.py ===
+import json
+import logging
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from agent.conversation_compression import compress_context
+from agent.context_compressor import ContextCompressor
+
+
+class _TodoStore:
+    def format_for_injection(self):
+        return ""
+
+
+class _Agent:
+    def __init__(self, compressor):
+        self.context_compressor = compressor
+        self.session_id = "session-telemetry-test"
+        self.platform = "cli"
+        self.model = "test/main-model"
+        self.provider = "test-provider"
+        self.tools = []
+        self._compression_feasibility_checked = True
+        self.compression_in_place = False
+        self._memory_manager = None
+        self._session_db = None
+        self._todo_store = _TodoStore()
+        self._cached_system_prompt = None
+
+    def _emit_status(self, _message):
+        pass
+
+    def _emit_warning(self, _message):
+        pass
+
+    def _invalidate_system_prompt(self):
+        self._cached_system_prompt = None
+
+    def _build_system_prompt(self, system_message):
+        return system_message
+
+    def commit_memory_session(self, _messages):
+        pass
+
+
+def _messages(secret_text="TOPSECRET_TRANSCRIPT_TEXT"):
+    msgs = [{"role": "system", "content": "system prompt"}]
+    for idx in range(10):
+        msgs.append({"role": "user", "content": f"user message {idx} {secret_text}"})
+        msgs.append({"role": "assistant", "content": f"assistant reply {idx} {secret_text}"})
+    return msgs
+
+
+def _extract_telemetry(caplog):
+    records = [
+        record.getMessage()
+        for record in caplog.records
+        if "context compression attempt telemetry:" in record.getMessage()
+    ]
+    assert len(records) == 1
+    return json.loads(records[0].split("context compression attempt telemetry: ", 1)[1])
+
+
+def test_compression_attempt_telemetry_is_metadata_only(caplog):
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(
+            model="test/main-model",
+            provider="test-provider",
+            threshold_percent=0.50,
+            quiet_mode=True,
+            config_context_length=100_000,
+        )
+    compressor.tail_token_budget = 10
+    agent = _Agent(compressor)
+
+    with patch.object(compressor, "_generate_summary", return_value="SANITIZED SUMMARY"):
+        with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+            compressed, system_prompt = compress_context(
+                agent,
+                _messages(),
+                "system prompt",
+                approx_tokens=75_000,
+                force=True,
+            )
+
+    assert system_prompt == "system prompt"
+    assert compressed is not None
+    payload = _extract_telemetry(caplog)
+
+    assert payload["event"] == "compression_attempt"
+    assert payload["attempt_id"]
+    assert payload["session_id"] == "session-telemetry-test"
+    assert payload["trigger_source"] == "manual"
+    assert payload["main_model"] == "test/main-model"
+    assert payload["main_context_limit"] == 100_000
+    assert payload["current_estimated_tokens"] == 75_000
+    assert payload["effective_threshold"] == compressor.threshold_tokens
+    assert payload["protected_head_tokens"] is not None
+    assert payload["protected_tail_tokens"] is not None
+    assert payload["middle_window_tokens"] is not None
+    assert payload["chunking"] is False
+    assert payload["chunk_count"] in {0, 1}
+    assert payload["commit_status"] == "committed"
+    assert payload["split_status"] == "not_applicable"
+    assert payload["fallback_used"] is False
+    assert isinstance(payload["total_duration_ms"], int)
+    assert isinstance(payload["commit_ms"], int)
+    assert payload["queue_wait_ms"] is None
+    assert payload["prompt_build_ms"] is None
+    assert payload["time_to_first_progress_ms"] is None
+    assert payload["summary_generation_ms"] is None
+
+    raw_log = json.dumps(payload)
+    assert "TOPSECRET_TRANSCRIPT_TEXT" not in raw_log
+    assert "SANITIZED SUMMARY" not in raw_log
+    assert "user message" not in raw_log
+    assert "assistant reply" not in raw_log
+
+
+def test_aux_call_telemetry_records_durations_without_content(caplog):
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(
+            model="test/main-model",
+            provider="test-provider",
+            threshold_percent=0.50,
+            quiet_mode=True,
+            config_context_length=100_000,
+        )
+    compressor.tail_token_budget = 10
+    agent = _Agent(compressor)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="SANITIZED SUMMARY"))]
+    )
+
+    with patch("agent.context_compressor.call_llm", return_value=response):
+        with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+            compress_context(
+                agent,
+                _messages(),
+                "system prompt",
+                approx_tokens=75_000,
+            )
+
+    payload = _extract_telemetry(caplog)
+    assert payload["aux_prompt_tokens"] is not None
+    # Current main intentionally omits max_tokens from the aux summary call
+    # (the summary budget is prompt-level guidance only), so no output
+    # reservation is recorded.
+    assert payload["aux_output_reservation"] is None
+    assert isinstance(payload["aux_call_duration_ms"], int)
+    assert payload["aux_provider"]
+    assert payload["aux_model"]
+
+    raw_log = json.dumps(payload)
+    assert "TOPSECRET_TRANSCRIPT_TEXT" not in raw_log
+    assert "SANITIZED SUMMARY" not in raw_log
+
+
+def test_aux_call_telemetry_records_content_free_phase_timings():
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(
+            model="test/main-model",
+            provider="test-provider",
+            threshold_percent=0.50,
+            quiet_mode=True,
+            config_context_length=100_000,
+        )
+    compressor._begin_compression_telemetry(current_tokens=75_000)
+
+    compressor._record_aux_compression_call(
+        prompt_messages=[{"role": "user", "content": "TOPSECRET_TRANSCRIPT_TEXT"}],
+        max_tokens=1400,
+        duration_ms=22,
+        aux_provider="ollama",
+        aux_model="qwen3:8b",
+        phase_timings={
+            "queue_wait_ms": 3,
+            "prompt_build_ms": 5,
+            "time_to_first_progress_ms": 7,
+            "summary_generation_ms": 19,
+            "commit_ms": 11,
+        },
+    )
+
+    payload = compressor._last_compression_telemetry
+    assert payload is not None
+    assert {key: payload[key] for key in (
+        "queue_wait_ms",
+        "prompt_build_ms",
+        "time_to_first_progress_ms",
+        "summary_generation_ms",
+        "commit_ms",
+    )} == {
+        "queue_wait_ms": 3,
+        "prompt_build_ms": 5,
+        "time_to_first_progress_ms": 7,
+        "summary_generation_ms": 19,
+        "commit_ms": 11,
+    }
+    assert "TOPSECRET_TRANSCRIPT_TEXT" not in json.dumps(payload)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_compression_boundary.py ===
+"""Tests for context compression boundary alignment.
+
+Verifies that _align_boundary_backward correctly handles tool result groups
+so that parallel tool calls are never split during compression.
+"""
+
+from unittest.mock import patch
+
+from agent.context_compressor import ContextCompressor
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _tc(call_id: str) -> dict:
+    """Create a minimal tool_call dict."""
+    return {"id": call_id, "type": "function", "function": {"name": "test", "arguments": "{}"}}
+
+
+def _tool_result(call_id: str, content: str = "result") -> dict:
+    """Create a tool result message."""
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def _assistant_with_tools(*call_ids: str) -> dict:
+    """Create an assistant message with tool_calls."""
+    return {"role": "assistant", "tool_calls": [_tc(cid) for cid in call_ids], "content": None}
+
+
+def _make_compressor(**kwargs) -> ContextCompressor:
+    defaults = dict(
+        model="test-model",
+        threshold_percent=0.75,
+        protect_first_n=3,
+        protect_last_n=4,
+        quiet_mode=True,
+    )
+    defaults.update(kwargs)
+    with patch("agent.context_compressor.get_model_context_length", return_value=8000):
+        return ContextCompressor(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# _align_boundary_backward tests
+# ---------------------------------------------------------------------------
+
+class TestAlignBoundaryBackward:
+    """Test that compress-end boundary never splits a tool_call/result group."""
+
+    def test_boundary_at_clean_position(self):
+        """Boundary after a user message — no adjustment needed."""
+        comp = _make_compressor()
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "do something"},
+            _assistant_with_tools("tc_1"),
+            _tool_result("tc_1", "done"),
+            {"role": "user", "content": "thanks"},  # idx=6
+            {"role": "assistant", "content": "np"},
+        ]
+        # Boundary at 7, messages[6] = user — no adjustment
+        assert comp._align_boundary_backward(messages, 7) == 7
+
+    def test_boundary_after_assistant_with_tools(self):
+        """Original case: boundary right after assistant with tool_calls."""
+        comp = _make_compressor()
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            _assistant_with_tools("tc_1", "tc_2"),  # idx=3
+            _tool_result("tc_1"),                    # idx=4
+            _tool_result("tc_2"),                    # idx=5
+            {"role": "user", "content": "next"},
+        ]
+        # Boundary at 4, messages[3] = assistant with tool_calls → pull back to 3
+        assert comp._align_boundary_backward(messages, 4) == 3
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: compression must not lose tool results
+# ---------------------------------------------------------------------------
+
+class TestCompressionToolResultPreservation:
+    """Verify that compress() never silently drops tool results."""
+
+    def test_parallel_tool_results_not_lost(self):
+        """The exact scenario that triggered silent data loss before the fix."""
+        comp = _make_compressor(protect_first_n=3, protect_last_n=4)
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},            # 0
+            {"role": "user", "content": "Hello"},                         # 1
+            {"role": "assistant", "content": "Hi there!"},                # 2  (end of head)
+            {"role": "user", "content": "Read 7 files for me"},           # 3
+            _assistant_with_tools("tc_A", "tc_B", "tc_C", "tc_D", "tc_E", "tc_F", "tc_G"),  # 4
+            _tool_result("tc_A", "content of file A"),                    # 5
+            _tool_result("tc_B", "content of file B"),                    # 6
+            _tool_result("tc_C", "content of file C"),                    # 7
+            _tool_result("tc_D", "content of file D"),                    # 8
+            _tool_result("tc_E", "content of file E"),                    # 9
+            _tool_result("tc_F", "content of file F"),                    # 10
+            _tool_result("tc_G", "CRITICAL DATA in file G"),              # 11 ← compress_end=15-4=11
+            {"role": "user", "content": "Now summarize them"},            # 12
+            {"role": "assistant", "content": "Here is the summary..."},   # 13
+            {"role": "user", "content": "Thanks"},                        # 14
+        ]
+        # 15 messages. compress_end = 15 - 4 = 11 (before fix: splits tool group)
+
+        fake_summary = "[Summary of earlier conversation]"
+        with patch.object(comp, "_generate_summary", return_value=fake_summary):
+            result = comp.compress(messages, current_tokens=7000)
+
+        # After compression, no tool results should be orphaned/lost.
+        # All tool results in the result must have a matching assistant tool_call.
+        assistant_call_ids = set()
+        for msg in result:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    cid = tc.get("id", "")
+                    if cid:
+                        assistant_call_ids.add(cid)
+
+        tool_result_ids = set()
+        for msg in result:
+            if msg.get("role") == "tool":
+                cid = msg.get("tool_call_id")
+                if cid:
+                    tool_result_ids.add(cid)
+
+        # Every tool result must have a parent — no orphans
+        orphaned = tool_result_ids - assistant_call_ids
+        assert not orphaned, f"Orphaned tool results found (data loss!): {orphaned}"
+
+        # Every assistant tool_call must have a real result (not a stub)
+        for msg in result:
+            if msg.get("role") == "tool":
+                assert msg["content"] != "[Result from earlier conversation — see context summary above]", \
+                    f"Stub result found for {msg.get('tool_call_id')} — real result was lost"
+

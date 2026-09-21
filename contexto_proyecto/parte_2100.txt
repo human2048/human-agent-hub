@@ -1,0 +1,427 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_lean_single_aux_call.py ===
+"""Lean compaction makes EXACTLY ONE auxiliary LLM request per attempt.
+
+Contract (#96603 — the per-chunk digest loop made up to 28 extra aux calls
+and pushed compactions to 7-11 minutes on slow aux routes):
+
+(a) exactly one ``call_llm`` per compaction attempt in lean mode;
+(b) the single response's detailed-session-log section lands in the summary;
+(c) an oversized region is EVEN-SAMPLED into the one request's input (with
+    explicit elision markers), never split into extra requests;
+(d) the LLM-free anchor index and the session_search recovery footer are
+    still appended.
+"""
+
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+from agent.context_compressor import (
+    ContextCompressor,
+    _LEAN_ANCHOR_HEADING,
+    _LEAN_RECOVERY_HEADING,
+    _LEAN_SESSION_LOG_HEADING,
+)
+
+
+def _mk_compressor(**overrides):
+    kwargs = dict(
+        model="test/model",
+        threshold_percent=0.85,
+        protect_first_n=2,
+        protect_last_n=2,
+        quiet_mode=True,
+        tail_mode="lean",
+    )
+    kwargs.update(overrides)
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=100_000
+    ):
+        c = ContextCompressor(**kwargs)
+        _ = c.context_length
+    c._session_id = "sess-lean-1call"
+    return c
+
+
+def _llm_response(text):
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].message = MagicMock()
+    resp.choices[0].message.content = text
+    return resp
+
+
+def _big_region(n_rounds=60, tool_chars=6_000):
+    """Synthetic compacted region: user + assistant/tool rounds, ~360K chars."""
+    turns = [
+        {"role": "user", "content": "Please fix PR #12345 in agent/foo.py"},
+    ]
+    for i in range(n_rounds):
+        turns.append({
+            "role": "assistant",
+            "content": f"Working on step {i}: editing agent/foo.py line {i}",
+        })
+        turns.append({
+            "role": "tool",
+            "tool_call_id": f"tc{i}",
+            "tool_name": "terminal",
+            "content": f"round {i} output: " + ("x" * tool_chars),
+        })
+    return turns
+
+
+SUMMARY_BODY = (
+    "## Historical Task Snapshot\nUser asked: 'Please fix PR #12345 in agent/foo.py'\n\n"
+    "## Goal\nFix the bug.\n\n"
+    "## Completed Actions\n1. EDIT agent/foo.py — done [tool: patch]\n\n"
+    f"{_LEAN_SESSION_LOG_HEADING}\n- Edited agent/foo.py; PR #12345; ran pytest.\n"
+)
+
+
+class TestLeanSingleAuxiliaryCall:
+    def test_exactly_one_call_llm_per_lean_attempt(self):
+        c = _mk_compressor()
+        turns = _big_region()
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_llm_response(SUMMARY_BODY),
+        ) as main_call, patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=_llm_response(SUMMARY_BODY),
+        ) as aux_call:
+            summary = c._generate_summary(turns)
+        assert summary is not None
+        # THE contract: one auxiliary request per compaction attempt, total.
+        assert main_call.call_count + aux_call.call_count == 1
+
+    def test_session_log_heading_lands_in_summary(self):
+        c = _mk_compressor()
+        turns = _big_region(n_rounds=5)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_llm_response(SUMMARY_BODY),
+        ):
+            summary = c._generate_summary(turns)
+        assert _LEAN_SESSION_LOG_HEADING in summary
+
+    def test_prompt_requests_session_log_section(self):
+        c = _mk_compressor()
+        turns = _big_region(n_rounds=5)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_llm_response(SUMMARY_BODY),
+        ) as mock_call:
+            c._generate_summary(turns)
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert _LEAN_SESSION_LOG_HEADING in prompt
+        # The digest HARD RULES carried over into the single request.
+        assert "PRESERVE EXACTLY" in prompt
+
+    def test_anchor_index_and_recovery_footer_present(self):
+        c = _mk_compressor()
+        turns = _big_region(n_rounds=5)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_llm_response(SUMMARY_BODY),
+        ):
+            summary = c._generate_summary(turns)
+        assert _LEAN_ANCHOR_HEADING in summary
+        assert _LEAN_RECOVERY_HEADING in summary
+        assert "session_search" in summary
+
+    def test_oversized_region_sampled_not_split_into_more_requests(self):
+        c = _mk_compressor()
+        turns = _big_region(n_rounds=120, tool_chars=6_000)  # ~720K chars raw
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_llm_response(SUMMARY_BODY),
+        ) as mock_call:
+            c._generate_summary(turns)
+        assert mock_call.call_count == 1
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        # Bounded input with explicit elision markers, not a second request.
+        assert len(prompt) <= c._SUMMARY_INPUT_MAX_CHARS + 20_000
+        assert "chars elided" in prompt
+
+
+class TestSampledSummaryInput:
+    def test_small_input_passes_through(self):
+        content = "abc" * 100
+        assert ContextCompressor._sample_summary_input(content) == content
+
+    def test_sampling_is_bounded_ordered_and_marked(self):
+        # Distinct decade markers let us verify oldest-to-newest order and
+        # uniform coverage across the whole region.
+        content = "".join(
+            f"<seg{i:02d}>" + ("x" * 50_000) for i in range(10)
+        )
+        out = ContextCompressor._sample_summary_input(content)
+        assert len(out) <= ContextCompressor._SUMMARY_INPUT_MAX_CHARS
+        assert "chars elided" in out
+        seen = [i for i in range(10) if f"<seg{i:02d}>" in out]
+        # Coverage reaches past the head AND includes the newest end.
+        assert seen == sorted(seen)
+        assert any(i >= 5 for i in seen)
+        assert ("<seg09>" in out) or (content[-500:] in out)
+
+    def test_legacy_mode_keeps_head_tail_bound(self):
+        c = _mk_compressor(tail_mode="legacy")
+        turns = _big_region(n_rounds=120, tool_chars=6_000)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_llm_response("## Historical Task Snapshot\nNone."),
+        ) as mock_call:
+            c._generate_summary(turns)
+        assert mock_call.call_count == 1
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "summary input truncated" in prompt
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-q"])
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_learning_graph.py ===
+"""Behavior contracts for the learning-graph assembler.
+
+Asserts invariants (edges resolve to real nodes, clusters cover every node,
+memory cards are represented consistently), never a snapshot of the live skill
+catalog — that catalog grows every release and a count assertion would be a
+change-detector.
+"""
+
+from __future__ import annotations
+
+from agent import learning_graph
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+
+def _node(name: str, category: str, related=None):
+    n = learning_graph.SkillNode(name=name, category=category)
+    n.related = list(related or [])
+    return n
+
+
+
+
+def test_density_stats_count_isolated_nodes():
+    nodes = {
+        "a": _node("a", "x", related=["b"]),
+        "b": _node("b", "x", related=["a"]),
+        "c": _node("c", "y"),
+    }
+    stats = learning_graph.density_stats(nodes, learning_graph.build_edges(nodes))
+
+    assert stats["nodes"] == 3
+    assert stats["linked_nodes"] == 2
+    assert stats["isolated_pct"] == round(100 / 3, 1)
+
+
+
+
+def test_memory_is_cards_split_on_separator(tmp_path):
+    home = tmp_path / ".hermes"
+    (home / "memories").mkdir(parents=True)
+    (home / "memories" / "MEMORY.md").write_text(
+        "Project uses pytest with xdist\n§\nUser prefers concise responses",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(home)
+    try:
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    titles = [c["title"] for c in graph["memory"]]
+    assert "Project uses pytest with xdist" in titles
+    assert "User prefers concise responses" in titles
+    # Memory cards remain typed cards and also appear as memory-kind nodes.
+    assert all(c["source"] in {"memory", "profile"} for c in graph["memory"])
+    assert all("timestamp" in c for c in graph["memory"])
+    assert any(n["kind"] == "memory" for n in graph["nodes"])
+
+
+
+
+
+
+def test_full_payload_shape_and_edge_integrity(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    ids = {n["id"] for n in graph["nodes"]}
+    assert all(e["source"] in ids and e["target"] in ids for e in graph["edges"])
+    # Every node's category appears in the cluster list.
+    cluster_cats = {c["category"] for c in graph["clusters"]}
+    assert all(n["category"] in cluster_cats for n in graph["nodes"])
+    skill_nodes = [n for n in graph["nodes"] if n["kind"] == "skill"]
+    assert graph["stats"]["nodes"] == len(skill_nodes)
+    assert graph["stats"]["memory_nodes"] == len(graph["memory"])
+    assert all("timestamp" in n for n in graph["nodes"])
+
+
+def test_foreground_created_skill_is_in_journey_before_first_use(tmp_path):
+    """A skill created in the foreground (/learn, skill_manage) shows in the journey with zero
+    uses, while an unmarked never-used local skill (hand-written) stays out."""
+    from tools import skill_usage
+
+    home = tmp_path / ".hermes"
+    for name in ("fresh-learn-skill", "hand-written"):
+        (home / "skills" / "demo" / name).mkdir(parents=True)
+        (home / "skills" / "demo" / name / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d.\n---\n\n# {name}\n", encoding="utf-8")
+    token = set_hermes_home_override(home)
+    try:
+        skill_usage.record_created("fresh-learn-skill", agent_created=False)
+        skill_nodes = {n["id"] for n in learning_graph.build_learning_graph()["nodes"] if n["kind"] == "skill"}
+    finally:
+        reset_hermes_home_override(token)
+
+    assert "fresh-learn-skill" in skill_nodes
+    assert "hand-written" not in skill_nodes
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_learning_graph_render.py ===
+"""Behavior contracts for the terminal Star Map renderer.
+
+Asserts invariants of the timeline layout, the ported age gradient + palette, and
+the constellation scrubber — never a cell snapshot, which would be a
+change-detector against layout tuning.
+"""
+
+from __future__ import annotations
+
+from agent import learning_graph_render as render
+
+LEAD_IN = render.LEAD_IN
+
+
+def _payload(skills: int = 8, memories: int = 3, *, base_ts: int = 1_700_000_000):
+    nodes = []
+    for i in range(skills):
+        nodes.append(
+            {
+                "id": f"skill{i}",
+                "label": f"skill{i}",
+                "kind": "skill",
+                "timestamp": base_ts + i * 86400 * 20,
+                "category": "devops" if i % 2 else "research",
+                "useCount": i,
+            }
+        )
+    for j in range(memories):
+        nodes.append(
+            {
+                "id": f"memory:memory:{j}",
+                "label": f"mem {j}",
+                "kind": "memory",
+                "timestamp": base_ts + (skills + j) * 86400 * 20,
+                "category": "memory",
+            }
+        )
+    edges = [{"source": "skill0", "target": "skill1"}] if skills > 1 else []
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "clusters": [{"category": "devops", "count": skills}, {"category": "memory", "count": memories}],
+        "stats": {
+            "learned_skills": skills,
+            "memory_nodes": memories,
+            "related_edges": len(edges),
+            "memory_skill_edges": 0,
+        },
+    }
+
+
+def _flatten(grid):
+    return "".join(run[0] for row in grid for run in row)
+
+
+def _styles(grid):
+    return {run[1] for row in grid for run in row}
+
+
+def test_recency_is_timed_and_bounded():
+    rec = render.compute_recency(_payload()["nodes"])
+    assert rec["timed"] is True
+    for ratio in rec["rec"].values():
+        assert LEAD_IN - 1e-9 <= ratio <= 1 + 1e-9
+    assert abs(min(rec["rec"].values()) - LEAD_IN) < 1e-9
+    assert abs(max(rec["rec"].values()) - 1.0) < 1e-9
+
+
+def test_recency_ink_follows_age_gradient():
+    # Old quiet → recent bright (constants.ts AGE_GRADIENT), monotonic in between.
+    assert abs(render.recency_ink(0.0) - render.AGE_OLD_INK) < 1e-6
+    assert abs(render.recency_ink(1.0) - render.AGE_NEW_INK) < 1e-6
+    samples = [render.recency_ink(x / 10) for x in range(11)]
+    assert samples == sorted(samples)
+
+
+
+
+def test_grid_runs_are_text_style_alpha():
+    # Runs are [text, style, alpha] with an optional 4th hex override for
+    # category-colored bars.
+    frame = render.render_graph(_payload(), cols=60, rows=20)
+    for row in frame["grid"]:
+        for run in row:
+            assert 3 <= len(run) <= 4
+            assert isinstance(run[0], str) and isinstance(run[1], str)
+            assert isinstance(run[2], (int, float)) and 0.0 <= run[2] <= 1.0
+            assert run[0] != ""
+            if len(run) == 4:
+                assert run[3] is None or isinstance(run[3], str)
+
+
+def test_bars_render_skills_and_memories():
+    frame = render.render_graph(_payload(skills=10, memories=4), cols=72, rows=18, reveal=1.0)
+    flat = _flatten(frame["grid"])
+    # Skills draw as comet trails (━), memories anchor on diamonds (◆).
+    assert "━" in flat
+    assert render.MEMORY_GLYPH in flat
+    styles = _styles(frame["grid"])
+    assert render.STYLE_SKILL in styles
+    assert render.STYLE_MEMORY in styles
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_frames_play_through_grows_visibility():
+    payload = _payload(skills=10, memories=4)
+    out = render.render_frames(payload, cols=50, rows=16, frames=12)
+    assert out["count"] == len(payload["nodes"])
+    assert len(out["frames"]) == 12
+    assert out["frames"][0]["visible"] <= out["frames"][-1]["visible"]
+    assert out["frames"][-1]["visible"] == len(payload["nodes"])
+    assert "axis" in out
+    for fr in out["frames"]:
+        assert fr["grid"]
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,356 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_accretion_caps.py ===
+"""Accretion caps for _read_tracker (file_tools) and _completion_consumed
+(process_registry).
+
+Both structures are process-lifetime singletons that previously grew
+unbounded in long-running CLI / gateway sessions:
+
+  file_tools_read_tracking._read_tracker[task_id]
+    ├─ read_history (set)      — one entry per unique (path, offset, limit)
+    ├─ dedup (dict)            — one entry per unique (path, offset, limit)
+    └─ read_timestamps (dict)  — one entry per unique resolved path
+  process_registry._completion_consumed (set) — one entry per session_id
+    ever polled / waited / logged
+
+None of these were ever trimmed.  A 10k-read CLI session accumulated
+roughly 1.5MB of tracker state; a gateway with high background-process
+churn accumulated ~20B per session_id until the process exited.
+
+These tests pin the new caps + prune hooks.
+"""
+
+
+class TestReadTrackerCaps:
+    def setup_method(self):
+        from tools import file_tools_read_tracking as rt
+
+        # Clean slate per test.
+        with rt._read_tracker_lock:
+            rt._read_tracker.clear()
+
+    def test_read_history_capped(self, monkeypatch):
+        """read_history set is bounded by _READ_HISTORY_CAP."""
+        from tools import file_tools as ft
+        from tools import file_tools_read_tracking as rt
+
+        monkeypatch.setattr(rt, "_READ_HISTORY_CAP", 10)
+        task_data = {
+            "last_key": None,
+            "consecutive": 0,
+            "read_history": set((f"/p{i}", 0, 500) for i in range(50)),
+            "dedup": {},
+            "read_timestamps": {},
+        }
+        rt._cap_read_tracker_data(task_data)
+        assert len(task_data["read_history"]) == 10
+
+
+    def test_live_cap_applied_after_read_add(self, tmp_path, monkeypatch):
+        """Live read_file path enforces caps."""
+        from tools import file_tools as ft
+        from tools import file_tools_read_tracking as rt
+
+        monkeypatch.setattr(rt, "_READ_HISTORY_CAP", 3)
+        monkeypatch.setattr(rt, "_DEDUP_CAP", 3)
+        monkeypatch.setattr(rt, "_READ_TIMESTAMPS_CAP", 3)
+
+        # Create 10 distinct files and read each once.
+        for i in range(10):
+            p = tmp_path / f"file_{i}.txt"
+            p.write_text(f"content {i}\n" * 10)
+            ft.read_file_tool(path=str(p), task_id="long-session")
+
+        with rt._read_tracker_lock:
+            td = rt._read_tracker["long-session"]
+            assert len(td["read_history"]) <= 3
+            assert len(td["dedup"]) <= 3
+            # read_timestamps is populated lazily (via setdefault) only
+            # when os.path.getmtime() succeeds. On some CI filesystems
+            # that stat can race with file creation — skip rather than
+            # hard-error if the dict hasn't been created yet.
+            assert len(td.get("read_timestamps", {})) <= 3
+
+
+class TestCompletionConsumedPrune:
+    def test_prune_drops_completion_entry_with_expired_session(self):
+        """When a finished session is pruned, _completion_consumed is
+        cleared for the same session_id."""
+        from tools.process_registry import ProcessRegistry, FINISHED_TTL_SECONDS
+        import time
+
+        reg = ProcessRegistry()
+        # Fake a finished session whose started_at is older than the TTL.
+        class _FakeSess:
+            def __init__(self, sid):
+                self.id = sid
+                self.started_at = time.time() - (FINISHED_TTL_SECONDS + 100)
+                self.exited = True
+                self.process = None  # handle release reads the real dataclass fields
+                self._pty = None
+
+        reg._finished["stale-1"] = _FakeSess("stale-1")
+        reg._completion_consumed.add("stale-1")
+
+        with reg._lock:
+            reg._prune_if_needed()
+
+        assert "stale-1" not in reg._finished
+        assert "stale-1" not in reg._completion_consumed
+
+
+    def test_prune_clears_dangling_completion_entries(self):
+        """Stale entries in _completion_consumed without a backing session
+        record are cleared out (belt-and-suspenders invariant)."""
+        from tools.process_registry import ProcessRegistry
+
+        reg = ProcessRegistry()
+        # Add a dangling entry that was never in _running or _finished.
+        reg._completion_consumed.add("dangling-never-tracked")
+
+        with reg._lock:
+            reg._prune_if_needed()
+
+        assert "dangling-never-tracked" not in reg._completion_consumed
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_allowlist_legacy_config.py ===
+import yaml
+from tools import approval
+
+
+def test_legacy_string_allowlist_recovers_only_string_lists(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    description = "script execution via -e/-c flag"
+    for value in ([description], yaml.safe_dump([description])):
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump({"command_allowlist": value}))
+        assert approval.load_permanent_allowlist() == {description}
+        assert approval.is_approved("probe", description)
+    assert "command_allowlist" in caplog.text
+
+
+def test_malformed_allowlist_does_not_grant_approval(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for value in ("plain text", "[bad", {"not": "a list"}, [True, "candidate"], "[true, candidate]", 42):
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump({"command_allowlist": value}))
+        assert approval.load_permanent_allowlist() == set()
+        assert not approval.is_approved("probe", "candidate")
+    assert "command_allowlist" in caplog.text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_allowlist_quoted_metachars.py ===
+"""Tests for the quote-aware allowlist shell-operator check.
+
+Port of can1357/oh-my-pi#7553: `command_allowlist` glob rules (e.g.
+``cargo *``) used to reject any command whose *quoted arguments* contained
+shell metacharacters — a cargo benchmark regex filter like
+``'^layer3/write/(a|b)$'`` disqualified the whole command even though the
+metacharacters are literal to the shell. The matcher is now quote-aware,
+while still rejecting genuinely compound commands and quoted payloads that
+a ``-c``/``-e``-style option would hand to another interpreter.
+"""
+
+import pytest
+
+from tools.approval import _command_matches_permanent_allowlist
+from tools.approval_floors import _has_allowlist_shell_operator
+
+
+class TestHasAllowlistShellOperator:
+    # ------------------------------------------------------------------
+    # Simple commands stay simple
+    # ------------------------------------------------------------------
+
+    def test_plain_command(self):
+        assert not _has_allowlist_shell_operator("git status")
+
+    def test_quoted_metacharacters_are_literal(self):
+        # The motivating case: cargo bench regex filter (omp issue #7552).
+        cmd = (
+            "cargo bench --manifest-path layers/layer3/Cargo.toml "
+            "--bench standardized_criterion -- "
+            "'^layer3/write/file-wal/batch-(10|1000|10000)$'"
+        )
+        assert not _has_allowlist_shell_operator(cmd)
+
+    def test_double_quoted_literal_metachars(self):
+        assert not _has_allowlist_shell_operator('grep -r "a|b;c" src')
+
+    def test_escaped_metachar_is_literal(self):
+        assert not _has_allowlist_shell_operator("grep foo\\;bar file.txt")
+
+    def test_unquoted_dollar_variable_is_simple(self):
+        # Historical behavior: only `$(` was compound, bare $VAR was not.
+        assert not _has_allowlist_shell_operator("echo $HOME")
+
+    def test_unquoted_parens_alone_are_not_compound(self):
+        # Parens without $ were never matched by the old regex either.
+        assert not _has_allowlist_shell_operator("pytest -k (a and b)")
+
+    # ------------------------------------------------------------------
+    # Genuinely compound commands still rejected
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("cmd", [
+        "git status; rm -rf /tmp/x",
+        "git status && make",
+        "git status || make",
+        "cat foo | grep bar",
+        "echo hi > /etc/passwd",
+        "cat < seed",
+        "echo `rm x`",
+        "echo $(rm x)",
+        "git status\nrm x",
+        "git status & disown",
+    ])
+    def test_unquoted_operators_compound(self, cmd):
+        assert _has_allowlist_shell_operator(cmd)
+
+    def test_dollar_inside_double_quotes_is_active(self):
+        # Expansion still happens inside double quotes.
+        assert _has_allowlist_shell_operator('echo "$(rm x)"')
+        assert _has_allowlist_shell_operator('echo "`rm x`"')
+        assert _has_allowlist_shell_operator('echo "$HOME"')
+
+    def test_unterminated_quote_is_compound(self):
+        assert _has_allowlist_shell_operator("echo 'unterminated")
+
+    # ------------------------------------------------------------------
+    # Reinterpreted-argument options: quoted payloads become executable
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("cmd", [
+        "sh -c 'rm -rf /tmp/x; echo done'",
+        'bash -c "make | tee log"',
+        "git -c alias.x='!touch /tmp/pwn; printf ok' x",
+        'git -c alias.x="!touch /tmp/pwn; printf ok" x',
+        "node --eval 'require(\"child_process\").exec(\"id\")>1'",
+        "perl -e 'system(\"id\");'",
+    ])
+    def test_quoted_payload_with_interpreter_option(self, cmd):
+        assert _has_allowlist_shell_operator(cmd)
+
+    def test_interpreter_option_without_quoted_metachars_ok(self):
+        # -c with a payload containing control chars (parens) is flagged...
+        assert _has_allowlist_shell_operator("python -c 'print(1)'")
+        # ...but a clean payload with no control characters at all is fine.
+        assert not _has_allowlist_shell_operator("python -c 'import sys'")
+
+
+class TestAllowlistGlobWithQuotedArgs:
+    def test_cargo_glob_matches_quoted_regex_filter(self, monkeypatch):
+        import tools.approval as mod
+        monkeypatch.setattr(mod, "_permanent_approved", {"cargo *"})
+        cmd = (
+            "cargo bench --bench standardized_criterion -- "
+            "'^layer3/write/file-wal/batch-(10|1000|10000)$'"
+        )
+        assert _command_matches_permanent_allowlist(cmd)
+
+    def test_glob_still_refuses_compound(self, monkeypatch):
+        import tools.approval as mod
+        monkeypatch.setattr(mod, "_permanent_approved", {"cargo *"})
+        assert not _command_matches_permanent_allowlist("cargo build && rm -rf /tmp/x")
+
+    def test_glob_refuses_git_alias_payload(self, monkeypatch):
+        import tools.approval as mod
+        monkeypatch.setattr(mod, "_permanent_approved", {"git *"})
+        assert not _command_matches_permanent_allowlist(
+            "git -c alias.x='!touch /tmp/pwn; printf ok' x"
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_annotate_preview_tool.py ===
+"""Tests for the GUI-surface ``annotate_preview`` tool."""
+
+import json
+
+import pytest
+
+from tools import annotate_preview_tool as an
+from tools.registry import registry
+
+
+def test_lives_in_the_gui_surface_toolset(monkeypatch):
+    """Scoped by toolset, not by the backend's env — same as its siblings."""
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    entry = registry.get_entry("annotate_preview")
+
+    assert entry is not None
+    assert entry.toolset == "desktop_ui"
+    assert entry.check_fn is None
+
+
+def test_requires_callback():
+    result = json.loads(an.annotate_preview_tool(ref="@e1", callback=None))
+    assert "desktop" in result["error"]
+
+
+def test_rejects_an_unknown_action():
+    result = json.loads(an.annotate_preview_tool(action="scribble", callback=lambda _p: "{}"))
+    assert "action must be one of" in result["error"]
+
+
+@pytest.mark.parametrize("verb", ["add", "remove"])
+def test_marking_one_thing_needs_a_target(verb):
+    """A mark with nothing to attach to is a mistake worth naming early."""
+    result = json.loads(an.annotate_preview_tool(action=verb, callback=lambda _p: "{}"))
+    assert "ref" in result["error"]
+
+
+def test_speaks_the_renderer_s_verbs():
+    """The overlay knows pin/unpin; the model gets words it can guess at."""
+    sent = []
+
+    def cb(payload):
+        sent.append(payload)
+        return json.dumps({"acted": "pinned Buy now", "success": True})
+
+    an.annotate_preview_tool(action="add", ref="@e4", label="cheapest", callback=cb)
+    an.annotate_preview_tool(action="remove", ref="@e4", callback=cb)
+
+    assert sent[0] == {"action": "pin", "ref": "@e4", "text": "cheapest"}
+    assert sent[1] == {"action": "unpin", "ref": "@e4"}
+
+
+def test_clear_sends_no_target_so_the_overlay_drops_them_all():
+    """`clear` IS an untargeted unpin — a ref left on it would take down one."""
+    sent = []
+
+    def cb(payload):
+        sent.append(payload)
+        return json.dumps({"acted": "cleared every pin", "success": True})
+
+    an.annotate_preview_tool(action="clear", ref="@e4", selector="a", callback=cb)
+
+    assert sent == [{"action": "unpin"}]
+
+
+def test_defaults_to_adding():
+    sent = []
+
+    def cb(payload):
+        sent.append(payload)
+        return json.dumps({"success": True})
+
+    an.annotate_preview_tool(ref="@e2", callback=cb)
+
+    assert sent[0]["action"] == "pin"
+
+
+def test_passes_the_renderer_s_answer_straight_through():
+    out = json.loads(
+        an.annotate_preview_tool(ref="@e1", callback=lambda _p: json.dumps({"acted": "pinned Save", "success": True}))
+    )
+
+    assert out == {"acted": "pinned Save", "success": True}
+
+
+def test_reports_a_silent_bridge():
+    result = json.loads(an.annotate_preview_tool(ref="@e1", callback=lambda _p: ""))
+    assert "open_preview" in result["error"]
+

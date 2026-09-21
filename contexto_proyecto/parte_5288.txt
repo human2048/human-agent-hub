@@ -1,0 +1,315 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\user-guide\skills\optional\yuanbao\yuanbao-yuanbao.md ===
+---
+title: "Yuanbao — Yuanbao (元宝) groups: @mention users, query info/members"
+sidebar_label: "Yuanbao"
+description: "Yuanbao (元宝) groups: @mention users, query info/members"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Yuanbao
+
+Yuanbao (元宝) groups: @mention users, query info/members.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Optional — install with `hermes skills install official/yuanbao/yuanbao` |
+| Path | `optional-skills/yuanbao` |
+| Version | `1.0.0` |
+| Author | Teknium (teknium1), Hermes Agent |
+| License | MIT |
+| Platforms | linux, macos, windows |
+| Tags | `yuanbao`, `mention`, `at`, `group`, `members`, `元宝`, `派`, `艾特` |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
+
+# Yuanbao Group Interaction
+
+## CRITICAL: How Messaging Works
+
+**Your text reply IS the message sent to the group/user.** The gateway automatically delivers your response text to the chat. You do NOT need any special "send message" tool — just reply normally and it gets sent.
+
+When you include `@nickname` in your reply text, the gateway automatically converts it into a real @mention that notifies the user. This is built-in — you have full @mention capability.
+
+**NEVER say you cannot send messages or @mention users. NEVER suggest the user do it manually. NEVER add disclaimers about permissions. Just reply with the text you want sent.**
+
+## Available Tools
+
+| Tool | When to use |
+|------|------------|
+| `yb_query_group_info` | Query group name, owner, member count |
+| `yb_query_group_members` | Find a user, list bots, list all members, or get nickname for @mention |
+| `yb_send_dm` | Send a private/direct message (DM / 私信) to a user, with optional media files |
+
+## @Mention Workflow
+
+When you need to @mention / 艾特 someone:
+
+1. Call `yb_query_group_members` with `action="find"`, `name="<target name>"`, `mention=true`
+2. Get the exact nickname from the response
+3. Include `@nickname` in your reply text — the gateway handles the rest
+
+Example: user says "帮我艾特元宝"
+
+Step 1 — tool call:
+```json
+{ "group_code": "328306697", "action": "find", "name": "元宝", "mention": true }
+```
+
+Step 2 — your reply (this gets sent to the group with a working @mention):
+```
+@元宝 你好，有人找你！
+```
+
+**That's it.** No extra explanation needed. Keep it short and natural.
+
+**Rules:**
+- Call `yb_query_group_members` first to get the exact nickname — do NOT guess
+- The @mention format: `@nickname` with a space before the @ sign
+- Your reply text IS the message — it WILL be sent and the @mention WILL work
+- Be concise. Do NOT explain how @mention works to the user.
+
+## Send DM (Private Message) Workflow
+
+When someone asks to send a private message / 私信 / DM to a user:
+
+1. Call `yb_send_dm` with `group_code`, `name` (target user's name), and `message`
+2. The tool automatically finds the user and sends the DM
+3. Report the result to the user
+
+Example: user says "给 @用户aea3 私信发一个 hello"
+
+```json
+yb_send_dm({ "group_code": "535168412", "name": "用户aea3", "message": "hello" })
+```
+
+Example with media: user says "给 @用户aea3 私信发一张图片"
+
+```json
+yb_send_dm({
+  "group_code": "535168412",
+  "name": "用户aea3",
+  "message": "Here is the image",
+  "media_files": [{"path": "/tmp/photo.jpg"}]
+})
+```
+
+**Rules:**
+- Extract `group_code` from the current chat_id (e.g. `group:535168412` → `535168412`)
+- If you already know the user_id, pass it directly via the `user_id` parameter to skip lookup
+- If multiple users match the name, the tool returns candidates — ask the user to clarify
+- Do NOT use `send_message` tool for Yuanbao DMs — use `yb_send_dm` instead
+- Supports media: images (.jpg/.png/.gif/.webp/.bmp) sent as image messages, other files as documents
+
+## Query Group Info
+
+```json
+yb_query_group_info({ "group_code": "328306697" })
+```
+
+## Query Members
+
+| Action | Description |
+|--------|-------------|
+| `find` | Search by name (partial match, case-insensitive) |
+| `list_bots` | List bots and Yuanbao AI assistants |
+| `list_all` | List all members |
+
+## Notes
+
+- `group_code` comes from chat_id: `group:328306697` → `328306697`
+- Groups are called "派 (Pai)" in the Yuanbao app
+- Member roles: `user`, `yuanbao_ai`, `bot`
+
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\developer-guide\acp-internals.md ===
+---
+sidebar_position: 2
+title: "ACP 内部机制"
+description: "ACP 适配器的工作原理：生命周期、会话、事件桥接、审批流程与工具渲染"
+---
+
+# ACP 内部机制
+
+ACP 适配器将 Hermes 的同步 `AIAgent` 封装为异步 JSON-RPC stdio 服务器。
+
+关键实现文件：
+
+- `acp_adapter/entry.py`
+- `acp_adapter/server.py`
+- `acp_adapter/session.py`
+- `acp_adapter/events.py`
+- `acp_adapter/permissions.py`
+- `acp_adapter/tools.py`
+- `acp_adapter/auth.py`
+
+## 启动流程
+
+```text
+hermes acp / hermes-acp / python -m acp_adapter
+  -> acp_adapter.entry.main()
+  -> parse --version / --check / --setup before server startup
+  -> load ~/.hermes/.env
+  -> configure stderr logging
+  -> construct HermesACPAgent
+  -> acp.run_agent(agent, use_unstable_protocol=True)
+```
+
+stdout 保留用于 ACP JSON-RPC 传输。人类可读的日志输出至 stderr。
+
+## 主要组件
+
+### `HermesACPAgent`
+
+`acp_adapter/server.py` 实现 ACP agent 协议。
+
+职责：
+
+- 初始化 / 认证
+- 新建/加载/恢复/fork/列出/取消会话方法
+- prompt（提示词）执行
+- 会话模型切换
+- 将同步 AIAgent 回调接入 ACP 异步通知
+
+### `SessionManager`
+
+`acp_adapter/session.py` 跟踪活跃的 ACP 会话。
+
+每个会话存储：
+
+- `session_id`
+- `agent`
+- `cwd`
+- `model`
+- `history`
+- `cancel_event`
+
+管理器线程安全，支持：
+
+- create
+- get
+- remove
+- fork
+- list
+- cleanup
+- cwd 更新
+
+### 事件桥接
+
+`acp_adapter/events.py` 将 AIAgent 回调转换为 ACP `session_update` 事件。
+
+已桥接的回调：
+
+- `tool_progress_callback`
+- `thinking_callback`（当前在 ACP 桥接中设置为 `None`——推理内容通过 `step_callback` 转发）
+- `step_callback`
+
+由于 `AIAgent` 在工作线程中运行，而 ACP I/O 位于主事件循环，桥接使用：
+
+```python
+asyncio.run_coroutine_threadsafe(...)
+```
+
+### 权限桥接
+
+`acp_adapter/permissions.py` 将危险终端审批 prompt 适配为 ACP 权限请求。
+
+映射关系：
+
+- `allow_once` -> Hermes `once`
+- `allow_always` -> Hermes `always`
+- 拒绝选项 -> Hermes `deny`
+
+超时和桥接失败默认拒绝。
+
+### 工具渲染辅助
+
+`acp_adapter/tools.py` 将 Hermes 工具映射到 ACP 工具类型，并构建面向编辑器的内容。
+
+示例：
+
+- `patch` / `write_file` -> 文件 diff
+- `terminal` -> shell 命令文本
+- `read_file` / `search_files` -> 文本预览
+- 大型结果 -> 截断文本块（保障 UI 安全）
+
+## 会话生命周期
+
+```text
+new_session(cwd)
+  -> create SessionState
+  -> create AIAgent(platform="acp", enabled_toolsets=["hermes-acp"])
+  -> bind task_id/session_id to cwd override
+
+prompt(..., session_id)
+  -> extract text from ACP content blocks
+  -> reset cancel event
+  -> install callbacks + approval bridge
+  -> run AIAgent in ThreadPoolExecutor
+  -> update session history
+  -> emit final agent message chunk
+```
+
+### 取消
+
+`cancel(session_id)`：
+
+- 设置会话取消事件
+- 在可用时调用 `agent.interrupt()`
+- 使 prompt 响应返回 `stop_reason="cancelled"`
+
+### Fork
+
+`fork_session()` 将消息历史深拷贝至新的活跃会话，在保留对话状态的同时为 fork 分配独立的 session ID 和 cwd。
+
+## Provider/认证行为
+
+ACP 不实现自己的认证存储。
+
+而是复用 Hermes 的运行时解析器：
+
+- `acp_adapter/auth.py`
+- `hermes_cli/runtime_provider.py`
+
+因此 ACP 通告并使用当前配置的 Hermes provider/凭据。它还始终通告一个终端 setup 认证方法（`hermes-setup`，参数 `--setup`），以便首次运行的 ACP 客户端在启动正常 ACP 会话前可以打开 Hermes 的交互式模型/provider 配置。
+
+## 工作目录绑定
+
+ACP 会话携带编辑器 cwd。
+
+会话管理器通过任务作用域的终端/文件覆盖将该 cwd 绑定到 ACP session ID，使文件和终端工具相对于编辑器工作区运行。
+
+## 重复同名工具调用
+
+事件桥接按工具名称以 FIFO 队列跟踪工具 ID，而非每个名称仅保留一个 ID。这对以下场景至关重要：
+
+- 并行同名调用
+- 单步内重复同名调用
+
+若不使用 FIFO 队列，完成事件将附加到错误的工具调用上。
+
+## 审批回调恢复
+
+ACP 在 prompt 执行期间临时在终端工具上安装审批回调，执行完成后恢复之前的回调。这避免了将 ACP 会话特定的审批处理器永久全局安装。
+
+## 当前限制
+
+- ACP 会话持久化至共享的 `~/.hermes/state.db`（SessionDB），在进程重启后透明恢复；它们会出现在 `session_search` 中
+- 非文本 prompt 块在请求文本提取时当前被忽略
+- 编辑器特定的 UX 因 ACP 客户端实现而异
+
+## 相关文件
+
+- `tests/acp/` — ACP 测试套件
+- `toolsets.py` — `hermes-acp` toolset 定义
+- `hermes_cli/main.py` — `hermes acp` CLI 子命令
+- `pyproject.toml` — `[acp]` 可选依赖 + `hermes-acp` 脚本

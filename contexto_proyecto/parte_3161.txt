@@ -1,0 +1,351 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_compress_type_ahead.py ===
+"""Type-ahead queue-drain proof for /compress (issue #61042, PR #68284).
+
+PR #68284 made the classic prompt_toolkit CLI keep the composer editable
+while ``/compress`` runs (``_busy_command(..., blocks_input=False)``), with
+the docstring claim that "the queued input is processed against the
+compacted history after the command completes."
+
+These tests pin that claim end-to-end for the classic CLI:
+
+1. ``test_type_ahead_queued_during_compress_becomes_next_prompt`` — runs
+   ``_manual_compress`` on a worker thread (matching the real topology:
+   slash commands execute on ``process_loop``, which is blocked inside
+   ``process_command`` for the duration), submits a type-ahead payload into
+   ``_pending_input`` mid-compression (what ``handle_enter``'s idle branch
+   does — ``_agent_running`` is False while a slash command runs), and
+   asserts that after compression commits the compacted history the queued
+   text is still the next item ``process_loop`` will drain. Nothing inside
+   the compression path may consume or drop it.
+
+2. ``test_handle_enter_never_gates_on_command_running`` — structural
+   invariant: ``handle_enter`` must not consult ``_command_running`` /
+   ``_command_blocks_input``. The composer's read-only state is enforced
+   solely by the TextArea's ``read_only=Condition(_command_blocks_input)``;
+   if a future edit added an early-return in ``handle_enter`` while a
+   command runs, type-ahead submissions would be silently dropped and the
+   drain contract above would break without any other test noticing.
+
+The Ink TUI (ui-tui) needs no equivalent fix: its ``/compress`` is an async
+``session.compress`` RPC and the composer is never made read-only while it
+runs; the gateway already resolves the concurrent-mutation race via the
+``history_version`` guard in ``_compress_session_history``.
+"""
+
+from __future__ import annotations
+
+import ast
+import queue as queue_mod
+import threading
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from tests.hermes_cli.test_cli_init import _make_cli
+
+
+def _make_history() -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+
+
+def test_type_ahead_queued_during_compress_becomes_next_prompt():
+    """Text queued while /compress runs survives compaction and is the next prompt."""
+    shell = _make_cli()
+    history = _make_history()
+    compressed = [
+        {"role": "user", "content": "[summary]"},
+        history[-1],
+    ]
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent.tools = None
+    shell.agent.session_id = shell.session_id
+
+    compress_started = threading.Event()
+    release_compress = threading.Event()
+    mid_compress = {}
+
+    def _compress(*_args, **_kwargs):
+        compress_started.set()
+        # Hold the "compression in flight" window open until the test has
+        # simulated the user's type-ahead submission.
+        assert release_compress.wait(timeout=10), "test deadlock: never released"
+        return (list(compressed), "")
+
+    shell.agent._compress_context.side_effect = _compress
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        worker = threading.Thread(target=shell._manual_compress, daemon=True)
+        worker.start()
+        assert compress_started.wait(timeout=10), "compression never started"
+
+        # Mid-compression: composer stays editable (spinner up, input open).
+        mid_compress["running"] = shell._command_running
+        mid_compress["blocks_input"] = shell._command_blocks_input
+
+        # The user types a follow-up and presses Enter. handle_enter's normal
+        # routing puts it on _pending_input (agent idle — slash commands run
+        # on process_loop, not the agent). process_loop is blocked inside
+        # process_command → _manual_compress, so the payload must sit queued.
+        shell._pending_input.put("follow-up prompt drafted during compaction")
+
+        release_compress.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive(), "_manual_compress did not finish"
+    assert mid_compress == {"running": True, "blocks_input": False}
+
+    # Compaction committed the compressed transcript...
+    assert shell.conversation_history == compressed
+    # ...and busy state was fully unwound so the next turn renders normally.
+    assert shell._command_running is False
+    assert shell._command_blocks_input is False
+
+    # The queued type-ahead is exactly the next item process_loop drains —
+    # i.e. it becomes the next prompt, processed against the compacted
+    # history. Compression must not consume, reorder, or drop it.
+    assert (
+        shell._pending_input.get_nowait()
+        == "follow-up prompt drafted during compaction"
+    )
+    with pytest.raises(queue_mod.Empty):
+        shell._pending_input.get_nowait()
+
+
+def test_handle_enter_never_gates_on_command_running():
+    """handle_enter must not consult the busy-command flags (drop-proof routing).
+
+    Enter-key routing while a slash command runs must keep flowing into
+    ``_pending_input``; read-only enforcement belongs exclusively to the
+    TextArea's ``read_only=Condition(...)``. A ``_command_running`` /
+    ``_command_blocks_input`` check inside ``handle_enter`` would let a
+    future edit silently drop type-ahead submissions during /compress.
+    """
+    cli_path = Path(__file__).resolve().parents[2] / "hermes_cli" / "cli_tui_mixin.py"
+    tree = ast.parse(cli_path.read_text(encoding="utf-8"))
+
+    handlers = ("_tui_handle_enter", "_tui_enter_inline_command", "_tui_enter_overlay",
+                "_tui_enter_clarify_freetext", "_tui_enter_clarify_choice", "_tui_enter_while_busy")
+    targets = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in handlers]
+    assert {n.name for n in targets} == set(handlers), "Enter handlers not found in cli_tui_mixin.py"
+
+    offenders = [
+        node.attr
+        for target in targets
+        for node in ast.walk(target)
+        if isinstance(node, ast.Attribute)
+        and node.attr in {"_command_running", "_command_blocks_input"}
+    ]
+    assert not offenders, (
+        "handle_enter references busy-command state — Enter routing while a "
+        f"slash command runs risks dropping type-ahead input: {offenders}"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_computer_use_cli.py ===
+"""CLI coverage for the public Computer Use command surface."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from importlib import import_module
+from unittest.mock import Mock
+
+import pytest
+
+from tools.computer_use import cua_backend_driver
+
+
+def _run(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "computer-use", *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _invoke(monkeypatch: pytest.MonkeyPatch, *args: str) -> int:
+    """Run the in-process CLI and normalize its process-style exit status."""
+    cli_main = import_module("hermes_cli.main")
+    monkeypatch.setattr(sys, "argv", ["hermes", "computer-use", *args])
+    monkeypatch.setattr(cli_main, "_prepare_agent_startup", lambda _args: None)
+    try:
+        cli_main.main()
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    return 0
+
+
+def test_computer_use_help_omits_browser_approve() -> None:
+    result = _run("--help")
+
+    assert result.returncode == 0
+    assert "browser-approve" not in result.stdout
+    assert "doctor" in result.stdout
+    assert "permissions" in result.stdout
+
+
+def test_computer_use_rejects_removed_browser_approve_command() -> None:
+    result = _run("browser-approve", "--pid", "123")
+
+    assert result.returncode == 2
+    assert "'browser-approve' is not a `hermes computer-use` command" in result.stderr
+    assert "choose from" not in result.stderr
+
+
+def test_computer_use_status_returns_zero_for_compatible_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import tools_config
+    import hermes_cli.tools_config_cua as tools_config_cua
+
+    driver = r"C:\Users\tester\.local\bin\cua-driver.exe"
+    monkeypatch.delenv("HERMES_CUA_DRIVER_CMD", raising=False)
+    monkeypatch.setattr(cua_backend_driver, "resolve_cua_driver_cmd", lambda: driver)
+    monkeypatch.setattr(
+        tools_config,
+        "_cua_driver_contract_status",
+        lambda _binary=None: {"ready": True},
+    )
+    monkeypatch.setattr(
+        tools_config_cua,
+        "_cua_driver_contract_status",
+        lambda _binary=None: {"ready": True},
+    )
+    monkeypatch.setattr(
+        cua_backend_driver,
+        "cua_driver_update_check",
+        lambda: {"update_available": False},
+    )
+
+    assert _invoke(monkeypatch, "status") == 0
+
+
+def test_computer_use_status_returns_nonzero_when_driver_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+
+    monkeypatch.setattr(cua_backend_driver, "resolve_cua_driver_cmd", lambda: None)
+
+    assert _invoke(monkeypatch, "status") == 1
+    assert "cua-driver: not installed" in capsys.readouterr().out
+
+
+def test_computer_use_status_returns_nonzero_for_incompatible_standard_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_cli import tools_config
+    import hermes_cli.tools_config_cua as tools_config_cua
+
+    driver = r"C:\Users\tester\.local\bin\cua-driver.exe"
+    monkeypatch.delenv("HERMES_CUA_DRIVER_CMD", raising=False)
+    monkeypatch.setattr(cua_backend_driver, "resolve_cua_driver_cmd", lambda: driver)
+    monkeypatch.setattr(
+        tools_config,
+        "_cua_driver_contract_status",
+        lambda _binary=None: {
+            "ready": False,
+            "reason": "required runtime features are missing",
+        },
+    )
+    monkeypatch.setattr(
+        tools_config_cua,
+        "_cua_driver_contract_status",
+        lambda _binary=None: {
+            "ready": False,
+            "reason": "required runtime features are missing",
+        },
+    )
+
+    assert _invoke(monkeypatch, "status") == 1
+    output = capsys.readouterr().out
+    assert "Repair required" in output
+    assert "Run: hermes computer-use install" in output
+
+
+def test_computer_use_status_returns_nonzero_for_incompatible_custom_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_cli import tools_config
+    import hermes_cli.tools_config_cua as tools_config_cua
+
+    driver = r"C:\custom\cmd.exe"
+    monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", driver)
+    monkeypatch.setattr(cua_backend_driver, "resolve_cua_driver_cmd", lambda: driver)
+    monkeypatch.setattr(
+        tools_config,
+        "_cua_driver_contract_status",
+        lambda _binary=None: {"ready": False, "reason": "manifest is invalid"},
+    )
+    monkeypatch.setattr(
+        tools_config_cua,
+        "_cua_driver_contract_status",
+        lambda _binary=None: {"ready": False, "reason": "manifest is invalid"},
+    )
+
+    assert _invoke(monkeypatch, "status") == 1
+    output = capsys.readouterr().out
+    assert "custom binary from HERMES_CUA_DRIVER_CMD" in output
+    assert "unset the override" in output
+
+
+@pytest.mark.parametrize(("ready", "expected"), [(True, 0), (False, 1)])
+def test_computer_use_install_checks_resulting_runtime_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    ready: bool,
+    expected: int,
+) -> None:
+    from hermes_cli import tools_config
+    import hermes_cli.tools_config_cua as tools_config_cua
+
+    install = Mock(return_value=True)
+    monkeypatch.setattr(tools_config, "install_cua_driver", install)
+    monkeypatch.setattr(
+        tools_config,
+        "_cua_driver_contract_status",
+        lambda: {"ready": ready},
+    )
+    monkeypatch.setattr(
+        tools_config_cua,
+        "_cua_driver_contract_status",
+        lambda: {"ready": ready},
+    )
+
+    assert _invoke(monkeypatch, "install") == expected
+    install.assert_called_once_with(upgrade=False)
+
+
+def test_computer_use_install_returns_nonzero_for_unrepairable_custom_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import tools_config
+    import hermes_cli.tools_config_cua as tools_config_cua
+
+    driver = r"C:\custom\cmd.exe"
+    monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", driver)
+    install = Mock(return_value=False)
+    contract = Mock(side_effect=AssertionError("failed install must short-circuit"))
+    monkeypatch.setattr(tools_config, "install_cua_driver", install)
+    monkeypatch.setattr(tools_config, "_cua_driver_contract_status", contract)
+    monkeypatch.setattr(tools_config_cua, "_cua_driver_contract_status", contract)
+
+    assert _invoke(monkeypatch, "install") == 1
+    install.assert_called_once_with(upgrade=False)
+    contract.assert_not_called()
+

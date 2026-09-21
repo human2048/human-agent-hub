@@ -1,0 +1,380 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\browser_use\orchestrate_cloud.py ===
+"""Cloud-backend battery: pr arm attached to a provisioned cloud browser per cell.
+
+Backends:
+    nous-cloud   - Nous Portal-provisioned Browser Use cloud browser
+                   (plugins.browser.browser_use provider; needs gateway access)
+    browserbase  - fresh Browserbase session per cell
+                   (needs BROWSERBASE_API_KEY + BROWSERBASE_PROJECT_ID)
+
+Usage:
+    BUBENCH_BASE_TREE=... BUBENCH_PR_TREE=... \
+        python3 orchestrate_cloud.py --backend nous-cloud [--reps 2]
+        python3 orchestrate_cloud.py --backend browserbase [--reps 1]
+
+Per cell: provision a session, export its CDP endpoint via BENCH_CDP_URL /
+BU_CDP_WS, run single_run.py (pr arm), close the session. Resume-safe.
+"""
+
+import argparse
+import itertools
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = os.environ.get("BUBENCH_ROOT", os.path.dirname(os.path.abspath(__file__)))
+PY = sys.executable
+ENV_BASE = {**os.environ}
+ENV_BASE["PATH"] = (
+    os.path.expanduser("~/.local/bin") + os.pathsep + ENV_BASE.get("PATH", "")
+)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--backend", required=True, choices=["nous-cloud", "browserbase"])
+parser.add_argument("--tasks", default=os.path.join(ROOT, "tasks", "hard.json"))
+parser.add_argument("--models", default="anthropic/claude-opus-4.8,moonshotai/kimi-k3")
+parser.add_argument("--reps", type=int, default=2)
+parser.add_argument("--results", default=None)
+parser.add_argument("--run-timeout", type=int, default=1200)
+args = parser.parse_args()
+
+RESULTS = args.results or os.path.join(ROOT, "results", f"results_{args.backend}.jsonl")
+os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
+MODELS = args.models.split(",")
+TASKS = list(json.load(open(args.tasks, encoding="utf-8")).keys())
+REPS = list(range(1, args.reps + 1))
+
+done = set()
+if os.path.exists(RESULTS):
+    for line in open(RESULTS, encoding="utf-8"):
+        try:
+            r = json.loads(line)
+            done.add((r["task"], r["model"], r["rep"]))
+        except Exception:
+            pass
+
+
+class NousCloud:
+    def __init__(self):
+        sys.path.insert(0, os.environ["BUBENCH_PR_TREE"])
+        import importlib
+
+        self._mod = importlib.import_module("plugins.browser.browser_use.provider")
+
+    def create(self, name):
+        self._prov = self._mod.BrowserUseBrowserProvider()
+        sess = self._prov.create_session(name)
+        return sess, {"BENCH_CDP_URL": sess["cdp_url"]}
+
+    def close(self, sess):
+        self._prov.close_session(
+            sess.get("bb_session_id") or sess.get("session_name", "")
+        )
+
+
+class Browserbase:
+    def create(self, name):
+        req = urllib.request.Request(
+            "https://api.browserbase.com/v1/sessions",
+            data=json.dumps({
+                "projectId": os.environ["BROWSERBASE_PROJECT_ID"]
+            }).encode(),
+            headers={
+                "x-bb-api-key": os.environ["BROWSERBASE_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            sess = json.load(resp)
+        return sess, {
+            "BU_CDP_WS": sess["connectUrl"],
+            "BENCH_CDP_URL": sess["connectUrl"],
+        }
+
+    def close(self, sess):
+        req = urllib.request.Request(
+            f"https://api.browserbase.com/v1/sessions/{sess['id']}",
+            data=json.dumps({
+                "projectId": os.environ["BROWSERBASE_PROJECT_ID"],
+                "status": "REQUEST_RELEASE",
+            }).encode(),
+            headers={
+                "x-bb-api-key": os.environ["BROWSERBASE_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=30)
+
+
+provider = NousCloud() if args.backend == "nous-cloud" else Browserbase()
+
+cells = [(t, m, rep) for m, t, rep in itertools.product(MODELS, TASKS, REPS)]
+total = len(cells)
+n = 0
+for task, model, rep in cells:
+    n += 1
+    if (task, model, rep) in done:
+        continue
+    print(f"[{n}/{total}] {args.backend} pr {task} {model} rep{rep}", flush=True)
+    sess = None
+    t0 = time.time()
+    try:
+        sess, extra_env = provider.create(f"bubench-{task}-{rep}")
+    except Exception as e:  # noqa: BLE001
+        rec = {
+            "arm": f"pr-{args.backend}",
+            "task": task,
+            "model": model,
+            "rep": rep,
+            "ok": False,
+            "error": f"session-create: {e}",
+        }
+        with open(RESULTS, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        continue
+    env = {**ENV_BASE, **extra_env, "BUBENCH_TASKS": args.tasks}
+    subprocess.run(["pkill", "-f", "browser_harness"], capture_output=True)
+    try:
+        proc = subprocess.run(
+            [PY, os.path.join(ROOT, "single_run.py"), "pr", task, model, str(rep)],
+            capture_output=True,
+            text=True,
+            timeout=args.run_timeout,
+            env=env,
+        )
+        rec = None
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("RESULT_JSON:"):
+                rec = json.loads(line[len("RESULT_JSON:") :])
+        if rec is None:
+            rec = {
+                "task": task,
+                "model": model,
+                "rep": rep,
+                "ok": False,
+                "error": "no-result",
+                "stderr_tail": (proc.stderr or "")[-600:],
+            }
+    except subprocess.TimeoutExpired:
+        rec = {
+            "task": task,
+            "model": model,
+            "rep": rep,
+            "ok": False,
+            "error": f"timeout-{args.run_timeout}s",
+        }
+    finally:
+        try:
+            provider.close(sess)
+        except Exception as e:  # noqa: BLE001
+            print(f"  close warning: {e}", flush=True)
+    rec["arm"] = f"pr-{args.backend}"
+    rec["cell_wall_s"] = round(time.time() - t0, 1)
+    with open(RESULTS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(
+        f"  -> ok={rec.get('ok')} err={rec.get('error')} wall={rec.get('cell_wall_s')}s",
+        flush=True,
+    )
+
+print("CLOUD BATTERY COMPLETE", flush=True)
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\browser_use\README.md ===
+# Browser Use Mode Benchmark
+
+The A/B battery behind PR [#81958](https://github.com/NousResearch/hermes-agent/pull/81958)
+(Browser Use CLI 3.0 mode, salvage of #66476 by @laithrw): built-in
+`browser_*` toolset vs the single `browser_exec` driver, measured as total
+task tokens / tool calls / wall clock at accuracy parity on live multi-step
+web tasks.
+
+## Design
+
+- **Arms differ only by tree + config.** `base` runs the built-in twelve
+  `browser_*` tools from a merge-base checkout; `pr` runs `browser_exec`
+  (`browser.backend: browser-use`) from the branch checkout; `prns` is `pr`
+  with the schema's helpers digest stripped to the header (isolates the
+  digest's value). Each cell gets a throwaway `HERMES_HOME`; web-fetch
+  credentials are stripped so every arm must actually drive the browser.
+- **Tasks are oracle-checked.** toscrape-family sites (stable content, no
+  anti-bot), regex oracles over the final answer. `tasks/easy.json` (5 tasks:
+  price lookup, category extract, count/aggregate, login, pagination) and
+  `tasks/hard.json` (6 tasks: full-category multi-page crawls, five-star
+  rating aggregation, JS/delayed render, login chain, cross-category
+  compare).
+- **Resume-safe.** Completed cells in `results/*.jsonl` are skipped on rerun
+  (same pattern as `evals/toolperf_abeval`).
+- **Backend matrix.** `orchestrate.py` drives a local headless-Chrome CDP;
+  `orchestrate_cloud.py --backend nous-cloud|browserbase` provisions a real
+  cloud browser per cell through the same provider plumbing the product uses.
+
+## Run
+
+```bash
+# arms are pinned checkouts — e.g. merge-base worktree vs your branch
+export BUBENCH_BASE_TREE=/path/to/merge-base-tree
+export BUBENCH_PR_TREE=/path/to/branch-tree
+```
+
+Note: since #81958 merged (and #85170 made Browser Use the default driver),
+a current-main checkout resolves to `browser_exec` in BOTH arms. The `base`
+arm only measures the built-in `browser_*` toolset when `BUBENCH_BASE_TREE`
+is pinned to a pre-#81958 tree (the original run used the PR's merge-base
+worktree). For future A/Bs of new browser changes, pin `base` to the
+merge-base of the change under test — the arms are generic.
+
+```bash
+google-chrome --headless=new --remote-debugging-port=9333 \
+  --user-data-dir=/tmp/bubench-chrome --no-first-run --disable-gpu about:blank &
+
+python3 orchestrate.py --tasks tasks/hard.json --reps 3     # 108 cells @ 2 models x 3 arms
+python3 report.py results/results.jsonl
+```
+
+## Baseline scorecard (Aug 8-10 2026, the #81958 run — 204 cells total)
+
+**Hard-task battery, local Chrome CDP** (6 tasks x 3 reps per cell; final
+corrected-oracle readout, nothing excluded):
+
+```
+model      arm       ok  tok_mean  tok_med  calls  wall_s  vs base tok
+opus4.8    base   18/18     64594    63776    4.1    25.2            —
+opus4.8    pr     18/18     25934    25030    2.0    17.5         -60%
+opus4.8    prns   18/18     25578    27934    3.2    23.7         -60%
+kimi-k3    base   18/18     56464    53276    5.3    50.0            —
+kimi-k3    pr     18/18     19230    16710    2.4    33.3         -66%
+kimi-k3    prns   18/18     23099    21160    4.1    50.5         -59%
+```
+
+Digest ablation: pr (with helpers digest) 36/36 ok, mean 22,582 tok; prns
+(header-only) 36/36 ok, mean 24,339 tok — the pinned 3.4KB digest costs
+nothing and saves a little; the full 11KB live skill dump adds nothing.
+
+**Backend matrix** (pr arm, same tasks):
+
+```
+model      backend          ok  tok_mean  calls   wall
+opus4.8    local-cdp     17/18     25934    2.0   17.5
+opus4.8    nous-cloud    12/12     33330    2.8   33.8
+opus4.8    browserbase    6/6      26712    2.2   23.2
+kimi-k3    local-cdp     18/18     19230    2.4   33.3
+kimi-k3    nous-cloud    12/12     22050    2.9   41.4
+kimi-k3    browserbase    6/6      22121    2.8   35.2
+```
+
+**Easy battery, round 1** (5 tasks x 3 reps, sonnet-5 + qwen3-coder-30b;
+after excluding provider-noise runs — raw chat-template XML, 0 tool calls):
+
+```
+model                     arm    ok     prompt  compl   total  calls  wall_s
+claude-sonnet-5           base  15/15    39771    324   40095   2.7    16.5
+claude-sonnet-5           pr    15/15    27482    509   27991   2.4    14.3
+qwen3-coder-30b           base  13/14    59509    559   60068   5.7    21.5
+qwen3-coder-30b           pr    10/11    57146   1616   58763   6.8    26.3
+```
+
+sonnet-5: −30% tokens at parity. qwen3-30b: a wash — weak coders burn the
+savings retrying exec code. The token win concentrates on multi-step tasks
+and grows with task hardness; strong models also finish in fewer tool calls.
+
+Compatibility probes from the same run: Firecrawl cloud browsers attach fine
+(CDP websocket); Camofox has no CDP surface — structurally incompatible,
+hence the automatic fallback to the built-in toolset in #81958.
+
+Caveats: toscrape-family sites (no anti-bot, no heavy SPA); n<=3 per cell;
+success-rate deltas at this n are noise — audit sub-100% cells run-by-run
+before calling a regression.
+
+## Provenance
+
+The original per-run `results*.jsonl` files lived in `/tmp/bu-bench/` (tmpfs)
+and were lost in a host reboot on Aug 12 2026. The harness, task definitions,
+and aggregate readouts in this directory were recovered verbatim from the
+session transcripts of the benchmark run (session `20260808_050008_5f615e`
+tool-call history); `single_run.py`/`orchestrate*.py` are the recovered
+scripts with the hardcoded `/tmp/bu-bench` paths parameterized. Rerunning the
+battery reproduces fresh per-run data.
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\browser_use\report.py ===
+"""Aggregate results.jsonl into the scorecard tables.
+
+Usage:
+    python3 report.py [results/results.jsonl ...]
+
+Groups by (model, arm): ok-rate, token mean/median, tool calls, wall clock,
+and token delta vs the ``base`` arm of the same model when present.
+"""
+
+import json
+import statistics
+import sys
+from collections import defaultdict
+
+
+def main(paths):
+    rows = []
+    for p in paths:
+        for line in open(p, encoding="utf-8"):
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    if not rows:
+        print("no rows")
+        return
+
+    cells = defaultdict(list)
+    for r in rows:
+        cells[(r.get("model", "?"), r.get("arm", "?"))].append(r)
+
+    base_tok = {}
+    for (model, arm), rs in cells.items():
+        if arm == "base":
+            oks = [r for r in rs if r.get("ok")]
+            if oks:
+                base_tok[model] = statistics.mean(r.get("total_tokens", 0) for r in oks)
+
+    hdr = f"{'model':<34} {'arm':<16} {'ok':>7} {'tok_mean':>9} {'tok_med':>8} {'calls':>6} {'wall_s':>7} {'vs base':>8}"
+    print(hdr)
+    print("-" * len(hdr))
+    for model, arm in sorted(cells):
+        rs = cells[(model, arm)]
+        oks = [r for r in rs if r.get("ok")]
+        n_ok, n = len(oks), len(rs)
+        toks = [r.get("total_tokens", 0) for r in oks]
+        calls = [r.get("tool_calls", 0) for r in oks]
+        walls = [r.get("wall_s", 0) for r in oks]
+        tok_mean = statistics.mean(toks) if toks else 0
+        delta = ""
+        if arm != "base" and model in base_tok and tok_mean:
+            delta = f"{(tok_mean - base_tok[model]) / base_tok[model] * 100:+.0f}%"
+        print(
+            f"{model:<34} {arm:<16} {n_ok:>3}/{n:<3} {tok_mean:>9.0f} "
+            f"{statistics.median(toks) if toks else 0:>8.0f} "
+            f"{statistics.mean(calls) if calls else 0:>6.1f} "
+            f"{statistics.mean(walls) if walls else 0:>7.1f} {delta:>8}"
+        )
+
+    errs = [r for r in rows if r.get("error")]
+    if errs:
+        print(f"\nerrors: {len(errs)}")
+        for r in errs[:10]:
+            print(
+                f"  {r.get('model')}/{r.get('arm')}/{r.get('task')}/rep{r.get('rep')}: {r['error'][:120]}"
+            )
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:] or ["results/results.jsonl"])
+

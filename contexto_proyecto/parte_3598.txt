@@ -1,0 +1,394 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_top_level_value_flags_parity.py ===
+"""Top-level value-flag classification must match the real parser (#93530).
+
+``_first_positional_argv`` and ``_apply_profile_override`` in ``main.py``
+historically kept hand-maintained copies of "which top-level options consume
+a value". Those copies drift — ``--reasoning`` was a value-taking top-level
+option absent from both sets, so every ``hermes --reasoning high <cmd> …``
+invocation mis-classified ``high`` as the first positional and forced eager
+plugin CLI discovery (~500-650ms startup tax).
+
+Both sites now share ``hermes_cli._parser.top_level_value_flag_sets()``,
+derived from ``build_top_level_parser()`` (mirroring the
+``update_cmd._holder_value_flags`` precedent). These tests pin:
+
+  1. parity — the helper covers every value-taking option the live parser
+     declares, so future drift fails CI instead of silently degrading
+     startup;
+  2. the ``--reasoning`` misparse regression itself.
+"""
+
+import sys
+
+import pytest
+
+from hermes_cli._parser import build_top_level_parser, top_level_value_flag_sets
+from hermes_cli.main import _first_positional_argv, _plugin_cli_discovery_needed
+
+
+def _parser_value_flags() -> tuple[set, set]:
+    """(required, optional) option strings of value-taking top-level actions.
+
+    An action consumes a value when its nargs is not zero-valued: Store /
+    Append with nargs=None take exactly one; '?' takes an optional value.
+    Boolean flags in this parser expose nargs == 0.
+    """
+    parser = build_top_level_parser()[0]
+    required: set = set()
+    optional: set = set()
+    for action in parser._actions:
+        if not action.option_strings or action.nargs == 0:
+            continue
+        target = optional if action.nargs == "?" else required
+        target.update(action.option_strings)
+    return required, optional
+
+
+def test_helper_sets_match_top_level_parser():
+    required, optional = top_level_value_flag_sets()
+    parser_required, parser_optional = _parser_value_flags()
+    missing_required = parser_required - required
+    missing_optional = parser_optional - optional
+    assert not missing_required, (
+        f"value flags missing from required set: {sorted(missing_required)} "
+        "(they will be misread as positionals and force eager plugin discovery)"
+    )
+    assert not missing_optional, (
+        f"optional-value flags missing: {sorted(missing_optional)}"
+    )
+
+
+def test_reasoning_is_classified_as_value_flag():
+    required, optional = top_level_value_flag_sets()
+    assert "--reasoning" in (required | optional)
+
+
+def test_first_positional_skips_reasoning_value(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["hermes", "--reasoning", "high", "chat", "hello"])
+    assert _first_positional_argv() == "chat"
+    assert _plugin_cli_discovery_needed() is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["hermes", "--reasoning", "ultra", "--provider", "openai", "-z", "prompt here"],
+    ["hermes", "-m", "x", "--reasoning=low", "chat"],
+])
+def test_reasoning_forms_do_not_shadow_the_subcommand(monkeypatch, argv):
+    monkeypatch.setattr("sys.argv", argv)
+    first = _first_positional_argv()
+    assert first not in {"high", "ultra", "low"}, (
+        f"a reasoning level leaked through as the positional: {first!r}"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_transformed_stream_output.py ===
+"""Regression coverage for CLI delivery after transform_llm_output streaming."""
+
+from cli import _post_stream_transform_output
+
+
+def test_streamed_transform_prints_only_appended_suffix():
+    output = _post_stream_transform_output(
+        "original answer\n\n[plugin appended this]",
+        {
+            "response_transformed": True,
+            "pre_transform_response": "original answer",
+        },
+    )
+
+    assert output == "\n\n[plugin appended this]"
+
+
+def test_streamed_transform_prints_full_replacement_instead_of_dropping_it():
+    output = _post_stream_transform_output(
+        "XYZ",
+        {
+            "response_transformed": True,
+            "pre_transform_response": "abc",
+        },
+    )
+
+    assert output == "\n[Response transformed after streaming]\nXYZ"
+
+
+def test_untransformed_stream_has_no_post_stream_output():
+    assert _post_stream_transform_output("original answer", {}) == ""
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_tts_picker.py ===
+"""Tests for the TTS plugin picker surface in hermes_cli/tools_config.py (issue #30398).
+
+Covers ``_plugin_tts_providers()`` and the ``_visible_providers()``
+integration that injects plugin rows into the Text-to-Speech category.
+
+Mirrors the structure of existing image_gen / browser picker tests.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agent import tts_registry
+from agent.tts_provider import TTSProvider
+from hermes_cli import tools_config
+
+
+class _FakeTTSProvider(TTSProvider):
+    def __init__(self, name: str, schema: dict | None = None):
+        self._name = name
+        self._schema = schema
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def synthesize(self, text, output_path, **kw):
+        return output_path
+
+    def get_setup_schema(self):
+        if self._schema is not None:
+            return self._schema
+        return super().get_setup_schema()
+
+
+@pytest.fixture(autouse=True)
+def _reset_registry():
+    tts_registry._reset_for_tests()
+    yield
+    tts_registry._reset_for_tests()
+
+
+class TestPluginTTSProviders:
+    """``_plugin_tts_providers()`` returns picker-row dicts."""
+
+
+
+
+    def test_skips_providers_with_no_name(self):
+        """Defense in depth: a provider with no .name attribute is skipped
+        rather than crashing the picker."""
+
+        class _NoName:
+            display_name = "Bogus"
+            def get_setup_schema(self):
+                return {"name": "Bogus"}
+
+        tts_registry._providers["bogus"] = _NoName()  # type: ignore[assignment]
+        try:
+            rows = tools_config._plugin_tts_providers()
+            # Provider has no .name so the picker filters it out
+            assert all(r.get("tts_plugin_name") != "bogus" for r in rows)
+        finally:
+            tts_registry._providers.pop("bogus", None)  # type: ignore[arg-type]
+
+
+    def test_minimal_schema_uses_display_name(self):
+        """A provider with no setup_schema override gets a row built from
+        ``display_name`` and ``name`` only."""
+        tts_registry.register_provider(_FakeTTSProvider(name="minimal"))
+        rows = tools_config._plugin_tts_providers()
+        assert len(rows) == 1
+        assert rows[0]["name"] == "Minimal"  # display_name default
+        assert rows[0]["tts_provider"] == "minimal"
+        assert rows[0]["env_vars"] == []
+
+
+
+class TestVisibleProvidersInjectsTTSPlugins:
+    """``_visible_providers()`` injects plugin rows into the Text-to-Speech
+    category alongside the hardcoded built-in rows."""
+
+    def test_tts_category_includes_plugin_rows(self):
+        tts_registry.register_provider(_FakeTTSProvider(name="cartesia"))
+
+        tts_cat = tools_config.TOOL_CATEGORIES["tts"]
+        visible = tools_config._visible_providers(tts_cat, config={})
+
+        names = [row.get("name") for row in visible]
+        # Hardcoded rows (sample — check at least one is present)
+        assert "Microsoft Edge TTS" in names
+        # Plugin row injected at the end
+        assert "Cartesia" in names
+
+        # Plugin row has tts_provider key for write-path compat
+        plugin_rows = [r for r in visible if r.get("tts_plugin_name")]
+        assert len(plugin_rows) == 1
+        assert plugin_rows[0]["tts_provider"] == "cartesia"
+
+    def test_other_categories_unaffected_by_tts_plugins(self):
+        """Registering a TTS plugin must not leak into the Image Generation
+        or Browser pickers."""
+        tts_registry.register_provider(_FakeTTSProvider(name="cartesia"))
+
+        img_cat = tools_config.TOOL_CATEGORIES["image_gen"]
+        visible = tools_config._visible_providers(img_cat, config={})
+        names = [row.get("name") for row in visible]
+        assert "Cartesia" not in names
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_tui_bundled.py ===
+
+
+def test_tui_finds_bundled_entry_js(tmp_path):
+    """_find_bundled_tui finds entry.js bundled in the package."""
+    tui_dist = tmp_path / "hermes_cli" / "tui_dist"
+    tui_dist.mkdir(parents=True)
+    entry = tui_dist / "entry.js"
+    entry.write_text("// bundled TUI", encoding="utf-8")
+
+    from hermes_cli.main_tui_launch import _find_bundled_tui
+    result = _find_bundled_tui(hermes_cli_dir=tmp_path / "hermes_cli")
+    assert result is not None
+    assert result.name == "entry.js"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_tui_heap_sizing.py ===
+"""Tests for cgroup-aware TUI V8 heap sizing.
+
+V8 is not cgroup-aware: a flat ``--max-old-space-size=8192`` lets the heap grow
+toward 8GB in a memory-limited container, so the cgroup OOM-killer SIGKILLs Node
+before V8's own monitor fires — leaving the user with only a bare gateway
+``stdin EOF`` and no breadcrumb. ``_resolve_tui_heap_mb`` reads the real cgroup
+limit and sizes the cap below it so V8 exits gracefully instead.
+"""
+
+import builtins
+import io
+from unittest import mock
+
+import hermes_cli.main as m
+from hermes_cli import main_tui_launch
+
+V2 = "/sys/fs/cgroup/memory.max"
+V1 = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+GB = 1024 ** 3
+
+
+def _fake_open(files: dict):
+    """Return an open() shim serving cgroup paths from ``files`` (path->str)."""
+    real_open = builtins.open
+
+    def opener(path, *args, **kwargs):
+        if path in (V2, V1):
+            content = files.get(path)
+            if content is None:
+                raise FileNotFoundError(path)
+            return io.StringIO(content)
+        return real_open(path, *args, **kwargs)
+
+    return opener
+
+
+def _read(files: dict):
+    with mock.patch.object(builtins, "open", _fake_open(files)):
+        return main_tui_launch._read_cgroup_memory_limit()
+
+
+class TestReadCgroupMemoryLimit:
+    def test_v2_max_is_unlimited(self):
+        assert _read({V2: "max"}) is None
+
+
+class TestResolveTuiHeapMb:
+    def _resolve(self, limit_bytes):
+        with mock.patch.object(main_tui_launch, "_read_cgroup_memory_limit", return_value=limit_bytes):
+            return main_tui_launch._resolve_tui_heap_mb()
+
+    def test_unconstrained_uses_default(self):
+        assert self._resolve(None) == 8192
+
+
+class TestNodeOptionsTokenMerge:
+    """The _launch_tui token-merge block must add the sized cap unless the user
+    already supplied one, and must preserve unrelated NODE_OPTIONS flags."""
+
+    def _merge(self, node_options, limit_bytes):
+        with mock.patch.object(main_tui_launch, "_read_cgroup_memory_limit", return_value=limit_bytes):
+            tokens = node_options.split()
+            if not any(t.startswith("--max-old-space-size=") for t in tokens):
+                tokens.append(f"--max-old-space-size={main_tui_launch._resolve_tui_heap_mb()}")
+            return " ".join(tokens)
+
+    def test_unconstrained_empty(self):
+        assert self._merge("", None) == "--max-old-space-size=8192"
+
+
+    def test_preserves_other_flags(self):
+        assert self._merge("--enable-source-maps", 4 * GB) == "--enable-source-maps --max-old-space-size=3072"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_tui_launcher_skips_plugin_discovery.py ===
+
+"""Regression test: the TUI launcher must not spend time on plugin discovery.
+
+`hermes --tui` just spawns a Node process; the spawned tui_gateway backend
+performs its own plugin discovery. Running discover_plugins() in the
+launcher added ~0.5s to every `hermes --tui` startup for work the backend
+then redoes. Plain chat must still discover plugins.
+"""
+
+from __future__ import annotations
+
+from argparse import Namespace
+import sys
+import types
+
+from hermes_cli import main as main_mod
+
+
+def _install_discover_spy(monkeypatch):
+    calls = []
+
+    def _discover():
+        calls.append("discover")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(
+            discover_plugins=_discover,
+            # main.py now kicks discovery off in a background thread; both
+            # entry points count as "discovery work happened in the launcher".
+            start_background_plugin_discovery=_discover,
+        ),
+    )
+    return calls
+
+
+def _args(**overrides):
+    base = {
+        "accept_hooks": False,
+        "yolo": False,
+        "safe_mode": False,
+        "command": None,
+        "query": None,
+        "image": None,
+    }
+    base.update(overrides)
+    return Namespace(**base)
+
+
+def test_plugin_discovery_skipped_for_tui_launch(monkeypatch):
+    calls = _install_discover_spy(monkeypatch)
+    main_mod._prepare_agent_startup(_args(tui=True))
+    assert calls == [], (
+        "Plugin discovery must not run in the TUI launcher: the spawned "
+        "tui_gateway backend discovers plugins itself."
+    )
+
+
+def test_plugin_discovery_runs_for_plain_chat(monkeypatch):
+    calls = _install_discover_spy(monkeypatch)
+    main_mod._prepare_agent_startup(_args(tui=False, command="chat"))
+    assert calls == ["discover"]
+

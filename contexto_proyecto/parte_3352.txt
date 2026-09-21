@@ -1,0 +1,419 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_login_cli_command.py ===
+import threading
+from io import StringIO
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from rich.console import Console
+
+from hermes_cli import anon_auth
+from hermes_cli import cli_commands_mixin as commands
+
+
+class _Thread:
+    def __init__(self, target):
+        self.target = target
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def join(self):
+        self.target()
+
+
+def _cli(monkeypatch):
+    cli = SimpleNamespace(console=MagicMock())
+    workers = []
+
+    def side_worker(produce, **kwargs):
+        thread = _Thread(produce)
+        workers.append((thread, kwargs))
+        return thread
+
+    cli._side_worker = side_worker
+    cli._handle_login_command = commands.CLICommandsMixin._handle_login_command.__get__(cli)
+    output = []
+    monkeypatch.setattr(commands, "_cp", lambda *lines: output.extend(lines))
+    return cli, workers, output
+
+
+def test_the_cli_handler_prints_the_code_then_drains_off_thread(monkeypatch):
+    cli, workers, output = _cli(monkeypatch)
+    states = iter([
+        anon_auth.Code("https://example.test/sign-in", "CODE-1", 900, 5),
+        anon_auth.Completed(email="person@example.test", model="model-1", model_changed=True),
+    ])
+    monkeypatch.setattr(anon_auth, "run_sign_in", lambda **_kwargs: states)
+    monkeypatch.setattr(
+        anon_auth, "render_sign_in_cli_code",
+        lambda state, **kwargs: kwargs["printer"](state.link, state.code, f"  {state.copy_with_wait}"))
+
+    cli._handle_login_command("/login")
+
+    assert output == [
+        "  Starting sign-in...",
+        "https://example.test/sign-in",
+        "CODE-1",
+        "  Do not share this code. Waiting for sign-in, up to 15 minutes.",
+    ]
+    assert workers[0][0].started is True
+    assert workers[0][0].target() == (
+        "Signed in as person@example.test.\nDefault model is now model-1.")
+
+
+@pytest.mark.parametrize(
+    "terminal,initial_model,expected_model",
+    [
+        (anon_auth.Completed(model="model-1", model_changed=True), anon_auth.GUEST_MODEL, "model-1"),
+        (anon_auth.Completed(model="model-1", model_changed=True),
+         "openrouter/some-model", "openrouter/some-model"),
+        (anon_auth.Declined(), anon_auth.GUEST_MODEL, anon_auth.GUEST_MODEL),
+    ],
+)
+def test_the_drain_only_moves_the_free_tier_model_on_completion(
+        monkeypatch, terminal, initial_model, expected_model):
+    cli, workers, _output = _cli(monkeypatch)
+    cli.model = initial_model
+    monkeypatch.setattr(anon_auth, "run_sign_in", lambda **_kwargs: iter([
+        anon_auth.Code("https://example.test/sign-in", "CODE-1", 900, 5),
+        terminal,
+    ]))
+    monkeypatch.setattr(anon_auth, "render_sign_in_cli_code", lambda *_args, **_kwargs: None)
+
+    cli._handle_login_command("/login")
+    workers[0][0].join()
+
+    assert cli.model == expected_model
+
+
+def test_a_precondition_prints_without_starting_a_thread(monkeypatch):
+    cli, workers, output = _cli(monkeypatch)
+    monkeypatch.setattr(anon_auth, "run_sign_in", lambda **_kwargs: iter([anon_auth.AlreadySignedIn()]))
+
+    cli._handle_login_command("/login")
+
+    assert output == ["  Starting sign-in...", "  Already signed in."]
+    assert workers == []
+
+
+def test_ctrl_c_during_the_first_advance_prints_the_cancelled_copy(monkeypatch):
+    cli, workers, output = _cli(monkeypatch)
+    closed = threading.Event()
+
+    def flow():
+        try:
+            raise KeyboardInterrupt
+            yield
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(anon_auth, "run_sign_in", lambda **_kwargs: flow())
+
+    cli._handle_login_command("/login")
+
+    assert output[-1] == anon_auth.UPGRADE_CANCELLED
+    assert closed.is_set()
+    assert workers == []
+
+
+def test_the_handler_never_calls_input_and_uses_the_short_timeout(monkeypatch):
+    cli, _workers, _output = _cli(monkeypatch)
+    seen = []
+    monkeypatch.setattr("builtins.input", lambda *_args: (_ for _ in ()).throw(AssertionError("input called")))
+
+    def flow(**kwargs):
+        seen.append(kwargs)
+        return iter([anon_auth.AlreadySignedIn()])
+
+    monkeypatch.setattr(anon_auth, "run_sign_in", flow)
+    cli._handle_login_command("/login")
+
+    assert seen == [{"timeout_seconds": 8.0}]
+
+
+def test_the_in_chat_and_terminal_completion_use_their_own_copy():
+    state = anon_auth.Completed(email="", model="", model_changed=True)
+    assert "run /model to pick one" in anon_auth.drain_sign_in_copy(iter([state]), chat=True)
+    assert "run `hermes model` to pick one" in anon_auth.drain_sign_in_copy(iter([state]), chat=False)
+
+
+def test_the_command_resolves_through_the_cli_fallback():
+    from cli import HermesCLI
+    assert HermesCLI._slash_handler("login") == ("_handle_login_command", True)
+
+
+def test_the_drain_writes_to_the_console_captured_at_start(monkeypatch):
+    old_buf, new_buf = StringIO(), StringIO()
+    gate = threading.Event()
+    threads = []
+    cli = SimpleNamespace(
+        console=Console(file=old_buf, force_terminal=False, width=100),
+        _app=None,
+        bell_on_complete=False,
+        final_response_markdown=False,
+        _scrollback_box_width=lambda: 80,
+        _invalidate=lambda **_kwargs: None,
+    )
+    real_side_worker = commands.CLICommandsMixin._side_worker.__get__(cli)
+
+    def side_worker(*args, **kwargs):
+        thread = real_side_worker(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    cli._side_worker = side_worker
+    cli._handle_login_command = commands.CLICommandsMixin._handle_login_command.__get__(cli)
+    monkeypatch.setattr(commands, "_cp", lambda *_lines: None)
+    monkeypatch.setattr(anon_auth, "render_sign_in_cli_code", lambda *_args, **_kwargs: None)
+
+    def flow(**_kwargs):
+        yield anon_auth.Code("https://example.test/sign-in", "CODE", 60, 1)
+        gate.wait()
+        yield anon_auth.Completed(email="person@example.test")
+
+    monkeypatch.setattr(anon_auth, "run_sign_in", flow)
+    cli._handle_login_command("/login")
+    cli.console = Console(file=new_buf, force_terminal=False, width=100)
+    gate.set()
+    threads[0].join(timeout=2)
+
+    assert "Signed in as person@example.test." in old_buf.getvalue()
+    assert new_buf.getvalue() == ""
+
+
+def test_the_live_tui_drain_prints_through_cprint_instead_of_the_captured_console(monkeypatch):
+    import cli as cli_module
+
+    old_buf, new_buf = StringIO(), StringIO()
+    gate = threading.Event()
+    threads = []
+    output = []
+    cli = SimpleNamespace(
+        console=Console(file=old_buf, force_terminal=False, width=100),
+        _app=SimpleNamespace(invalidate=lambda: None),
+        bell_on_complete=False,
+        final_response_markdown=False,
+        _scrollback_box_width=lambda: 80,
+        _invalidate=lambda **_kwargs: None,
+    )
+    real_side_worker = commands.CLICommandsMixin._side_worker.__get__(cli)
+
+    def side_worker(*args, **kwargs):
+        thread = real_side_worker(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    cli._side_worker = side_worker
+    cli._handle_login_command = commands.CLICommandsMixin._handle_login_command.__get__(cli)
+    monkeypatch.setattr(commands, "_cp", lambda *lines: output.extend(lines))
+    monkeypatch.setattr(cli_module, "_cprint", lambda *lines, **_kwargs: output.extend(lines))
+    monkeypatch.setattr(anon_auth, "render_sign_in_cli_code", lambda *_args, **_kwargs: None)
+
+    def flow(**_kwargs):
+        yield anon_auth.Code("https://example.test/sign-in", "CODE", 60, 1)
+        gate.wait()
+        yield anon_auth.Completed(email="person@example.test")
+
+    monkeypatch.setattr(anon_auth, "run_sign_in", flow)
+    cli._handle_login_command("/login")
+    cli.console = Console(file=new_buf, force_terminal=False, width=100)
+    gate.set()
+    threads[0].join(timeout=2)
+
+    assert not threads[0].is_alive()
+    assert old_buf.getvalue() == ""
+    assert new_buf.getvalue() == ""
+    assert "  Sign-in" in output
+    assert any("Signed in as person@example.test." in line for line in output)
+
+
+def test_upgrade_guest_keeps_the_terminal_timeout(monkeypatch):
+    seen = []
+    monkeypatch.setattr(anon_auth, "render_sign_in_cli", lambda **kwargs: seen.append(kwargs) or 0)
+    monkeypatch.setattr("hermes_cli.auth_device_flow._is_remote_session", lambda: True)
+
+    assert anon_auth.upgrade_guest(SimpleNamespace(timeout=None, no_browser=False)) == 0
+    assert seen[0]["timeout_seconds"] == 15.0
+    assert seen[0]["chat"] is False
+
+
+def test_the_terminal_renderer_keeps_the_original_line_sequence(monkeypatch, capsys):
+    monkeypatch.setattr("hermes_cli.auth_device_flow._is_remote_session", lambda: True)
+    monkeypatch.setattr(anon_auth, "run_sign_in", lambda **_kwargs: iter([
+        anon_auth.Code("https://example.test/sign-in", "CODE-1", 900, 5),
+        anon_auth.Waiting(),
+        anon_auth.Completed(email="person@example.test", model="model-1", model_changed=True),
+    ]))
+
+    assert anon_auth.upgrade_guest(SimpleNamespace(timeout=None, no_browser=False)) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        anon_auth.UPGRADE_START,
+        "",
+        "To continue:",
+        "  1. Open: https://example.test/sign-in",
+        "  2. If prompted, enter code: CODE-1",
+        f"  {anon_auth.UPGRADE_DO_NOT_SHARE}",
+        anon_auth.UPGRADE_WAITING,
+        "Signed in as person@example.test.",
+        "Default model is now model-1.",
+    ]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_logs.py ===
+"""Tests for hermes_cli.logs — log viewing and filtering."""
+
+from datetime import datetime, timedelta
+
+
+from hermes_cli.logs import (
+    LOG_FILES,
+    _extract_level,
+    _extract_logger_name,
+    _line_matches_component,
+    _matches_filters,
+    _parse_line_timestamp,
+    _parse_since,
+    _read_last_n_lines,
+    _read_tail,
+)
+
+
+# ---------------------------------------------------------------------------
+# Timestamp parsing
+# ---------------------------------------------------------------------------
+
+class TestParseSince:
+    def test_hours(self):
+        cutoff = _parse_since("2h")
+        assert cutoff is not None
+        assert abs((datetime.now() - cutoff).total_seconds() - 7200) < 2
+
+
+    def test_invalid_returns_none(self):
+        assert _parse_since("abc") is None
+        assert _parse_since("") is None
+        assert _parse_since("10x") is None
+
+    def test_whitespace_tolerance(self):
+        cutoff = _parse_since("  5m  ")
+        assert cutoff is not None
+
+
+class TestParseLineTimestamp:
+    def test_standard_format(self):
+        ts = _parse_line_timestamp("2026-04-11 10:23:45 INFO gateway.run: msg")
+        assert ts == datetime(2026, 4, 11, 10, 23, 45)
+
+
+class TestExtractLevel:
+    def test_info(self):
+        assert _extract_level("2026-01-01 00:00:00 INFO gateway.run: msg") == "INFO"
+
+
+# ---------------------------------------------------------------------------
+# Logger name extraction (new for component filtering)
+# ---------------------------------------------------------------------------
+
+class TestExtractLoggerName:
+    def test_standard_line(self):
+        line = "2026-04-11 10:23:45 INFO gateway.run: Starting gateway"
+        assert _extract_logger_name(line) == "gateway.run"
+
+
+    def test_no_match(self):
+        assert _extract_logger_name("random text") is None
+
+
+class TestLineMatchesComponent:
+
+    def test_gateway_nested(self):
+        # Migrated platform adapters log under plugins.platforms.* (#41112) and
+        # must still resolve to the gateway component. Use the real expanded
+        # gateway prefixes (COMPONENT_PREFIXES["gateway"]) the CLI passes, not a
+        # bare ("gateway",), since the logger name no longer literally starts
+        # with "gateway".
+        from hermes_logging import COMPONENT_PREFIXES
+        line = "2026-04-11 10:23:45 INFO plugins.platforms.telegram.adapter: msg"
+        assert _line_matches_component(line, COMPONENT_PREFIXES["gateway"])
+
+
+
+
+
+    def test_unparseable_line(self):
+        assert not _line_matches_component("random text", ("gateway",))
+
+
+# ---------------------------------------------------------------------------
+# Combined filter
+# ---------------------------------------------------------------------------
+
+class TestMatchesFilters:
+
+    def test_level_filter(self):
+        assert _matches_filters(
+            "2026-01-01 00:00:00 WARNING x: msg", min_level="WARNING")
+        assert not _matches_filters(
+            "2026-01-01 00:00:00 INFO x: msg", min_level="WARNING")
+
+
+    def test_combined_filters(self):
+        """All filters must pass for a line to match."""
+        line = "2026-04-11 10:00:00 WARNING [sess_1] gateway.run: connection lost"
+        assert _matches_filters(
+            line,
+            min_level="WARNING",
+            session_filter="sess_1",
+            component_prefixes=("gateway",),
+        )
+        # Fails component filter
+        assert not _matches_filters(
+            line,
+            min_level="WARNING",
+            session_filter="sess_1",
+            component_prefixes=("tools",),
+        )
+
+    def test_since_filter(self):
+        # Line with a very old timestamp should be filtered out
+        assert not _matches_filters(
+            "2020-01-01 00:00:00 INFO x: old msg",
+            since=datetime.now() - timedelta(hours=1))
+        # Line with a recent timestamp should pass
+        recent = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        assert _matches_filters(
+            f"{recent} INFO x: recent msg",
+            since=datetime.now() - timedelta(hours=1))
+
+
+# ---------------------------------------------------------------------------
+# File reading
+# ---------------------------------------------------------------------------
+
+class TestReadTail:
+    def test_read_small_file(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        lines = [f"2026-01-01 00:00:0{i} INFO x: line {i}\n" for i in range(10)]
+        log_file.write_text("".join(lines))
+
+        result = _read_last_n_lines(log_file, 5)
+        assert len(result) == 5
+        assert "line 9" in result[-1]
+
+
+# ---------------------------------------------------------------------------
+# LOG_FILES registry
+# ---------------------------------------------------------------------------
+
+class TestLogFiles:
+    def test_known_log_files(self):
+        assert "agent" in LOG_FILES
+        assert "errors" in LOG_FILES
+        assert "gateway" in LOG_FILES
+        assert "gui" in LOG_FILES
+

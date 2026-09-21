@@ -1,0 +1,216 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\model_cost_guard.py ===
+"""Expensive-model confirmation helpers for model selection surfaces."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Optional
+
+from agent.models_dev import ModelInfo, PROVIDER_TO_MODELS_DEV
+
+
+INPUT_COST_WARNING_THRESHOLD = Decimal("20")
+OUTPUT_COST_WARNING_THRESHOLD = Decimal("100")
+GPT55_PRO_OPENROUTER_ID = "openai/gpt-5.5-pro"
+GPT55_SUGGESTION = "did you mean to select openai/gpt-5.5?"
+
+
+@dataclass(frozen=True)
+class ExpensiveModelWarning:
+    """Confirmation payload for models above Hermes' cost guardrail."""
+
+    model: str
+    provider: str
+    input_cost_per_million: Optional[Decimal]
+    output_cost_per_million: Optional[Decimal]
+    source: str
+    message: str
+
+
+def _to_decimal(value: object) -> Optional[Decimal]:
+    try:
+        return None if value is None else Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _format_money(value: Optional[Decimal]) -> str:
+    return "unknown" if value is None else f"${value:.2f}/M"
+
+
+def _pricing_from_model_info(
+    model_info: Optional[ModelInfo]) -> tuple[Optional[Decimal], Optional[Decimal], str]:
+    if model_info is None or not model_info.has_cost_data():
+        return None, None, ""
+    return _to_decimal(model_info.cost_input), _to_decimal(model_info.cost_output), "models.dev"
+
+
+def _known_models_dev_provider(provider: Optional[str]) -> Optional[str]:
+    normalized = (provider or "").strip().lower()
+    return PROVIDER_TO_MODELS_DEV.get(normalized) if normalized else None
+
+
+def _can_trust_model_info_pricing(
+    provider: Optional[str], model_info: Optional[ModelInfo]) -> bool:
+    expected_provider = _known_models_dev_provider(provider)
+    if not expected_provider or model_info is None:
+        return False
+    actual_provider = str(getattr(model_info, "provider_id", "") or "").strip().lower()
+    return not actual_provider or actual_provider == expected_provider
+
+
+def _can_trust_pricing_lookup(
+    model_name: str, *, provider: Optional[str], base_url: Optional[str]) -> bool:
+    try:
+        from agent.usage_pricing import resolve_billing_route
+
+        route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    except Exception:
+        return False
+    return route.billing_mode != "unknown"
+
+
+def expensive_model_warning(
+    model_name: str, *, provider: Optional[str] = None, base_url: Optional[str] = None,
+    api_key: Optional[str] = None, model_info: Optional[ModelInfo] = None,
+) -> Optional[ExpensiveModelWarning]:
+    """Warning payload when KNOWN pricing exceeds the safety thresholds (never fires on unknown
+    pricing). Call after model resolution so aliases / provider-specific ids have settled."""
+    model = (model_name or "").strip()
+    if not model:
+        return None
+
+    input_cost: Optional[Decimal] = None
+    output_cost: Optional[Decimal] = None
+    source = ""
+    if _can_trust_model_info_pricing(provider, model_info):
+        input_cost, output_cost, source = _pricing_from_model_info(model_info)
+
+    def _unpriced() -> bool:
+        return input_cost is None and output_cost is None
+
+    if _unpriced() and _known_models_dev_provider(provider):
+        try:
+            from agent.models_dev import get_model_info
+
+            input_cost, output_cost, source = _pricing_from_model_info(get_model_info(provider, model))
+        except Exception:
+            pass
+
+    if _unpriced() and _can_trust_pricing_lookup(model, provider=provider, base_url=base_url):
+        try:
+            from agent.usage_pricing import get_pricing_entry
+
+            entry = get_pricing_entry(model, provider=provider, base_url=base_url, api_key=api_key)
+        except Exception:
+            entry = None
+        if entry is not None:
+            input_cost = entry.input_cost_per_million
+            output_cost = entry.output_cost_per_million
+            source = entry.source
+
+    is_known_gpt55_pro_confusion = model.lower() == GPT55_PRO_OPENROUTER_ID
+    over_input = input_cost is not None and input_cost > INPUT_COST_WARNING_THRESHOLD
+    over_output = output_cost is not None and output_cost > OUTPUT_COST_WARNING_THRESHOLD
+    if not over_input and not over_output and not is_known_gpt55_pro_confusion:
+        return None
+
+    lines = [
+        "!!! EXPENSIVE MODEL WARNING !!!",
+        "",
+        f"{model} has known pricing above Hermes' safety threshold.",
+        f"Input tokens: {_format_money(input_cost)}",
+        f"Output tokens: {_format_money(output_cost)}",
+        "Threshold: more than $20/M input tokens or more than $100/M output tokens."]
+    if source:
+        lines.append(f"Pricing source: {source}.")
+    if is_known_gpt55_pro_confusion:
+        lines.append(GPT55_SUGGESTION)
+    lines.append("Confirm only if you intend to use this model.")
+
+    return ExpensiveModelWarning(
+        model=model, provider=(provider or "").strip(), input_cost_per_million=input_cost,
+        output_cost_per_million=output_cost, source=source or "unknown", message="\n".join(lines))
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\model_data_policy_guard.py ===
+"""Data-policy confirmation helpers for model selection surfaces.
+
+Some inference tiers are cheap *because* the vendor trains on your prompts. A static rule table (not
+a ProviderProfile hook) because the guard runs inside core selection code (``auth.py`` /
+``web_server.py``), which never calls into the active provider profile.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+
+@dataclass(frozen=True)
+class DataTrainingWarning:
+    """Confirmation payload for models whose tier trains on user data."""
+
+    model: str
+    provider: str
+    message: str
+
+
+# Rule predicates are deliberately conservative: match an explicit, vendor-documented id rather
+# than guessing from price (a corroborating signal that can change).
+
+def _is_meta_contributor(model_lower: str, provider_lower: str) -> bool:
+    # Meta "contributor" tier, matched on the id alone (no provider check) so it fires whether
+    # selected via the meta-ai plugin, a gateway, or a custom endpoint serving the same id.
+    return model_lower.endswith("-contributor") or "contributor" in model_lower.split("-")
+
+
+_META_CONTRIBUTOR_MESSAGE = (
+    "!!! CONTRIBUTOR TIER — TRAINS ON YOUR DATA !!!\n"
+    "\n"
+    "This is Meta's contributor tier. Selecting it permits Meta to use your\n"
+    "prompts and completions to train future Meta models.\n"
+    "\n"
+    "See current pricing and rate limits for the Meta Model API here:\n"
+    "  https://dev.meta.ai/docs/pricing-rate-limits/\n"
+    "\n"
+    "It lowers the barrier to entry for prototyping, testing integrations, and\n"
+    "scaling experiments where training on your data is acceptable. Do NOT use it\n"
+    "for confidential, proprietary, personal, or otherwise sensitive data. For the\n"
+    "same model with no training on your data, select the standard variant\n"
+    "(without the -contributor suffix).\n"
+    "\n"
+    "Confirm only if training on your prompts and completions is acceptable."
+)
+
+
+# (predicate, message) pairs, evaluated in order; first match wins.
+_RULES: tuple[tuple[Callable[[str, str], bool], str], ...] = (
+    (_is_meta_contributor, _META_CONTRIBUTOR_MESSAGE),
+)
+
+
+def data_training_warning(
+    model_name: str,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,  # noqa: ARG001 — reserved for host-scoped rules
+) -> Optional[DataTrainingWarning]:
+    """Warning payload when *model_name* selects a data-training tier, else ``None``. Call after model
+    resolution; surface ``.message`` as a confirm prompt."""
+    model = (model_name or "").strip()
+    if not model:
+        return None
+    model_lower, provider_lower = model.lower(), (provider or "").strip().lower()
+    for predicate, message in _RULES:
+        try:
+            if predicate(model_lower, provider_lower):
+                return DataTrainingWarning(model=model, provider=(provider or "").strip(), message=message)
+        except Exception:
+            continue  # a misbehaving predicate must never break model selection
+    return None
+

@@ -1,6 +1,11 @@
 import os
 import re
+from pathlib import Path
 from typing import Dict, Any
+
+
+DEFAULT_FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
+
 
 class FrontendBuilderAgent:
     """
@@ -9,10 +14,9 @@ class FrontendBuilderAgent:
     Dominio: Construcción de interfaces web de alta conversión (Mobile-First, 
     diseño minimalista tipo SaaS moderno, paletas profesionales y animaciones fluidas).
     """
-    def __init__(self, frontend_dir: str = "frontend"):
-        self.frontend_dir = frontend_dir
-        if not os.path.exists(self.frontend_dir):
-            os.makedirs(self.frontend_dir)
+    def __init__(self, frontend_dir: str | Path = DEFAULT_FRONTEND_DIR):
+        self.frontend_dir = Path(frontend_dir)
+        self.frontend_dir.mkdir(parents=True, exist_ok=True)
 
     def execute(self, file_name: str = "menu-viewer.html", brand_name: str = "Micro-SaaS Local") -> Dict[str, Any]:
         """
@@ -20,7 +24,7 @@ class FrontendBuilderAgent:
         basada en principios de UX/UI y alta conversión.
         """
         try:
-            file_path = os.path.join(self.frontend_dir, file_name)
+            file_path = self.frontend_dir / file_name
             
             # Código fuente optimizado con estándares de élite (UI/UX moderna, Tailwind CSS nativo, transiciones y responsividad)
             elite_html_content = f"""<!DOCTYPE html>

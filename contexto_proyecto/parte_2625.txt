@@ -1,0 +1,320 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_empty_model_fallback.py ===
+"""Tests for empty model fallback — when provider is configured but model is missing."""
+
+from unittest.mock import patch
+
+
+class TestGetDefaultModelForProvider:
+    """Unit tests for hermes_cli.models.get_default_model_for_provider."""
+
+    def test_known_provider_returns_first_model(self):
+        from hermes_cli.models import get_default_model_for_provider
+        result = get_default_model_for_provider("openai-codex")
+        # Should return first model from _PROVIDER_MODELS["openai-codex"]
+        assert result
+        assert isinstance(result, str)
+
+
+
+
+
+    def test_catalog_label_overrides_constant(self):
+        """A ``"default": true`` label in the cached catalog manifest wins over
+        the in-repo constant, so maintainers can rotate the silent default
+        without shipping a release."""
+        from unittest.mock import patch
+
+        from hermes_cli import models as models_mod
+
+        with patch(
+            "hermes_cli.model_catalog.get_default_model_from_cache",
+            return_value="qwen/qwen3.8-max-0902",
+        ):
+            assert (
+                models_mod.get_preferred_silent_default_model("nous")
+                == "qwen/qwen3.8-max-0902"
+            )
+            # nous catalog carries qwen3.8-max-0902, so the full resolver follows.
+            assert (
+                models_mod.get_default_model_for_provider("nous")
+                == "qwen/qwen3.8-max-0902"
+            )
+
+
+
+
+
+
+class TestGatewayEmptyModelFallback:
+    """Test that _resolve_session_agent_runtime fills in empty model from provider catalog."""
+
+    def test_empty_model_filled_from_provider(self):
+        """When config has no model but provider is openai-codex, use first codex model."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+
+        # Mock _resolve_gateway_model to return empty string
+        # Mock _resolve_runtime_agent_kwargs to return openai-codex provider
+        with patch("gateway.run._resolve_gateway_model", return_value=""), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "openai-codex",
+                 "api_key": "test-key",
+                 "base_url": "https://chatgpt.com/backend-api/codex",
+                 "api_mode": "codex_responses",
+             }):
+            model, kwargs = runner._resolve_session_agent_runtime()
+
+        # Model should have been filled in from provider catalog
+        assert model, "Model should not be empty when provider is known"
+        assert isinstance(model, str)
+        assert kwargs["provider"] == "openai-codex"
+
+    def test_nonempty_model_not_overridden(self):
+        """When config has a model set, don't override it."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+
+        with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.4"), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "openai-codex",
+                 "api_key": "test-key",
+                 "base_url": "https://chatgpt.com/backend-api/codex",
+                 "api_mode": "codex_responses",
+             }):
+            model, kwargs = runner._resolve_session_agent_runtime()
+
+        assert model == "gpt-5.4", "Explicit model should not be overridden"
+
+    def test_empty_model_no_provider_stays_empty(self):
+        """When both model and provider are empty, model stays empty."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+
+        with patch("gateway.run._resolve_gateway_model", return_value=""), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "",
+                 "api_key": "test-key",
+                 "base_url": "https://example.com",
+                 "api_mode": "chat_completions",
+             }):
+            model, kwargs = runner._resolve_session_agent_runtime()
+
+        # Can't fill in a default without knowing the provider
+        assert model == ""
+
+
+class TestResolveGatewayModel:
+    """Test _resolve_gateway_model reads model from config correctly."""
+
+    def test_returns_default_key(self):
+        from gateway.run import _resolve_gateway_model
+        assert _resolve_gateway_model({"model": {"default": "gpt-5.4"}}) == "gpt-5.4"
+
+    def test_returns_model_key_fallback(self):
+        from gateway.run import _resolve_gateway_model
+        assert _resolve_gateway_model({"model": {"model": "gpt-5.4"}}) == "gpt-5.4"
+
+    def test_returns_empty_when_missing(self):
+        from gateway.run import _resolve_gateway_model
+        assert _resolve_gateway_model({"model": {}}) == ""
+
+    def test_returns_empty_when_no_model_section(self):
+        from gateway.run import _resolve_gateway_model
+        assert _resolve_gateway_model({}) == ""
+
+    def test_string_model_config(self):
+        from gateway.run import _resolve_gateway_model
+        assert _resolve_gateway_model({"model": "my-model"}) == "my-model"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_empty_model_recovery.py ===
+"""Regression tests for #35314 — empty model on the post-interrupt recovery turn.
+
+After a ``stream_interrupt_abort`` during an active gateway session, the recovery
+turn was sometimes built with ``model=""`` (a transient config-cache miss returned
+an empty ``user_config``). Every API call then failed HTTP 400 "No models
+provided", "trying fallback..." was logged but never executed (the user had no
+fallback configured), and the session went silent until the user re-sent.
+
+These tests pin two fixes:
+  1. ``_resolve_session_agent_runtime`` caches the last successfully-resolved
+     model per session and recovers it when a fresh resolution comes back empty.
+  2. ``_has_pending_fallback`` gates the "trying fallback..." status so it is only
+     announced when a fallback chain actually exists.
+"""
+
+import threading
+
+import gateway.run as gateway_run
+
+
+def _make_runner():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_model_overrides = {}
+    runner._last_resolved_model = {}
+    runner._service_tier = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    return runner
+
+
+def _patch_resolution(monkeypatch, *, model_from_config: str, provider: str = "openrouter"):
+    """Stub gateway model + runtime resolution to a known state."""
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: model_from_config)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": provider,
+            "api_key": "x",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+
+
+def test_empty_model_recovers_session_last_good(monkeypatch):
+    runner = _make_runner()
+    sk = "agent:main:discord:dm:123"
+
+    # Turn 1: config has the model — cache it.
+    _patch_resolution(monkeypatch, model_from_config="deepseek/deepseek-v4-flash")
+    runner._resolve_session_agent_runtime(session_key=sk, user_config={"model": {"default": "x"}})
+
+    # Turn 2: simulate the transient empty config read (the #35314 race).
+    _patch_resolution(monkeypatch, model_from_config="", provider="")
+    model, _ = runner._resolve_session_agent_runtime(session_key=sk, user_config={})
+
+    assert model == "deepseek/deepseek-v4-flash", "recovery turn must reuse last-known-good, not build model=''"
+
+
+def test_bare_runner_without_cache_attr_does_not_crash(monkeypatch):
+    """object.__new__ runners (test helpers / pitfall #17) lack _last_resolved_model.
+
+    The getattr guard must tolerate the missing attribute.
+    """
+    _patch_resolution(monkeypatch, model_from_config="deepseek/deepseek-v4-flash")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_model_overrides = {}
+    runner._service_tier = None
+    # Deliberately omit _last_resolved_model.
+
+    model, _ = runner._resolve_session_agent_runtime(session_key="x", user_config={"model": {}})
+
+    assert model == "deepseek/deepseek-v4-flash"
+
+
+# ── _has_pending_fallback gate ──────────────────────────────────────────────
+
+
+def _bare_agent():
+    import run_agent
+
+    return object.__new__(run_agent.AIAgent)
+
+
+def test_has_pending_fallback_empty_chain():
+    agent = _bare_agent()
+    agent._fallback_chain = []
+    agent._fallback_index = 0
+    assert agent._has_pending_fallback() is False
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_empty_sentinel_rewrite_copy.py ===
+"""The gateway's ``(empty)`` sentinel rewrite reads from the same constant as the CLI explainer
+(``agent.turn_explainers.EMPTY_RESPONSE_EXPLANATION``), so a chat user and a terminal user see one
+text for "the model produced nothing after retries"."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from agent.turn_explainers import EMPTY_RESPONSE_EXPLANATION
+from gateway.run_turn import GatewayTurnMixin
+
+
+class _Runner(GatewayTurnMixin):
+    def __init__(self):
+        self.async_session_store = SimpleNamespace(clear_resume_pending=self._noop)
+
+    async def _noop(self, *_a, **_k):
+        return None
+
+    async def _clear_restart_failure_count(self, *_a, **_k):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_empty_sentinel_rewrite_uses_the_shared_explanation_with_the_model_name():
+    runner = _Runner()
+    agent_result = {"final_response": "(empty)", "model": "llama3", "messages": [], "api_calls": 2}
+    source = SimpleNamespace(chat_id="c1", platform=SimpleNamespace(value="telegram"))
+    response, silent, _messages = await runner._hmwa_shape_agent_response(
+        agent_result, source, history=[], session_entry=SimpleNamespace(session_id="s"), session_key=None,
+        _quick_key=None, run_generation=0, _run_start_session_id="s", _platform_name="telegram",
+        _msg_start_time=0.0,
+    )
+    assert silent is False
+    assert EMPTY_RESPONSE_EXPLANATION.format(model="llama3") in response
+    assert "after processing tool results" not in response
+    assert "/model" in response and "continue" in response
+
+
+@pytest.mark.asyncio
+async def test_response_ready_log_includes_the_session_key(caplog):
+    """Per-conversation latency aggregation needs the session key on the completion line:
+    ``chat=`` alone merges every Slack thread of one channel (#111931)."""
+    runner = _Runner()
+    source = SimpleNamespace(chat_id="C1", platform=SimpleNamespace(value="slack"))
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._hmwa_shape_agent_response(
+            {"final_response": "done", "messages": [], "api_calls": 1},
+            source, history=[], session_entry=SimpleNamespace(session_id="s"),
+            session_key="slack:C1:thread-123", _quick_key=None, run_generation=0,
+            _run_start_session_id="s", _platform_name="slack", _msg_start_time=0.0,
+        )
+
+    response_log = next(record.getMessage() for record in caplog.records
+                        if record.getMessage().startswith("response ready:"))
+    assert "session=slack:C1:thread-123" in response_log
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_env_flag_truthy.py ===
+"""Env flags accept 'on' as truthy consistently (salvage of #2863).
+
+Behavior contract: every env-driven enable flag in gateway config coerces
+through the shared TRUTHY_STRINGS set, so "on" behaves like "1"/"true"/"yes".
+"""
+
+import os
+from unittest.mock import patch
+
+from utils import TRUTHY_STRINGS, env_var_enabled
+
+
+def test_truthy_strings_include_on():
+    assert "on" in TRUTHY_STRINGS
+
+
+def test_env_var_enabled_default_respected():
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("SIGNAL_IGNORE_STORIES", None)
+        assert env_var_enabled("SIGNAL_IGNORE_STORIES", "true") is True
+        assert env_var_enabled("SIGNAL_IGNORE_STORIES") is False
+
+
+

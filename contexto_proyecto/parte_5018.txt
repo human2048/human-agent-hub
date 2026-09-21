@@ -1,0 +1,202 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\user-guide\features\deliverable-mode.md ===
+---
+title: Deliverable Mode (Artifacts in Chat)
+sidebar_label: Deliverable Mode
+description: How the agent ships generated charts, PDFs, spreadsheets, and other files as native attachments in messaging platforms.
+---
+
+# Deliverable Mode
+
+When Hermes Agent runs inside a messaging gateway (Slack, Discord, Telegram,
+WhatsApp, Signal, etc.), it can deliver generated files directly into the
+chat — not as paths the user has to copy, but as native attachments.
+
+A chart shows up as an inline image. A PDF report shows up as a file
+download. A spreadsheet uploads as `.xlsx`. The agent does not need to
+write a `MEDIA:` tag or do anything special — it just generates the file
+and mentions its absolute path in the response. The gateway picks the path
+out of the text, removes it from the visible message, and uploads the
+file natively.
+
+## How it works
+
+Three pieces fit together:
+
+1. **The agent has tools that produce files.** `execute_code` for charts via
+   matplotlib, the `docx` skill for Word documents, the `xlsx` skill for
+   spreadsheets, the `pdf` and `latex-pdf-report` skills for PDFs, the
+   `powerpoint` skill for decks, `image_generate` for images,
+   `text_to_speech` for audio, and so on.
+
+2. **The gateway scans agent responses for file paths.** Any absolute path
+   (`/tmp/...`) or home-relative path (`~/...`) ending in a supported
+   extension gets extracted. Paths inside code blocks and inline code are
+   ignored so code samples are never mutilated.
+
+3. **The gateway dispatches by file type.** Images embed inline where the
+   platform supports it; videos embed inline; audio routes to voice/audio
+   attachments; everything else uploads as a file attachment.
+
+## Supported file extensions
+
+| Category | Extensions | Delivery |
+|---|---|---|
+| Images | `.png .jpg .jpeg .gif .webp .bmp .tiff .svg` | Inline embed |
+| Video | `.mp4 .mov .avi .mkv .webm .3gp` | Inline embed (where supported) |
+| Audio | `.mp3 .m2a .wav .ogg .opus .m4a .flac` | Voice / audio attachment |
+| Documents | `.pdf .docx .doc .odt .rtf .txt .md .epub` | File upload |
+| Data | `.xlsx .xls .ods .csv .tsv .json .xml .yaml .yml` | File upload |
+| Geospatial | `.kmz .kml .geojson .gpx` | File upload |
+| Presentations | `.pptx .ppt .odp .key` | File upload |
+| Archives | `.zip .tar .gz .tgz .bz2 .xz .7z .rar .apk .ipa` | File upload |
+| Web | `.html .htm` | File upload |
+
+`.py`, `.log`, and other source-file extensions are intentionally excluded so
+the agent doesn't auto-ship arbitrary source files; if you want to send code
+to the user, use a code block.
+
+## Encouraging the agent to produce artifacts
+
+The agent doesn't reach for artifacts by default — it has to know to.
+Two ways to nudge it:
+
+**Per-session:** ask explicitly ("send me the comparison as a chart",
+"return the data as a CSV") or write your own custom-instructions /
+personality entry that biases toward artifact-style replies on
+messaging platforms.
+
+**Project-level:** add the bias to `AGENTS.md` / `CLAUDE.md` /
+`.cursorrules` in a project the agent works from, to your global
+persona in `~/.hermes/SOUL.md`, or as a named preset under
+`agent.personalities` in `~/.hermes/config.yaml` (switchable per session
+via `/personality`).
+
+The mechanic the agent has to use is simple: render the file to an
+absolute path (e.g. `/tmp/q3-revenue.png`) and mention that path as
+plain text in the reply. The gateway does the rest. Paths inside
+fenced code blocks or backticks are ignored so code samples are never
+mutilated.
+
+## Kanban: artifacts ride completion notifications
+
+If you use Hermes' kanban multi-agent workflow, workers can attach
+deliverable files to their `kanban_complete` call:
+
+```python
+kanban_complete(
+    summary="rendered Q3 revenue chart and report",
+    artifacts=[
+        "/tmp/q3-revenue.png",
+        "/tmp/q3-report.pdf",
+    ],
+)
+```
+
+When the gateway notifier delivers the "task completed" message to whoever
+subscribed to the task in Slack/Telegram/etc., it also uploads each artifact
+as a native attachment to that chat. The human gets the deliverable and the
+summary in one place.
+
+Files that don't exist on disk when the notifier runs are silently skipped.
+
+## Connecting more services with MCP
+
+Beyond the artifact-delivery pipeline, the agent can reach into other
+services via MCP (Model Context Protocol). The MCP ecosystem ships
+community servers for most popular tools — install whichever you need:
+
+| Service | What it unlocks |
+|---|---|
+| **Notion** | Read/write Notion pages, databases, query workspace |
+| **GitHub** | Issues, PRs, comments, repo search beyond the gh CLI |
+| **Linear** | Tickets, projects, cycles |
+| **Slack** | Workspace-wide search, read other channels |
+| **Gmail** | Inbox triage, send mail, label management |
+| **Salesforce** | Leads, opportunities, account data |
+| **Snowflake / BigQuery** | SQL against data warehouses |
+| **Google Drive** | File search, contents, share management |
+
+Install MCP servers via `~/.hermes/config.yaml` under the `mcp_servers`
+section. See [MCP integration](./mcp.md) for the full setup guide.
+
+## Comparison to Perplexity Computer in Slack
+
+Perplexity Computer's Slack integration is built around the same idea:
+the agent generates a deliverable (chart, PDF, slide deck) and posts it
+back into the thread as a native attachment. Hermes Agent's deliverable
+mode provides the same user-facing pattern locally:
+
+- Generation happens in the user's own venv / sandbox (no remote tenant).
+- Files land in the chat via the same Slack `files.uploadV2` API.
+- Connector breadth comes via MCP rather than a curated catalog of 400
+  hosted integrations — install the ones you actually use.
+
+OAuth tokens stay on the user's machine in `auth.json` / `.env`. No hosted
+token storage. No multi-tenant microVM. Same end result.
+
+
+
+=== ARCHIVO: .\hermes-agent\website\docs\user-guide\features\document-extraction.md ===
+---
+sidebar_position: 3
+title: "Document Extraction"
+description: "How read_file converts PDFs, Office documents, and notebooks to text — and what to do when a PDF is scanned images"
+---
+
+# Document Extraction
+
+The `read_file` tool automatically converts common document formats to readable text, so the agent can inspect a PDF or spreadsheet the same way it reads source code.
+
+## Supported formats
+
+| Format | Extensions | Converter | Availability |
+|--------|-----------|-----------|--------------|
+| Jupyter notebooks | `.ipynb` | Built-in (stdlib) | Always |
+| Word documents | `.docx` | Built-in (stdlib) | Always |
+| Excel workbooks | `.xlsx` | Built-in (stdlib) | Always |
+| PDF | `.pdf` | Optional `anydoc` converter | Auto-installed on first use* |
+| Legacy Office | `.doc`, `.ppt`, `.xls`, `.pptx`, and variants | Optional `anydoc` converter | Auto-installed on first use* |
+| OpenDocument | `.odt`, `.ods`, `.odp` | Optional `anydoc` converter | Auto-installed on first use* |
+| Rich text / eBooks | `.rtf`, `.epub` | Optional `anydoc` converter | Auto-installed on first use* |
+
+\* The optional converter is the `firecrawl-anydoc` package, installed lazily where installs are permitted (`security.allow_lazy_installs` in `config.yaml`). Without it, the three stdlib formats still work; other formats fall back to the binary-file guard.
+
+Conversion output is Markdown, paginated through `read_file`'s normal `offset`/`limit` window. East Asian phonetic guides (XLSX `rPh`, DOCX ruby text) annotate cell or run text and are not part of the extracted value: a cell holding 東京 with the guide トウキョウ reads as `東京`. Documents over 50 MB are refused to keep tool turns bounded.
+
+Notebook cell outputs longer than 20,000 characters are truncated; the truncation marker carries a `jq` command that names the notebook's full, shell-quoted path so the omitted output can be pulled from the original file.
+
+Extraction works with remote terminal backends (Docker, Modal, SSH): the file's bytes are transferred across the backend boundary and converted host-side, so a document inside a sandbox reads the same as a local one.
+
+## Scanned PDFs: the coverage warning
+
+PDF conversion reads the **text layer only**. Pages that are scanned images — common in legal documents, resale packages, signed contracts, faxes — contain no text layer and silently convert to nothing. The telltale signature is section headers with empty bodies.
+
+When a meaningful share of pages yields no text (over 20% of the document, or 10+ pages absolute), `read_file` prepends a warning to the extraction. Each unreadable gap is labeled with the last text extracted before it — usually a section divider — so the agent can target only the gaps it actually needs instead of OCRing the whole document:
+
+```
+[EXTRACTION COVERAGE WARNING: 198 of 311 pages in this PDF yielded no
+text. ... Unreadable gaps, each labeled with the last text extracted
+before it:
+  pages 42-77 (36 pages) — after "Antigua Maintenance Corp Bylaws" (p41)
+  pages 92-213 (122 pages) — after "... Covenants, Codes and Regulations" (p91)
+  page 224 (1 page) — after "... Insurance Declaration Pages" (p223)
+Decide which gaps you actually need — do NOT OCR or render everything. ...]
+```
+
+The warning lists the exact page ranges and the recovery paths:
+
+1. **A few pages — render + vision.** Convert the pages to images and read them with the vision tool:
+   ```bash
+   pdftoppm -jpeg -r 150 -f 92 -l 94 document.pdf /tmp/page
+   ```
+   Then inspect each image with `vision_analyze`. Zero extra dependencies (poppler is required for the detection itself).
+2. **Many pages — OCR.** The `ocr-and-documents` skill covers bulk OCR with marker-pdf (90+ languages, handles equations and tables; ~3-5 GB install).
+
+Detection uses poppler's `pdftotext` for per-page text counts. If poppler is not installed, extraction still works — the coverage check is silently skipped.
+
+:::tip
+The agent handles the warning on its own — it will offer to render or OCR the missing pages. If you're reading extractions yourself, treat "header with an empty body" as a scanned section, not a missing one.
+:::
+

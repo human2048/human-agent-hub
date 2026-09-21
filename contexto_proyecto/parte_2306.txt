@@ -1,0 +1,382 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_transcription_registry.py ===
+"""Tests for agent/transcription_registry.py and agent/transcription_provider.py.
+
+Covers:
+- Registration happy path
+- Registration rejection: non-TranscriptionProvider type
+- Registration rejection: empty/whitespace name
+- Built-in name shadowing: warning + silent ignore (no exception)
+- Re-registration: overwrites + logs at debug
+- Case + whitespace insensitivity on lookup
+- ABC contract: default implementations work
+- ABC contract: transcribe() must be implemented
+- Sync invariant: registry built-ins match tools/transcription_tools.py
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+import pytest
+
+from agent import transcription_registry
+from agent.transcription_provider import TranscriptionProvider
+
+
+class _FakeProvider(TranscriptionProvider):
+    def __init__(
+        self,
+        name: str = "fake",
+        display: Optional[str] = None,
+        available: bool = True,
+        transcribe_impl: Optional[Any] = None,
+    ):
+        self._name = name
+        self._display = display
+        self._available = available
+        self._transcribe_impl = transcribe_impl
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def display_name(self) -> str:
+        return self._display if self._display is not None else super().display_name
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def transcribe(self, file_path: str, **kw):
+        if self._transcribe_impl is not None:
+            return self._transcribe_impl(file_path, **kw)
+        return {"success": True, "transcript": f"fake({file_path})", "provider": self._name}
+
+
+@pytest.fixture(autouse=True)
+def _reset_registry():
+    transcription_registry._reset_for_tests()
+    yield
+    transcription_registry._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+class TestRegistration:
+    def test_happy_path(self):
+        p = _FakeProvider(name="openrouter")
+        transcription_registry.register_provider(p)
+        assert transcription_registry.get_provider("openrouter") is p
+        assert [r.name for r in transcription_registry.list_providers()] == ["openrouter"]
+
+
+
+
+    @pytest.mark.parametrize(
+        "builtin",
+        [
+            "local",
+            "local_command",
+            "groq",
+            "openai",
+            "mistral",
+            "xai",
+            "elevenlabs",
+            "deepinfra",
+        ],
+    )
+    def test_rejects_builtin_shadow_with_warning(self, builtin, caplog):
+        p = _FakeProvider(name=builtin)
+        with caplog.at_level(logging.WARNING, logger="agent.transcription_registry"):
+            transcription_registry.register_provider(p)
+        assert "shadows a built-in name" in caplog.text
+        assert builtin in caplog.text
+        assert transcription_registry.get_provider(builtin) is None
+        assert transcription_registry.list_providers() == []
+
+
+
+
+# ---------------------------------------------------------------------------
+# Lookup
+# ---------------------------------------------------------------------------
+
+
+class TestLookup:
+
+    def test_get_provider_non_string_returns_none(self):
+        assert transcription_registry.get_provider(None) is None  # type: ignore[arg-type]
+        assert transcription_registry.get_provider(123) is None  # type: ignore[arg-type]
+
+
+
+    def test_list_providers_sorted(self):
+        transcription_registry.register_provider(_FakeProvider(name="zylo"))
+        transcription_registry.register_provider(_FakeProvider(name="alpha"))
+        transcription_registry.register_provider(_FakeProvider(name="middle"))
+        names = [p.name for p in transcription_registry.list_providers()]
+        assert names == ["alpha", "middle", "zylo"]
+
+
+# ---------------------------------------------------------------------------
+# ABC contract
+# ---------------------------------------------------------------------------
+
+
+class TestABCContract:
+
+    def test_must_implement_name(self):
+        class Incomplete(TranscriptionProvider):
+            def transcribe(self, file_path, **kw):
+                return {"success": True, "transcript": "", "provider": "incomplete"}
+            # name NOT implemented
+
+        with pytest.raises(TypeError, match="abstract"):
+            Incomplete()  # type: ignore[abstract]
+
+
+
+
+
+
+    def test_default_model_first_listed(self):
+        class WithModels(_FakeProvider):
+            def list_models(self):
+                return [{"id": "whisper-large-v3-turbo"}, {"id": "whisper-large-v3"}]
+
+        p = WithModels(name="openrouter")
+        assert p.default_model() == "whisper-large-v3-turbo"
+
+    def test_get_setup_schema_default_minimal(self):
+        p = _FakeProvider(name="openrouter")
+        schema = p.get_setup_schema()
+        assert schema["name"] == "Openrouter"
+        assert schema["env_vars"] == []
+
+
+# ---------------------------------------------------------------------------
+# Sync invariant: registry built-ins vs dispatcher built-ins
+# ---------------------------------------------------------------------------
+
+
+class TestBuiltinSync:
+    """``_BUILTIN_NAMES`` in agent/transcription_registry.py is duplicated
+    from ``BUILTIN_STT_PROVIDERS`` in tools/transcription_tools.py
+    (importing directly would create a circular dependency). This test
+    fails loudly if the two lists drift — a new built-in added to
+    transcription_tools.py MUST also be added to
+    transcription_registry.py's ``_BUILTIN_NAMES`` or the registry will
+    accept a name the dispatcher will silently route to the wrong
+    handler.
+    """
+
+    def test_registry_builtins_match_dispatcher_builtins(self):
+        from tools.transcription_tools import BUILTIN_STT_PROVIDERS
+
+        assert transcription_registry._BUILTIN_NAMES == BUILTIN_STT_PROVIDERS, (
+            "agent.transcription_registry._BUILTIN_NAMES and "
+            "tools.transcription_tools.BUILTIN_STT_PROVIDERS have drifted!\n"
+            f"  Registry only: {sorted(transcription_registry._BUILTIN_NAMES - BUILTIN_STT_PROVIDERS)}\n"
+            f"  Dispatcher only: {sorted(BUILTIN_STT_PROVIDERS - transcription_registry._BUILTIN_NAMES)}\n"
+            "Add the missing names to whichever list is incomplete. "
+            "These two lists exist as a circular-import workaround and "
+            "MUST be kept in sync manually."
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_transcript_decoration_idempotence.py ===
+"""Idempotence law for transcript decoration passes: f(f(x)) == f(x).
+
+Pins bug #90971 (fixed in PR #91350): ``apply_anthropic_cache_control`` was
+non-idempotent on pre-decorated input — the negative-slice / tool-budget
+interplay stacked a fifth ``cache_control`` marker onto messages a prior
+pass had already decorated, reproducing Anthropic's ``cache_control can only
+be specified up to 4 times`` HTTP 400 mid-conversation.
+
+Behavior contracts pinned here (complementing, not duplicating,
+tests/agent/test_prompt_caching.py::TestApplyIdempotency which covers exact
+layout convergence and caller non-mutation):
+
+1. IDEMPOTENCE — for every realistic transcript shape x, the serialized form
+   of f(f(x)) is byte-identical to f(x).
+2. BUDGET — the total decoration count after any number of passes never
+   exceeds Anthropic's 4-breakpoint budget.
+
+Shapes include the #90971 regression input (already-decorated transcripts)
+plus dict-content and list-content messages, tool blocks, and mixed forms.
+"""
+
+import copy
+import json
+
+import pytest
+
+from agent.prompt_caching import (
+    _count_cache_markers,
+    apply_anthropic_cache_control,
+)
+
+MARKER = {"type": "ephemeral"}
+BUDGET = 4  # Anthropic's hard cap on cache_control breakpoints
+
+
+def _canon(messages):
+    """Deterministic byte serialization for the byte-identity assertion."""
+    return json.dumps(messages, sort_keys=True, ensure_ascii=False).encode()
+
+
+def _tool_block(i, decorated=False):
+    # Two text parts: single-part [{"type","text"}] lists are canonicalized
+    # to plain strings by the strip pass (by-design flattening of the shape
+    # decoration itself produces), so multi-part is the realistic list form
+    # that must round-trip byte-exactly.
+    part = {"type": "text", "text": f"tool result {i}"}
+    if decorated:
+        part["cache_control"] = dict(MARKER)
+    return {
+        "role": "tool",
+        "tool_call_id": f"call_{i}",
+        "content": [{"type": "text", "text": f"tool header {i}"}, part],
+    }
+
+
+def _clean_transcript():
+    """system + alternating user/assistant, plain string (dict) content."""
+    msgs = [{"role": "system", "content": "STATIC_PREFIX system rules and tools"}]
+    for i in range(6):
+        msgs.append({"role": "user", "content": f"user turn {i}"})
+        msgs.append({"role": "assistant", "content": f"assistant turn {i}"})
+    return msgs
+
+
+def _list_content_transcript():
+    """List-content parts on user turns + tool blocks interleaved."""
+    msgs = [{"role": "system", "content": "STATIC_PREFIX system rules"}]
+    for i in range(4):
+        msgs.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"question {i}"},
+                {"type": "text", "text": "attachment context"},
+            ],
+        })
+        msgs.append({
+            "role": "assistant",
+            "content": f"calling tool {i}",
+            "tool_calls": [{"id": f"call_{i}", "type": "function",
+                            "function": {"name": "t", "arguments": "{}"}}],
+        })
+        msgs.append(_tool_block(i))
+        msgs.append({"role": "assistant", "content": f"answer {i}"})
+    return msgs
+
+
+def _predecorated_transcript():
+    """The #90971 regression shape: input a PRIOR pass already decorated.
+
+    Markers live both top-level and on content parts (both shapes the
+    decorator itself produces), including on a tool block near the tail
+    where the negative-slice budget math went wrong.
+    """
+    msgs = [{"role": "system", "content": [
+        {"type": "text", "text": "STATIC_PREFIX early", "cache_control": dict(MARKER)},
+        {"type": "text", "text": "late suffix", "cache_control": dict(MARKER)},
+    ]}]
+    for i in range(5):
+        msgs.append({"role": "user", "content": f"u{i}"})
+        msgs.append({"role": "assistant", "content": f"a{i}"})
+    # tail: pre-decorated user (top-level marker) + decorated tool block
+    msgs.append({"role": "user", "content": "recent question",
+                 "cache_control": dict(MARKER)})
+    msgs.append({"role": "assistant", "content": "using tool",
+                 "tool_calls": [{"id": "call_z", "type": "function",
+                                 "function": {"name": "t", "arguments": "{}"}}]})
+    msgs.append(_tool_block(99, decorated=True))
+    msgs.append({"role": "assistant", "content": "final answer"})
+    return msgs
+
+
+def _mixed_partially_decorated():
+    """Stale markers scattered mid-transcript (replayed history)."""
+    msgs = _clean_transcript()
+    msgs[3] = dict(msgs[3], cache_control=dict(MARKER))
+    msgs[7] = {"role": "user", "content": [
+        {"type": "text", "text": "mid turn", "cache_control": dict(MARKER)},
+    ]}
+    return msgs
+
+
+SHAPES = [
+    pytest.param(_clean_transcript, id="clean-dict-content"),
+    pytest.param(_list_content_transcript, id="list-content-with-tools"),
+    pytest.param(_predecorated_transcript, id="predecorated-90971-regression"),
+    pytest.param(_mixed_partially_decorated, id="mixed-stale-markers"),
+]
+
+VARIANTS = [
+    pytest.param({}, id="default"),
+    pytest.param({"static_system_prefix": "STATIC_PREFIX"}, id="split-system"),
+    pytest.param({"native_anthropic": True}, id="native-anthropic"),
+    pytest.param({"cache_ttl": "1h",
+                  "static_system_prefix": "STATIC_PREFIX"}, id="1h-ttl"),
+]
+
+
+class TestDecorationIdempotenceLaw:
+    """f(f(x)) == f(x), byte-identical, for all transcript shapes (#90971)."""
+
+    @pytest.mark.parametrize("kwargs", VARIANTS)
+    @pytest.mark.parametrize("make", SHAPES)
+    def test_double_apply_is_byte_identical(self, make, kwargs):
+        once = apply_anthropic_cache_control(make(), **kwargs)
+        twice = apply_anthropic_cache_control(
+            copy.deepcopy(once), **kwargs)
+        assert _canon(twice) == _canon(once), (
+            "decoration pass is not idempotent: f(f(x)) != f(x)"
+        )
+
+    @pytest.mark.parametrize("kwargs", VARIANTS)
+    @pytest.mark.parametrize("make", SHAPES)
+    def test_budget_never_exceeded_across_passes(self, make, kwargs):
+        """No pass — first, second, or fifth — may exceed Anthropic's
+        4-breakpoint budget, even when the input was already decorated."""
+        msgs = make()
+        for round_no in range(1, 6):
+            msgs = apply_anthropic_cache_control(msgs, **kwargs)
+            count = _count_cache_markers(msgs, [])
+            assert count <= BUDGET, (
+                f"round {round_no}: {count} cache_control markers exceed the "
+                f"{BUDGET}-breakpoint budget (the #90971 HTTP-400 class)"
+            )
+
+    def test_predecorated_input_does_not_inherit_extra_markers(self):
+        """#90971 core symptom: pre-decorated input must not carry stale
+        markers PLUS fresh ones. Every marker in the output is one the
+        current pass placed — total exactly within budget, and no message
+        carries more than one marker at both levels."""
+        out = apply_anthropic_cache_control(
+            _predecorated_transcript(), static_system_prefix="STATIC_PREFIX")
+        assert _count_cache_markers(out, []) <= BUDGET
+        for msg in out:
+            top = 1 if "cache_control" in msg else 0
+            content = msg.get("content")
+            parts = (
+                sum(1 for p in content
+                    if isinstance(p, dict) and "cache_control" in p)
+                if isinstance(content, list) else 0
+            )
+            # A single message may legitimately hold two SYSTEM breakpoints
+            # (prefix + suffix in the split-system layout); non-system
+            # messages must never stack top-level + part markers.
+            if msg.get("role") != "system":
+                assert top + parts <= 1, (
+                    f"stacked markers on one message: {msg!r}"
+                )
+

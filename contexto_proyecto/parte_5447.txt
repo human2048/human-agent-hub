@@ -1,0 +1,433 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\productivity\productivity-teams-meeting-pipeline.md ===
+---
+title: "Teams Meeting Pipeline"
+sidebar_label: "Teams Meeting Pipeline"
+description: "通过 Hermes CLI 操作 Teams 会议摘要流水线 — 总结会议、检查流水线状态、重放任务、管理 Microsoft Graph 订阅"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Teams Meeting Pipeline
+
+通过 Hermes CLI 操作 Teams 会议摘要流水线 — 总结会议、检查流水线状态、重放任务、管理 Microsoft Graph 订阅。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/productivity/teams-meeting-pipeline` |
+| 版本 | `1.1.0` |
+| 作者 | Hermes Agent + Teknium |
+| 许可证 | MIT |
+| 标签 | `Teams`, `Microsoft Graph`, `Meetings`, `Productivity`, `Operations` |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发该 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时所看到的指令内容。
+:::
+
+# Teams Meeting Pipeline
+
+当用户询问 Microsoft Teams 会议摘要、转录文本、录制内容、行动项、Graph 订阅，或任何与 Teams 会议流水线相关的运维问题时，使用此 skill。支持任意语言 — 以下触发示例并非完整列表。
+
+所有面向运维人员的操作均通过终端工具执行 `hermes teams-pipeline` 子命令完成。此流水线没有新的模型工具 — CLI 是唯一操作界面。
+
+## 使用场景
+
+用户希望：
+- 总结 Teams 会议 / 提取行动项 / 获取会议记录
+- 检查流水线状态、查看已存储的会议任务，或查看近期会议
+- 重放 / 重新运行失败或需要重新生成摘要的已存储任务
+- 在更改环境变量或配置后验证 Microsoft Graph 设置
+- 排查"会议摘要未送达"或"新会议未被采集"等问题
+- 管理 Graph webhook 订阅（创建、续期、删除、查看）
+- 设置自动订阅续期（参见下方注意事项）
+
+多语言触发示例（非完整列表）：
+- 英语："summarize the Teams meeting"、"pipeline status"、"replay job X"
+- 土耳其语："Teams meeting özetle"、"action item çıkar"、"toplantı notu"、"pipeline durumu"、"replay job"
+
+## 前置条件
+
+使用流水线前，请确认以下变量已在 `~/.hermes/.env` 中设置：
+
+```bash
+MSGRAPH_TENANT_ID=...
+MSGRAPH_CLIENT_ID=...
+MSGRAPH_CLIENT_SECRET=...
+```
+
+如有缺失，请将用户引导至 `/docs/guides/microsoft-graph-app-registration` 的 Azure 应用注册指南 — 流水线正常运行需要一个已获得管理员授权的 Azure AD 应用注册，并配置相应的 Graph 应用权限。
+
+## 命令参考
+
+### 状态与检查（从这里开始）
+
+```bash
+hermes teams-pipeline validate              # 配置快照 — 每次变更后首先运行
+hermes teams-pipeline token-health          # Graph token 状态
+hermes teams-pipeline token-health --force-refresh   # 强制重新获取 token
+hermes teams-pipeline list                  # 近期会议任务
+hermes teams-pipeline list --status failed  # 仅显示失败任务
+hermes teams-pipeline show <job-id>         # 查看某个任务的完整详情
+hermes teams-pipeline subscriptions         # 当前 Graph webhook 订阅
+```
+
+### 重新运行 / 调试
+
+```bash
+hermes teams-pipeline run <job-id>          # 重放已存储任务（重新生成摘要并重新投递）
+hermes teams-pipeline fetch --meeting-id <id>   # 试运行：解析会议及转录文本，不持久化
+hermes teams-pipeline fetch --join-web-url "<url>"   # 通过加入链接进行试运行
+```
+
+### 订阅管理
+
+```bash
+hermes teams-pipeline subscribe \
+  --resource communications/onlineMeetings/getAllTranscripts \
+  --notification-url https://<your-public-host>/msgraph/webhook \
+  --client-state "$MSGRAPH_WEBHOOK_CLIENT_STATE"
+
+hermes teams-pipeline renew-subscription <sub-id> --expiration <iso-8601>
+hermes teams-pipeline delete-subscription <sub-id>
+hermes teams-pipeline maintain-subscriptions            # 续期即将到期的订阅
+hermes teams-pipeline maintain-subscriptions --dry-run  # 显示将被续期的内容
+```
+
+## 常见问题决策树
+
+- 用户问"为什么今天的会议没有收到摘要？" → 先执行 `list --status failed`，再对相关行执行 `show <job-id>`。如果任务根本不存在，检查 `subscriptions` — webhook 可能已过期（参见下方注意事项）。
+- 用户问"设置是否正常？" → 依次执行 `validate`、`token-health`、`subscriptions`。三项均通过后，发起一次测试会议，并检查 `list` 是否出现新行。
+- 用户问"重新运行会议 X 的摘要" → 执行 `list` 找到任务 ID，执行 `run <job-id>` 进行重放。若再次失败，执行 `show <job-id>` 查看错误，并用 `fetch --meeting-id` 对制品解析进行试运行。
+- 用户问"将会议 X 加入流水线" → 通常无需手动操作 — 流水线由订阅驱动，而非按单次会议触发。如果用户希望对某个历史会议生成摘要，使用 `fetch` 拉取转录文本，并在任务创建后执行 `run`。
+
+## 关键注意事项：Graph 订阅 72 小时后过期
+
+Microsoft Graph 将 webhook 订阅上限设为 72 小时，且**不会自动续期**。如果未调度 `maintain-subscriptions`，手动创建订阅 3 天后会议通知将静默停止。
+
+当用户反馈"昨天流水线还正常，今天没有任何内容进来"时：
+1. 执行 `hermes teams-pipeline subscriptions` — 如果结果为空，或所有条目的 `expirationDateTime` 均已过期，即为原因所在。
+2. 按上方示例使用 `subscribe` 重新创建订阅。
+3. **立即设置自动续期**，可通过 `hermes cron add`、systemd timer 或普通 crontab 实现。运维手册 `/docs/guides/operate-teams-meeting-pipeline#automating-subscription-renewal-required-for-production` 提供了三种方案的完整说明。12 小时间隔是安全的（相对 72 小时上限有 6 倍余量）。
+
+## 其他注意事项
+
+- **转录文本尚未就绪。** Teams 在会议结束后需要一段时间才能生成转录制品。对刚结束的会议执行 `fetch --meeting-id` 可能返回空结果。等待 2-5 分钟后重试，或让 Graph webhook 自然驱动采集。
+- **投递模式不匹配。** 如果摘要已生成（`list` 显示成功）但 Teams 中未收到任何内容，检查 `platforms.teams.extra.delivery_mode` 及对应的目标配置（`incoming_webhook_url` 或 `chat_id` 或 `team_id`+`channel_id`）。写入器从 config.yaml 或 `TEAMS_*` 环境变量中读取这些配置。
+- **Graph 应用权限。** token 获取正常（`token-health` 通过），但 Graph API 调用返回 401/403，原因是权限已添加但未重新授予管理员同意。请用户重新进入 Azure 门户中的应用注册页面，再次点击"授予管理员同意"。
+
+## 相关文档
+
+当用户需要比本 skill 更深入的内容时，请将其引导至以下资源：
+- Azure 应用注册操作指南：`/docs/guides/microsoft-graph-app-registration`
+- 完整流水线设置：`/docs/user-guide/messaging/teams-meetings`
+- 运维手册（续期自动化、故障排查、上线检查清单）：`/docs/guides/operate-teams-meeting-pipeline`
+- Webhook 监听器设置：`/docs/user-guide/messaging/msgraph-webhook`
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\research\research-arxiv.md ===
+---
+title: "Arxiv — 通过关键词、作者、分类或 ID 搜索 arXiv 论文"
+sidebar_label: "Arxiv"
+description: "通过关键词、作者、分类或 ID 搜索 arXiv 论文"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Arxiv
+
+通过关键词、作者、分类或 ID 搜索 arXiv 论文。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/research/arxiv` |
+| 版本 | `1.0.0` |
+| 作者 | Hermes Agent |
+| 许可证 | MIT |
+| 平台 | linux, macos, windows |
+| 标签 | `Research`, `Arxiv`, `Papers`, `Academic`, `Science`, `API` |
+| 相关 skill | [`ocr-and-documents`](/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时所看到的指令内容。
+:::
+
+# arXiv 学术研究
+
+通过 arXiv 免费 REST API 搜索并获取学术论文。无需 API key，无需额外依赖——仅使用 curl。
+
+## 快速参考
+
+| 操作 | 命令 |
+|--------|---------|
+| 搜索论文 | `curl "https://export.arxiv.org/api/query?search_query=all:QUERY&max_results=5"` |
+| 获取指定论文 | `curl "https://export.arxiv.org/api/query?id_list=2402.03300"` |
+| 阅读摘要（网页） | `web_extract(urls=["https://arxiv.org/abs/2402.03300"])` |
+| 阅读完整论文（PDF） | `web_extract(urls=["https://arxiv.org/pdf/2402.03300"])` |
+
+## 搜索论文
+
+API 返回 Atom XML 格式数据。可使用 `grep`/`sed` 解析，或通过管道传给 `python3` 获得整洁输出。
+
+### 基本搜索
+
+```bash
+curl -s "https://export.arxiv.org/api/query?search_query=all:GRPO+reinforcement+learning&max_results=5"
+```
+
+### 整洁输出（将 XML 解析为可读格式）
+
+```bash
+curl -s "https://export.arxiv.org/api/query?search_query=all:GRPO+reinforcement+learning&max_results=5&sortBy=submittedDate&sortOrder=descending" | python3 -c "
+import sys, xml.etree.ElementTree as ET
+ns = {'a': 'http://www.w3.org/2005/Atom'}
+root = ET.parse(sys.stdin).getroot()
+for i, entry in enumerate(root.findall('a:entry', ns)):
+    title = entry.find('a:title', ns).text.strip().replace('\n', ' ')
+    arxiv_id = entry.find('a:id', ns).text.strip().split('/abs/')[-1]
+    published = entry.find('a:published', ns).text[:10]
+    authors = ', '.join(a.find('a:name', ns).text for a in entry.findall('a:author', ns))
+    summary = entry.find('a:summary', ns).text.strip()[:200]
+    cats = ', '.join(c.get('term') for c in entry.findall('a:category', ns))
+    print(f'{i+1}. [{arxiv_id}] {title}')
+    print(f'   Authors: {authors}')
+    print(f'   Published: {published} | Categories: {cats}')
+    print(f'   Abstract: {summary}...')
+    print(f'   PDF: https://arxiv.org/pdf/{arxiv_id}')
+    print()
+"
+```
+
+## 搜索查询语法
+
+| 前缀 | 搜索范围 | 示例 |
+|--------|----------|---------|
+| `all:` | 所有字段 | `all:transformer+attention` |
+| `ti:` | 标题 | `ti:large+language+models` |
+| `au:` | 作者 | `au:vaswani` |
+| `abs:` | 摘要 | `abs:reinforcement+learning` |
+| `cat:` | 分类 | `cat:cs.AI` |
+| `co:` | 备注 | `co:accepted+NeurIPS` |
+
+### 布尔运算符
+
+```
+# AND（使用 + 时的默认行为）
+search_query=all:transformer+attention
+
+# OR
+search_query=all:GPT+OR+all:BERT
+
+# AND NOT
+search_query=all:language+model+ANDNOT+all:vision
+
+# 精确短语
+search_query=ti:"chain+of+thought"
+
+# 组合使用
+search_query=au:hinton+AND+cat:cs.LG
+```
+
+## 排序与分页
+
+| 参数 | 选项 |
+|-----------|---------|
+| `sortBy` | `relevance`, `lastUpdatedDate`, `submittedDate` |
+| `sortOrder` | `ascending`, `descending` |
+| `start` | 结果偏移量（从 0 开始） |
+| `max_results` | 结果数量（默认 10，最大 30000） |
+
+```bash
+# cs.AI 分类下最新的 10 篇论文
+curl -s "https://export.arxiv.org/api/query?search_query=cat:cs.AI&sortBy=submittedDate&sortOrder=descending&max_results=10"
+```
+
+## 获取指定论文
+
+```bash
+# 通过 arXiv ID
+curl -s "https://export.arxiv.org/api/query?id_list=2402.03300"
+
+# 多篇论文
+curl -s "https://export.arxiv.org/api/query?id_list=2402.03300,2401.12345,2403.00001"
+```
+
+## 生成 BibTeX
+
+获取论文元数据后，生成 BibTeX 条目：
+
+&#123;% raw %&#125;
+```bash
+curl -s "https://export.arxiv.org/api/query?id_list=1706.03762" | python3 -c "
+import sys, xml.etree.ElementTree as ET
+ns = {'a': 'http://www.w3.org/2005/Atom', 'arxiv': 'http://arxiv.org/schemas/atom'}
+root = ET.parse(sys.stdin).getroot()
+entry = root.find('a:entry', ns)
+if entry is None: sys.exit('Paper not found')
+title = entry.find('a:title', ns).text.strip().replace('\n', ' ')
+authors = ' and '.join(a.find('a:name', ns).text for a in entry.findall('a:author', ns))
+year = entry.find('a:published', ns).text[:4]
+raw_id = entry.find('a:id', ns).text.strip().split('/abs/')[-1]
+cat = entry.find('arxiv:primary_category', ns)
+primary = cat.get('term') if cat is not None else 'cs.LG'
+last_name = entry.find('a:author', ns).find('a:name', ns).text.split()[-1]
+print(f'@article{{{last_name}{year}_{raw_id.replace(\".\", \"\")},')
+print(f'  title     = {{{title}}},')
+print(f'  author    = {{{authors}}},')
+print(f'  year      = {{{year}}},')
+print(f'  eprint    = {{{raw_id}}},')
+print(f'  archivePrefix = {{arXiv}},')
+print(f'  primaryClass  = {{{primary}}},')
+print(f'  url       = {{https://arxiv.org/abs/{raw_id}}}')
+print('}')
+"
+```
+&#123;% endraw %&#125;
+
+## 阅读论文内容
+
+找到论文后，按以下方式阅读：
+
+```
+# 摘要页（速度快，包含元数据和摘要）
+web_extract(urls=["https://arxiv.org/abs/2402.03300"])
+
+# 完整论文（PDF → 通过 Firecrawl 转为 markdown）
+web_extract(urls=["https://arxiv.org/pdf/2402.03300"])
+```
+
+本地 PDF 处理请参阅 `ocr-and-documents` skill。
+
+## 常用分类
+
+| 分类 | 领域 |
+|----------|-------|
+| `cs.AI` | 人工智能 |
+| `cs.CL` | 计算与语言（NLP） |
+| `cs.CV` | 计算机视觉 |
+| `cs.LG` | 机器学习 |
+| `cs.CR` | 密码学与安全 |
+| `stat.ML` | 机器学习（统计） |
+| `math.OC` | 优化与控制 |
+| `physics.comp-ph` | 计算物理 |
+
+完整列表：https://arxiv.org/category_taxonomy
+
+## 辅助脚本
+
+`scripts/search_arxiv.py` 脚本负责处理 XML 解析并提供整洁输出：
+
+```bash
+python scripts/search_arxiv.py "GRPO reinforcement learning"
+python scripts/search_arxiv.py "transformer attention" --max 10 --sort date
+python scripts/search_arxiv.py --author "Yann LeCun" --max 5
+python scripts/search_arxiv.py --category cs.AI --sort date
+python scripts/search_arxiv.py --id 2402.03300
+python scripts/search_arxiv.py --id 2402.03300,2401.12345
+```
+
+无需额外依赖——仅使用 Python 标准库。
+
+---
+
+## Semantic Scholar（引用、相关论文、作者主页）
+
+arXiv 不提供引用数据或推荐功能。请使用 **Semantic Scholar API**——免费，基本使用无需 API key（1 次请求/秒），返回 JSON 格式。
+
+### 获取论文详情及引用信息
+
+```bash
+# 通过 arXiv ID
+curl -s "https://api.semanticscholar.org/graph/v1/paper/arXiv:2402.03300?fields=title,authors,citationCount,referenceCount,influentialCitationCount,year,abstract" | python3 -m json.tool
+
+# 通过 Semantic Scholar 论文 ID 或 DOI
+curl -s "https://api.semanticscholar.org/graph/v1/paper/DOI:10.1234/example?fields=title,citationCount"
+```
+
+### 获取引用该论文的文献（被引情况）
+
+```bash
+curl -s "https://api.semanticscholar.org/graph/v1/paper/arXiv:2402.03300/citations?fields=title,authors,year,citationCount&limit=10" | python3 -m json.tool
+```
+
+### 获取该论文的参考文献（引用情况）
+
+```bash
+curl -s "https://api.semanticscholar.org/graph/v1/paper/arXiv:2402.03300/references?fields=title,authors,year,citationCount&limit=10" | python3 -m json.tool
+```
+
+### 搜索论文（arXiv 搜索的替代方案，返回 JSON）
+
+```bash
+curl -s "https://api.semanticscholar.org/graph/v1/paper/search?query=GRPO+reinforcement+learning&limit=5&fields=title,authors,year,citationCount,externalIds" | python3 -m json.tool
+```
+
+### 获取论文推荐
+
+```bash
+curl -s -X POST "https://api.semanticscholar.org/recommendations/v1/papers/" \
+  -H "Content-Type: application/json" \
+  -d '{"positivePaperIds": ["arXiv:2402.03300"], "negativePaperIds": []}' | python3 -m json.tool
+```
+
+### 作者主页
+
+```bash
+curl -s "https://api.semanticscholar.org/graph/v1/author/search?query=Yann+LeCun&fields=name,hIndex,citationCount,paperCount" | python3 -m json.tool
+```
+
+### 常用 Semantic Scholar 字段
+
+`title`、`authors`、`year`、`abstract`、`citationCount`、`referenceCount`、`influentialCitationCount`、`isOpenAccess`、`openAccessPdf`、`fieldsOfStudy`、`publicationVenue`、`externalIds`（包含 arXiv ID、DOI 等）
+
+---
+
+## 完整研究工作流
+
+1. **发现论文**：`python scripts/search_arxiv.py "your topic" --sort date --max 10`
+2. **评估影响力**：`curl -s "https://api.semanticscholar.org/graph/v1/paper/arXiv:ID?fields=citationCount,influentialCitationCount"`
+3. **阅读摘要**：`web_extract(urls=["https://arxiv.org/abs/ID"])`
+4. **阅读完整论文**：`web_extract(urls=["https://arxiv.org/pdf/ID"])`
+5. **查找相关工作**：`curl -s "https://api.semanticscholar.org/graph/v1/paper/arXiv:ID/references?fields=title,citationCount&limit=20"`
+6. **获取推荐**：向 Semantic Scholar 推荐接口发送 POST 请求
+7. **追踪作者**：`curl -s "https://api.semanticscholar.org/graph/v1/author/search?query=NAME"`
+
+## 速率限制
+
+| API | 速率 | 认证 |
+|-----|------|------|
+| arXiv | 约 1 次请求 / 3 秒 | 无需认证 |
+| Semantic Scholar | 1 次请求 / 秒 | 无需认证（有 API key 可达 100 次/秒） |
+
+## 注意事项
+
+- arXiv 返回 Atom XML——使用辅助脚本或解析代码片段获得整洁输出
+- Semantic Scholar 返回 JSON——通过管道传给 `python3 -m json.tool` 提升可读性
+- arXiv ID 格式：旧格式（`hep-th/0601001`）与新格式（`2402.03300`）
+- PDF：`https://arxiv.org/pdf/{id}` — 摘要：`https://arxiv.org/abs/{id}`
+- HTML（如有）：`https://arxiv.org/html/{id}`
+- 本地 PDF 处理请参阅 `ocr-and-documents` skill
+
+## ID 版本控制
+
+- `arxiv.org/abs/1706.03762` 始终解析为**最新**版本
+- `arxiv.org/abs/1706.03762v1` 指向某个**特定**不可变版本
+- 生成引用时，请保留你实际阅读的版本后缀，以防引用漂移（后续版本可能对内容有重大修改）
+- API 的 `<id>` 字段返回带版本号的 URL（例如 `http://arxiv.org/abs/1706.03762v7`）
+
+## 已撤回论文
+
+论文提交后可能被撤回。发生这种情况时：
+- `<summary>` 字段会包含撤回声明（注意查找 "withdrawn" 或 "retracted" 字样）
+- 元数据字段可能不完整
+- 在将某条结果视为有效论文之前，请务必检查摘要内容

@@ -1,0 +1,316 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_sanitize_tool_error.py ===
+"""Tests for `_sanitize_tool_error` in model_tools.
+
+Ported from ironclaw#1639 — defense-in-depth on tool exception strings before
+they enter the model's `tool` message content. Note that `json.dumps()` in
+`handle_function_call` already handles quote/backslash escaping at the wire
+layer; this helper exists to strip structural framing tokens the model
+itself might react to (XML role tags, CDATA, markdown code fences) and to
+cap pathological lengths.
+"""
+from __future__ import annotations
+
+from model_tools import _sanitize_tool_error, _TOOL_ERROR_MAX_LEN
+
+
+class TestRoleTagStripping:
+    def test_strips_tool_call_tags(self):
+        out = _sanitize_tool_error("bad <tool_call>injected</tool_call> happened")
+        assert "<tool_call>" not in out
+        assert "</tool_call>" not in out
+        assert "bad injected happened" in out
+
+
+    def test_strips_role_tags(self):
+        # Each of these should be stripped
+        for tag in ("system", "assistant", "user", "result", "response", "output", "input"):
+            raw = f"prefix <{tag}>hi</{tag}> suffix"
+            out = _sanitize_tool_error(raw)
+            assert f"<{tag}>" not in out, f"failed to strip <{tag}>"
+            assert f"</{tag}>" not in out, f"failed to strip </{tag}>"
+
+
+    def test_unrelated_xml_kept(self):
+        # We intentionally only strip the role-like tag whitelist, not all XML
+        out = _sanitize_tool_error("Error parsing <ParseError>line 5</ParseError>")
+        assert "<ParseError>" in out
+
+
+class TestCDATAStripping:
+    def test_strips_cdata(self):
+        out = _sanitize_tool_error("error: <![CDATA[malicious]]> here")
+        assert "<![CDATA[" not in out
+        assert "]]>" not in out
+
+
+
+class TestCodeFenceStripping:
+    def test_strips_leading_fence_with_lang(self):
+        out = _sanitize_tool_error("```json\n{\"x\": 1}")
+        assert not out.replace("[TOOL_ERROR] ", "").startswith("```")
+
+
+    def test_strips_bare_fence(self):
+        out = _sanitize_tool_error("```\nstuff")
+        assert "```" not in out.split("\n")[0]
+
+
+class TestTruncation:
+    def test_caps_long_input(self):
+        long = "A" * (_TOOL_ERROR_MAX_LEN * 2)
+        out = _sanitize_tool_error(long)
+        # Total length is prefix + truncated body
+        body = out[len("[TOOL_ERROR] "):]
+        assert len(body) == _TOOL_ERROR_MAX_LEN
+        assert body.endswith("...")
+
+
+
+class TestEnvelope:
+    def test_wraps_with_prefix(self):
+        out = _sanitize_tool_error("oh no")
+        assert out.startswith("[TOOL_ERROR] ")
+
+
+
+
+class TestHandleFunctionCallIntegration:
+    """Verify handle_function_call routes exception-path errors through the sanitizer.
+
+    Note: the "Unknown tool: ..." early-return in tools/registry.py is a
+    *different* code path from `except Exception` in handle_function_call —
+    that one returns directly without sanitization (and there's nothing to
+    sanitize in a hardcoded format string anyway). This test exercises the
+    real exception path by passing args that make a known tool raise.
+    """
+
+    def test_exception_path_error_is_sanitized(self):
+        import json
+        from model_tools import handle_function_call
+        from tools.registry import registry as _registry
+
+        # Force a known tool to raise with a payload containing role tags.
+        def boom(_args, **_kwargs):
+            raise RuntimeError("<tool_call>injected</tool_call> boom")
+
+        all_tools = _registry.get_all_tool_names()
+        assert all_tools, "no tools registered — test environment broken"
+        target = all_tools[0]
+        original = _registry._tools[target].handler
+        _registry._tools[target].handler = boom
+        try:
+            result_str = handle_function_call(target, {})
+        finally:
+            _registry._tools[target].handler = original
+
+        payload = json.loads(result_str)
+        assert "error" in payload, payload
+        assert payload["error"].startswith("[TOOL_ERROR] "), payload["error"]
+        # Role-tag stripping carried through
+        assert "<tool_call>" not in payload["error"]
+        assert "</tool_call>" not in payload["error"]
+        assert "boom" in payload["error"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_stale_utils_module_import.py ===
+"""Regression for the stale-``utils``-module ImportError after a hot ``git pull``.
+
+Real incident (gateway session 1518671026962174144)::
+
+    Sorry, I encountered an error (ImportError).
+    cannot import name 'env_float' from 'utils' (~/.hermes/hermes-agent/utils.py)
+
+Mechanism:
+
+1. A long-running gateway/agent process imported ``utils`` BEFORE ``env_float``
+   existed (added in 06ca1e99, 2026-06-20 14:00). The cached module object in
+   ``sys.modules`` therefore has no ``env_float`` attribute.
+2. ``hermes update`` ran ``git pull``, updating ``utils.py`` (now defining
+   ``env_float``) and ~22 consumer modules (now doing ``from utils import
+   env_float``) on disk -- WITHOUT restarting the process.
+3. Switching the live session's model (anthropic/opus -> opencode/glm) forced the
+   FIRST import of a consumer module on the new provider's code path. Its
+   top-level ``from utils import env_float`` resolved against the STALE cached
+   ``utils`` -> ImportError. The path in parentheses is the consumer-reported
+   ``utils.__file__`` on disk (which *does* define ``env_float``), which is why
+   the error is so confusing: the file on disk is fine, the in-memory module is not.
+
+``hermes_cli/main.py`` (the ``hermes update`` flow, ~line 9326) already
+acknowledges this exact hazard -- "source files on disk are newer than cached
+Python modules in this process" -- and reloads ``hermes_constants`` after the
+pull, but NOT ``utils``. Any ``utils`` consumer added in the same release stays
+exposed until the process restarts.
+
+The messaging client (Discord/Telegram/Feishu/...) is incidental: the trigger is
+a fresh import on a stale process, not the platform. We assert that below by
+reproducing the failure with the Discord adapter's exact import line.
+"""
+
+import sys
+import types
+
+import pytest
+
+
+def _import_fresh_consumer(name: str, source: str) -> types.ModuleType:
+    """Import a brand-new module whose body runs ``source`` -- mimicking a
+    consumer module being imported for the first time on the model-switch path."""
+    mod = types.ModuleType(name)
+    mod.__file__ = f"{name}.py"
+    sys.modules.pop(name, None)
+    exec(compile(source, mod.__file__, "exec"), mod.__dict__)
+    sys.modules[name] = mod
+    return mod
+
+
+class TestStaleUtilsModuleImport:
+    def test_fresh_consumer_import_fails_against_stale_utils(self, monkeypatch):
+        """The bug: stale in-memory ``utils`` + fresh ``from utils import env_float``."""
+        import utils
+
+        # Sanity: today's on-disk source is healthy.
+        assert hasattr(utils, "env_float")
+
+        # Simulate the pre-06-20 cached module (monkeypatch auto-restores after).
+        monkeypatch.delattr(utils, "env_float")
+
+        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
+            _import_fresh_consumer("stale_switch_path_consumer", "from utils import env_float\n")
+
+    def test_client_is_incidental_discord_import_line_fails_identically(self, monkeypatch):
+        """Same failure via the Discord adapter's exact import line -- the client
+        does not determine the bug, the stale process does."""
+        import utils
+
+        monkeypatch.delattr(utils, "env_float")
+
+        # plugins/platforms/discord/adapter.py:106
+        with pytest.raises(ImportError, match=r"cannot import name 'env_float' from 'utils'"):
+            _import_fresh_consumer(
+                "stale_discord_consumer",
+                "from utils import atomic_json_write, env_float\n",
+            )
+
+    def test_healthy_process_imports_consumer_fine(self):
+        """Control: when the cached ``utils`` matches disk (env_float present),
+        the same consumer import succeeds -- proving the harness isolates the
+        staleness, not an unrelated import error."""
+        import utils
+
+        assert hasattr(utils, "env_float")
+        mod = _import_fresh_consumer(
+            "healthy_consumer",
+            "from utils import env_float\nVALUE = env_float('UNSET_FOR_TEST', 1.5)\n",
+        )
+        assert mod.VALUE == 1.5
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_termux_all_extra_compat.py ===
+"""Regression coverage for the Termux broad install profile."""
+
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+
+
+def test_pyproject_defines_termux_all_without_known_blockers() -> None:
+    text = PYPROJECT.read_text()
+    assert "termux-all = [" in text
+    assert '"hermes-agent[termux]"' in text
+    assert '"hermes-agent[matrix]"' not in text.split("termux-all = [", 1)[1].split("]", 1)[0]
+    assert '"hermes-agent[voice]"' not in text.split("termux-all = [", 1)[1].split("]", 1)[0]
+
+
+def test_install_script_prefers_termux_all_then_fallbacks() -> None:
+    text = INSTALL_SH.read_text()
+    assert "pip install -e '.[termux-all]' -c constraints-termux.txt" in text
+    assert "Termux broad profile (.[termux-all]) failed, trying baseline Termux profile..." in text
+    assert "Termux baseline profile (.[termux]) failed, trying base install..." in text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_tests_tree_layout.py ===
+"""The tests/ tree mirrors the source tree.
+
+``scripts/run_tests.sh tests/<dir>/`` is how a change gets its regression
+coverage run, so a test filed under a directory that does not correspond to
+the code it exercises is a test nobody runs when that code changes. Two
+drifts had accumulated: parallel directories for one source package
+(``tests/cli`` beside ``tests/hermes_cli``, ``tests/run_agent`` beside
+``tests/agent``, ``tests/state`` beside ``tests/hermes_state``) and ~250
+loose files at ``tests/`` root that belonged to a package.
+
+Filenames also stopped carrying issue numbers: ``test_89315_x.py`` reads as
+noise in a directory listing and the number belongs in the docstring, where
+``git log -S`` and a reader can both find it with context.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TESTS_ROOT = REPO_ROOT / "tests"
+
+# tests/<name>/ directories that do not mirror a source directory but are
+# legitimate homes: cross-cutting suites, fixtures, and script-family tests.
+_NON_MIRROR_DIRS = {
+    "ci", "conformance", "dashboard", "desktop", "docker", "e2e", "evals",
+    "fakes", "fixtures", "honcho_plugin", "install", "integration", "manual",
+    "monitoring", "openviking_plugin", "perf_guards", "scripts", "secret_sources",
+    "security", "skills", "verify", "website", "computer_use", "hermes_state",
+}
+
+# Root-level modules whose tests sit directly in tests/ (no package to mirror).
+_ROOT_MODULE_STEMS = {p.stem for p in REPO_ROOT.glob("*.py")}
+
+_ISSUE_NUMBER = re.compile(r"(^test_\d{4,6}_)|(_\d{4,6}\.py$)")
+
+
+def _source_dirs() -> set[str]:
+    return {
+        p.name
+        for p in REPO_ROOT.iterdir()
+        if p.is_dir() and (p / "__init__.py").exists()
+    }
+
+
+def test_every_test_directory_mirrors_a_source_directory_or_is_declared():
+    """No sibling directory for a source package that already has one."""
+    source_dirs = _source_dirs()
+    offenders = sorted(
+        d.name
+        for d in TESTS_ROOT.iterdir()
+        if d.is_dir()
+        and d.name not in ("__pycache__",)
+        and d.name not in source_dirs
+        and d.name not in _NON_MIRROR_DIRS
+    )
+    assert not offenders, (
+        "tests/ directories that mirror no source package: "
+        f"{offenders}. Put the tests under tests/<source dir>/ (tests/agent, "
+        "tests/hermes_cli, ...) or, for a genuinely cross-cutting suite, add the "
+        "name to _NON_MIRROR_DIRS in this file with a reason."
+    )
+
+
+def test_no_issue_numbers_in_test_filenames():
+    """Issue numbers live in docstrings, where the reader gets context."""
+    offenders = sorted(
+        str(p.relative_to(REPO_ROOT))
+        for p in TESTS_ROOT.rglob("test_*.py")
+        if _ISSUE_NUMBER.search(p.name)
+    )
+    assert not offenders, (
+        f"Issue numbers in test filenames: {offenders}. Drop the number from the "
+        "name and cite the issue in the module docstring instead."
+    )
+

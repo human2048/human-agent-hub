@@ -1,0 +1,313 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_sh_node_tarball_without_xz.py ===
+"""Node.js download picks a .tar.gz when the host has no ``xz`` (#11197).
+
+`tar xf node-*.tar.xz` shells out to the xz binary; minimal Debian/DietPi/WSL images ship tar
+without it, so the extract died mid-way and the installer then failed on a missing directory.
+Both tarball selectors (installer and runtime bootstrap) are driven for real against a stubbed
+index page; only the ``xz`` binary's presence differs between the two arms.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INDEX = "node-v26.7.0-linux-x64.tar.xz\nnode-v26.7.0-linux-x64.tar.gz\n"
+
+
+def _function(path: Path, name: str) -> str:
+    match = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n", path.read_text(encoding="utf-8"), re.M | re.S)
+    assert match, f"{name}() not found in {path}"
+    return match.group(0)
+
+
+def _selected_tarball(tmp_path: Path, *, with_xz: bool, script: Path, fn: str, call: str) -> str:
+    """Run the real tarball-selection function with curl stubbed to serve INDEX; the download step
+    records the chosen name and aborts, so nothing is extracted."""
+    bin_dir = tmp_path / ("bin-xz" if with_xz else "bin-noxz")
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text("#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = -o ] && { echo \"$4\" >> \"$PICKED\"; exit 1; }; done\n"
+                    f"printf '%s' '{INDEX}'\n", encoding="utf-8")
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+    # PATH holds only this dir: the host's real xz must not leak into the "no xz" arm.
+    for tool in ("grep", "head", "mktemp", "rm", "uname", "sh", "printf"):
+        real = shutil.which(tool)
+        if real:
+            os.symlink(real, bin_dir / tool)
+    if with_xz:
+        (bin_dir / "xz").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (bin_dir / "xz").chmod(0o755)
+    picked = tmp_path / f"picked-{with_xz}-{fn}"
+    harness = ("log_info() { :; }; log_warn() { :; }; _nb_log() { :; }; _nb_warn() { :; }\n"
+               "HERMES_NODE_TARGET_MAJOR=26\n" + _function(script, fn) + call)
+    env = {"PATH": str(bin_dir), "PICKED": str(picked), "HOME": str(tmp_path)}
+    subprocess.run([shutil.which("bash") or "/bin/bash", "-c", harness], env=env, check=False, capture_output=True)
+    return picked.read_text(encoding="utf-8").strip() if picked.exists() else ""
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("script, fn, call", [
+    (REPO_ROOT / "scripts" / "install.sh", "install_node_line", "\ninstall_node_line 26 linux x64\n"),
+    (REPO_ROOT / "scripts" / "lib" / "node-bootstrap.sh", "_nb_install_bundled_node", "\n_nb_install_bundled_node\n"),
+])
+def test_tarball_format_follows_xz_availability(tmp_path: Path, script: Path, fn: str, call: str) -> None:
+    assert _selected_tarball(tmp_path, with_xz=True, script=script, fn=fn, call=call).endswith(".tar.xz")
+    assert _selected_tarball(tmp_path, with_xz=False, script=script, fn=fn, call=call).endswith(".tar.gz")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_sh_pythonpath_sanitization.py ===
+"""Regression tests for install.sh Python environment sanitization.
+
+When install.sh is launched from another Python-driven tool session, inherited
+PYTHONPATH/PYTHONHOME can shadow the freshly installed checkout. The installer
+must sanitize those vars both during installation and at runtime launch.
+"""
+
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+
+
+def test_install_script_unsets_pythonpath_and_pythonhome_early() -> None:
+    text = INSTALL_SH.read_text()
+
+    # During install, inherited Python env must be sanitized before pip/venv use.
+    assert 'unset PYTHONPATH' in text
+    assert 'unset PYTHONHOME' in text
+
+
+def test_hermes_launcher_wrapper_clears_python_env_before_exec() -> None:
+    text = INSTALL_SH.read_text()
+
+    # Wrapper should clear env and forward args untouched to the venv entrypoint.
+    assert 'cat > "$command_link_dir/hermes" <<EOF' in text
+    assert 'unset PYTHONPATH' in text
+    assert 'unset PYTHONHOME' in text
+    assert 'exec "$HERMES_BIN" "\\$@"' in text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_sh_reuse_supported_python.py ===
+"""install.sh reuses an already-installed supported Python instead of downloading 3.11 (#10778)."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+
+
+def _exe(path: Path, content: str) -> Path:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def _run_prerequisites(tmp_path: Path, *, uv_find_script: str) -> subprocess.CompletedProcess[str]:
+    """Run the real ``--stage prerequisites`` with a stub managed uv whose ``python find`` we script."""
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    (hermes_home / "bin").mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _exe(bin_dir / "python3.13", "#!/bin/sh\n[ \"$1\" = --version ] && echo 'Python 3.13.12'\nexit 0\n")
+    _exe(hermes_home / "bin" / "uv", "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'uv 0.9.0'; exit 0; }\n"
+         "if [ \"$1\" = python ] && [ \"$2\" = find ]; then\n" + uv_find_script + "fi\n"
+         "if [ \"$1\" = python ] && [ \"$2\" = install ]; then echo 'DOWNLOAD ATTEMPTED' >&2; exit 1; fi\nexit 0\n")
+    for tool in ("git", "node", "npm", "curl", "rg", "g++", "c++"):
+        _exe(bin_dir / tool, "#!/bin/sh\ncase \"$1\" in --version|-v) echo 'v22.12.0 2.50.0';; esac\nexit 0\n")
+    env = os.environ.copy()
+    env.update({"HOME": str(home), "HERMES_HOME": str(hermes_home),
+                "PATH": f"{bin_dir}{os.pathsep}{env.get('PATH', os.defpath)}"})
+    bash = shutil.which("bash") or "/bin/bash"
+    return subprocess.run([bash, str(INSTALL_SH), "--stage", "prerequisites", "--non-interactive"],
+                          env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+
+
+@pytest.mark.linux_only
+def test_supported_newer_python_is_reused_instead_of_downloading_311(tmp_path: Path) -> None:
+    """3.11 absent, 3.13 present: the installer must take 3.13 and never call ``uv python install``."""
+    result = _run_prerequisites(tmp_path, uv_find_script=(
+        # The range probe must carry --system: with the install's own venv activated, a plain
+        # `uv python find` returns venv/bin/python3, which setup_venv then deletes.
+        f"  [ \"$3\" = 3.11 ] && exit 2\n  [ \"$3\" = --system ] && [ \"$4\" = '>=3.11,<3.14' ] && {{ echo {tmp_path}/bin/python3.13; exit 0; }}\n  exit 2\n"))
+    assert "DOWNLOAD ATTEMPTED" not in result.stdout, result.stdout
+    assert "Python found: Python 3.13.12" in result.stdout, result.stdout
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_sh_root_fhs_uv_python_path.py ===
+"""Regression test for install.sh root-mode uv Python install path.
+
+When installing as root with the FHS layout (INSTALL_DIR=/usr/local/lib/...),
+``uv python install`` must place the managed Python under a world-readable
+location, otherwise the venv interpreter ends up at ``/root/.local/share/uv/...``
+and the shared ``/usr/local/bin/hermes`` wrapper fails for non-root users with
+"bad interpreter: Permission denied".  See #21457.
+"""
+
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+
+
+def _resolve_install_layout_body() -> str:
+    """Return just the body of resolve_install_layout(), bounded by its
+    opening signature and the next top-level ``}`` close brace.
+
+    Using the function body (not "first ``return 0`` after a marker") guards
+    the tests below against future refactors that hoist the export above
+    another conditional with its own early-return, or that insert an early-
+    return between the marker and the export — both of which would leave the
+    export unreachable while a less-strict assertion still passed.
+    """
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    head, _, rest = text.partition("resolve_install_layout() {\n")
+    assert rest, "Could not find resolve_install_layout() in scripts/install.sh"
+    body, _, _ = rest.partition("\n}\n")
+    assert body, "Could not find resolve_install_layout() closing brace"
+    return body
+
+
+def test_root_fhs_layout_exports_world_readable_uv_python_dirs() -> None:
+    text = INSTALL_SH.read_text(encoding="utf-8")
+
+    assert 'export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/usr/local/share/uv/python}"' in text
+    assert 'export UV_PYTHON_BIN_DIR="${UV_PYTHON_BIN_DIR:-/usr/local/share/uv/bin}"' in text
+
+
+def test_root_fhs_uv_python_export_is_inside_root_branch() -> None:
+    """The export must live in the root-FHS branch of resolve_install_layout,
+    after ``ROOT_FHS_LAYOUT=true`` and before the branch's ``return 0``, so
+    non-root and Termux installs are unaffected. Bound the slice by the
+    function body (not "next return 0" in the whole file) so the assertion
+    can't accept an unreachable export."""
+    body = _resolve_install_layout_body()
+
+    marker = 'ROOT_FHS_LAYOUT=true'
+    assert marker in body
+    after_marker = body.split(marker, 1)[1]
+    return_idx = after_marker.find('return 0')
+    export_idx = after_marker.find('UV_PYTHON_INSTALL_DIR')
+    assert export_idx != -1, "UV_PYTHON_INSTALL_DIR export missing from root-FHS branch"
+    assert return_idx != -1, "root-FHS branch must end with `return 0`"
+    assert export_idx < return_idx, (
+        "Export must precede the branch's `return 0` — otherwise unreachable"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_sh_setup_wizard_tty_probe.py ===
+"""Regression for #16746: install.sh /dev/tty gates must actually open /dev/tty.
+
+In a Docker build, ``/dev/tty`` exists as a device node (so a bare ``-e``
+existence test returns true) but opening it fails with ``ENXIO: No such
+device or address``. Under the old gates the script proceeded past the "no
+terminal available" skip and then crashed on the ``< /dev/tty`` redirect a
+few lines later, aborting the entire image build. The fix replaces every
+existence-based check that guards a subsequent ``< /dev/tty`` redirect with
+an open-based probe so the skip kicks in correctly.
+
+This module covers all three affected functions: ``run_setup_wizard()``
+(the reproducer in #16746), ``install_system_packages()`` (the apt sudo
+prompt fallback), and ``maybe_start_gateway()`` (the gateway-install gate).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+
+# Every function in scripts/install.sh that previously gated on a bare
+# ``[ -e /dev/tty ]`` check before redirecting stdin from ``/dev/tty``.
+GATED_FUNCTIONS = ("run_setup_wizard", "install_system_packages", "maybe_start_gateway")
+
+
+def _extract_function_body(name: str) -> str:
+    """Return the body of ``<name>()`` as a single string.
+
+    Anchored to ``<name>()`` and a top-of-line ``}`` so the helper keeps
+    working if neighbouring functions are renamed.
+    """
+    text = INSTALL_SH.read_text()
+    match = re.search(
+        rf"^{re.escape(name)}\(\)\s*\{{\s*\n(?P<body>.*?)^\}}",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"{name}() not found in scripts/install.sh"
+    return match["body"]
+
+
+@pytest.mark.parametrize("fn_name", GATED_FUNCTIONS)
+def test_tty_gate_does_not_use_existence_only_check(fn_name: str) -> None:
+    """The bare ``-e`` test is the bug — no spelling of it should remain."""
+    body = _extract_function_body(fn_name)
+    # Cover ``[ -e /dev/tty ]``, ``[ -e "/dev/tty" ]``, ``test -e /dev/tty``
+    # and friends, with arbitrary surrounding whitespace.
+    pattern = re.compile(
+        r"""(
+            \[\s*-e\s+["']?/dev/tty["']?\s*\]
+            |
+            \btest\s+-e\s+["']?/dev/tty["']?
+        )""",
+        re.VERBOSE,
+    )
+    match = pattern.search(body)
+    assert match is None, (
+        f"{fn_name} contains an existence-only check on /dev/tty "
+        f"({match.group(0)!r}). Bare `-e` tests pass in Docker builds "
+        "where the device node is in the mount namespace but cannot be "
+        "opened (ENXIO). Use an open-based probe (e.g. "
+        "`(: </dev/tty) 2>/dev/null` or `exec 3</dev/tty`) so the skip "
+        "kicks in before the function tries to read from /dev/tty. "
+        "See #16746."
+    )
+
+
+@pytest.mark.parametrize("fn_name", GATED_FUNCTIONS)
+def test_tty_gate_uses_open_based_probe(fn_name: str) -> None:
+    """The gate must actually attempt to open ``/dev/tty``.
+
+    Any ``if``/``if !``/``elif`` whose condition opens ``/dev/tty`` for
+    input counts: ``(: </dev/tty)``, ``exec 3</dev/tty``,
+    ``{ exec 3</dev/tty; }``, etc. Asserting the higher-level invariant
+    rather than a specific spelling so equivalent refactors stay green.
+    """
+    body = _extract_function_body(fn_name)
+    gate = re.compile(
+        r"^\s*(?:if|elif)\s+!?\s*[^\n]*<\s*/dev/tty[^\n]*;\s*then",
+        re.MULTILINE,
+    )
+    assert gate.search(body), (
+        f"{fn_name} must gate on an open-based probe of /dev/tty "
+        "(an `if`/`if !`/`elif` whose test redirects stdin from /dev/tty), "
+        "not a mere existence check. See #16746."
+    )
+

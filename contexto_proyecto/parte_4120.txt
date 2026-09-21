@@ -1,0 +1,111 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_execute_code_lifecycle_guard_deadline.py ===
+"""execute_code's gateway-lifecycle identity probe shares the cell deadline (#111922).
+
+The same ``_is_supervised_gateway_process`` probe that wedged ``terminal_tool`` runs
+ahead of every ``execute_code`` cell; a probe that renders no verdict must fail closed
+within the deadline instead of holding the tool call (and its cron slot) forever.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+
+import tools.code_execution_tool as cet
+import tools.terminal_tool as terminal_module
+
+
+def test_wedged_lifecycle_probe_returns_bounded_error_without_running(monkeypatch):
+    import tools.process_registry as process_registry
+
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(cet, "_load_config", lambda: {"timeout": 0.05})
+    monkeypatch.setattr(terminal_module, "_PRE_EXEC_GUARD_MIN_TIMEOUT_S", 0)
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: time.sleep(1))
+    ran: list[str] = []
+    monkeypatch.setattr(cet, "_get_env_config", lambda: ran.append("env") or {"env_type": "local"}, raising=False)
+
+    start = time.monotonic()
+    result = json.loads(cet.execute_code("print('hi')"))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.5, f"lifecycle probe wedged execute_code for {elapsed:.2f}s"
+    assert "did not finish" in result["error"]
+    assert ran == [], "a probe with no verdict must not fail open into execution"
+
+
+def test_interpreter_kill_in_execute_code_names_the_owned_process_route(monkeypatch):
+    """Sibling surface of the terminal guard (#113667): an image-name kill inside a cell gets the same
+    proc_* / explicit-PID rejection, not the generic lifecycle text."""
+    import tools.process_registry as process_registry
+
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    result = json.loads(cet.execute_code('import subprocess; subprocess.run(["pkill", "-9", "python3"])'))
+    assert "proc_" in result["error"] and "explicit PID" in result["error"]
+    generic = json.loads(cet.execute_code('import os; os.system("hermes gateway restart")'))
+    assert "proc_" not in generic["error"] and "cannot restart or stop the gateway" in generic["error"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_execute_helper_contract.py ===
+"""Execute the helper usage taught by the public schema and recovery hints."""
+
+import json
+import re
+
+import pytest
+
+from tools import code_execution_tool
+from tools.code_kernel import shutdown_all_kernels
+from tools.registry import registry
+
+
+PROBE = '''
+from __future__ import annotations
+{imports}
+import json
+print(json.dumps([json_parse('{{"value": 7}}')["value"],
+                  shell_quote("two words"), retry(lambda: "ok", delay=0)]))
+'''
+
+
+@pytest.fixture(autouse=True)
+def local_kernel(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("code_execution:\n  mode: strict\n", encoding="utf-8")
+    shutdown_all_kernels()
+    yield
+    shutdown_all_kernels()
+
+
+def run(code, reset=False):
+    return json.loads(registry.dispatch("execute_code", {"code": code, "reset": reset},
+                                        task_id="helper-contract", enabled_tools=[]))
+
+
+def test_schema_helper_instructions_work_across_kernel_lifetimes():
+    description = registry.get_schema("execute_code")["description"]
+    imports = "\n".join(re.findall(r"`(from hermes_tools import [\w, ]+)`", description))
+    for reset, reused in ((False, False), (False, True), (True, False)):
+        result = run(PROBE.format(imports=imports), reset=reset)
+        assert result["status"] == "success", result
+        assert json.loads(result["output"]) == [7, "'two words'", "ok"]
+        assert result["kernel"]["reused"] is reused
+
+
+def test_missing_helper_recovery_instructions_execute():
+    for helper in ("json_parse", "shell_quote", "retry"):
+        failed = run(f"print({helper})", reset=True)
+        assert failed["status"] == "error", failed
+        instruction = re.search(r"from hermes_tools import \w+", failed["hint"])
+        assert instruction, failed
+        recovered = run(instruction.group() + f"\nprint(callable({helper}))")
+        assert recovered["status"] == "success", recovered
+        assert recovered["output"].strip() == "True"
+        skew = code_execution_tool._sandbox_failure_hint(
+            f"ImportError: cannot import name '{helper}' from 'hermes_tools'")
+        assert instruction.group() in skew
+

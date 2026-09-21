@@ -1,0 +1,310 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\web-pentest\references\scope-enforcement.md ===
+# Scope Enforcement
+
+The pentest skill is dangerous because Hermes can drive network tools
+unattended. The single most important rule: **every active request must
+target a host the operator authorized.** This file is the procedure.
+
+## The Three Authorities
+
+1. `engagement/authorization.md` — what the operator wrote down.
+2. `engagement/scope.txt` — the machine-readable allowlist.
+3. The current shell prompt — implicit: "I'm running as Hermes inside
+   the operator's box."
+
+If any of those three disagree, you STOP and ask. Don't try to reconcile.
+
+## scope.txt format
+
+One target per line. Comments with `#`.
+
+```
+# Hostnames — resolved at use time
+localhost
+127.0.0.1
+::1
+staging.example.com
+api-staging.example.com
+
+# CIDR — internal labs only, requires operator OK in writing
+192.168.50.0/24
+10.0.5.0/24
+```
+
+Wildcards are NOT supported. If you need `*.staging.example.com`, list
+each host explicitly. This is on purpose: subdomain wildcards in
+authorization scope are how unauthorized testing happens.
+
+## Host Extraction Rules
+
+Before any active request, extract the target host from the command
+or URL and confirm it's in scope.
+
+| Surface | Where the host lives | Example |
+|---------|----------------------|---------|
+| `curl URL` | The URL | `curl https://staging.example.com/login` |
+| `curl --resolve HOST:PORT:ADDR` | HOST | reject — resolve overrides scope |
+| `nmap TARGET` | Each TARGET arg | `nmap 10.0.5.5 staging.example.com` |
+| `whatweb URL` | The URL | `whatweb https://staging.example.com` |
+| `browser_navigate(url)` | The URL | python-side: extract host from `url` |
+| Tool-driven HTTP (sqlmap, wfuzz, gobuster) | `-u`, `-h`, target arg | depends on tool |
+
+For URLs: `urllib.parse.urlparse(url).hostname.lower()`.
+For raw IPs: keep as IP, check against CIDR entries with
+`ipaddress.ip_address(host) in ipaddress.ip_network(cidr)`.
+
+## Pre-Send Checklist
+
+For every active request, before you press enter:
+
+1. Did you extract the host correctly? (URL host, not Host header, not
+   `--resolve` aliasing.)
+2. Is the host in scope.txt (exact hostname match) OR is its resolved
+   IP in a scope.txt CIDR?
+3. If it's a redirect target you're following, did you re-check scope
+   on the redirect URL?
+4. If it's the second hop of an SSRF probe, is the inner URL in scope?
+   (Usually NOT — that's the whole point. Don't auto-fire.)
+5. Did the operator approve this class of payload? (Read-only recon
+   is auto-OK; destructive payloads need explicit OK.)
+
+If any answer is "no" or "not sure," STOP and ask the operator.
+
+## Things That Look In-Scope But Aren't
+
+- **Redirects to a parent or sister host.** `staging.example.com` →
+  `auth.example.com` is a different host. Stop, re-confirm.
+- **CNAMEs.** `app.staging.example.com` may CNAME to
+  `prod-cluster.aws.example.com`. Resolve and check IP, not just name.
+- **Cloud metadata IPs.** `169.254.169.254` is not in any sane
+  scope.txt. If your SSRF candidate resolves there, you're probably
+  testing against a real cloud host and need explicit approval before
+  the probe.
+- **127.0.0.1 / localhost on a shared box.** If you're in a container
+  or shared dev box, `localhost` may be someone else's service.
+  Confirm with the operator that 127.0.0.1 means what they think.
+- **External services the target depends on.** Stripe API, OAuth
+  providers, S3 buckets — even if your tests would touch them, they
+  are NOT in scope by default.
+
+## When Scope Fails Open
+
+If you can't decide whether a host is in scope:
+
+```
+DEFAULT: out of scope.
+```
+
+Stop the agent. Ask the operator. Resume only after written
+confirmation. There is no penalty for asking; there is significant
+penalty for testing the wrong host.
+
+## Logging
+
+Every active request should append to `engagement/request-log.jsonl`:
+
+```json
+{"ts": "2026-05-25T03:14:15Z", "method": "GET", "url": "https://staging.example.com/api/users", "host": "staging.example.com", "in_scope": true, "phase": "recon", "result_status": 200, "evidence_ref": "evidence/recon.md#endpoints"}
+```
+
+This is your audit trail. If anyone ever asks "why did the pentest
+agent hit X?" you can answer from this log.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\web-pentest\references\vuln-taxonomy.md ===
+# Vulnerability Taxonomy
+
+Two classification systems used during analysis. Both come from Shannon
+(concepts only; rewritten here). Both exist to make the question
+"is this exploitable?" mechanical instead of vibes-based.
+
+## Injection: Slot Types
+
+Every injection sink has a **slot type** — the lexical position the
+attacker payload lands in. Each slot type has a small set of
+**required defenses**. A mismatch is a vulnerability. The same defense
+applied to the wrong slot is also a vulnerability.
+
+| Slot | Example | Required defense |
+|------|---------|------------------|
+| `SQL-val` | `SELECT * FROM u WHERE id = :v` | Parameterized binding |
+| `SQL-ident` | `SELECT * FROM ${table}` | Allowlist on identifier values |
+| `SQL-keyword` | `ORDER BY ${col} ${dir}` | Allowlist on column AND direction |
+| `CMD-argument` | `subprocess.run(["ls", v])` | argv list (never shell=True) |
+| `CMD-shell` | `os.system("ls " + v)` | DON'T — refactor to argv list |
+| `PATH-segment` | `open("/data/" + v)` | Normalize + allowlist + base-relative check |
+| `URL-host` | redirect to `https://${v}/x` | Allowlist of acceptable hosts |
+| `URL-fetch` | `requests.get(v)` | Allowlist + block private/metadata IPs (SSRF) |
+| `TEMPLATE-string` | `Template("Hello {{ v }}")` | Autoescape ON, no user-controlled template syntax |
+| `DESERIALIZE-pickle` | `pickle.loads(v)` | DON'T — use JSON / msgpack |
+| `DESERIALIZE-yaml` | `yaml.load(v)` | `yaml.safe_load`, never `yaml.load` |
+| `XPATH-expr` | `tree.xpath("//u[@id='" + v + "']")` | Parameterized XPath or escape |
+| `LDAP-filter` | `(uid=${v})` | LDAP filter escaping |
+| `REGEX-pattern` | `re.search(v, text)` | Don't take pattern from user (ReDoS too) |
+| `LOG-record` | `log.info("got " + v)` | Encode CR/LF/control chars before logging |
+| `EMAIL-header` | `Subject: ${v}` | Reject CR/LF |
+| `HTTP-header` | `Set-Cookie: ${v}` | Reject CR/LF (response splitting) |
+
+When you classify a finding:
+1. Identify the slot type
+2. Identify the actual defense in the code (if you have source)
+3. If defense doesn't match the required-defense set: vulnerable
+
+## XSS: Render Contexts
+
+XSS exploitability depends on **where** in the HTML/JS the value lands.
+Encoding for one context doesn't protect another.
+
+| Context | Example | Required encoding |
+|---------|---------|-------------------|
+| `HTML_BODY` | `<div>{{ v }}</div>` | HTML entity encode `<>&"'` |
+| `HTML_ATTR_QUOTED` | `<a href="{{ v }}">` | HTML attr encode |
+| `HTML_ATTR_UNQUOTED` | `<a href={{ v }}>` | Almost impossible to safely encode; quote the attr |
+| `URL_ATTR` (href/src) | `<a href="{{ v }}">` | Validate scheme allowlist + attr encode |
+| `JAVASCRIPT_STRING` | `<script>var x = "{{ v }}";</script>` | JS string escape + ensure quote consistency |
+| `JAVASCRIPT_BLOCK` | `<script>{{ v }}</script>` | DON'T — refactor; no safe encoding |
+| `CSS_VALUE` | `<style>color: {{ v }};</style>` | CSS encode + allowlist scheme/format |
+| `CSS_BLOCK` | `<style>{{ v }}</style>` | DON'T — refactor |
+| `JSON_RESPONSE` (consumed by JS) | `JSON.parse(response)` | JSON encode + correct content-type header |
+| `EVENT_HANDLER` | `<div onclick="{{ v }}">` | JS string escape *inside* HTML attr encode |
+| `URL_PATH` (router-driven) | route param echoed unencoded | URL-encode + HTML-encode |
+| `DOM_INNERHTML` | `el.innerHTML = v` (DOM XSS) | Use `textContent` instead, or DOMPurify |
+| `DOM_DOC_WRITE` | `document.write(v)` | DON'T — refactor |
+
+When you classify:
+1. Identify the render context where user input lands
+2. Identify the encoding applied
+3. Mismatch = vulnerable. Even "HTML encoded" output in
+   `JAVASCRIPT_STRING` is exploitable (`</script><script>` evasion).
+
+## OWASP Top 10 (2021) Mapping
+
+For reporting:
+
+| OWASP | Slot/context covered |
+|-------|----------------------|
+| A01 Broken Access Control | authz class (IDOR, vertical/horizontal) |
+| A02 Cryptographic Failures | infra class (weak TLS, plaintext storage) |
+| A03 Injection | injection class (all slot types except deserialize) |
+| A04 Insecure Design | reported in findings narrative |
+| A05 Security Misconfiguration | infra class |
+| A06 Vulnerable Components | infra class (whatweb output) |
+| A07 Auth Failures | auth class |
+| A08 Software/Data Integrity | DESERIALIZE-* slots, also supply chain |
+| A09 Logging/Monitoring | infra class (out of scope for active testing) |
+| A10 SSRF | ssrf class |
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\web-pentest\templates\authorization.md ===
+# Engagement Authorization
+
+Fill out before any active testing. Save to `engagement/authorization.md`.
+
+---
+
+**Engagement ID:** <UUID or short slug>
+**Operator:** <name of the person driving this Hermes session>
+**Date opened:** <ISO 8601 timestamp>
+**Engagement window:** <start ISO timestamp> through <end ISO timestamp>
+
+## Target
+
+- Primary URL(s):
+  - https://...
+- Primary IP(s):
+  - X.X.X.X
+- Hostnames covered:
+  - host.example.com
+  - api.host.example.com
+- Networks covered (CIDR):
+  - 10.0.0.0/24 (internal lab)
+
+## Authorization Basis
+
+(Pick one — record evidence in writing for anything but ownership.)
+
+- [ ] Operator owns the application and infrastructure being tested.
+- [ ] Written authorization from <name, role, organization, date>.
+      Document stored at: <path or link to signed authorization>.
+- [ ] Hermes Agent dashboard, running on this same workstation, used
+      as a self-test target. Operator confirms no other user is
+      connected to the dashboard instance during the engagement.
+
+## Out of Scope (must not be tested)
+
+- Production systems unless explicitly listed above
+- Third-party APIs / SaaS the application calls into
+- Other tenants if the target is multi-tenant
+- Cloud metadata endpoints (169.254.169.254, etc.) unless explicitly
+  included above
+- Destructive payloads (DROP, DELETE, file writes outside test
+  directories) without per-payload approval
+- Active social engineering, phishing, physical security
+
+## Constraints
+
+- Rate limit: <N> req/s per host. Default 5/s (200ms gap).
+- Hours: <none> | <only between HH:MM and HH:MM local>
+- Notify-before for: <list of categories> e.g. "any payload that
+  writes data," "any traffic that touches the auth endpoint after
+  10pm local"
+
+## Acknowledgement
+
+By approving this engagement, the operator confirms:
+
+1. The targets listed above are authorized for active testing by the
+   listed authorization basis.
+2. Testing may produce HTTP 4xx/5xx responses, log noise, alert
+   notifications, and rate-limit triggers in monitoring systems.
+3. The operator is responsible for any consequences of testing
+   targets that are NOT correctly authorized.
+4. The operator will revoke authorization (by stopping the agent) if
+   the scope changes, the time window ends, or any unexpected
+   off-scope behavior is observed.
+
+**Operator signature (typed name):** ________________
+**Confirmed at:** <ISO 8601 timestamp>
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\web-pentest\templates\exploitation-queue.json ===
+{
+  "schema": "hermes-web-pentest exploitation-queue v1",
+  "vuln_class": "injection|xss|auth|authz|ssrf|infra",
+  "generated_at": "ISO 8601 timestamp",
+  "engagement_id": "<engagement slug>",
+  "candidates": [
+    {
+      "id": "INJ-001",
+      "vuln_subclass": "sql_injection|command_injection|path_traversal|ssti|lfi|rfi|deserialization",
+      "endpoint": {
+        "method": "GET",
+        "url": "https://target.example/api/items",
+        "parameter": "id",
+        "location": "query|body|header|cookie|path"
+      },
+      "source_ref": "path/to/file.py:123",
+      "slot_type": "SQL-val|CMD-argument|PATH-segment|...",
+      "suspected_defense": "none|parameterized|escape|allowlist|...",
+      "verdict": "identified|partial|confirmed|critical|false_positive",
+      "confidence": 0.7,
+      "witness_payload": "' AND 1=1--",
+      "witness_response_signal": "row count change | timing | reflected marker | ...",
+      "bypass_attempts": [
+        {
+          "payload": "%2527%20OR%201=1--",
+          "blocked": true,
+          "notes": "WAF returned 403 on encoded variant"
+        }
+      ],
+      "notes": "free text",
+      "next_action": "send_witness | escalate_to_L3 | classify_FP | abort_scope_concern"
+    }
+  ]
+}
+

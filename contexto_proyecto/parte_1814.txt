@@ -1,0 +1,337 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_yaml_indent_consistency.py ===
+"""Regression tests for issue #31999.
+
+All YAML config write paths must produce 2-space-indented list items
+(matching ruamel.yaml's layout).  Mixing 0-indent (default PyYAML) and
+2-indent (ruamel.yaml) in the same config.yaml produces a file that
+stricter parsers like js-yaml reject with "bad indentation of a mapping
+entry", silently dropping custom_providers and breaking model switching.
+"""
+
+import yaml
+from utils import IndentDumper, atomic_yaml_write
+
+
+class TestIndentDumperShape:
+    """IndentDumper emits 2-space-indented list items under mapping keys."""
+
+    def test_indent_dumper_produces_2_indent_lists(self):
+        """List items under a mapping key must start at column 2, not 0."""
+        data = {
+            "custom_providers": [
+                {"name": "NVIDIA", "base_url": "https://api.nvidia.com"},
+            ],
+        }
+        out = yaml.dump(data, Dumper=IndentDumper, default_flow_style=False)
+        # The list item should be indented 2 spaces under the key
+        assert "  - " in out, f"Expected 2-indent list, got:\n{out}"
+
+    def test_default_pyyaml_produces_0_indent_lists(self):
+        """Default PyYAML (the buggy baseline) emits 0-indent lists."""
+        data = {
+            "custom_providers": [
+                {"name": "NVIDIA", "base_url": "https://api.nvidia.com"},
+            ],
+        }
+        out = yaml.dump(data, default_flow_style=False)
+        # The list item should be at column 0 (no leading spaces)
+        lines = out.strip().split("\n")
+        list_lines = [l for l in lines if l.lstrip().startswith("- ")]
+        assert all(not l.startswith("  - ") for l in list_lines), \
+            f"Expected 0-indent list (buggy baseline), got:\n{out}"
+
+    def test_indent_dumper_matches_ruamel_layout(self):
+        """IndentDumper output should match ruamel.yaml's list-under-mapping layout."""
+        data = {
+            "items": [
+                {"key": "value1"},
+                {"key": "value2"},
+            ],
+        }
+        pyyaml_out = yaml.dump(data, Dumper=IndentDumper, default_flow_style=False)
+        # ruamel.yaml with indent(mapping=2, sequence=4, offset=2) produces:
+        #   items:
+        #     - key: value1
+        #     - key: value2
+        # The key check: list items are NOT at column 0
+        lines = pyyaml_out.strip().split("\n")
+        list_lines = [l for l in lines if l.lstrip().startswith("- ")]
+        assert all(l.startswith("  - ") for l in list_lines), \
+            f"List items not 2-indent:\n{pyyaml_out}"
+
+
+class TestAtomicYamlWriteUsesIndentDumper:
+    """atomic_yaml_write must produce 2-indent lists via IndentDumper."""
+
+    def test_atomic_yaml_write_produces_2_indent_lists(self, tmp_path):
+        """The file written by atomic_yaml_write must have 2-indent list items."""
+        data = {
+            "custom_providers": [
+                {"name": "Test", "base_url": "https://example.com"},
+            ],
+        }
+        path = tmp_path / "config.yaml"
+        atomic_yaml_write(path, data)
+
+        content = path.read_text(encoding="utf-8")
+        assert "  - " in content, \
+            f"Expected 2-indent list in file, got:\n{content}"
+
+    def test_atomic_yaml_write_preserves_unicode(self, tmp_path):
+        """allow_unicode=True should write real UTF-8, not escape sequences."""
+        data = {"name": "Tëst Näme"}
+        path = tmp_path / "config.yaml"
+        atomic_yaml_write(path, data)
+
+        content = path.read_text(encoding="utf-8")
+        assert "Tëst Näme" in content
+
+    def test_atomic_yaml_write_is_atomic(self, tmp_path):
+        """atomic_yaml_write should create the file and clean up temp files."""
+        data = {"key": "value"}
+        path = tmp_path / "config.yaml"
+        atomic_yaml_write(path, data)
+
+        assert path.exists()
+        assert path.read_text(encoding="utf-8").strip().endswith("value")
+        # No leftover temp files
+        temp_files = list(tmp_path.glob(".config_*.tmp"))
+        assert len(temp_files) == 0
+
+
+class TestRoundtripConsistency:
+    """Output of atomic_yaml_write should round-trip through ruamel.yaml."""
+
+    def test_pyyaml_output_loads_in_ruamel(self, tmp_path):
+        """File written by atomic_yaml_write should load in ruamel.yaml without errors."""
+        data = {
+            "custom_providers": [
+                {"name": "Provider A", "base_url": "https://a.example.com"},
+                {"name": "Provider B", "base_url": "https://b.example.com"},
+            ],
+            "fallback_providers": ["backup1", "backup2"],
+        }
+        path = tmp_path / "config.yaml"
+        atomic_yaml_write(path, data)
+
+        from ruamel.yaml import YAML
+        yaml_rt = YAML(typ="rt")
+        loaded = yaml_rt.load(path.read_text(encoding="utf-8"))
+        assert loaded["custom_providers"][0]["name"] == "Provider A"
+        assert loaded["fallback_providers"] == ["backup1", "backup2"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\__init__.py ===
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\acp_adapter\conftest.py ===
+"""Shared fixtures for tests/acp_adapter.
+
+Keeps the ACP server tests offline: ``HermesACPAgent._build_model_state``
+calls ``hermes_cli.inventory.build_models_payload``, which (without this
+fixture) performs live network fetches — models.dev registry, GitHub model
+catalog, Copilot token exchange, Anthropic model list — adding ~3s of real
+SSL/socket time to every test that creates or loads a session (~147s total
+for test_server.py alone).
+
+Tests that assert model-state behavior re-patch these same attributes with
+``unittest.mock.patch`` / ``monkeypatch``; inner patches win, so this
+default is transparent to them.
+"""
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _offline_model_inventory(monkeypatch):
+    """Stub the shared model inventory so ACP tests never hit the network."""
+    import hermes_cli.inventory as inventory
+
+    class _StubPickerContext:
+        def with_overrides(self, **_kwargs):
+            return self
+
+    monkeypatch.setattr(inventory, "load_picker_context", lambda: _StubPickerContext())
+    monkeypatch.setattr(
+        inventory,
+        "build_models_payload",
+        lambda *_args, **_kwargs: {"providers": []},
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\acp_adapter\test_acp_commands.py ===
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
+from acp.schema import TextContentBlock
+
+from acp_adapter.server import HermesACPAgent
+from acp_adapter.session import SessionManager
+
+
+class FakeAgent:
+    def __init__(self):
+        self.model = "fake-model"
+        self.provider = "fake-provider"
+        self.enabled_toolsets = ["hermes-acp"]
+        self.disabled_toolsets = []
+        self.tools = []
+        self.valid_tool_names = set()
+        self._supports_active_turn_redirect = True
+        self.steers = []
+        self.redirects = []
+        self.runs = []
+
+    def steer(self, text):
+        self.steers.append(text)
+        return True
+
+    def redirect(self, text):
+        self.redirects.append(text)
+        return True
+
+    def run_conversation(self, *, user_message, conversation_history, task_id, **kwargs):
+        self.runs.append(user_message)
+        messages = list(conversation_history or [])
+        messages.append({"role": "user", "content": user_message})
+        final = f"ran: {user_message}"
+        messages.append({"role": "assistant", "content": final})
+        return {"final_response": final, "messages": messages}
+
+
+class CaptureConn:
+    def __init__(self):
+        self.updates = []
+
+    async def session_update(self, *args, **kwargs):
+        if kwargs:
+            self.updates.append((kwargs.get("session_id"), kwargs.get("update")))
+        else:
+            self.updates.append((args[0], args[1]))
+
+    async def request_permission(self, *args, **kwargs):
+        return SimpleNamespace(outcome="allow")
+
+
+class NoopDb:
+    def get_session(self, *_args, **_kwargs):
+        return None
+
+    def create_session(self, *_args, **_kwargs):
+        return None
+
+    def update_session(self, *_args, **_kwargs):
+        return None
+
+
+def make_agent_and_state():
+    fake = FakeAgent()
+    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    conn = CaptureConn()
+    acp_agent.on_connect(conn)
+    return acp_agent, state, fake, conn
+
+
+def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
+    """ACP sessions persist to SessionDB; recall must receive the same DB handle."""
+    captured = {}
+    sentinel_db = NoopDb()
+
+    class CapturingAgent(FakeAgent):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured.update(kwargs)
+
+    def mod(name, **attrs):
+        module = ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=CapturingAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m", "provider": "p"}}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {
+                "provider": "p",
+                "api_mode": "chat_completions",
+                "base_url": "u",
+                "api_key": "k",
+                "command": None,
+                "args": [],
+            },
+        ),
+    )
+
+    manager = SessionManager(db=sentinel_db)
+    agent = manager._make_agent(session_id="acp-session", cwd=".")
+
+    assert isinstance(agent, CapturingAgent)
+    assert captured["session_db"] is sentinel_db
+    assert captured["platform"] == "acp"
+    assert captured["session_id"] == "acp-session"
+
+
+@pytest.mark.asyncio
+async def test_acp_steer_slash_command_injects_into_running_agent():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.is_running = True
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/steer prefer the simpler fix")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.steers == ["prefer the simpler fix"]
+    assert fake.runs == []
+
+
+
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.is_running = True
+    state.current_prompt_text = "original request"
+    observed = {}
+
+    def interrupt():
+        acquired = state.runtime_lock.acquire(blocking=False)
+        observed["lock_held"] = not acquired
+        if acquired:
+            state.runtime_lock.release()
+
+    fake.interrupt = interrupt
+
+    await acp_agent.cancel(state.session_id)
+
+    assert observed["lock_held"] is True
+    assert state.cancel_event.is_set()
+    assert state.interrupted_prompt_text == "original request"
+
+
+
+
+
+
+

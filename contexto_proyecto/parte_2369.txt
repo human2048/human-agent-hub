@@ -1,0 +1,381 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\persistence\test_cell3_rotation_atomicity.py ===
+"""Cell 3 — crash mid-compression-rotation: the atomic-publication contract.
+
+Contract clause: a compression rotation (close parent + publish continuation
+child + write compacted handoff) is visible **entirely or not at all**. A hard
+crash at any point must never yield an orphan — a parent ended with
+``end_reason='compression'`` and no continuation child — because that is the
+state every reader treats as unreachable (the P1 in #80337; the recovery
+merged in #80487 exists to drain the pre-atomicity population of exactly
+these rows).
+
+The forensics on #80337 established the contract holds architecturally on
+current main (``publish_compression_child`` runs parent-close + child-insert
++ handoff in one transaction on one handle). This cell pins it empirically:
+a writer process performs rotations in a tight loop through the REAL leased
+path (``try_acquire_compression_lock`` → ``publish_compression_child``) and
+is SIGKILLed mid-loop; recovery then audits every rotation for atomicity.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from tests.conformance.persistence._harness import (
+    effective_mode_or_skip,
+    integrity_ok,
+    kill9_and_reap,
+    make_hermes_home,
+    spawn_child,
+    wait_for,
+)
+
+ROTATOR = r"""
+import json, sys
+from pathlib import Path
+from hermes_state import SessionDB
+
+db_path = Path({db_path!r})
+journal = Path({journal!r})
+db = SessionDB(db_path=db_path)
+
+i = 0
+with journal.open("a", buffering=1) as j:
+    while True:
+        parent = f"parent-{{i}}"
+        child = f"child-{{i}}"
+        db.create_session(parent, source="conformance")
+        db.append_message(parent, "user", content="pre-rotation turn")
+        holder = f"cell3:pid={{__import__('os').getpid()}}"
+        assert db.try_acquire_compression_lock(parent, holder)
+        db.publish_compression_child(
+            parent_session_id=parent,
+            child_session_id=child,
+            source="conformance",
+            messages=[{{"role": "user", "content": "compacted handoff"}}],
+            compression_lock_holder=holder,
+        )
+        j.write(json.dumps({{"i": i}}) + "\n")
+        j.flush()
+        i += 1
+"""
+
+
+def _completed_rotations(journal: Path) -> int:
+    if not journal.exists():
+        return 0
+    n = 0
+    for line in journal.read_text().splitlines():
+        try:
+            json.loads(line)
+            n += 1
+        except json.JSONDecodeError:
+            continue  # torn final line under SIGKILL — unacknowledged
+    return n
+
+
+@pytest.mark.parametrize("requested_mode", [None, "DELETE", "WAL"])
+def test_rotation_is_atomic_under_sigkill(tmp_path, requested_mode):
+    db_path = tmp_path / "state.db"
+    journal = tmp_path / "rotations.jsonl"
+
+    child_env = {}
+    if requested_mode is not None:
+        # Steer the CHILD's own resolver via an isolated HERMES_HOME config:
+        # pre-seeding the file alone is not enough — SessionDB.__init__ runs
+        # apply_wal_with_fallback(), which upgrades a non-WAL file to WAL
+        # whenever the configured mode says so (the resolver's downgrade
+        # gates may still refuse; effective_mode_or_skip audits post-run).
+        child_env["HERMES_HOME"] = str(
+            make_hermes_home(tmp_path, requested_mode.lower())
+        )
+
+    child = spawn_child(
+        ROTATOR.format(db_path=str(db_path), journal=str(journal)), env=child_env
+    )
+    try:
+        wait_for(
+            lambda: _completed_rotations(journal) >= 50,
+            what=">=50 completed rotations",
+            child=child,
+        )
+        assert child.poll() is None, (
+            f"rotator exited early (rc={child.returncode}): "
+            f"{(child.stderr.read() if child.stderr else b'').decode(errors='replace')[-1500:]}"
+        )
+    finally:
+        kill9_and_reap(child)
+
+    # A leg that ran in a different mode than requested is no evidence for
+    # the requested mode — skip it rather than silently double-counting WAL.
+    mode = effective_mode_or_skip(db_path, requested_mode)
+    acked = _completed_rotations(journal)
+    assert acked >= 50, (
+        f"[journal_mode={mode}] only {acked} rotations acknowledged before "
+        "the kill — harness window too small"
+    )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # THE contract: no compression-ended parent may lack a child row.
+        orphans = conn.execute(
+            """
+            SELECT p.id FROM sessions p
+            WHERE p.end_reason = 'compression'
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions c WHERE c.parent_session_id = p.id
+              )
+            """
+        ).fetchall()
+        assert not orphans, (
+            f"[journal_mode={mode}] atomicity violated: {len(orphans)} "
+            f"compression-ended parent(s) with no continuation "
+            f"({[o[0] for o in orphans[:5]]}) — the #80337 orphan shape"
+        )
+
+        # Completeness the other way: every acknowledged rotation is fully
+        # visible (parent ended AND child present).
+        for i in range(acked):
+            parent_row = conn.execute(
+                "SELECT end_reason FROM sessions WHERE id = ?",
+                (f"parent-{i}",),
+            ).fetchone()
+            child_row = conn.execute(
+                "SELECT id FROM sessions WHERE id = ?", (f"child-{i}",)
+            ).fetchone()
+            assert parent_row and parent_row[0] == "compression" and child_row, (
+                f"[journal_mode={mode}] acknowledged rotation {i} not fully "
+                f"visible after recovery (parent={parent_row}, child={child_row})"
+            )
+
+        # The interrupted trailing rotation (if any) must be all-or-nothing:
+        # either invisible or complete — checked by the orphan query above.
+    finally:
+        conn.close()
+
+    assert integrity_ok(db_path), f"[journal_mode={mode}] integrity_check failed"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\persistence\test_cells_wave2_stubs.py ===
+"""Wave-2 cell stubs — contract clauses named, implementations interlocked.
+
+These are deliberate ``pytest.skip`` placeholders, not TODOs: each names the
+exact contract clause it will pin and the reason it is not implemented in the
+skeleton PR. See the tracking issue (#80921) for the full ~39-cell matrix.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+def test_cell4_fork_determinism_on_rewind_stub():
+    """Cell 4 — fork determinism on the edit/rewind paths.
+
+    Contract clause: after an edit/rewind fork, recovery yields exactly the
+    chosen prefix (no resurrection of superseded turns, no archived-copy
+    duplication), deterministically across independent recovery passes.
+
+    Deliberately deferred: the rewind/archive semantics this cell would pin
+    are being actively redesigned in #82956–#82959 (durable row-id
+    addressing, archive-mode dedup, /retry archive_drop plumbing). Writing
+    the cell against today's behavior would test a moving target; it lands
+    as that cluster's conformance check once the contract settles.
+    """
+    pytest.skip(
+        "wave 2: interlocked with the rewind/archive redesign "
+        "(#82956-#82959) — cell lands as that cluster's conformance check"
+    )
+
+
+def test_cell5_delivery_outbox_exactly_once_stub():
+    """Cell 5 — effect exactly-once across the delivery outbox boundary.
+
+    Contract clause: a crash between provider send and durable record must
+    not double-deliver on catch-up (cron ticker restart, gateway reboot) —
+    the cell the paper (arXiv:2608.03836) probes as 'effect exactly-once',
+    distinct from cell 2's consume-once (claim vs side-effect).
+
+    Deliberately deferred: requires a deterministic fake-transport seam for
+    the delivery path (the send must be observable without a live adapter);
+    the cron delivery-scope interplay is also in flight (#83197/#83557).
+    """
+    pytest.skip(
+        "wave 2: needs a deterministic fake-transport seam; cron delivery "
+        "scope fixes in flight (#83197/#83557)"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\persistence\_harness.py ===
+"""Shared harness for the crash/resume persistence conformance cells (#80921).
+
+Method (per the spot-probes in the tracking issue): real ``SessionDB``
+against an isolated temp database, real ``SIGKILL`` delivered to a separate
+OS process mid-write, deterministic and LLM-free. Every wait has a hard
+deadline so a wedged child can never hang the suite; coordination uses file
+barriers, never bare sleeps.
+
+Journal-mode policy mirrors the issue's caveat: cells run on the mode the
+repo's own ``resolve_journal_mode()`` selects for this interpreter/filesystem
+(recorded per cell), plus an explicit ``DELETE`` run; an explicit ``WAL`` run
+is attempted and skipped when the resolver's downgrade gates trip (e.g. the
+WAL-reset interpreter bug), so WAL semantics are probed exactly where they
+are actually deployable.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# Generous deadlines: xdist-loaded CI boxes stall; correctness never depends
+# on these being tight, they only bound a hung child.
+CHILD_DEADLINE = 60.0
+POLL_INTERVAL = 0.02
+
+
+def spawn_child(script_body: str, *, cwd: Path | None = None, env: dict | None = None) -> subprocess.Popen:
+    """Run ``script_body`` in a fresh interpreter with the repo importable."""
+    child_env = dict(os.environ)
+    # Prepend, don't clobber: CI images may rely on an inherited PYTHONPATH
+    # for dependencies — losing it would fail child imports while the parent
+    # collects fine, surfacing only as an opaque wait_for deadline.
+    inherited = child_env.get("PYTHONPATH")
+    child_env["PYTHONPATH"] = (
+        f"{REPO_ROOT}{os.pathsep}{inherited}" if inherited else str(REPO_ROOT)
+    )
+    child_env["PYTHONUNBUFFERED"] = "1"
+    if env:
+        child_env.update(env)
+    return subprocess.Popen(
+        [sys.executable, "-c", script_body],
+        cwd=str(cwd or REPO_ROOT),
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def wait_for(
+    predicate,
+    *,
+    deadline: float = CHILD_DEADLINE,
+    what: str = "condition",
+    child: "subprocess.Popen | None" = None,
+) -> None:
+    """Poll ``predicate`` until true or fail loudly at the deadline.
+
+    When ``child`` is given and it exits before the predicate turns true,
+    fail IMMEDIATELY with its captured stderr — a crashed writer must be an
+    instant diagnostic, not a 60s opaque deadline.
+    """
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        if predicate():
+            return
+        if child is not None and child.poll() is not None:
+            err = b""
+            if child.stderr is not None:
+                err = child.stderr.read() or b""
+            raise AssertionError(
+                f"child exited early (rc={child.returncode}) while waiting "
+                f"for {what}; stderr:\n{err.decode(errors='replace')[-2000:]}"
+            )
+        time.sleep(POLL_INTERVAL)
+    raise AssertionError(f"deadline ({deadline}s) waiting for {what}")
+
+
+def kill9_and_reap(proc: subprocess.Popen, *, deadline: float = CHILD_DEADLINE) -> None:
+    """SIGKILL ``proc`` and reap it within ``deadline``."""
+    try:
+        proc.kill()  # SIGKILL on POSIX
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=deadline)
+
+
+def reap(proc: subprocess.Popen, *, deadline: float = CHILD_DEADLINE) -> tuple[int, str, str]:
+    """Wait for a child to exit on its own; kill + fail if it doesn't."""
+    try:
+        out, err = proc.communicate(timeout=deadline)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate(timeout=10)
+        raise AssertionError(
+            f"child did not exit within {deadline}s; stderr:\n"
+            f"{err.decode(errors='replace')[-2000:]}"
+        )
+    return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+def on_disk_journal_mode(db_path: Path) -> str:
+    """Record the journal mode actually in effect for a cell result."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        return str(row[0]) if row else "unknown"
+    finally:
+        conn.close()
+
+
+def integrity_ok(db_path: Path) -> bool:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        return bool(row) and str(row[0]).lower() == "ok"
+    finally:
+        conn.close()
+
+
+def make_hermes_home(base: Path, journal_mode: str) -> Path:
+    """Create an isolated HERMES_HOME whose config pins ``database.journal_mode``.
+
+    The journal-mode matrix legs must steer the CHILD's own resolver:
+    pre-seeding the DB file alone is not enough, because ``SessionDB.__init__``
+    runs ``apply_wal_with_fallback()`` which upgrades a non-WAL file to WAL
+    whenever the configured mode (default ``wal``) says so — on healthy
+    SQLite the DELETE leg would silently run in WAL.
+    """
+    home = base / f"hermes-home-{journal_mode}"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        f"database:\n  journal_mode: {journal_mode}\n", encoding="utf-8"
+    )
+    return home
+
+
+def effective_mode_or_skip(db_path: Path, requested_mode: str | None) -> str:
+    """Record the on-disk journal mode; skip if a requested leg wasn't honored.
+
+    A leg that ran in a different mode than advertised must never count as
+    green evidence for the advertised mode.
+    """
+    import pytest
+
+    mode = on_disk_journal_mode(db_path)
+    if requested_mode is not None and mode.upper() != requested_mode.upper():
+        pytest.skip(
+            f"journal_mode={requested_mode} not honored by this environment "
+            f"(effective {mode}) — matrix leg not probeable here"
+        )
+    return mode
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\persistence\__init__.py ===
+

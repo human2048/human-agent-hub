@@ -1,0 +1,276 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\spokeo.json ===
+{
+  "id": "spokeo",
+  "name": "Spokeo",
+  "category": "people_search",
+  "priority": "crucial",
+  "jurisdictions": ["US"],
+  "parent": "spokeo",
+  "owns": ["freepeopledirectory"],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://www.spokeo.com/search",
+    "fetch": "browser",
+    "match_signal": "profile",
+    "by": ["name", "phone", "email", "address"]
+  },
+  "optout": {
+    "tier": "T1",
+    "method": "web_form",
+    "url": "https://www.spokeo.com/optout",
+    "email": "privacy@spokeo.com",
+    "requires": {
+      "profile_url": true,
+      "email_verification": true,
+      "captcha": false,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": ["profile_url", "contact_email"],
+    "deletion": {
+      "via": "email_followup",
+      "email": "privacy@spokeo.com",
+      "kinds": ["ccpa", "generic"],
+      "notes": "privacy@spokeo.com is the documented direct privacy contact (verified live on /optout 2026-07-01). Use for full CCPA deletion beyond listing opt-out, for listings the form rejects, and when more listings keep surfacing."
+    },
+    "playbook": [
+      "Opt-out form at spokeo.com/optout -- clears FreePeopleDirectory. Inputs: the confirmed profile URL + contact email; the form emails a confirmation link (poll-verification picks it up; open it in the agent's own browser).",
+      "EVERY LISTING SEPARATELY: 'you may have multiple listings on Spokeo. Each one is identified by a unique URL and must be opted out individually' (their own wording). Run ALL search vectors first, collect every listing URL, and submit one opt-out per URL.",
+      "Fast: requests process in 24-48 hours per their page -- re-scan after 2 days and record the real outcome.",
+      "FULL DELETION follow-up: send-email --kind ccpa (CA) / generic to privacy@spokeo.com naming all listing URLs -- covers data retained beyond the free-search suppression.",
+      "Paid/account data may be retained even when hidden from free search -- verify actual removal via re-scan; never mark confirmed_removed off the free-search view alone."
+    ],
+    "notes": "Form + privacy@spokeo.com verified live 2026-07-01. Their page: opting out does not remove data from original sources and listings may reappear as new public records arrive -- keep the reappearance re-scan scheduled.",
+    "quirks": [
+      "Profile URL formats the form accepts: listing URL like spokeo.com/{First}-{Last}/{City}/{ST}/p{id} or a purchase URL spokeo.com/purchase?q=... (examples shown on /optout).",
+      "Multiple listings per person are NORMAL (one per name x location x record cluster); each unique URL must be opted out individually -- feed every found listing URL through the form.",
+      "Processing is 24-48h ('depending on the nature of your request and the amount of data').",
+      "Paid accounts may retain data even when hidden from free search - verify actual removal, don't mark confirmed_removed off the free-search view alone."
+    ],
+    "est_processing_days": 2,
+    "reappearance_risk": "medium"
+  },
+  "last_verified": "2026-07-01",
+  "source": "BADBOOL"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\thatsthem.json ===
+{
+  "id": "thatsthem",
+  "name": "That's Them",
+  "category": "people_search",
+  "priority": "crucial",
+  "jurisdictions": ["US"],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://thatsthem.com/",
+    "fetch": "browser",
+    "match_signal": "result",
+    "by": ["name", "phone", "email", "address"],
+    "url_patterns": {
+      "name": "https://thatsthem.com/name/{First}-{Last}/{City}-{ST}",
+      "phone": "https://thatsthem.com/phone/{areacode}-{prefix}-{line}",
+      "email": "https://thatsthem.com/email/{email}",
+      "address": "https://thatsthem.com/address/{Street}-{City}-{ST}-{ZIP}"
+    },
+    "url_format_quirks": [
+      "ADDRESS path is fully hyphen-joined and joins street+city+state+ZIP with hyphens (e.g. /address/123-Main-St-Anytown-NY-12345) and REQUIRES the ZIP. The older slash form (/address/Street/City-ST) and any ZIP-less form 404.",
+      "NAME and PHONE and EMAIL paths use a slash before city/state and do NOT need a ZIP: /name/First-Last/City-ST , /phone/AAA-PPP-LLLL , /email/addr@host.",
+      "Street abbreviations are kept verbatim (Ave, Pl, St) - do NOT expand to Avenue/Place/Street; expanding 404s.",
+      "A 404 on a constructed URL means WRONG PATTERN, not 'no record present'. Treat as INCONCLUSIVE: fall back to the on-site search box (browser_type into the address/name field + submit) and read the resulting canonical URL."
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://thatsthem.com/optout",
+    "requires": {
+      "profile_url": false,
+      "email_verification": false,
+      "captcha": true,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": ["full_name", "street", "city", "state", "postal", "contact_email", "phone"],
+    "notes": "Opt-out form is gated by a Cloudflare Turnstile CAPTCHA (so tier is T2 without a captcha-clearing browser backend; T1 with Browserbase). All 7 fields are marked required by the form (Full Name, Street Address, City, State, ZIP, Email, Phone). Site sends a confirmation email and states ~72h processing (this is a completion notice, not a click-to-verify link). Least-disclosure tension: the form DEMANDS email+phone even though a public record may show less - disclose only to remove a record that is actually about the subject. Do not click the Spokeo identity-theft-protection link (paid product).",
+    "est_processing_days": 3,
+    "reappearance_risk": "low"
+  },
+  "last_verified": "2026-06-30",
+  "source": "BADBOOL"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\truepeoplesearch.json ===
+{
+  "id": "truepeoplesearch",
+  "name": "TruePeopleSearch",
+  "category": "people_search",
+  "priority": "high",
+  "jurisdictions": ["US"],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://www.truepeoplesearch.com/",
+    "fetch": "browser",
+    "antibot": "datadome",
+    "match_signal": "result",
+    "match_signal_notes": "SEO TRAP: the page title/H1/intro auto-inserts the query ('FREE public records found for {Name} in {City}') even with ZERO real matches. That templated echo is NOT a result. Record `found` ONLY on an actual result CARD corroborated by the subject's address or DOB; unrelated same-name cards in other states are namesakes. Ignore the title/intro/H1 text entirely.",
+    "by": ["name", "phone", "address", "email"],
+    "url_patterns": {
+      "name": "https://www.truepeoplesearch.com/results?name={First%20Last}&citystatezip={City,%20ST}"
+    },
+    "url_format_quirks": [
+      "Search results URL is QUERY-PARAM, not path: /results?name=Jane%20Public&citystatezip=Anytown,%20NY (space-encoded; comma between city and state). Confirmed as the canonical form the site's own search box generates.",
+      "On-site search tabs: Name / Phone / Address / Email / Neighbors (so name-, phone-, address-, and email-searchable).",
+      "HARD-BLOCKED for automated reads (2026-06-30): Cloudflare 'Just a moment...' interstitial -> DataDome device-check CAPTCHA (geo.captcha-delivery.com) on every results navigation. Page chrome (header/footer) may render while the result body stays blocked; submitting any search bounces to DataDome. web_extract/Firecrawl 504-timed out. Needs a residential-proxy/stealth browser (e.g. Browserbase) to scan; otherwise record 'blocked'."
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://www.truepeoplesearch.com/removal",
+    "requires": {
+      "profile_url": false,
+      "email_verification": true,
+      "captcha": true,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": ["full_name", "contact_email"],
+    "notes": "Removal page renders even when results are blocked. Flow: name+email+captcha -> emailed link -> fill opt-out form matching the record -> confirmation ('allow 3 days'). Fields: dropdown 'Exercise my rights as a: The subject of the request / An authorized agent of the subject', First Name*, Middle Name, Last Name*, Email Address*, consent checkbox. CAPTCHA-gated: hCaptcha ('I am human'). Contact support@truepeoplesearch.com; PO Box 7775 PMB 29296, San Francisco CA 94120-7775. Verified read-only 2026-06-30; not submitted. (Record previously mis-declared email_verification:false.)",
+    "est_processing_days": 3,
+    "reappearance_risk": "high"
+  },
+  "last_verified": "2026-06-30",
+  "source": "BADBOOL"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\usphonebook.json ===
+{
+  "id": "usphonebook",
+  "name": "USPhoneBook",
+  "category": "people_search",
+  "priority": "high",
+  "jurisdictions": [
+    "US"
+  ],
+  "parent": "usphonebook",
+  "owns": [],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://www.usphonebook.com/",
+    "fetch": "browser",
+    "match_signal": "result",
+    "antibot": "cloudflare",
+    "by": [
+      "name",
+      "phone",
+      "address"
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://www.usphonebook.com/opt-out",
+    "requires": {
+      "profile_url": true,
+      "email_verification": true,
+      "captcha": false,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": [
+      "full_name",
+      "contact_email",
+      "profile_url"
+    ],
+    "notes": "Reverse-phone + people-search. Opt-out: paste the listing URL, provide an email, confirm via the emailed link.",
+    "quirks": [
+      "Opt-out URL is the documented public endpoint; datacenter IPs get 403 (anti-bot), so confirm the live flow via the operator's residential browser before the first submission, then set last_verified.",
+      "Needs the confirmed profile_url.",
+      "Email verification required."
+    ],
+    "est_processing_days": 3,
+    "reappearance_risk": "medium"
+  },
+  "last_verified": null,
+  "source": "curated",
+  "confidence": "documented"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\whitepages.json ===
+{
+  "id": "whitepages",
+  "name": "Whitepages",
+  "category": "people_search",
+  "priority": "crucial",
+  "jurisdictions": ["US"],
+  "parent": "whitepages",
+  "owns": ["411"],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://www.whitepages.com/",
+    "fetch": "browser",
+    "match_signal": "listing",
+    "by": ["name", "phone", "address"]
+  },
+  "optout": {
+    "tier": "T1",
+    "method": "email",
+    "url": "https://www.whitepages.com/suppression_requests",
+    "email": "privacyrequest@whitepages.com",
+    "requires": {
+      "profile_url": true,
+      "email_verification": true,
+      "captcha": false,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": ["full_name", "contact_email", "profile_url"],
+    "deletion": {
+      "via": "email",
+      "email": "privacyrequest@whitepages.com",
+      "url": "https://whitepagesprivacy.zendesk.com/hc/en-us/requests/new",
+      "kinds": ["ccpa", "generic"],
+      "notes": "privacyrequest@whitepages.com handles BOTH opt-out (removal from the site) and CCPA deletion requests, explicitly offered for people who do not want to provide a phone number for the automated tool. ~2 business day reply; opt-outs processed within 15 days. Verified from whitepages.com/privacy/consumer-rights 2026-07-01 (page dated 2026-06-22)."
+    },
+    "playbook": [
+      "EMAIL LANE (fully autonomous -- use this): send the removal + deletion request to privacyrequest@whitepages.com including the confirmed listing URL. This is Whitepages' own documented alternative 'if you would prefer not to provide a phone number'. Expect a reply within ~2 business days; they may ask identity-verification questions (name, email) -- answer with least-disclosure, never an ID number.",
+      "Include in the email: the listing URL(s), the subject's full name as listed, and the request to (a) remove the listing(s), (b) opt out of sale/sharing, and (c) delete personal data (CCPA 1798.105 for CA residents; they honor requests from other states per their consumer-rights page).",
+      "'Once a listing is removed, all known connected listings are also removed and the requester's information will not be sold by Whitepages in any capacity' -- one request covers connected listings; still re-scan afterward, and check Whitepages Premium + 411.com separately.",
+      "Alternative 1: webform at whitepagesprivacy.zendesk.com/hc/en-us/requests/new (same ~2-day handling; good fallback if the mailbox bounces).",
+      "Alternative 2 (only with an operator on the phone): the automated tool at whitepages.com/suppression_requests -- paste the listing URL, provide a phone number, answer the automated voice call and enter the 4-digit code. Fastest (est 1 day) but NOT autonomous.",
+      "Opt-out requests may take up to 15 days; verify with a re-scan before recording confirmed_removed."
+    ],
+    "notes": "Email/webform lane verified 2026-07-01: privacyrequest@whitepages.com or the Zendesk form replace the phone-callback tool ('if you would prefer not to provide a phone number... submit a request to a customer service agent'). Authorized agents: written signed permission required. General privacy contact: support@whitepages.com.",
+    "quirks": [
+      "The automated suppression tool (whitepages.com/suppression_requests) REQUIRES a phone number + automated voice call with a 4-digit code + agreeing to their ToS -- that lane is phone_callback/T2. The email/webform lane exists precisely to avoid it; prefer email for autonomy.",
+      "Deletion exceptions they state: public records (property, court), fraud-prevention data, active-subscription data, legal holds. 'Hidden from search' vs 'deleted' distinction applies -- their opt-out removes the listing; the CCPA deletion covers non-public account data.",
+      "CCPA opt-out requests: up to 15 days to process. Right-to-know/access requests also via privacyrequest@whitepages.com or the Zendesk form."
+    ],
+    "est_processing_days": 15,
+    "reappearance_risk": "medium"
+  },
+  "last_verified": "2026-07-01",
+  "source": "BADBOOL"
+}
+

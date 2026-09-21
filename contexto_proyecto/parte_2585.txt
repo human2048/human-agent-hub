@@ -1,0 +1,336 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_destructive_slash_confirm.py ===
+"""Tests for the gateway's destructive-slash-confirm wrapper.
+
+When ``approvals.destructive_slash_confirm`` is True (default), /new,
+/reset, and /undo route through the slash-confirm primitive — native
+yes/no buttons on Telegram/Discord/Slack, text fallback elsewhere.
+When False (after "Always Approve"), the destructive action runs
+immediately.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionEntry, SessionSource, build_session_key
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_event(text: str) -> MessageEvent:
+    return MessageEvent(text=text, source=_make_source(), message_id="m1")
+
+
+def _make_runner():
+    """Mirror tests/gateway/test_unknown_command.py::_make_runner."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    # No send_slash_confirm override -> button render returns None,
+    # _request_slash_confirm falls back to text path.
+    adapter.send_slash_confirm = AsyncMock(return_value=None)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.rewrite_transcript = MagicMock()
+
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    import itertools as _it
+    runner._slash_confirm_counter = _it.count(1)
+    runner.hooks = SimpleNamespace(
+        emit=AsyncMock(),
+        emit_collect=AsyncMock(return_value=[]),
+        loaded_hooks=False,
+    )
+    runner._thread_metadata_for_source = lambda *a, **kw: None
+    runner._reply_anchor_for_event = lambda _e: None
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_gate_on_pending_confirm_registered(monkeypatch):
+    """When the gate is on, a pending slash-confirm entry is registered for
+    the session — the user's /approve reply will resolve it."""
+    from tools import slash_confirm as _slash_confirm_mod
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    session_key = build_session_key(_make_source())
+    runner._session_key_for_source = lambda src: session_key
+    _slash_confirm_mod.clear(session_key)
+
+    execute = AsyncMock(return_value="reset done")
+
+    await runner._maybe_confirm_destructive_slash(
+        event=_make_event("/new"),
+        command="new",
+        title="/new",
+        detail="Discards history.",
+        execute=execute,
+    )
+
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+    assert pending["command"] == "new"
+    _slash_confirm_mod.clear(session_key)
+
+
+@pytest.mark.asyncio
+async def test_resolve_always_persists_opt_out_and_runs_execute(monkeypatch):
+    """Resolving with 'always' must (a) flip the config gate to False,
+    (b) run execute, and (c) include a one-time opt-out note in the reply."""
+    from tools import slash_confirm as _slash_confirm_mod
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    session_key = build_session_key(_make_source())
+    runner._session_key_for_source = lambda src: session_key
+    _slash_confirm_mod.clear(session_key)
+
+    saved: dict = {}
+
+    def _fake_save(path, value):
+        saved[path] = value
+        return True
+
+    import cli as cli_mod
+    monkeypatch.setattr(cli_mod, "save_config_value", _fake_save)
+
+    execute = AsyncMock(return_value="✨ fresh")
+
+    await runner._maybe_confirm_destructive_slash(
+        event=_make_event("/new"),
+        command="new",
+        title="/new",
+        detail="Discards history.",
+        execute=execute,
+    )
+
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+    resolved = await _slash_confirm_mod.resolve(
+        session_key, pending["confirm_id"], "always",
+    )
+
+    execute.assert_awaited_once()
+    assert saved.get("approvals.destructive_slash_confirm") is False
+    assert resolved is not None
+    assert "✨ fresh" in resolved
+    assert "config.yaml" in resolved
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_diagnostic_wake_presentation.py ===
+"""Diagnostic-only wakes execute while their unsolicited free-form reply stays private."""
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
+
+
+class Adapter(BasePlatformAdapter):
+    async def connect(self, **kwargs):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def get_chat_info(self, chat_id):
+        return {"name": "fixture", "type": "dm"}
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(content)
+        return SendResult(success=True, message_id="sent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suppressed", [False, True])
+async def test_diagnostic_wake_executes_without_final_or_error_echo(tmp_path, monkeypatch, suppressed):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(suppressed).lower()}}}")
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.TELEGRAM)
+    adapter.sent = []
+    adapter._start_typing_refresh = lambda *a: None
+    adapter._stop_typing_refresh = AsyncMock()
+    adapter._run_processing_hook = AsyncMock()
+    adapter._fire_post_delivery_callback = AsyncMock()
+    adapter._flush_text_debounce_now = AsyncMock()
+    adapter._finish_session_task = lambda *a: None
+    adapter.send_final_ledgered = AsyncMock(return_value=(SendResult(success=True), adapter))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    event = MessageEvent(text="internal diagnostic", source=source, internal=True,
+                         metadata={"notification_category": "diagnostic"})
+    adapter._message_handler = AsyncMock(return_value="I repeat the technical diagnostic")
+    await adapter._process_message_background(event, "session")
+    assert adapter._message_handler.await_count == 1
+    assert adapter.send_final_ledgered.await_count == (0 if suppressed else 1)
+    adapter._message_handler = AsyncMock(side_effect=RuntimeError("provider detail"))
+    await adapter._process_message_background(event, "session")
+    assert bool(adapter.sent) is not suppressed
+    assert adapter._run_processing_hook.await_args.args[-1].value == "failure"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_diff_command.py ===
+"""End-to-end tests for the gateway ``/diff`` command.
+
+Exercises the real handler against real git repositories (default modes) and
+a real checkpoint store (session mode), proving the messaging surface returns
+fenced, truncated diff text and degrades to friendly messages when there's
+nothing to show.
+"""
+
+import shutil
+import subprocess
+
+import pytest
+
+import gateway.run as gateway_run
+import tools.checkpoint_manager as cpm
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("git") is None, reason="git required for /diff"
+)
+
+
+def _runner():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = None
+    runner.config = None
+    return runner
+
+
+def _event(text: str) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        user_name="tester",
+        chat_type="dm",
+    )
+    return MessageEvent(text=text, source=source)
+
+
+def _git(repo, *args):
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                        "HOME": str(repo),
+                        "PATH": __import__("os").environ["PATH"]})
+
+
+@pytest.fixture()
+def repo(tmp_path, monkeypatch):
+    d = tmp_path / "repo"
+    d.mkdir()
+    _git(d, "init", "-q")
+    (d / "main.py").write_text("print('hello')\n", encoding="utf-8")
+    _git(d, "add", "-A")
+    _git(d, "commit", "-q", "-m", "init")
+    monkeypatch.setenv("TERMINAL_CWD", str(d))
+    return d
+
+
+def _enable_checkpoints(tmp_path, monkeypatch, enabled=True):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        f"checkpoints:\n  enabled: {str(enabled).lower()}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", home, raising=False)
+    monkeypatch.setattr(cpm, "CHECKPOINT_BASE", tmp_path / "checkpoints")
+
+
+# ---------------------------------------------------------------------------
+# Default (working-tree) mode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_diff_long_output_truncated(repo):
+    lines = "\n".join(f"line{i} = {i}" for i in range(300)) + "\n"
+    (repo / "main.py").write_text(lines, encoding="utf-8")
+
+    result = await _runner()._handle_diff_command(_event("/diff"))
+
+    # Hard-truncated in the handler before the platform senders apply their
+    # own message-splitting limits (3-layer tool-progress-style truncation).
+    assert "truncated" in result
+    assert len(result) < 6000
+
+
+# ---------------------------------------------------------------------------
+# Session mode — checkpoint baseline
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_diff_session_reports_cumulative_changes(tmp_path, monkeypatch):
+    _enable_checkpoints(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("print('hello')\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_CWD", str(project))
+
+    # Baseline checkpoint (pre-edit) then an edit, so a diff exists.
+    mgr = cpm.CheckpointManager(enabled=True, max_snapshots=50)
+    assert mgr.ensure_checkpoint(str(project), "baseline") is True
+    (project / "main.py").write_text("print('changed')\n", encoding="utf-8")
+
+    result = await _runner()._handle_diff_command(_event("/diff session"))
+
+    assert "-print('hello')" in result
+    assert "+print('changed')" in result
+
+
+@pytest.mark.asyncio
+async def test_diff_session_no_changes_message(tmp_path, monkeypatch):
+    _enable_checkpoints(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(project))
+
+    result = await _runner()._handle_diff_command(_event("/diff session"))
+
+    assert "No changes" in result
+
+
+

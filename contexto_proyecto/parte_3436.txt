@@ -1,0 +1,343 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_picker_key_cmd_discovery.py ===
+"""Command-auth discovery is lazy, credential-scoped, and never persists bearers."""
+
+import copy
+
+import pytest
+
+from hermes_cli import model_switch_providers as picker
+
+
+@pytest.mark.parametrize("route", ["providers", "custom_providers"])
+@pytest.mark.parametrize("static", [{}, {"api_key": "stale"}, {"key_env": "TEST_GATEWAY_KEY"}])
+def test_picker_command_auth_is_lazy_and_credential_scoped(monkeypatch, route, static):
+    from agent import command_token_source
+    from hermes_cli import models
+
+    monkeypatch.setenv("TEST_GATEWAY_KEY", "stale")
+    mints, probes = [], []
+
+    def mint(command, label):
+        mints.append(command)
+        if command == "broken":
+            raise RuntimeError("private helper output")
+        return f"token-{command}", 3600
+
+    def fetch(key, url, **kwargs):
+        probes.append(key)
+        return ["fallback", f"catalog-{key}"] if key.startswith("token-") else None
+
+    monkeypatch.setattr(command_token_source, "_mint", mint)
+    monkeypatch.setattr(models, "fetch_api_models", fetch)
+    monkeypatch.setattr("hermes_cli.models_local.should_use_ollama_native_catalog", lambda *a, **k: False)
+    entry = {"name": "Gateway", "base_url": "https://gateway.invalid/v1", "key_cmd": "tenant-a",
+             "model": "fallback", "default_model": "fallback", **static}
+
+    def rows(entries, *, probe=True):
+        b = picker._PickerBuild("", "", "", None, False, False, probe, False, False, set(), {})
+        if route == "providers":
+            picker._lap_user_provider_rows(b, {f"gateway-{i}": e for i, e in enumerate(entries)})
+        else:
+            picker._lap_custom_provider_rows(b, entries)
+        return b.results
+
+    for disabled in [False, "false"]:
+        assert rows([{**entry, "discover_models": disabled}])[0]["models"] == ["fallback"]
+    assert rows([entry], probe=False)[0]["models"] == ["fallback"]
+    assert not mints and not probes
+
+    first = rows([entry])[0]["models"]
+    assert first == ["fallback", "catalog-token-tenant-a"]
+    assert mints == ["tenant-a"] and probes == ["token-tenant-a"]
+    for probe in [False, True]:
+        assert rows([entry], probe=probe)[0]["models"] == first
+    assert mints == ["tenant-a"] and probes == ["token-tenant-a"]
+
+    from hermes_cli.config import save_config, load_config
+    other = {**entry, "key_cmd": "tenant-b", "discover_models": False}
+    save_config({"custom_providers": [entry, other]})
+    if route == "custom_providers":
+        rows([entry])
+        assert load_config()["custom_providers"][1].get("models") is None
+    source = command_token_source.build_command_token_provider("tenant-a")
+    empty = picker._NativePickerModelList()
+    result = models.cached_fetch_api_models(
+        source, entry["base_url"], force_refresh=True, fetch_models=lambda: empty)
+    assert isinstance(result, picker._NativePickerModelList) and result == []
+    cached_empty = models.cached_fetch_api_models(source, entry["base_url"], cache_only=True)
+    assert isinstance(cached_empty, picker._NativePickerModelList) and cached_empty == []
+    for probe in [False, True]:
+        native_row = rows([entry], probe=probe)[0]
+        assert native_row["models"] == [] and native_row["native_catalog_empty"]
+    models.clear_provider_models_cache()
+
+    distinct = rows([entry, {**entry, "key_cmd": "tenant-b"}])
+    assert [r["models"] for r in distinct] == [first, ["fallback", "catalog-token-tenant-b"]]
+    assert rows([{**entry, "key_cmd": "broken"}])[0]["models"] == ["fallback"]
+    assert "stale" not in probes
+
+
+@pytest.mark.parametrize("route", ["providers", "custom_providers"])
+@pytest.mark.parametrize("discover", [True, False, "false"])
+@pytest.mark.parametrize("static", [{}, {"api_key": "stale"}, {"key_env": "TEST_GATEWAY_KEY"}])
+def test_setup_probe_credentials_never_become_saved_credentials(monkeypatch, route, discover, static):
+    from agent import command_token_source
+    from hermes_cli import config as config_module, models
+    from hermes_cli import model_setup_flows_custom as setup
+
+    monkeypatch.setenv("TEST_GATEWAY_KEY", "stale")
+    mints, probes, choices = [], [], []
+    entry = {"name": "Gateway", "base_url": "https://gateway.invalid/v1", "key_cmd": "tenant-a",
+             "model": "fallback", "default_model": "fallback", "discover_models": discover, **static}
+    config = {"model": {"default": "fallback", "provider": "custom"},
+              route: {"gateway": copy.deepcopy(entry)} if route == "providers" else [copy.deepcopy(entry)]}
+    config_module.save_config(config)
+    from hermes_cli.main_provider_setup import _named_custom_provider_map
+    info = next(iter(_named_custom_provider_map(config_module.load_config()).values()))
+
+    def mint(command, label):
+        mints.append(command)
+        return "transient-bearer", 3600
+
+    def fetch(key, url, **kwargs):
+        probes.append(key)
+        return ["fallback", "discovered"] if key == "transient-bearer" else None
+
+    def pick(name, available, saved):
+        choices.extend(available)
+        return available[-1]
+
+    monkeypatch.setattr(command_token_source, "_mint", mint)
+    monkeypatch.setattr(models, "fetch_api_models", fetch)
+    monkeypatch.setattr("hermes_cli.models_local.should_use_ollama_native_catalog", lambda *a, **k: False)
+    monkeypatch.setattr(setup, "_pick_named_custom_model", pick)
+    monkeypatch.setattr(setup, "_ask", lambda *a, **k: "fallback")
+    setup._model_flow_named_custom(config, info)
+    if discover is True:
+        assert mints == ["tenant-a"] and probes == ["transient-bearer"]
+        assert choices == ["fallback", "discovered"]
+    else:
+        assert not mints and not probes
+        assert choices == ["fallback"]
+    saved = config_module.load_config()
+    assert "transient-bearer" not in repr(saved)
+    persisted = saved[route]["gateway"] if route == "providers" else saved[route][0]
+    assert persisted["key_cmd"] == entry["key_cmd"]
+    assert persisted.get("api_key", "") == static.get("api_key", "")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_picker_prewarm.py ===
+"""Tests for the /model picker background cache prewarm.
+
+``prewarm_picker_cache_async()`` warms the provider-models disk cache off the
+user's critical path so the first ``/model`` open in a session is fast instead
+of blocking ~1-2s on serial /v1/models fetches. These pin the two contracts
+that matter: it runs the warm path exactly once per process (no thread leak),
+and it delegates to ``list_authenticated_providers`` to do the warming.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import hermes_cli.model_switch as ms
+from hermes_cli import model_switch_providers
+
+
+def _reset_guard():
+    model_switch_providers._picker_prewarm_done.clear()
+
+
+def test_prewarm_runs_list_authenticated_providers_once():
+    """First call spawns a thread that calls list_authenticated_providers;
+    the warm side effect is delegated there (which disk-caches per provider)."""
+    _reset_guard()
+    with patch.object(ms, "list_authenticated_providers", return_value=[]) as mock_list:
+        t = model_switch_providers.prewarm_picker_cache_async()
+        assert t is not None, "first call must spawn a prewarm thread"
+        t.join(timeout=10)
+        assert not t.is_alive(), "prewarm thread should finish promptly"
+        mock_list.assert_called_once()
+    _reset_guard()
+
+
+def test_prewarm_guard_is_once_per_process():
+    """The process-level Event guard must make repeat calls no-ops so a
+    long-lived process never leaks one OS thread per call."""
+    _reset_guard()
+    with patch.object(ms, "list_authenticated_providers", return_value=[]):
+        t1 = model_switch_providers.prewarm_picker_cache_async()
+        assert t1 is not None
+        t1.join(timeout=10)
+        # Subsequent calls return None (guard set) — no new thread.
+        assert model_switch_providers.prewarm_picker_cache_async() is None
+        assert model_switch_providers.prewarm_picker_cache_async() is None
+    _reset_guard()
+
+
+def test_prewarm_warms_the_active_custom_endpoint_for_the_next_open(monkeypatch):
+    """End-to-end regression for #72762: the active custom endpoint must be
+    warm by the time the user opens ``/model``, not just first-class
+    ``PROVIDER_REGISTRY`` providers.
+
+    The cache is keyed purely on ``base_url`` (see ``cached_fetch_api_models``
+    in ``hermes_cli/models.py``), so this is not specific to any named
+    provider — the fixture below stands in for any OpenAI-compatible custom
+    endpoint a user might configure (an LLM gateway, Kilo Code, Together AI,
+    a self-hosted vLLM/SGLang server, ...).
+
+    Runs the real ``list_authenticated_providers()`` (not mocked, unlike the
+    two tests above) through the prewarm thread against a fake
+    ``load_picker_context()`` config with one active custom provider, then
+    replays the exact kwargs the plain CLI ``/model`` handler passes twice in
+    a row (``probe_custom_providers=False, probe_current_custom_provider=True``),
+    simulating two ``/model`` opens in one session.
+
+    We deliberately do NOT assert on *which* of (prewarm thread, first
+    foreground open) wins the race to perform the live fetch — that's a
+    thread-scheduling detail, not the contract. What must hold regardless of
+    scheduling: across the warm-up plus two foreground opens, the endpoint is
+    ever probed live at most once, and every open after that first probe is
+    served from the disk cache with zero additional network calls.
+    """
+    import hermes_cli.inventory as inventory_mod
+    import hermes_cli.models as models_mod
+
+    _reset_guard()
+
+    base_url = "https://api.example-gateway.test/v1"
+    ctx = inventory_mod.ConfigContext(
+        current_provider="custom:example-gateway",
+        current_model="",  # avoid the unrelated current-model-always-shown guarantee (line ~3104)
+        current_base_url=base_url,
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "example-gateway",
+                "base_url": base_url,
+                "api_key": "sk-gateway-key",
+            }
+        ],
+        excluded_providers=[],
+    )
+    monkeypatch.setattr(inventory_mod, "load_picker_context", lambda: ctx)
+
+    calls = []
+
+    def fake_fetch_api_models(api_key, url, **kwargs):
+        calls.append((api_key, url))
+        return ["gateway-model-a", "gateway-model-b"]
+
+    monkeypatch.setattr(models_mod, "fetch_api_models", fake_fetch_api_models)
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+
+    def open_picker():
+        return ms.list_authenticated_providers(
+            current_provider=ctx.current_provider,
+            current_base_url=ctx.current_base_url,
+            current_model=ctx.current_model,
+            user_providers=ctx.user_providers,
+            custom_providers=ctx.custom_providers,
+            excluded_providers=ctx.excluded_providers,
+            # Exact kwargs cli.py's plain (no-args, no --refresh) /model
+            # handler passes: probe only the active custom endpoint,
+            # everything else from the warm disk cache.
+            probe_custom_providers=False,
+            probe_current_custom_provider=True,
+        )
+
+    t = model_switch_providers.prewarm_picker_cache_async()
+    assert t is not None
+    t.join(timeout=10)
+
+    first_open = open_picker()
+    assert len(calls) == 1, (
+        "the endpoint must be live-probed at most once across boot prewarm "
+        "plus the first /model open, however the race between them resolves"
+    )
+    row = next(p for p in first_open if p.get("api_url") == base_url)
+    assert row["models"] == ["gateway-model-a", "gateway-model-b"]
+
+    second_open = open_picker()
+    assert len(calls) == 1, (
+        "a second /model open in the same session must be served entirely "
+        "from the disk cache — this is the #72762 regression: previously "
+        "every open re-probed the endpoint live"
+    )
+    row2 = next(p for p in second_open if p.get("api_url") == base_url)
+    assert row2["models"] == ["gateway-model-a", "gateway-model-b"]
+
+    _reset_guard()
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_pin_kanban_board_env.py ===
+"""Tests for `_pin_kanban_board_env` helper invoked by `cmd_chat`.
+
+Regression coverage for #20074: a chat session must export the active kanban
+board into `HERMES_KANBAN_BOARD` at boot so subprocess shell-outs (e.g.
+`hermes kanban …`) inherit the same board the in-process kanban tools resolve.
+Without this, a concurrent `hermes kanban boards switch` from another session
+can flip the global current-board file mid-turn and silently divert the
+shell calls to a different DB.
+"""
+import importlib
+import os
+
+import pytest
+from hermes_cli import main_tui_launch
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kanban_board_env():
+    """Snapshot `HERMES_KANBAN_BOARD` and restore it after the test.
+
+    `_pin_kanban_board_env()` writes to ``os.environ`` directly, bypassing
+    any ``monkeypatch.setenv`` tracking. Without this fixture the mutation
+    leaks into subsequent tests and breaks anything that resolves a kanban
+    path from the env (e.g. ``TestSharedBoardPaths`` in test_kanban_db.py).
+    """
+    prev = os.environ.get("HERMES_KANBAN_BOARD")
+    os.environ.pop("HERMES_KANBAN_BOARD", None)
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("HERMES_KANBAN_BOARD", None)
+        else:
+            os.environ["HERMES_KANBAN_BOARD"] = prev
+
+
+def test_pin_writes_resolved_board_when_env_unset(monkeypatch):
+    main_mod = importlib.import_module("hermes_cli.main")
+
+    import hermes_cli.kanban_db as kdb
+    monkeypatch.setattr(kdb, "get_current_board", lambda: "space")
+
+    main_tui_launch._pin_kanban_board_env()
+
+    assert main_mod.os.environ.get("HERMES_KANBAN_BOARD") == "space"
+
+
+def test_pin_does_not_overwrite_existing_env(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "preset")
+    main_mod = importlib.import_module("hermes_cli.main")
+
+    import hermes_cli.kanban_db as kdb
+
+    def _explode():
+        raise AssertionError("get_current_board must not be called when env is set")
+
+    monkeypatch.setattr(kdb, "get_current_board", _explode)
+
+    main_tui_launch._pin_kanban_board_env()
+
+    assert main_mod.os.environ.get("HERMES_KANBAN_BOARD") == "preset"
+
+
+

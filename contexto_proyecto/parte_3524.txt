@@ -1,0 +1,251 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_served_profile_mirror_platforms.py ===
+"""A served secondary's api_server/webhook are MIRRORS of the default's listener (``/p/<profile>/...``),
+never adapters of their own, so the multiplexer record has no ``<profile>:api_server`` entry. Every
+status reader used to fall through to ``pending_restart``: the Desktop Messaging card and Command
+Center read "Restart needed" forever for a platform that was answering. The mirror must project as the
+default's live state plus the URL the client has to call; ``/api/status?profile=`` names the profiles a
+restart of the shared gateway would blip.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+
+
+@pytest.fixture
+def served_root(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    (root / "profiles" / "alpha").mkdir(parents=True)
+    (root / "config.yaml").write_text("gateway: {multiplex_profiles: true}\n", encoding="utf-8")
+    (root / "gateway.pid").write_text(json.dumps({"pid": os.getpid(), "hermes_home": str(root)}), encoding="utf-8")
+    (root / "gateway_state.json").write_text(json.dumps({
+        "pid": os.getpid(), "hermes_home": str(root), "gateway_state": "running",
+        "served_profiles": ["default", "alpha", "beta"],
+        "platforms": {
+            "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:45719"},
+            "webhook": {"state": "fatal", "error_code": "port_in_use"},
+            "alpha:telegram": {"state": "connected"},
+        }}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
+    import hermes_constants
+    import gateway.status as status
+    # Liveness is a verified identity; this pytest process passes as the default gateway only by
+    # wearing a gateway command line.
+    monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "hermes gateway run")
+    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    return root
+
+
+def test_served_profile_projects_the_default_listener_mirrors_with_their_url(served_root):
+    from gateway.status import profile_platforms_from_multiplexer, resolve_gateway_liveness
+    alpha = served_root / "profiles" / "alpha"
+    live = resolve_gateway_liveness(profile_dir=alpha, health_probe=None, use_cache=False)
+    plats = profile_platforms_from_multiplexer(live.runtime, "alpha")
+    # The mirror inherits the default's live state and points at the profile's own prefix.
+    assert plats["api_server"]["state"] == "connected"
+    assert plats["api_server"]["ingress_url"] == "http://127.0.0.1:45719/p/alpha/v1"
+    # A dead default listener is dead for the profile too — never "connected" by fiat.
+    assert "webhook" not in plats
+    assert plats["telegram"] == {"state": "connected"}
+    # The default profile keeps its own un-prefixed entries; nothing is mirrored onto it.
+    assert "ingress_url" not in profile_platforms_from_multiplexer(live.runtime, "default").get("api_server", {})
+
+
+def test_messaging_card_for_a_served_profile_reads_connected_not_restart_needed(served_root, monkeypatch):
+    from hermes_cli.web_routers import messaging
+    monkeypatch.setattr(messaging, "_platform_enablement", lambda *a, **k: (True, True, None))
+    entry = {"id": "api_server", "name": "API server", "description": "", "docs_url": "", "env_vars": [],
+             "required_env": []}
+    alpha = served_root / "profiles" / "alpha"
+    [payload] = messaging._platform_payloads(alpha, [entry])
+    assert payload["gateway_running"] is True
+    assert payload["state"] == "connected", payload
+    assert payload["ingress_url"] == "http://127.0.0.1:45719/p/alpha/v1"
+
+
+def test_messaging_card_ignores_a_served_profiles_stale_own_runtime_record(served_root, monkeypatch):
+    """A served profile writes no live ``gateway_state.json`` of its own, but one left behind by a
+    pre-multiplex or standalone run (``stopped``, empty platforms) used to shadow the multiplexer's
+    record: the fallback only ran when the file was missing, the bare-key lookup found nothing, and
+    the card read "Restart needed" forever for a platform that was connected (#112765)."""
+    from hermes_cli.web_routers import messaging
+    monkeypatch.setattr(messaging, "_platform_enablement", lambda *a, **k: (True, True, None))
+    entry = {"id": "telegram", "name": "Telegram", "description": "", "docs_url": "", "env_vars": [],
+             "required_env": []}
+    alpha = served_root / "profiles" / "alpha"
+    (alpha / "gateway_state.json").write_text(json.dumps(
+        {"gateway_state": "stopped", "platforms": {}}), encoding="utf-8")
+    [payload] = messaging._platform_payloads(alpha, [entry])
+    assert payload["gateway_running"] is True
+    assert payload["state"] == "connected", payload
+    # The shared record is scoped per profile: beta has no ``beta:telegram`` entry, so alpha's
+    # connected verdict must not bleed into beta's card.
+    beta = served_root / "profiles" / "beta"
+    beta.mkdir()
+    (beta / "gateway_state.json").write_text(json.dumps({"gateway_state": "stopped", "platforms": {}}), encoding="utf-8")
+    [beta_payload] = messaging._platform_payloads(beta, [entry])
+    assert beta_payload["state"] == "pending_restart", beta_payload
+
+
+def test_messaging_card_keeps_a_live_own_gateway_record_over_the_multiplexer(served_root, monkeypatch):
+    """Transitional dual-live case: a profile running its own standalone gateway while the live
+    multiplexer still lists it in ``served_profiles``. ``resolve_gateway_liveness`` answers from the
+    own record (rung 3) before the multiplexer (rung 4); the card must read the same record, or
+    liveness and platform state come from two different gateways."""
+    import gateway.status as status
+    from hermes_cli.web_routers import messaging
+    monkeypatch.setattr(messaging, "_platform_enablement", lambda *a, **k: (True, True, None))
+    alpha = served_root / "profiles" / "alpha"
+    # Two live gateways: this process is the default multiplexer; a second (fake, never signalled)
+    # PID wears alpha's argv. Only the live guard sees a foreign PID, so existence is stubbed.
+    own_pid = 2 ** 22 - 1
+    (alpha / "gateway_state.json").write_text(json.dumps({
+        "pid": own_pid, "hermes_home": str(alpha), "gateway_state": "running",
+        "platforms": {"telegram": {"state": "retrying", "error_code": "network"}}}), encoding="utf-8")
+    real_pid_exists = status._pid_exists
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: pid == own_pid or real_pid_exists(pid))
+    monkeypatch.setattr(status, "_read_process_cmdline",
+                        lambda pid: "hermes -p alpha gateway run" if pid == own_pid else "hermes gateway run")
+    assert status.multiplexer_liveness_for_profile(alpha) is not None
+    entry = {"id": "telegram", "name": "Telegram", "description": "", "docs_url": "", "env_vars": [],
+             "required_env": []}
+    [payload] = messaging._platform_payloads(alpha, [entry])
+    assert payload["gateway_running"] is True
+    assert payload["state"] == "retrying", payload
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_serve_command.py ===
+"""Contract for the headless ``hermes serve`` backend command.
+
+``serve`` is what the desktop app and remote backends launch — the same gateway
+as ``dashboard`` (shared handler) but always headless, and decoupled in name so
+the desktop never invokes ``dashboard``. These tests pin that contract:
+
+- ``serve`` routes to the same handler as ``dashboard``;
+- ``serve`` is headless by default, ``dashboard`` is not;
+- both expose the identical server-runtime flag surface.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+from hermes_cli.subcommands.dashboard import build_dashboard_parser
+
+
+def _dash(args):  # sentinel handler — identity-compared, never invoked
+    return args
+
+
+def _register(args):
+    return args
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    build_dashboard_parser(
+        parser.add_subparsers(dest="command"),
+        cmd_dashboard=_dash,
+        cmd_dashboard_register=_register,
+    )
+    return parser
+
+
+
+
+
+
+def test_serve_supports_the_lifecycle_flags():
+    for flag in ("--stop", "--status"):
+        assert getattr(_parser().parse_args(["serve", flag]), flag.lstrip("-")) is True
+
+
+def test_serve_is_a_headless_backend_but_dashboard_is_not():
+    # `headless_backend` is the flag cmd_dashboard reads to skip the web UI
+    # build; only `serve` carries it.
+    assert getattr(_parser().parse_args(["serve"]), "headless_backend", False) is True
+    assert getattr(_parser().parse_args(["dashboard"]), "headless_backend", False) is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_serve_mcp_discovery_after_bind.py ===
+"""Desktop `serve` starts background MCP discovery only after the socket binds.
+
+The MCP SDK import (~350ms) used to run on a thread started BEFORE
+web_server was imported, holding the GIL against the main thread's own
+import path and delaying the READY sentinel the Desktop waits on.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+
+import hermes_cli.mcp_startup as mcp_startup
+import hermes_cli.web_server as web_server
+import hermes_cli.web_server_lifecycle as web_server_lifecycle
+from tests.hermes_cli.test_dashboard_auth_gate import _stub_uvicorn_run
+
+
+def _reset_discovery_state(monkeypatch):
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_started", set())
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", {})
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_deferred", None)
+
+
+def test_desktop_serve_arms_mcp_discovery_only_after_ready_sentinel(monkeypatch):
+    _reset_discovery_state(monkeypatch)
+    order: list[str] = []
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda *, logger, thread_name: order.append("discovery:" + thread_name),
+    )
+    monkeypatch.setattr(web_server, "_write_machine_sentinel_line", lambda line: order.append("sentinel"))
+    monkeypatch.setattr(web_server_lifecycle, "_write_machine_sentinel_line", lambda line: order.append("sentinel"))
+    _stub_uvicorn_run(monkeypatch)
+
+    web_server.start_server(
+        host="127.0.0.1", port=0, open_browser=False, headless=True,
+        start_mcp_discovery_after_bind=True,
+    )
+    timer = mcp_startup._mcp_discovery_deferred
+    assert order == ["sentinel"] and isinstance(timer, threading.Timer)
+    timer.cancel()
+    # An agent build inside the delay window pulls discovery forward itself.
+    mcp_startup.wait_for_mcp_discovery(timeout=0)
+    assert order == ["sentinel", "discovery:dashboard-mcp-discovery"]
+    assert mcp_startup._mcp_discovery_deferred is None
+
+    # Without the flag (dashboard / non-Desktop serve) start_server does not
+    # start discovery itself — cmd_dashboard's pre-import path still owns it.
+    order.clear()
+    _reset_discovery_state(monkeypatch)
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False, headless=True)
+    assert order == ["sentinel"] and mcp_startup._mcp_discovery_deferred is None
+
+
+def test_deferred_discovery_fires_once_and_is_idempotent(monkeypatch):
+    _reset_discovery_state(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda *, logger, thread_name: calls.append(thread_name),
+    )
+    log = logging.getLogger("test")
+    mcp_startup.defer_background_mcp_discovery(logger=log, thread_name="t", delay=60)
+    mcp_startup.defer_background_mcp_discovery(logger=log, thread_name="t", delay=60)  # second arm is a no-op
+    first = mcp_startup._mcp_discovery_deferred
+    mcp_startup._start_deferred_mcp_discovery_now()
+    mcp_startup._start_deferred_mcp_discovery_now()
+    assert calls == ["t"]
+    assert first is not None and mcp_startup._mcp_discovery_deferred is None
+

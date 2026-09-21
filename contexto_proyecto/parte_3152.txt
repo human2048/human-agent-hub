@@ -1,0 +1,358 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cmd_update_apt.py ===
+"""APT-managed Hermes installs must never fall through to the git updater."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli.main import cmd_update
+from hermes_cli.update_cmd import _cmd_update_check
+
+
+def test_apt_stamp_is_detected_and_recommends_pkg_upgrade(tmp_path):
+    from hermes_cli.config import detect_install_method, recommended_update_command_for_method
+
+    (tmp_path / ".install_method").write_text("apt\n", encoding="utf-8")
+    assert detect_install_method(project_root=tmp_path) == "apt"
+    assert recommended_update_command_for_method("apt") == "pkg upgrade hermes-agent"
+
+
+@patch("hermes_cli.config.is_managed", return_value=False)
+@patch("hermes_cli.config.detect_install_method", return_value="apt")
+@patch("subprocess.run")
+def test_cmd_update_apt_prints_pkg_guidance_without_git(
+    mock_run, _mock_method, _mock_managed, capsys
+):
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_update(SimpleNamespace(check=False))
+
+    # exit 2 = refused-by-contract (#91277 Phase 3), distinct from exit-1 errors
+    assert excinfo.value.code == 2
+    assert "pkg upgrade hermes-agent" in capsys.readouterr().out
+    assert mock_run.call_args_list == []
+
+
+@patch("hermes_cli.config.detect_install_method", return_value="apt")
+@patch("subprocess.run")
+def test_cmd_update_check_apt_prints_pkg_guidance_without_git(
+    mock_run, _mock_method, capsys
+):
+    with pytest.raises(SystemExit) as excinfo:
+        _cmd_update_check()
+
+    # exit 2 = refused-by-contract (#91277 Phase 3)
+    assert excinfo.value.code == 2
+    assert "pkg upgrade hermes-agent" in capsys.readouterr().out
+    assert mock_run.call_args_list == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cmd_update_docker.py ===
+"""Tests for ``hermes update`` / ``--check`` inside the Docker container.
+
+Background: ``.dockerignore`` excludes ``.git``, so the existing git-pull
+update path can never succeed inside the published image.  Before this
+fix, ``hermes update`` would fall through to ``"✗ Not a git repository.
+Please reinstall: curl ... install.sh"`` — that script installs a *new*
+host-side Hermes, not an update to the running container, so the message
+was actively misleading.
+
+These tests pin the new behaviour: when ``detect_install_method`` reports
+``"docker"`` (stamped by ``docker/stage2-hook.sh``), both the apply path
+(``cmd_update``) and the check path (``_cmd_update_check``) print the
+``docker pull`` guidance from ``format_docker_update_message`` and exit
+with status 1, without running ``git fetch`` / ``subprocess.run``.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli.main import cmd_update
+from hermes_cli.update_cmd import _cmd_update_check
+
+
+# ---------- cmd_update (apply path) ----------
+
+
+@patch("hermes_cli.config.is_managed", return_value=False)
+@patch("hermes_cli.config.detect_install_method", return_value="docker")
+@patch("subprocess.run")
+def test_cmd_update_in_docker_prints_guidance_and_exits(
+    mock_run, _mock_method, _mock_managed, capsys
+):
+    """``hermes update`` inside Docker → friendly message + exit 2, no git calls.
+
+    Exit 2 = refused-by-contract (#91277 Phase 3), distinct from exit-1 errors.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_update(SimpleNamespace(check=False))
+
+    assert excinfo.value.code == 2
+    out = capsys.readouterr().out
+    # Spot-check the key guidance — exhaustive wording is locked in by the
+    # config-module test below to keep these CLI tests resilient to copy edits.
+    assert "doesn't apply inside the Docker container" in out
+    assert "docker pull nousresearch/hermes-agent:latest" in out
+
+    # No git invocations — the early-return must beat every git command.
+    git_calls = [c for c in mock_run.call_args_list if c.args and c.args[0] and "git" in str(c.args[0][0])]
+    assert git_calls == [], f"expected no git calls, got: {git_calls}"
+
+
+
+
+# ---------- _cmd_update_check (check path, direct entry) ----------
+
+
+# ---------- Non-Docker installs unaffected ----------
+
+
+
+
+# ---------- format_docker_update_message — content lock ----------
+
+
+def test_format_docker_update_message_contents():
+    """Lock in the high-value content of the Docker update message.
+
+    These are the bits a user actually needs to act on; if any of them
+    disappear in a copy edit, the message has lost its value.  Specific
+    wording around them is free to evolve (we don't assert full text).
+    """
+    from hermes_cli.config import format_docker_update_message
+
+    msg = format_docker_update_message()
+
+    # Primary command — the entire reason this message exists.
+    assert "docker pull nousresearch/hermes-agent:latest" in msg
+
+    # The four key concepts the message must cover:
+    assert "restart" in msg.lower(), "must explain that a restart is required"
+    assert "--version" in msg, "must show how to verify the new version"
+    assert ":latest" in msg, "must mention tag pinning caveat"
+    assert "HERMES_HOME" in msg or "/opt/data" in msg, (
+        "must address config persistence across upgrades"
+    )
+
+    # Acknowledges that forks exist (build-your-own-image escape hatch).
+    assert "fork" in msg.lower() or "Dockerfile" in msg
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_coalesce_session_args.py ===
+"""Tests for _coalesce_session_name_args — multi-word session name merging."""
+
+from hermes_cli.main import _coalesce_session_name_args
+
+
+class TestCoalesceSessionNameArgs:
+    """Ensure unquoted multi-word session names are merged into one token."""
+
+    # ── -c / --continue ──────────────────────────────────────────────────
+
+    def test_continue_multiword_unquoted(self):
+        """hermes -c Pokemon Agent Dev → -c 'Pokemon Agent Dev'"""
+        assert _coalesce_session_name_args(
+            ["-c", "Pokemon", "Agent", "Dev"]
+        ) == ["-c", "Pokemon Agent Dev"]
+
+
+    # ── -r / --resume ────────────────────────────────────────────────────
+
+
+    # ── combined flags ───────────────────────────────────────────────────
+
+
+    # ── passthrough (no session flags) ───────────────────────────────────
+
+    def test_no_session_flags_passthrough(self):
+        """hermes -w chat -q hello (nothing to merge)"""
+        result = _coalesce_session_name_args(["-w", "chat", "-q", "hello"])
+        assert result == ["-w", "chat", "-q", "hello"]
+
+
+    # ── subcommand boundary ──────────────────────────────────────────────
+
+
+    def test_stops_at_setup_subcommand(self):
+        """hermes -c my setup → 'setup' is a subcommand, not part of name"""
+        assert _coalesce_session_name_args(
+            ["-c", "my", "setup"]
+        ) == ["-c", "my", "setup"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_codex_cli_model_picker.py ===
+"""Regression tests for the /model picker's credential-discovery paths.
+
+Covers:
+ - Normal path (tokens already in Hermes auth store)
+ - Claude Code fallback (tokens only in ~/.claude/.credentials.json)
+ - Negative case (no credentials anywhere)
+
+Note: auto-import from ~/.codex/auth.json was removed in #12360 — Hermes
+now owns its own openai-codex auth state, and users explicitly adopt
+existing Codex CLI tokens via `hermes auth openai-codex`. The old
+"Codex CLI shared file" discovery tests were removed with that change.
+"""
+
+import base64
+import json
+import time
+from pathlib import Path
+
+import pytest
+
+
+def _make_fake_jwt(expiry_offset: int = 3600) -> str:
+    """Build a fake JWT with a future expiry."""
+    header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+    exp = int(time.time()) + expiry_offset
+    payload_bytes = json.dumps({"exp": exp, "sub": "test"}).encode()
+    payload = base64.urlsafe_b64encode(payload_bytes).rstrip(b"=").decode()
+    return f"{header}.{payload}.fakesig"
+
+
+@pytest.fixture()
+def hermes_auth_only_env(tmp_path, monkeypatch):
+    """Tokens already in Hermes auth store (no Codex CLI needed)."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    # Point CODEX_HOME to nonexistent dir to prove it's not needed
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no_codex"))
+
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 2,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": _make_fake_jwt(),
+                    "refresh_token": "fake-refresh",
+                },
+                "last_refresh": "2026-04-12T00:00:00Z",
+            }
+        },
+    }))
+
+    for var in [
+        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+        "NOUS_API_KEY", "DEEPSEEK_API_KEY",
+    ]:
+        monkeypatch.delenv(var, raising=False)
+
+    return hermes_home
+
+
+def test_normal_path_still_works(hermes_auth_only_env):
+    """openai-codex appears when tokens are already in Hermes auth store."""
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    providers = list_authenticated_providers(
+        current_provider="openai-codex",
+        max_models=10,
+    )
+    slugs = [p["slug"] for p in providers]
+    assert "openai-codex" in slugs
+
+
+
+
+@pytest.fixture()
+def claude_code_only_env(tmp_path, monkeypatch):
+    """Set up an environment where Anthropic credentials only exist in
+    ~/.claude/.credentials.json (Claude Code) — not in env vars or Hermes
+    auth store."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    # No Codex CLI
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no_codex"))
+
+    (hermes_home / "auth.json").write_text(
+        json.dumps({"version": 2, "providers": {}})
+    )
+
+    # Claude Code credentials in the correct format
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": _make_fake_jwt(),
+            "refreshToken": "fake-refresh",
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+        }
+    }))
+
+    # Patch Path.home() so the adapter finds the file
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    for var in [
+        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "NOUS_API_KEY", "DEEPSEEK_API_KEY",
+    ]:
+        monkeypatch.delenv(var, raising=False)
+
+    return hermes_home
+
+
+def test_claude_code_file_detected_by_model_picker(claude_code_only_env):
+    """anthropic should appear when credentials only exist in ~/.claude/.credentials.json."""
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    providers = list_authenticated_providers(
+        current_provider="anthropic",
+        max_models=10,
+    )
+    slugs = [p["slug"] for p in providers]
+    assert "anthropic" in slugs, (
+        f"anthropic not found in /model picker providers: {slugs}"
+    )
+
+    anthropic = next(p for p in providers if p["slug"] == "anthropic")
+    assert anthropic["is_current"] is True
+    assert anthropic["total_models"] > 0
+
+
+def test_no_codex_when_no_credentials(tmp_path, monkeypatch):
+    """openai-codex should NOT appear when no credentials exist anywhere."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no_codex"))
+
+    (hermes_home / "auth.json").write_text(
+        json.dumps({"version": 2, "providers": {}})
+    )
+
+    for var in [
+        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+        "NOUS_API_KEY", "DEEPSEEK_API_KEY", "COPILOT_GITHUB_TOKEN",
+        "GH_TOKEN", "GEMINI_API_KEY",
+    ]:
+        monkeypatch.delenv(var, raising=False)
+
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        max_models=10,
+    )
+    slugs = [p["slug"] for p in providers]
+    assert "openai-codex" not in slugs, (
+        "openai-codex should not appear without any credentials"
+    )
+

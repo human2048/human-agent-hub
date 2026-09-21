@@ -1,0 +1,394 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_info.py ===
+"""Tests for GatewayRunner._format_session_info — session config surfacing."""
+
+import pytest
+from unittest.mock import patch
+
+from gateway.run import GatewayRunner
+
+
+@pytest.fixture()
+def runner():
+    """Create a bare GatewayRunner without __init__."""
+    return GatewayRunner.__new__(GatewayRunner)
+
+
+def _patch_info(tmp_path, config_yaml, model, runtime):
+    """Return a context-manager stack that patches _format_session_info deps."""
+    cfg_path = tmp_path / "config.yaml"
+    if config_yaml is not None:
+        cfg_path.write_text(config_yaml)
+    return (
+        patch("gateway.run._hermes_home", tmp_path),
+        patch("gateway.run._resolve_gateway_model", return_value=model),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value=runtime),
+    )
+
+
+class TestFormatSessionInfo:
+
+    def test_includes_model_name(self, runner, tmp_path):
+        p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: anthropic/claude-opus-4.6\n  provider: openrouter\n",
+                                  "anthropic/claude-opus-4.6",
+                                  {"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1", "api_key": "k"})
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        assert "claude-opus-4.6" in info
+
+
+    def test_config_context_length(self, runner, tmp_path):
+        p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: test-model\n  context_length: 32768\n",
+                                  "test-model",
+                                  {"provider": "custom", "base_url": "", "api_key": ""})
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        assert "32K" in info
+        assert "config" in info
+
+    def test_default_fallback_hint(self, runner, tmp_path):
+        p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: unknown-model-xyz\n",
+                                  "unknown-model-xyz",
+                                  {"provider": "", "base_url": "", "api_key": ""})
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        assert "256K" in info
+        assert "model.context_length" in info
+
+    def test_local_endpoint_shown(self, runner, tmp_path):
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: qwen3:8b\n  provider: custom\n  base_url: http://localhost:11434/v1\n  context_length: 8192\n",
+            "qwen3:8b",
+            {"provider": "custom", "base_url": "http://localhost:11434/v1", "api_key": ""})
+        with p1, p2, p3:
+            info = runner._format_session_info()
+        assert "localhost:11434" in info
+        assert "8K" in info
+
+    def test_moa_preset_names_the_billed_aggregator(self, runner, tmp_path):
+        """#112359: the preset name hides who pays; /model must name the acting aggregator."""
+        p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: review\n  provider: moa\n",
+                                  "review", {"provider": "moa", "base_url": "", "api_key": ""})
+        moa_cfg = {"moa": {"presets": {"review": {
+            "reference_models": [{"provider": "openai", "model": "gpt-5.5"}],
+            "aggregator": {"provider": "nous", "model": "claude-opus-4.8"},
+        }}}}
+        with p1, p2, p3, patch("hermes_cli.config.load_config", return_value=moa_cfg):
+            info = runner._format_session_info()
+        assert "Acting model (billed for the run): nous:claude-opus-4.8" in info
+
+    def test_named_custom_provider_keeps_context_pin_without_model_base_url(
+        self, runner, tmp_path
+    ):
+        """Session-reset banner must honor model.context_length for named custom providers.
+
+        Repro: /status shows 262144 from config while the reset banner said
+        ``131K tokens (detected)`` because empty model.base_url + runtime URL
+        falsely cleared the pin and fell through to the Qwen family default.
+        """
+        model = "custom-local-agentw/Qwen-AgentWorld-35B-A3B-Q5_K_XL"
+        config_yaml = (
+            "model:\n"
+            f"  default: {model}\n"
+            "  provider: custom-local-agentw\n"
+            "  context_length: 262144\n"
+            "custom_providers:\n"
+            "  - name: custom-local-agentw\n"
+            "    base_url: http://127.0.0.1:8080/v1\n"
+            "    models: {}\n"
+        )
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            config_yaml,
+            model,
+            {
+                "provider": "custom-local-agentw",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "api_key": "",
+            },
+        )
+        with p1, p2, p3, patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=[
+                {
+                    "name": "custom-local-agentw",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "models": {},
+                }
+            ],
+        ), patch(
+            "agent.model_metadata.get_model_context_length",
+            side_effect=lambda *args, **kwargs: (
+                kwargs.get("config_context_length")
+                if kwargs.get("config_context_length")
+                else 131072
+            ),
+        ):
+            info = runner._format_session_info()
+        assert "262K" in info
+        assert "config" in info
+        assert "131K" not in info
+
+
+class TestResetNoticeSessionInfo:
+    """#59003: the auto-reset banner must report the serving profile's config,
+    not the multiplexer's base config."""
+
+    _RUNTIME = {"provider": "", "base_url": "", "api_key": ""}
+
+    def _source(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        return SessionSource(
+            platform=Platform.TELEGRAM, chat_id="123", user_id="u1",
+            profile="planner",
+        )
+
+    def _homes(self, tmp_path):
+        base = tmp_path / "base"
+        profile = tmp_path / "profiles" / "planner"
+        profile.mkdir(parents=True)
+        base.mkdir()
+        base.joinpath("config.yaml").write_text(
+            "model:\n  default: base-model\n  provider: custom\n  context_length: 1000\n")
+        profile.joinpath("config.yaml").write_text(
+            "model:\n  default: profile-model\n  provider: anthropic\n  context_length: 2000\n")
+        return base, profile
+
+    def test_multiplex_uses_profile_config(self, runner, tmp_path):
+        from types import SimpleNamespace
+        base, profile = self._homes(tmp_path)
+        runner.config = SimpleNamespace(multiplex_profiles=True)
+        with patch("gateway.run._hermes_home", base), \
+             patch.object(GatewayRunner, "_resolve_profile_home_for_source", return_value=profile), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value=self._RUNTIME):
+            info = runner._reset_notice_session_info(self._source())
+        assert "profile-model" in info
+        assert "anthropic" in info
+        assert "base-model" not in info
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_list_allowed_sources.py ===
+"""Regression tests for the TUI gateway's ``session.list`` handler.
+
+History:
+- The original implementation hardcoded an allow-list of known gateway
+  sources (``tui, cli, telegram, discord, slack, ...``). New or unlisted
+  sources (``acp``, ``webhook``, user-defined ``HERMES_SESSION_SOURCE``
+  values, newly-added platforms) were silently dropped from the resume
+  picker — users reported "lots of sessions are missing from browse
+  but exist in .hermes/sessions."
+- The handler now deny-lists only the internal/noisy source ``tool``
+  (sub-agent runs) and surfaces every other source to the picker.
+- The default ``limit`` raised from 20 to 200 so longer-running users
+  can scroll through their history without hitting an artificial cap.
+"""
+
+from __future__ import annotations
+
+from tui_gateway import server
+
+
+class _StubDB:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls: list[dict] = []
+
+    def list_sessions_rich(self, **kwargs):
+        self.calls.append(kwargs)
+        return list(self.rows)
+
+
+def _call(limit: int | None = None):
+    params: dict = {}
+    if limit is not None:
+        params["limit"] = limit
+    return server.handle_request({
+        "id": "1",
+        "method": "session.list",
+        "params": params,
+    })
+
+
+def test_session_list_surfaces_all_user_facing_sources(monkeypatch):
+    """acp / webhook / custom sources should all appear; only ``tool`` is hidden."""
+    rows = [
+        {"id": "tui-1", "source": "tui", "started_at": 9},
+        {"id": "tool-1", "source": "tool", "started_at": 8},
+        {"id": "tg-1", "source": "telegram", "started_at": 7},
+        {"id": "acp-1", "source": "acp", "started_at": 6},
+        {"id": "cli-1", "source": "cli", "started_at": 5},
+        {"id": "webhook-1", "source": "webhook", "started_at": 4},
+        {"id": "custom-1", "source": "my-custom-source", "started_at": 3},
+    ]
+    db = _StubDB(rows)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = _call(limit=10)
+    ids = [s["id"] for s in resp["result"]["sessions"]]
+
+    # Every human-facing source — including previously-hidden acp, webhook,
+    # and custom sources — must surface in the picker now.
+    assert "tg-1" in ids
+    assert "tui-1" in ids
+    assert "cli-1" in ids
+    assert "acp-1" in ids, "acp sessions were being hidden by the old allow-list"
+    assert "webhook-1" in ids, "webhook sessions were being hidden by the old allow-list"
+    assert "custom-1" in ids, "custom HERMES_SESSION_SOURCE values were being hidden"
+
+    # Only internal sub-agent runs stay hidden.
+    assert "tool-1" not in ids
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_load_bool.py ===
+"""Regression tests for issue #46994.
+
+Corrupted sessions.json entries (e.g. a bare bool where a dict is expected)
+must not crash the entire session loading loop. The TypeError from
+`"origin" in True` escaped the (ValueError, KeyError) except and aborted
+loading ALL remaining sessions, not just the corrupted one.
+"""
+
+import json
+import threading
+from pathlib import Path
+
+from gateway.session import SessionStore
+
+
+class TestSessionLoadBoolCorruption:
+    """Verify that non-dict entries in sessions.json are skipped, not fatal."""
+
+    def _make_store(self, tmp_path: Path, sessions_data: dict) -> SessionStore:
+        """Create a SessionStore with a pre-populated sessions.json."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "sessions.json").write_text(
+            json.dumps(sessions_data), encoding="utf-8"
+        )
+        # Only routing configuration is needed for loading the index.
+        class FakeConfig:
+            group_sessions_per_user = True
+            thread_sessions_per_user = False
+            multiplex_profiles = False
+
+        store = SessionStore.__new__(SessionStore)
+        store.sessions_dir = sessions_dir
+        store._entries = {}
+        store._loaded = False
+        store._lock = threading.RLock()
+        store.config = FakeConfig()
+        store._has_active_processes_fn = None
+        return store
+
+    def _valid_entry(self, session_id: str = "20260101_120000_abc12345") -> dict:
+        return {
+            "session_key": "agent:main:telegram:dm:123456",
+            "session_id": session_id,
+            "created_at": "2026-01-01T12:00:00",
+            "updated_at": "2026-01-01T12:30:00",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "123456",
+                "chat_type": "dm",
+            },
+        }
+
+    def test_bool_entry_skipped_not_fatal(self, tmp_path):
+        """A bool entry must not crash the loop or block other sessions."""
+        data = {
+            "_README": "test sentinel",
+            "corrupted_key": True,
+            "valid_key": self._valid_entry(),
+        }
+        store = self._make_store(tmp_path, data)
+        store._ensure_loaded()
+
+        # The valid entry must still be loaded
+        assert "valid_key" in store._entries
+        assert store._entries["valid_key"].session_id == "20260101_120000_abc12345"
+        # The corrupted entry must NOT be loaded
+        assert "corrupted_key" not in store._entries
+
+    def test_string_entry_skipped(self, tmp_path):
+        """A string entry must also be skipped without crashing."""
+        data = {
+            "bad_string": "not a dict",
+            "valid_key": self._valid_entry("20260101_130000_def67890"),
+        }
+        store = self._make_store(tmp_path, data)
+        store._ensure_loaded()
+
+        assert "valid_key" in store._entries
+        assert "bad_string" not in store._entries
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_messages_shutdown_preserve.py ===
+"""Regression tests for #72680 (retargeted).
+
+The earlier attempt (#73171) snapshotted GatewayRunner._pending_messages, which
+on current main has no writers — the live container is the per-agent
+``agent._session_messages`` flushed via ``_flush_messages_to_session_db``.
+When that flush raises (FTS/SQLite corruption) the in-memory transcript must
+be dumped to a recovery snapshot instead of lost.
+
+These tests exercise the real preservation path:
+``_finalize_shutdown_agents`` -> flush raises -> ``_preserve_agent_history_on_shutdown``
+-> ``flush_agent_history_to_file``.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from gateway.shutdown_flush import (
+    flush_agent_history_to_file,
+)
+
+
+def _make_flush_dir(tmp_path: Path) -> Path:
+    """Create a temp flush dir and monkeypatch _get_flush_dir to use it."""
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir(parents=True, exist_ok=True)
+    return flush_dir
+
+
+def test_preserves_agent_history_when_flush_raises(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    history = [{"role": "user", "content": "lost msg"}]
+    flush_agent_history_to_file("sess:abc123", history)
+
+    files = list(flush_dir.glob("*.json"))
+    assert files, "expected recovery snapshot"
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    assert data["issue"] == "#72680"
+    assert data["session_id"] == "sess:abc123"
+    assert data["count"] == 1
+    assert data["messages"][0]["content"] == "lost msg"
+
+
+def test_no_recovery_file_on_empty_history(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    flush_agent_history_to_file("sess:abc123", [])
+    assert not list(flush_dir.glob("*.json"))
+
+
+

@@ -1,0 +1,396 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_document_to_action_items_skill.py ===
+"""Tests for the document-to-action-items optional skill."""
+import re
+from pathlib import Path
+
+import yaml
+
+SKILL_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "skills"
+    / "productivity"
+    / "document-to-action-items"
+    / "SKILL.md"
+)
+
+
+def _frontmatter_and_body():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert content.startswith("---")
+    m = re.search(r"\n---\s*\n", content[3:])
+    assert m, "frontmatter must close with ---"
+    fm = yaml.safe_load(content[3 : m.start() + 3])
+    body = content[m.end() + 3 :]
+    return fm, body
+
+
+def test_skill_file_exists():
+    assert SKILL_PATH.is_file()
+
+
+def test_frontmatter_required_fields():
+    fm, _ = _frontmatter_and_body()
+    for field in ("name", "description", "version", "author", "license", "platforms"):
+        assert field in fm, f"missing frontmatter field: {field}"
+    assert fm["name"] == "document-to-action-items"
+    hermes = fm["metadata"]["hermes"]
+    assert hermes["tags"]
+    assert "related_skills" in hermes
+
+
+def test_description_hardline():
+    fm, _ = _frontmatter_and_body()
+    desc = fm["description"]
+    assert len(desc) <= 60, f"description is {len(desc)} chars; hardline is 60"
+    assert desc.endswith(".")
+
+
+def test_author_credits_human_first():
+    fm, _ = _frontmatter_and_body()
+    assert not fm["author"].startswith("Hermes Agent"), "human contributor must be credited first"
+    assert "benbarclay" in fm["author"]
+
+
+def test_related_skills_resolve_in_repo():
+    fm, _ = _frontmatter_and_body()
+    repo_root = SKILL_PATH.parents[3]
+    for name in fm["metadata"]["hermes"]["related_skills"]:
+        hits = list(repo_root.glob(f"skills/*/{name}/SKILL.md")) + list(
+            repo_root.glob(f"optional-skills/*/{name}/SKILL.md")
+        ) + list(repo_root.glob(f"skills/*/*/{name}/SKILL.md"))
+        assert hits, f"related_skills entry does not resolve in-repo: {name}"
+
+
+def test_body_structure_and_size():
+    _, body = _frontmatter_and_body()
+    for section in ("## When to Use", "## Procedure", "## Pitfalls", "## Verification"):
+        assert section in body, f"missing section: {section}"
+    assert len(SKILL_PATH.read_text(encoding="utf-8")) <= 100_000
+
+
+def test_no_machine_local_paths():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert "/home/" not in content
+    assert not re.search(r"[A-Z]:\\\\Users", content)
+
+
+def test_steps_have_completion_criteria():
+    _, body = _frontmatter_and_body()
+    steps = re.findall(r"^### \d+\..*?(?=^### \d+\.|^## )", body, re.MULTILINE | re.DOTALL)
+    assert len(steps) >= 5
+    for step in steps:
+        assert "Done when" in step, f"step missing completion criterion: {step[:60]!r}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_email_inbox_triage_skill.py ===
+"""Tests for the email-inbox-triage bundled skill."""
+import re
+from pathlib import Path
+
+import yaml
+
+SKILL_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "skills"
+    / "email"
+    / "email-inbox-triage"
+    / "SKILL.md"
+)
+
+
+def _frontmatter_and_body():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert content.startswith("---")
+    m = re.search(r"\n---\s*\n", content[3:])
+    assert m, "frontmatter must close with ---"
+    fm = yaml.safe_load(content[3 : m.start() + 3])
+    body = content[m.end() + 3 :]
+    return fm, body
+
+
+def test_skill_file_exists():
+    assert SKILL_PATH.is_file()
+
+
+def test_frontmatter_required_fields():
+    fm, _ = _frontmatter_and_body()
+    for field in ("name", "description", "version", "author", "license", "platforms"):
+        assert field in fm, f"missing frontmatter field: {field}"
+    assert fm["name"] == "email-inbox-triage"
+    hermes = fm["metadata"]["hermes"]
+    assert hermes["tags"]
+    assert "related_skills" in hermes
+
+
+def test_description_hardline():
+    fm, _ = _frontmatter_and_body()
+    desc = fm["description"]
+    assert len(desc) <= 60, f"description is {len(desc)} chars; hardline is 60"
+    assert desc.endswith(".")
+
+
+def test_author_credits_human_first():
+    fm, _ = _frontmatter_and_body()
+    assert not fm["author"].startswith("Hermes Agent"), "human contributor must be credited first"
+    assert "benbarclay" in fm["author"]
+
+
+def test_related_skills_resolve_in_repo():
+    fm, _ = _frontmatter_and_body()
+    repo_root = SKILL_PATH.parents[3]
+    for name in fm["metadata"]["hermes"]["related_skills"]:
+        hits = (
+            list(repo_root.glob(f"skills/*/{name}/SKILL.md"))
+            + list(repo_root.glob(f"optional-skills/*/{name}/SKILL.md"))
+            + list(repo_root.glob(f"skills/*/*/{name}/SKILL.md"))
+        )
+        assert hits, f"related_skills entry does not resolve in-repo: {name}"
+
+
+def test_body_structure_and_size():
+    _, body = _frontmatter_and_body()
+    for section in ("## When to Use", "## Procedure", "## Pitfalls", "## Verification"):
+        assert section in body, f"missing section: {section}"
+    assert len(SKILL_PATH.read_text(encoding="utf-8")) <= 100_000
+
+
+def test_no_machine_local_paths():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert "/home/" not in content
+    assert not re.search(r"[A-Z]:\\\\Users", content)
+
+
+def test_steps_have_completion_criteria():
+    _, body = _frontmatter_and_body()
+    steps = re.findall(r"^### \d+\..*?(?=^### \d+\.|^## )", body, re.MULTILINE | re.DOTALL)
+    assert len(steps) >= 5
+    for step in steps:
+        assert "Done when" in step, f"step missing completion criterion: {step[:60]!r}"
+
+
+def test_mutation_boundary_is_default_safe():
+    _, body = _frontmatter_and_body()
+    assert "read + draft" in body, "scope step must default to read+draft, not send/delete"
+    assert "does not imply permission" in body
+
+
+def test_voice_calibration_is_evidence_based():
+    """Drafting must calibrate against the user's own sent replies,
+    with an explicit fallback when the Sent folder is unavailable."""
+    _, body = _frontmatter_and_body()
+    assert "Calibrate the user's voice" in body
+    assert "sent replies" in body.lower()
+    assert "fall back to matching the incoming thread's register" in body
+    assert "generic-professional" in body
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_evidence_store.py ===
+import pytest
+from pathlib import Path
+import importlib.util
+
+# Load the hyphenated script name dynamically
+repo_root = Path(__file__).parent.parent.parent
+script_path = repo_root / "optional-skills" / "security" / "oss-forensics" / "scripts" / "evidence-store.py"
+
+spec = importlib.util.spec_from_file_location("evidence_store", str(script_path))
+evidence_store = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evidence_store)
+EvidenceStore = evidence_store.EvidenceStore
+
+
+def test_evidence_store_init(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+    assert store.filepath == str(store_file)
+    assert len(store.data["evidence"]) == 0
+    assert "metadata" in store.data
+    assert store.data["metadata"]["version"] == "2.0"
+    assert "chain_of_custody" in store.data
+
+
+def test_evidence_store_add(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+
+    eid = store.add(
+        source="test_source",
+        content="test_content",
+        evidence_type="git",
+        actor="test_actor",
+        notes="test_notes",
+    )
+
+    assert eid == "EV-0001"
+    assert len(store.data["evidence"]) == 1
+    assert store.data["evidence"][0]["content"] == "test_content"
+    assert store.data["evidence"][0]["id"] == "EV-0001"
+    assert store.data["evidence"][0]["actor"] == "test_actor"
+    assert store.data["evidence"][0]["notes"] == "test_notes"
+    # Verify SHA-256 was computed
+    assert store.data["evidence"][0]["content_sha256"] is not None
+    assert len(store.data["evidence"][0]["content_sha256"]) == 64
+
+
+
+
+def test_evidence_store_sequential_ids(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+
+    eid1 = store.add(source="s1", content="c1", evidence_type="git")
+    eid2 = store.add(source="s2", content="c2", evidence_type="gh_api")
+    eid3 = store.add(source="s3", content="c3", evidence_type="ioc")
+
+    assert eid1 == "EV-0001"
+    assert eid2 == "EV-0002"
+    assert eid3 == "EV-0003"
+
+
+
+
+def test_evidence_store_verify_integrity(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+
+    store.add(source="s1", content="c1", evidence_type="git")
+    assert len(store.verify_integrity()) == 0
+
+    # Manually corrupt the content to trigger a hash mismatch
+    store.data["evidence"][0]["content"] = "corrupted_content"
+    issues = store.verify_integrity()
+    assert len(issues) == 1
+    assert issues[0]["id"] == "EV-0001"
+
+
+
+
+def test_evidence_store_query_searches_multiple_fields(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+
+    store.add(source="git_fsck", content="dangling commit abc123", evidence_type="git", actor="attacker")
+    store.add(source="manual", content="clean", evidence_type="manual")
+
+    # Search by source
+    assert len(store.query("fsck")) == 1
+    # Search by actor
+    assert len(store.query("attacker")) == 1
+    # Search returns nothing for non-matching
+    assert len(store.query("nonexistent")) == 0
+
+
+def test_evidence_store_chain_of_custody(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+
+    store.add(source="s1", content="c1", evidence_type="git")
+    store.add(source="s2", content="c2", evidence_type="gh_api")
+
+    chain = store.data["chain_of_custody"]
+    assert len(chain) == 2
+    assert chain[0]["evidence_id"] == "EV-0001"
+    assert chain[0]["action"] == "add"
+    assert chain[1]["evidence_id"] == "EV-0002"
+
+
+def test_evidence_store_export_markdown(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+
+    store.add(source="git_log", content="suspicious commit", evidence_type="git", actor="actor1")
+
+    md = store.export_markdown()
+    assert "# Evidence Registry" in md
+    assert "EV-0001" in md
+    assert "Chain of Custody" in md
+    assert "actor1" in md
+
+
+def test_evidence_store_summary(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store = EvidenceStore(str(store_file))
+
+    store.add(source="s1", content="c1", evidence_type="git", actor="a1")
+    store.add(source="s2", content="c2", evidence_type="git", actor="a2")
+    store.add(source="s3", content="c3", evidence_type="gh_api", actor="a1")
+
+    s = store.summary()
+    assert s["total"] == 3
+    assert s["by_type"]["git"] == 2
+    assert s["by_type"]["gh_api"] == 1
+    assert "a1" in s["unique_actors"]
+    assert "a2" in s["unique_actors"]
+
+
+def test_evidence_store_corrupted_file(tmp_path):
+    store_file = tmp_path / "test_evidence.json"
+    store_file.write_text("NOT VALID JSON {{{")
+
+    with pytest.raises(SystemExit):
+        EvidenceStore(str(store_file))
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_fetch_transcript.py ===
+"""Tests for skills/media/youtube-content/scripts/fetch_transcript.py (issue #22243)."""
+
+import sys
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "skills" / "media" / "youtube-content" / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+import fetch_transcript
+
+
+class TestExtractVideoId:
+    def test_standard_watch_url(self):
+        assert fetch_transcript.extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+
+    def test_short_url(self):
+        assert fetch_transcript.extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+
+
+    def test_shorts_url(self):
+        assert fetch_transcript.extract_video_id("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+
+
+    def test_with_extra_params(self):
+        assert fetch_transcript.extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42") == "dQw4w9WgXcQ"
+
+
+class TestFormatTimestamp:
+    def test_seconds_only(self):
+        assert fetch_transcript.format_timestamp(90) == "1:30"
+
+
+    def test_zero(self):
+        assert fetch_transcript.format_timestamp(0) == "0:00"
+
+    def test_minutes_only(self):
+        assert fetch_transcript.format_timestamp(600) == "10:00"
+
+
+
+
+class TestPyprojectDeclaresYoutubeExtra:
+    def test_youtube_extra_declared_in_pyproject(self):
+        """youtube-transcript-api must be listed in pyproject.toml [youtube] extra (issue #22243)."""
+        import tomllib
+        pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        with pyproject_path.open("rb") as f:
+            data = tomllib.load(f)
+        extras = data.get("project", {}).get("optional-dependencies", {})
+        assert "youtube" in extras, "Missing [youtube] extra in pyproject.toml"
+        youtube_deps = " ".join(extras["youtube"])
+        assert "youtube-transcript-api" in youtube_deps
+
+

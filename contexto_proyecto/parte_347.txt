@@ -1,0 +1,212 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\botmode-dm-delivery\exception-tick.py ===
+"""Controlled filesystem fault; run only against the native disposable sandbox."""
+import json
+import os
+from pathlib import Path
+
+from cron import scheduler_delivery as delivery
+from cron.bot_chat_delivery import _root
+from cron.scheduler import tick
+
+root = _root()
+original_which = delivery.shutil.which
+original_is_dir = Path.is_dir
+armed = False
+raised = 0
+
+
+def resolve_cli(*args, **kwargs):
+    global armed
+    armed = raised == 0
+    return original_which(*args, **kwargs)
+
+
+def is_dir(path):
+    global armed, raised
+    if armed and path == Path(os.environ["HERMES_HOME"]) / "profiles" / "beta":
+        armed = False
+        raised += 1
+        raise PermissionError("controlled target traversal denied after discovery")
+    return original_is_dir(path)
+
+
+delivery.shutil.which = resolve_cli
+Path.is_dir = is_dir
+try:
+    tick(verbose=False)
+    tick(verbose=False)
+finally:
+    Path.is_dir = original_is_dir
+    delivery.shutil.which = original_which
+    records = [json.loads(p.read_text(encoding="utf-8")) for p in root.glob("*.json") if p.name != "broken.json"]
+    Path(os.environ["BOT_DM_EXCEPTION_RECEIPT"]).write_text(json.dumps({"raised": raised, "records": records}, indent=2), encoding="utf-8")
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\botmode-dm-delivery\README.md ===
+# Native Bot Mode delivery probe
+
+Real Electron, production Python backend and tool execution, disposable HOME/HERMES_HOME,
+loopback scripted inference (no paid model). Linux seat fixture; run from repository root:
+
+```sh
+npm ci --no-audit --no-fund
+cp evals/botmode-dm-delivery/probe-dm-delivery.spec.ts apps/desktop/e2e/
+git apply evals/botmode-dm-delivery/mock-trigger.patch
+(cd apps/desktop && npm run build)
+(cd apps/desktop && DISPLAY=:0 XAUTHORITY=/run/user/1000/xauth_cnpsqU \
+  XDG_RUNTIME_DIR=/run/user/1000 VIRTUAL_ENV="$VIRTUAL_ENV" \
+  HERMES_DESKTOP_CDP_PORT=off npx playwright test e2e/probe-dm-delivery.spec.ts --reporter=list)
+git apply -R evals/botmode-dm-delivery/mock-trigger.patch
+rm apps/desktop/e2e/probe-dm-delivery.spec.ts
+```
+
+Use the current seat's actual Xauthority path and an existing runtime venv.
+Artifacts default to `/tmp/botmode-dm-review/native` (override with `BOT_DM_EVIDENCE`); sandbox path is printed. The
+fixture's generated hermes shim pins every child to this checkout, not an installed launcher.
+
+## Verified results
+
+Base `cf35e7351e770`: nested beta quiet CLI executes real `message_agent` to the named
+alpha Desktop owner. Admission, execution and reply succeed, and the quiet sender
+receives its completion. A reload then shows the attributed incoming message. The
+live pre-reload view showed the reply but omitted the incoming row in this fixture;
+that renderer-refresh behavior is not fixed by this cron change.
+
+Base CLI-owner case: separate cron producer returns exact `SESSION_NOT_OWNED` refusal.
+Release owner, run scheduler tick, open Beta in Desktop: no cron output, assertion red.
+Fixed case: queued receipt; release owner; real synchronous scheduler tick drains;
+Beta Desktop renders `CLI_OWNER_CRON_SENTINEL` and its reply once. Final two-case
+native run: **2 passed (1.2m)**. Supported-owner nested case also passed independently
+on base (**1 passed (40.0s)**).
+
+This does not establish native Windows parity, general retry after unowned CLI
+failure, or correction of the issue #105460 `--in ~` premise. CLI title resolution
+is profile-DB-based, not workspace selection; the named live-owner route is positive.
+
+The queue is deliberately at-most-once after claim. A crash before spawning but
+after claiming remains inspectable as claimed; it is not retried automatically.
+
+## Independent review follow-up
+
+The probe now admits the named Beta destination from the default scheduler, then
+changes the ticker's `HOME` to a different existing directory before drain.
+Published head `c91dfcbfe810c` fails with `Profile 'beta' does not exist`, leaving
+zero sentinel inputs in Beta. The follow-up pins the admitted home and ID; Beta
+renders one input and reply. Set `BOT_DM_CORRUPT=1` to add one malformed JSON
+record alongside the valid admission: before the follow-up the real tick raises
+`JSONDecodeError`; afterward the damaged record stays on disk while Beta delivers.
+
+Fresh built native run with both root change and corruption: **2 passed (1.4m)**,
+including the existing nested `message_agent` control. Receipts/screenshots:
+`/tmp/botmode-dm-review/{native-red2,corrupt-red,final-native}` and matching `.log`
+files. The first follow-up run also exposed a fixture mistake (the changed HOME
+was not created, so `--in ~` correctly refused); that failed receipt is retained
+in `native-green.log`, and both source legs were rerun with an existing HOME.
+Prior `/tmp/botmode-dm-recovery*` evidence remains untouched.
+
+## Per-record delivery exception isolation
+
+Set `BOT_DM_EXCEPTION=1` and select `-g "cron output"` for the controlled native
+exception probe. `exception-tick.py` raises `PermissionError` at the actual
+post-discovery target `Path.is_dir()` boundary, not at the delivery helper.
+The same exception was first reproduced with real directory traversal permission
+loss on Python 3.11/Linux; the retained test uses a portable controlled fault.
+Before the guard, native tick exits 1, leaving the head claimed and sibling queued.
+Afterward, the head is ambiguous, the sibling settles and renders once, and a
+second real tick replays neither. Logs: `/tmp/botmode-dm-exception-{red,green}.log`;
+receipts and screenshot: `/tmp/botmode-dm-exception/{red,green}/`.
+
+The review's repeated-head starvation claim is not reachable: the claim commits
+before delivery and later scans skip every non-queued record. One failed tick is
+real; recurring replay of that same head is not. Indefinite queued/payload retention
+is intentional, with no TTL or automatic ambiguous retry introduced here.
+
+## Ordinary custom-root fallback (#104066 / #104055)
+
+`probe-cron-root.spec.ts` adds the never-deferred sibling: copy it to
+`apps/desktop/e2e/` and run with the same native fixture (no mock-trigger patch
+needed for this case). It keeps default's real Desktop Bot Chat lease, submits
+ordinary cron output to unowned Alpha from a separate Python producer under a
+custom Hermes root, and holds the real quiet CLI child at loopback inference.
+The child shim PID must match Alpha's real CLI lease; default's lease is unchanged.
+After release, Alpha has exactly one input and Desktop renders the output.
+The same case removes unused Beta and verifies delivery neither recreates Beta nor
+creates a second `.hermes` root under HOME.
+
+Both `origin/main`'s scheduler and pre-follow-up `c827ae179d67c` fail with
+`Profile 'alpha' does not exist` before any recipient turn. Fixed native run:
+**1 passed (46.3s)**. Two invariant tests exercise the actual CLI startup resolver
+across named/default/own destinations with a changed active profile, and refusal
+when the destination is missing initially or disappears during discovery:
+**5 failed before, 5 passed after**. The old env-clearing test is replaced by these
+behavior checks rather than retaining the broken expectation.
+
+Evidence: `/tmp/botmode-cron-root/{before2,origin-main,after}.log`,
+`after/{owners.json,children.log,rows.json,result.json,missing.json,ordinary-recipient.png}`.
+The first fixture attempt (`before.log`) used the wrong default row label; the
+actual Desktop label is Hermes. No production failure is claimed for that attempt.
+Full cron directory: **1346 passed, 1 skipped across 116 files**; sibling mailbox,
+DM, gateway consumer and profile tests: **124 passed, 3 skipped across 4 files**.
+Credit @fangliquanflq's #104066 for the root-boundary diagnosis and anchoring fix;
+this combined branch reuses its already-resolved destination instead of repeating
+name resolution. No retry or receipt semantics change.
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\botmode-dm-matrix\README.md ===
+# Bot Mode native delivery matrix
+
+Production Electron/preload/backend/tool execution; loopback scripted inference only.
+Scratch HOME, HERMES_HOME, Python facade and CLI shims; no user profiles or credentials.
+Run from the repository root after installing root npm dependencies and building Desktop:
+
+```sh
+cp evals/botmode-dm-matrix/probe-dm-matrix.spec.ts apps/desktop/e2e/
+git apply --unidiff-zero evals/botmode-dm-matrix/mock-trigger.patch
+(cd apps/desktop && npm run build)
+# Set DISPLAY, current XAUTHORITY, XDG_RUNTIME_DIR and VIRTUAL_ENV first.
+(cd apps/desktop && HERMES_DESKTOP_CDP_PORT=off BOT_DM_SERVICE_PATH=1 \
+  BOT_DM_EVIDENCE=/tmp/botmode-dm-matrix-proof \
+  npx playwright test e2e/probe-dm-matrix.spec.ts --reporter=list)
+git apply --unidiff-zero -R evals/botmode-dm-matrix/mock-trigger.patch
+rm apps/desktop/e2e/probe-dm-matrix.spec.ts
+```
+
+`BOT_DM_SERVICE_PATH=1` creates a disposable Python venv facade with an adjacent
+worktree-pinned `hermes`; PATH contains a different inert `hermes` that exits 2
+and records every invocation. This simulates the reported stale-launcher service
+shape without modifying the shared interpreter or the user's installed launcher.
+Omit that flag only on the baseline: a PATH shim then pins all children to this tree.
+
+## Receipts
+
+Base: `40f2702b22a343cbc95647efd0bdffe8e0b3d9e9`.
+Normal PATH: two native cases passed. Default canonical Desktop owner remained
+unchanged while default -> quiet Beta CLI -> unowned Gamma CLI executed, Beta
+received its own completion and default received the Beta completion. Named
+persisted Bot Chat IDs remained `matrix-beta` and `matrix-gamma`; both used the
+scratch OS HOME as cwd, not the profile state directory. Gamma opened in Desktop
+and rendered its attributed input. This refutes #105323's `--in ~` ownership premise.
+
+Incoming live-owner case also passed without reload: wait for the attributed
+sender card to mount, then expand it. A rejected earlier probe expanded before
+asynchronous reconciliation had mounted the card; its final DOM already contained
+`Message from beta` and `show message`. Reload was never required.
+
+Stale PATH on base: real default message_agent acknowledged `sent`, wrong launcher
+recorded `-p beta chat --in ~ -c Bot Chat --create-if-missing -Q --query-file ...`,
+and Beta had zero input rows. With #100673 cherry-picked: same matrix, two passed;
+both nested children used the adjacent worktree entrypoint, no wrong-path marker.
+
+Artifacts retained separately under `/tmp/botmode-dm-matrix/{verified,service-base,service-fixed}`:
+SQLite snapshots, active lease snapshots, scoped process checkpoints, prompts,
+DOM text and screenshots. The `.live.json` ticket path is only for live-owner
+admission; unowned CLI fallback does not promise that receipt format.
+
+This establishes Linux native Electron behavior, not native Windows parity,
+real-model reasoning quality, or the separate 420-second tool-timeout report.
+No native Windows host was discovered in the available host inventory.
+

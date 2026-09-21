@@ -1,0 +1,377 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_setup_hidden_env.py ===
+"""Setup surfaces ask only for what a platform can't start without.
+
+The knobs in SETUP_HIDDEN_ENV_SUFFIXES are self-configuring (/sethome) or
+already correct by default, so they don't belong on a setup form. They must
+still be reachable everywhere else — this is a presentation change, not a
+feature removal.
+"""
+
+import pytest
+
+from hermes_cli.setup_hidden_env import is_setup_hidden_env
+
+
+class TestIsSetupHiddenEnv:
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "DISCORD_HOME_CHANNEL",
+            "DISCORD_HOME_CHANNEL_NAME",
+            "DISCORD_ALLOW_ALL_USERS",
+            "DISCORD_REPLY_TO_MODE",
+            "MATTERMOST_REPLY_MODE",
+            "TELEGRAM_PROXY",
+        ],
+    )
+    def test_self_configuring_knobs_are_hidden(self, key):
+        assert is_setup_hidden_env(key)
+
+
+    def test_applies_to_plugin_platforms_nobody_enumerated(self):
+        """Suffix matching is the point — IRC/SimpleX/ntfy get this for free."""
+        for key in (
+            "IRC_ALLOW_ALL_USERS",
+            "SIMPLEX_HOME_CHANNEL",
+            "NTFY_HOME_CHANNEL_NAME",
+            "LINE_ALLOW_ALL_USERS",
+        ):
+            assert is_setup_hidden_env(key), key
+
+
+class TestChannelCards:
+    def test_discord_card_asks_for_token_and_allowlist_only(self):
+        """The reported bug: the Discord card asked five questions for a
+        one-credential platform."""
+        from hermes_cli.web_server_messaging import _build_catalog_entry
+
+        assert set(_build_catalog_entry("discord")["env_vars"]) == {
+            "DISCORD_BOT_TOKEN",
+            "DISCORD_ALLOWED_USERS",
+        }
+
+    def test_no_card_shows_a_hidden_knob(self):
+        from hermes_cli.web_server_messaging import _messaging_platform_catalog
+
+        for entry in _messaging_platform_catalog():
+            for key in entry["env_vars"]:
+                assert not is_setup_hidden_env(key), f"{entry['id']}: {key}"
+
+
+    def test_hidden_knobs_move_to_the_keys_page_not_into_a_void(self):
+        """Keys hides what a Channels card owns. Dropping these from the card
+        must hand them back to Keys, not orphan them from every surface."""
+        from hermes_cli.web_server_messaging import _channel_managed_env_keys
+
+        managed = _channel_managed_env_keys()
+        for key in (
+            "DISCORD_HOME_CHANNEL",
+            "DISCORD_ALLOW_ALL_USERS",
+            "DISCORD_REPLY_TO_MODE",
+        ):
+            assert key not in managed, f"{key} is hidden from both surfaces"
+
+
+class TestCliWizard:
+    """`hermes setup gateway` drops the same knobs. Real wizard, scripted
+    stdin, real .env writes under a temp HERMES_HOME."""
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        return tmp_path
+
+    def _run(self, answers, monkeypatch):
+        import io
+
+        from hermes_cli import gateway as gw
+
+        platform = next(p for p in gw._PLATFORMS if p["key"] == "mattermost")
+        monkeypatch.setattr("sys.stdin", io.StringIO("\n".join(answers) + "\n"))
+        gw._setup_standard_platform(dict(platform))
+
+    def _env(self, home):
+        path = home / ".env"
+        if not path.exists():
+            return {}
+        out = {}
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k] = v
+        return out
+
+    def test_wizard_stops_asking_about_hidden_knobs(self, home, monkeypatch, capsys):
+        # Only the three real answers. If the wizard still prompted for the
+        # home channel it would read past them.
+        self._run(
+            ["https://mm.example.com", "tok-abc", "user26charid"], monkeypatch
+        )
+
+        written = self._env(home)
+        assert written.get("MATTERMOST_URL") == "https://mm.example.com"
+        assert written.get("MATTERMOST_TOKEN") == "tok-abc"
+        assert "MATTERMOST_HOME_CHANNEL" not in written
+        assert "MATTERMOST_REPLY_MODE" not in written
+
+        out = capsys.readouterr().out
+        assert "Home channel" not in out
+        assert "Reply mode" not in out
+
+    def test_required_token_still_gates_setup(self, home, monkeypatch):
+        """Proves the token wasn't swept out along with the knobs."""
+        self._run(["https://mm.example.com", ""], monkeypatch)
+
+        assert "MATTERMOST_TOKEN" not in self._env(home)
+
+
+class TestStillConfigurable:
+    def test_gateway_still_honors_the_env_vars(self, tmp_path, monkeypatch):
+        """Nothing was removed from the product — only from the setup form."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+        monkeypatch.setenv("DISCORD_HOME_CHANNEL", "999")
+        monkeypatch.setenv("DISCORD_REPLY_TO_MODE", "off")
+
+        from gateway.config import Platform, load_gateway_config
+
+        discord = load_gateway_config().platforms[Platform.DISCORD]
+        assert discord.home_channel is not None
+        assert discord.home_channel.chat_id == "999"
+        assert discord.reply_to_mode == "off"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_setup_irc.py ===
+"""Tests for IRC gateway configuration via `hermes setup gateway` UI.
+
+Covers the full plugin-platform discovery → status → configure flow so that
+a fresh Hermes install (no state, no env vars) can set up IRC through the
+interactive setup menus.
+"""
+
+import os
+
+from gateway.platform_registry import PlatformEntry, platform_registry
+
+
+def _register_irc_platform(**overrides):
+    """Manually register the IRC platform entry as if discover_plugins() found it.
+
+    Tests run outside the normal plugin-discovery path, so we inject the entry
+    directly into the singleton registry and yield its dict shape.
+    """
+    defaults = dict(
+        name="irc",
+        label="IRC",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: bool(os.getenv("IRC_SERVER", "") and os.getenv("IRC_CHANNEL", "")),
+        validate_config=None,
+        required_env=["IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"],
+        install_hint="No extra packages needed (stdlib only)",
+        setup_fn=lambda: None,
+        source="plugin",
+        plugin_name="irc_platform",
+        allowed_users_env="IRC_ALLOWED_USERS",
+        allow_all_env="IRC_ALLOW_ALL_USERS",
+        max_message_length=450,
+        pii_safe=False,
+        emoji="💬",
+        allow_update_command=True,
+        platform_hint="You are chatting via IRC.",
+    )
+    defaults.update(overrides)
+    entry = PlatformEntry(**defaults)
+    platform_registry.register(entry)
+    return {
+        "key": entry.name,
+        "label": entry.label,
+        "emoji": entry.emoji,
+        "token_var": entry.required_env[0] if entry.required_env else "",
+        "install_hint": entry.install_hint,
+        "_registry_entry": entry,
+    }
+
+
+def _unregister_irc_platform():
+    platform_registry.unregister("irc")
+
+
+# ── Fresh-install discovery ─────────────────────────────────────────────────
+
+
+class TestIRCFreshInstallDiscovery:
+    """IRC appears in the setup menu on a brand-new Hermes install."""
+
+    def test_irc_appears_in_all_platforms(self, monkeypatch):
+        """When the IRC plugin is registered, _all_platforms() surfaces it."""
+        import hermes_cli.gateway as gateway_mod
+
+        _register_irc_platform()
+        try:
+            # Ensure no stale env vars leak in
+            for key in ("IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"):
+                monkeypatch.delenv(key, raising=False)
+
+            platforms = gateway_mod._all_platforms()
+            keys = {p["key"] for p in platforms}
+            assert "irc" in keys
+
+            irc_plat = next(p for p in platforms if p["key"] == "irc")
+            assert irc_plat["label"] == "IRC"
+            assert irc_plat["emoji"] == "💬"
+        finally:
+            _unregister_irc_platform()
+
+
+    def test_irc_status_configured_when_env_set(self, monkeypatch):
+        """After the user sets IRC_SERVER and IRC_CHANNEL, status is 'configured'."""
+        import hermes_cli.gateway as gateway_mod
+
+        plat = _register_irc_platform()
+        try:
+            monkeypatch.setenv("IRC_SERVER", "irc.libera.chat")
+            monkeypatch.setenv("IRC_CHANNEL", "#hermes")
+            monkeypatch.setenv("IRC_NICKNAME", "hermes-bot")
+
+            status = gateway_mod._platform_status(plat)
+            assert status == "configured"
+        finally:
+            _unregister_irc_platform()
+
+
+# ── Interactive setup dispatch ──────────────────────────────────────────────
+
+
+class TestIRCInteractiveSetup:
+    """The setup UI dispatches to IRC's interactive_setup() correctly."""
+
+    def test_configure_platform_dispatches_to_irc_setup_fn(self, monkeypatch, capsys):
+        """_configure_platform() calls the IRC plugin's setup_fn when selected."""
+        import hermes_cli.gateway as gateway_mod
+
+        calls = []
+
+        def fake_setup():
+            calls.append("setup_called")
+            print("IRC setup complete!")
+
+        plat = _register_irc_platform(setup_fn=fake_setup)
+        try:
+            gateway_mod._configure_platform(plat)
+        finally:
+            _unregister_irc_platform()
+
+        assert "setup_called" in calls
+        out = capsys.readouterr().out
+        assert "IRC setup complete!" in out
+
+
+    def test_configure_platform_fallback_when_no_setup_fn(self, monkeypatch, capsys):
+        """A plugin with no setup_fn falls back to env-var instructions."""
+        import hermes_cli.gateway as gateway_mod
+
+        plat = _register_irc_platform(setup_fn=None)
+        try:
+            gateway_mod._configure_platform(plat)
+        finally:
+            _unregister_irc_platform()
+
+        out = capsys.readouterr().out
+        assert "IRC" in out
+        assert "IRC_SERVER" in out
+
+
+# ── End-to-end fresh-install gateway setup ──────────────────────────────────
+
+
+class TestIRCGatewaySetupFreshInstall:
+    """Simulate the full `hermes setup gateway` experience with IRC present."""
+
+    def test_setup_gateway_shows_irc_in_platform_menu(self, monkeypatch, capsys, tmp_path):
+        """The gateway setup menu lists IRC among the available platforms."""
+        import hermes_cli.gateway as gateway_mod
+        from hermes_cli import setup as setup_mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _register_irc_platform()
+        try:
+            for key in ("IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"):
+                monkeypatch.delenv(key, raising=False)
+
+            # Sanity-check: IRC must be visible to _all_platforms()
+            platforms = gateway_mod._all_platforms()
+            assert any(p["key"] == "irc" for p in platforms), \
+                f"IRC not in platforms: {[p['key'] for p in platforms]}"
+
+            # Capture what prompt_checklist is asked to display
+            checklist_calls = []
+
+            def capture_prompt_checklist(question, choices, pre_selected=None):
+                checklist_calls.append({"question": question, "choices": choices})
+                return []  # nothing selected → clean exit
+
+            monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *a, **kw: False)
+            monkeypatch.setattr(setup_mod, "prompt_checklist", capture_prompt_checklist)
+            monkeypatch.setattr(gateway_mod, "supports_systemd_services", lambda: False)
+            monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
+            monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+            monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+
+            setup_mod.setup_gateway({})
+
+            # Find the platform-selection prompt
+            platform_prompt = next(
+                (c for c in checklist_calls if "platform" in c["question"].lower()),
+                None,
+            )
+            assert platform_prompt is not None, \
+                f"No platform prompt found in {checklist_calls}"
+            choices_text = "\n".join(platform_prompt["choices"])
+            assert "IRC" in choices_text
+            assert "💬" in choices_text
+            assert "not configured" in choices_text.lower()
+        finally:
+            _unregister_irc_platform()
+
+    def test_setup_gateway_irc_counts_as_messaging_platform(self, monkeypatch, capsys, tmp_path):
+        """When IRC is configured, setup_gateway counts it as a messaging platform."""
+        import hermes_cli.gateway as gateway_mod
+        from hermes_cli import setup as setup_mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _register_irc_platform()
+        try:
+            monkeypatch.setenv("IRC_SERVER", "irc.libera.chat")
+            monkeypatch.setenv("IRC_CHANNEL", "#hermes")
+            monkeypatch.setenv("IRC_NICKNAME", "hermes-bot")
+
+            monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *a, **kw: False)
+            monkeypatch.setattr(setup_mod, "prompt_choice", lambda *a, **kw: 0)
+            # Select ONLY the IRC row. Without this, the non-TTY checklist
+            # falls back to its cancel value (the pre-selected "configured"
+            # platforms) — on a dev machine with real platforms configured
+            # that runs their interactive setup_fn, which calls input() and
+            # dies under captured stdin. IRC's setup_fn is a no-op lambda.
+            monkeypatch.setattr(
+                setup_mod,
+                "prompt_checklist",
+                lambda title, items, pre=None: [
+                    i for i, item in enumerate(items) if "IRC" in item
+                ],
+            )
+            monkeypatch.setattr(gateway_mod, "supports_systemd_services", lambda: False)
+            monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
+            monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+            monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+
+            setup_mod.setup_gateway({})
+
+            out = capsys.readouterr().out
+            assert "Messaging platforms configured!" in out
+        finally:
+            _unregister_irc_platform()
+

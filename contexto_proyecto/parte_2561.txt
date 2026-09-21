@@ -1,0 +1,359 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_compression_interrupt_demotion.py ===
+"""Regression tests for #56391.
+
+When context compression is in flight (state.db compression lock held),
+gateway ``busy_input_mode='interrupt'`` must demote to queue semantics so a
+rapid message burst cannot start a follow-up turn against the pre-rotation
+parent and fork orphaned compression siblings.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import time
+import types
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+_tg = types.ModuleType("telegram")
+_tg.constants = types.ModuleType("telegram.constants")
+_ct = MagicMock()
+_ct.SUPERGROUP = "supergroup"
+_ct.GROUP = "group"
+_ct.PRIVATE = "private"
+_tg.constants.ChatType = _ct
+sys.modules.setdefault("telegram", _tg)
+sys.modules.setdefault("telegram.constants", _tg.constants)
+sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
+
+from gateway.platforms.base import (
+    SessionSource,
+    build_session_key,
+)
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL  # noqa: E402
+
+
+def _make_event(text: str = "hello", chat_id: str = "123") -> MessageEvent:
+    source = SessionSource(
+        platform=MagicMock(value="telegram"),
+        chat_id=chat_id,
+        chat_type="private",
+        user_id="user1",
+    )
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg1",
+    )
+
+
+def _make_runner(*, session_id: str = "parent-session") -> GatewayRunner:
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._busy_ack_ts = {}
+    runner._draining = False
+    runner.adapters = {}
+    runner.config = MagicMock()
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = True
+    runner._is_user_authorized = lambda _source: True
+    runner._busy_input_mode = "interrupt"
+    session_key = build_session_key(_make_event().source)
+    entry = SimpleNamespace(session_key=session_key, session_id=session_id)
+    session_store = SimpleNamespace(
+        _lock=threading.Lock(),
+        _entries={session_key: entry},
+        switch_session=MagicMock(),
+    )
+    session_store._ensure_loaded_locked = lambda: None
+    runner.session_store = session_store
+    runner._session_db = MagicMock()
+    runner._session_db._db = MagicMock()
+    runner._session_db._db.get_compression_lock_holder.return_value = None
+    return runner
+
+
+def _make_adapter() -> MagicMock:
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    adapter._send_with_retry = AsyncMock()
+    adapter.config = MagicMock()
+    adapter.config.extra = {}
+    adapter.platform = MagicMock(value="telegram")
+    return adapter
+
+
+def _make_parent_no_subagents() -> MagicMock:
+    parent = MagicMock()
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent.get_activity_summary.return_value = {
+        "api_call_count": 3,
+        "max_iterations": 60,
+        "current_tool": "terminal",
+    }
+    return parent
+
+
+class TestSessionHasCompressionInFlight:
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_lock_held(self) -> None:
+        runner = _make_runner()
+        sk = build_session_key(_make_event().source)
+        runner._session_db._db.get_compression_lock_holder.return_value = "holder-1"
+        assert await runner._session_has_compression_in_flight(sk) is True
+
+
+class TestBusyHandlerDemotesInterruptForCompression:
+    @pytest.mark.asyncio
+    async def test_does_not_interrupt_when_compression_in_flight(self) -> None:
+        runner = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="follow up during compression")
+        sk = build_session_key(event.source)
+        parent = _make_parent_no_subagents()
+        runner._running_agents[sk] = parent
+        runner.adapters[event.source.platform] = adapter
+        runner._session_db._db.get_compression_lock_holder.return_value = "compressing"
+
+        handled = await runner._handle_active_session_busy_message(event, sk)
+
+        assert handled is True
+        parent.interrupt.assert_not_called()
+        assert adapter._pending_messages.get(sk) is event
+
+    @pytest.mark.asyncio
+    async def test_ack_explains_compression_demotion(self) -> None:
+        runner = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="hi mid-compress")
+        sk = build_session_key(event.source)
+        parent = _make_parent_no_subagents()
+        runner._running_agents[sk] = parent
+        runner._running_agents_ts[sk] = time.time() - 120
+        runner.adapters[event.source.platform] = adapter
+        runner._session_db._db.get_compression_lock_holder.return_value = "compressing"
+
+        with patch("gateway.platforms.base.merge_pending_message_event"):
+            await runner._handle_active_session_busy_message(event, sk)
+
+        adapter._send_with_retry.assert_called_once()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Compressing context" in content
+        assert "queued" in content.lower()
+        assert "/stop" in content
+        assert "Interrupting" not in content
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_compression_in_flight_check.py ===
+"""#5 regression: _session_has_compression_in_flight must offload both blocking sources to thread pool."""
+import inspect
+import threading
+from unittest.mock import MagicMock
+
+import pytest
+
+
+def _make_runner(holder_value=None, record_thread=False, thread_sink=None):
+    from gateway.run import GatewayRunner
+    runner = GatewayRunner.__new__(GatewayRunner)
+
+    store = MagicMock()
+    store._lock = threading.Lock()
+    store._loaded = True
+    store._entries = {"k": MagicMock(session_id="sess-123")}
+    store._ensure_loaded_locked = lambda: None
+    runner.session_store = store
+
+    raw_db = MagicMock()
+    if record_thread and thread_sink is not None:
+        def _holder(sid):
+            thread_sink["thread"] = threading.get_ident()
+            return holder_value
+        raw_db.get_compression_lock_holder = _holder
+    else:
+        raw_db.get_compression_lock_holder = MagicMock(return_value=holder_value)
+
+    session_db = MagicMock()
+    session_db._db = raw_db
+    runner._session_db = session_db
+    return runner
+
+
+def test_method_is_coroutine():
+    from gateway.run import GatewayRunner
+    assert inspect.iscoroutinefunction(
+        GatewayRunner._session_has_compression_in_flight
+    ), "#5: method must be async, blocking calls offloaded"
+
+
+@pytest.mark.asyncio
+async def test_returns_false_when_no_session_store():
+    from gateway.run import GatewayRunner
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.session_store = None
+    runner._session_db = MagicMock()
+    assert await runner._session_has_compression_in_flight("k") is False
+
+
+@pytest.mark.asyncio
+async def test_returns_false_when_holder_is_not_a_string():
+    """Lock holders are session-id strings. A MagicMock auto-attr must not
+    look like an in-flight compression and skip hygiene (#96953)."""
+    runner = _make_runner(holder_value=MagicMock())
+    assert await runner._session_has_compression_in_flight("k") is False
+    runner = _make_runner(holder_value=True)
+    assert await runner._session_has_compression_in_flight("k") is False
+    runner = _make_runner(holder_value="")
+    assert await runner._session_has_compression_in_flight("k") is False
+    runner = _make_runner(holder_value="agent-1")
+    assert await runner._session_has_compression_in_flight("k") is True
+
+
+@pytest.mark.asyncio
+async def test_db_call_runs_off_event_loop():
+    """Regression core: get_compression_lock_holder MUST execute in non-event-loop thread."""
+    sink = {}
+    runner = _make_runner(holder_value="agent-1", record_thread=True, thread_sink=sink)
+    loop_thread = threading.get_ident()
+    await runner._session_has_compression_in_flight("k")
+    assert "thread" in sink, "underlying db.get_compression_lock_holder was not called"
+    assert sink["thread"] != loop_thread, (
+        "DB call still on event loop thread — #5 NOT fixed (to_thread not applied)"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_compression_progress_notices.py ===
+"""Opt-in compression progress notices on chat gateways (#52995).
+
+Routine automatic compression is silent-by-design on human-facing chat
+platforms: the gateway noise filter (`_TELEGRAM_NOISY_STATUS_RE` via
+`_prepare_gateway_status_message`) swallows every ROUTINE compression status.
+`compression.progress_notices: true` (default: false) opens an opt-in gate
+that lets those ROUTINE compression statuses through — scoped strictly to
+the #69550 compression status template constants, so unrelated operational
+noise (auxiliary failures, provider retry/rate-limit chatter) stays
+suppressed even when the gate is enabled.
+
+The default-OFF path must stay byte-identical to silent-by-design main:
+tests/gateway/test_telegram_noise_filter.py pins that suite unchanged.
+"""
+
+import pytest
+
+import gateway.run as gateway_run
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    ROUTINE_COMPRESSION_STATUS_SAMPLES,
+)
+from gateway.run import _prepare_gateway_status_message
+
+# Chat surfaces the opt-in must deliver to (subset of the noise-filter
+# suite's CHAT_PLATFORMS; telegram + discord are the required anchors).
+CHAT_PLATFORMS = ["telegram", "discord", "slack", "whatsapp"]
+
+# Noisy statuses that are NOT routine compression progress — they must stay
+# suppressed on chat platforms even when progress_notices is enabled.
+NON_COMPRESSION_NOISE = [
+    "⚠ Auxiliary title generation failed: HTTP 400: Operation contains cybersecurity risk",
+    "⏳ Retrying in 4.2s (attempt 1/3)...",
+    "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
+    "⚠️ Max retries (3) exhausted — trying fallback...",
+    "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
+    (
+        "⚠ Configured auxiliary compression provider 'openai' is unavailable — "
+        "context compression will drop middle turns without a summary. Check "
+        "auxiliary.compression in config.yaml and reauthenticate that provider."
+    ),
+    (
+        "⚠ Skipping concurrent compression — another path is already "
+        "compressing this session. Will retry after it finishes."
+    ),
+]
+
+
+@pytest.fixture
+def progress_notices_enabled(monkeypatch):
+    """Gateway config with compression.progress_notices: true."""
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"compression": {"progress_notices": True}},
+    )
+
+
+@pytest.fixture
+def progress_notices_default(monkeypatch):
+    """Gateway config without the key — the silent-by-design default."""
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+@pytest.mark.parametrize("message", NON_COMPRESSION_NOISE, ids=lambda m: m[:32])
+def test_enabled_still_suppresses_non_compression_noise(
+    progress_notices_enabled, platform, message
+):
+    """The gate is scoped to compression progress statuses ONLY.
+
+    Aux-model failures, provider retry/rate-limit chatter, and other noisy
+    statuses that are not #69550 compression progress templates must stay
+    suppressed on chat surfaces even when progress_notices is enabled.
+    """
+    assert _prepare_gateway_status_message(platform, "warn", message) is None
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "default"])
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_compaction_completion_notice_respects_progress_notices_gate(
+    monkeypatch, platform, enabled
+):
+    """The completion edge follows the same opt-in gate as the start edge."""
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"compression": {"progress_notices": enabled}},
+    )
+    result = _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS)
+    if enabled:
+        assert result == COMPACTION_DONE_STATUS
+    else:
+        assert result is None
+
+
+def test_enabled_gate_does_not_leak_to_raw_platforms(progress_notices_enabled):
+    """Programmatic surfaces keep raw text regardless of the gate."""
+    message = ROUTINE_COMPRESSION_STATUS_SAMPLES[0]
+    for platform in ("local", "api_server", "webhook", "msgraph_webhook"):
+        assert (
+            _prepare_gateway_status_message(platform, "lifecycle", message) == message
+        )
+
+
+def test_progress_regex_covers_every_routine_sample():
+    """The template-derived membership regex matches every ROUTINE sample.
+
+    Guards the coupling: a new #69550 template constant added to
+    ROUTINE_COMPRESSION_STATUS_SAMPLES without being added to the gateway's
+    _COMPRESSION_PROGRESS_STATUS_RE alternatives fails here.
+    """
+    for message in ROUTINE_COMPRESSION_STATUS_SAMPLES:
+        assert gateway_run._COMPRESSION_PROGRESS_STATUS_RE.search(message), (
+            f"routine compression sample not covered by the opt-in gate: {message!r}"
+        )
+

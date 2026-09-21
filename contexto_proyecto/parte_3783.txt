@@ -1,0 +1,303 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_state_synchronous_pragma.py ===
+"""``database.synchronous`` is configurable, validated, and floored on macOS.
+
+Before this, `apply_database_pragmas()` accepted five sizing pragmas and no
+durability one, and `_enforce_macos_synchronous_full()` returned early off
+Darwin. So on Linux and Windows nothing in the process ever executed
+`PRAGMA synchronous` against state.db, and the effective level was whichever
+`SQLITE_DEFAULT_WAL_SYNCHRONOUS` the interpreter's SQLite happened to be
+compiled with -- invisible from config, unpinnable, and different between
+builds. See #90837, where three weeks of corruption forensics were carried out
+under the stated assumption of `synchronous=FULL` on Ubuntu.
+"""
+
+import sqlite3
+import sys
+
+import pytest
+
+import hermes_state
+import hermes_state_wal
+from hermes_state import apply_database_pragmas
+from hermes_state_wal import resolve_synchronous_level
+
+
+def _wal_conn(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "state.db"), isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _level(conn):
+    return conn.execute("PRAGMA synchronous").fetchone()[0]
+
+
+def _config(monkeypatch, database_section):
+    """Point apply_database_pragmas at an in-memory config.
+
+    It imports `hermes_cli.config` lazily inside the function body, so the
+    patch has to land on that module rather than on a name in this one.
+    """
+    import hermes_cli.config as config_mod
+
+    cfg = {"database": database_section}
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda *a, **k: cfg)
+    return cfg
+
+
+class TestResolveSynchronousLevel:
+    """The parser, in isolation -- a wrong answer here is a silent downgrade."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("OFF", 0),
+            ("NORMAL", 1),
+            ("FULL", 2),
+            ("EXTRA", 3),
+            ("full", 2),
+            ("Full", 2),
+            ("  FULL  ", 2),
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            ("2", 2),
+            (" 2 ", 2),
+        ],
+    )
+    def test_accepts_documented_spellings(self, raw, expected):
+        assert resolve_synchronous_level(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "PARANOID",
+            "",
+            "   ",
+            4,
+            -1,
+            "4",
+            None,
+            [],
+            {},
+            2.5,
+            "2.0",
+        ],
+    )
+    def test_rejects_everything_else(self, raw):
+        assert resolve_synchronous_level(raw) is None
+
+    def test_yaml_off_is_a_level_but_yaml_on_is_not(self):
+        """`synchronous: off` is bool False in YAML and means OFF.
+
+        `synchronous: on` is bool True and means nothing -- there is no
+        durability level it could map to, so it must be rejected rather than
+        coerced to 1 by int(True).
+        """
+        assert resolve_synchronous_level(False) == 0
+        assert resolve_synchronous_level(True) is None
+
+
+class TestAppliedFromConfig:
+    def test_configured_level_reaches_the_connection(self, tmp_path, monkeypatch):
+        _config(monkeypatch, {"synchronous": "NORMAL"})
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "linux")
+            apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 1
+        finally:
+            conn.close()
+
+    def test_full_reaches_the_connection(self, tmp_path, monkeypatch):
+        """The #90837 case: an operator asking for FULL on Linux gets FULL.
+
+        Fails without the patch -- the pragma was never executed at all, so the
+        connection kept whatever the build's default was.
+        """
+        _config(monkeypatch, {"synchronous": "FULL"})
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "linux")
+            conn.execute("PRAGMA synchronous=0")
+            assert _level(conn) == 0
+            apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 2
+        finally:
+            conn.close()
+
+    def test_unset_leaves_the_level_alone(self, tmp_path, monkeypatch):
+        """No config key must mean no write -- this is the default path."""
+        _config(monkeypatch, {"wal_autocheckpoint": 1000})
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "linux")
+            conn.execute("PRAGMA synchronous=0")
+            apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 0
+            assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1000
+        finally:
+            conn.close()
+
+    def test_garbage_warns_and_changes_nothing(self, tmp_path, monkeypatch, caplog):
+        """A typo must not fall through to a different durability level."""
+        _config(monkeypatch, {"synchronous": "PARANOID"})
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "linux")
+            conn.execute("PRAGMA synchronous=2")
+            with caplog.at_level("WARNING"):
+                apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 2
+            assert "PARANOID" in caplog.text
+        finally:
+            conn.close()
+
+    def test_the_other_pragmas_still_apply(self, tmp_path, monkeypatch):
+        """Guardrail for #77630's five keys -- they share the same function."""
+        _config(
+            monkeypatch,
+            {"synchronous": "FULL", "wal_autocheckpoint": 250, "mmap_size": 0},
+        )
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "linux")
+            apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 2
+            assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 250
+            assert conn.execute("PRAGMA mmap_size").fetchone()[0] == 0
+        finally:
+            conn.close()
+
+
+class TestMacOSFloor:
+    """#64355 enforced FULL on Darwin. Config must not be able to undo it.
+
+    `_enforce_macos_synchronous_full()` runs inside `apply_wal_with_fallback()`,
+    which is earlier than `apply_database_pragmas()`, so without an explicit
+    floor the config value would simply win by running last.
+    """
+
+    def test_lowering_below_full_is_refused_on_darwin(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        _config(monkeypatch, {"synchronous": "NORMAL"})
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "darwin")
+            hermes_state_wal._enforce_macos_synchronous_full(conn)
+            assert _level(conn) == 2
+            with caplog.at_level("WARNING"):
+                apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 2, "config lowered the macOS btree protection"
+            assert "macOS" in caplog.text
+        finally:
+            conn.close()
+
+    def test_raising_above_full_is_allowed_on_darwin(self, tmp_path, monkeypatch):
+        """The floor is a floor, not a pin -- EXTRA is strictly safer."""
+        _config(monkeypatch, {"synchronous": "EXTRA"})
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "darwin")
+            apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 3
+        finally:
+            conn.close()
+
+    def test_the_floor_does_not_apply_off_darwin(self, tmp_path, monkeypatch):
+        """Linux operators may deliberately choose NORMAL for write volume."""
+        _config(monkeypatch, {"synchronous": "NORMAL"})
+        conn = _wal_conn(tmp_path)
+        try:
+            monkeypatch.setattr(sys, "platform", "linux")
+            conn.execute("PRAGMA synchronous=2")
+            apply_database_pragmas(conn, db_label="state.db")
+            assert _level(conn) == 1
+        finally:
+            conn.close()
+
+
+def test_example_config_documents_the_key():
+    """An unpinnable durability level is the bug; docs are half the fix."""
+    from pathlib import Path
+
+    text = Path(__file__).resolve().parents[2] / "cli-config.yaml.example"
+    body = text.read_text(encoding="utf-8")
+    assert "synchronous: FULL" in body
+
+
+def test_example_config_calls_the_darwin_rule_a_floor_not_a_pin():
+    """The macOS wording has to match _apply_synchronous_pragma's actual rule.
+
+    Saying macOS is "always held at FULL" reads as "your setting is ignored
+    here", which would talk an operator out of choosing EXTRA -- the one level
+    that IS honored on Darwin. Only sub-FULL values are refused. The wording
+    is the whole interface for a key nobody can otherwise observe, so pin the
+    distinction rather than just the key's presence.
+    """
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parents[2] / "cli-config.yaml.example"
+    ).read_text(encoding="utf-8")
+    assert "floor, not a pin" in body
+    assert "EXTRA is honored" in body
+    assert "always held" not in body
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_storage_failure_copy.py ===
+"""One copy table for "session storage unavailable / not written" across CLI, gateway and RPC.
+
+Contract: the user gets a plain cause + the exact repair command, never the raw sqlite text as the
+lead, plus a stable machine-readable `code` a GUI can key a "Run doctor" button on.
+"""
+
+import sqlite3
+
+import pytest
+
+from hermes_state_user_copy import describe_storage_failure, storage_failure_details
+
+
+@pytest.mark.parametrize(
+    ("exc", "code", "command"),
+    [
+        (sqlite3.OperationalError("database is locked"), "storage_locked", "try again"),
+        (sqlite3.OperationalError("attempt to write a readonly database"), "storage_readonly", "hermes doctor --fix"),
+        (sqlite3.DatabaseError("database disk image is malformed"), "storage_corrupt", "hermes doctor --fix"),
+        (OSError(28, "No space left on device"), "disk_full", "Free some disk space"),
+        (None, "storage_unavailable", "hermes doctor --fix"),
+    ],
+)
+def test_each_cause_has_a_stable_code_and_an_action(exc, code, command):
+    failure = describe_storage_failure(exc)
+    assert failure.code == code
+    assert command in failure.action
+    assert failure.gloss and failure.gloss[0].islower()  # a clause that follows "Cause:"
+    # The raw sqlite wording never leaks into the user-facing gloss.
+    assert "sqlite" not in failure.gloss.lower() and "OperationalError" not in failure.gloss
+
+
+def test_details_line_is_flattened_and_bounded():
+    details = storage_failure_details("line one\n   line two " + "x" * 400, limit=60)
+    assert "\n" not in details and len(details) == 60 and details.endswith("...")
+
+
+def test_action_command_is_pinned_to_the_failing_profile(monkeypatch, tmp_path):
+    """The action names the profile whose store failed (multi-profile backends serve sessions
+    whose state.db is not the process default; a bare ``hermes`` follows active_profile)."""
+    from hermes_constants import profile_cli_selector
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "research"))
+    selector = profile_cli_selector()
+    assert selector.strip()
+    for exc in (sqlite3.OperationalError("database is locked"), sqlite3.DatabaseError("malformed"), None):
+        action = describe_storage_failure(exc).action
+        assert "{profile_arg}" not in action
+        assert f"`hermes {selector}" in action and "`hermes doctor" not in action and "`hermes gateway" not in action
+

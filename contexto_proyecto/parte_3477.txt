@@ -1,0 +1,264 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_profile_export_special_files.py ===
+"""Tests for special-file handling during profile export.
+
+:func:`shutil.copytree` cannot copy Unix sockets, FIFOs, or device nodes —
+it collects "[Errno 6] No such device or address" and raises
+``shutil.Error`` at the end of the walk. Profiles accumulate such files in
+normal operation (e.g. a stale agent-browser control socket under
+``home/.agent-browser/``), so exports must skip them instead of failing
+the whole archive.
+"""
+
+import os
+import socket
+import sys
+import tarfile
+
+import pytest
+
+from hermes_cli.profiles import export_profile
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Unix sockets and FIFOs are not available on Windows",
+)
+
+
+def _patch_named_profile(monkeypatch, profiles_root, profile_dir):
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda n: profile_dir)
+    monkeypatch.setattr("hermes_cli.profiles.validate_profile_name", lambda n: None)
+
+
+def _bind_unix_socket(monkeypatch, path):
+    """Bind an AF_UNIX socket at *path*.
+
+    Binds via a cwd-relative name so pytest's long tmp paths stay under the
+    ~104-byte ``sun_path`` limit on macOS. The filesystem entry outlives the
+    close — exactly the stale-socket state a real profile ends up with.
+    """
+    monkeypatch.chdir(path.parent)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.bind(path.name)
+
+
+def test_named_profile_export_survives_unix_socket(tmp_path, monkeypatch):
+    """Sockets and FIFOs in a named profile are skipped, not fatal."""
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / "sockety"
+    browser_dir = profile_dir / "home" / ".agent-browser"
+    browser_dir.mkdir(parents=True)
+
+    (profile_dir / "config.yaml").write_text("model: gpt-4\n")
+    (browser_dir / "state.json").write_text("{}\n")
+
+    # One socket the *.sock suffix rule catches, one only lstat can catch,
+    # and a FIFO — none of them may fail or enter the export.
+    _bind_unix_socket(monkeypatch, browser_dir / "dev-12345.sock")
+    _bind_unix_socket(monkeypatch, browser_dir / "control")
+    os.mkfifo(browser_dir / "events")
+
+    _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+    result = export_profile("sockety", str(tmp_path / "sockety.tar.gz"))
+
+    with tarfile.open(result, "r:gz") as tf:
+        names = tf.getnames()
+
+    assert any("config.yaml" in n for n in names)
+    assert any("state.json" in n for n in names)
+    assert not any(".sock" in n for n in names)
+    assert not any(n.endswith(("control", "events")) for n in names)
+
+
+def test_default_profile_export_survives_unix_socket(tmp_path, monkeypatch):
+    """The default-profile export skips suffixless sockets in allowed dirs."""
+    profile_dir = tmp_path / "hermes_home"
+    sessions_dir = profile_dir / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    (profile_dir / "config.yaml").write_text("model: gpt-4\n")
+    (sessions_dir / "log.jsonl").write_text("{}\n")
+    _bind_unix_socket(monkeypatch, sessions_dir / "ipc")
+
+    _patch_named_profile(monkeypatch, tmp_path / "profiles", profile_dir)
+
+    result = export_profile("default", str(tmp_path / "default.tar.gz"))
+
+    with tarfile.open(result, "r:gz") as tf:
+        names = tf.getnames()
+
+    assert any("config.yaml" in n for n in names)
+    assert any("log.jsonl" in n for n in names)
+    assert not any(n.endswith("ipc") for n in names)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_profile_identity_purge_cmd.py ===
+"""The `hermes profile purge-identity` retry path: dispatched, and honest about failure.
+
+`hermes profile delete` reports a pending identity settlement when it cannot purge and names this
+command as the retry — so the command must actually reach a handler, and must fail loudly when the
+settlement still cannot be made. Regression for the delete side of #111926.
+"""
+import argparse
+from argparse import Namespace
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import profile_cmd, profiles
+
+
+@pytest.fixture()
+def profile_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    return tmp_path
+
+
+def test_every_profile_subcommand_has_a_dispatch_entry():
+    """A subcommand that parses but has no entry in the dispatch table silently does nothing."""
+    from hermes_cli.subcommands.profile import build_profile_parser
+    top = argparse.ArgumentParser()
+    subparsers = top.add_subparsers(dest="command")
+    build_profile_parser(subparsers, cmd_profile=lambda args: None)
+    profile_parser = subparsers.choices["profile"]
+    groups = [a for a in profile_parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert groups, "the profile parser exposes subcommands"
+    assert set(groups[0].choices) == set(profile_cmd.PROFILE_ACTIONS) - {None}
+
+
+def test_purge_identity_reports_success(profile_env, monkeypatch, capsys):
+    monkeypatch.setattr("hermes_cli.profile_identity.purge_profile_identity", lambda name: True)
+
+    profile_cmd.cmd_profile(Namespace(profile_action="purge-identity", profile_name="gone"))
+
+    assert "identity purged: gone" in capsys.readouterr().out
+
+
+def test_purge_identity_exits_nonzero_when_settlement_stays_pending(
+        profile_env, monkeypatch, capsys):
+    monkeypatch.setattr("hermes_cli.profile_identity.purge_profile_identity", lambda name: False)
+
+    with pytest.raises(SystemExit) as exc:
+        profile_cmd.cmd_profile(Namespace(profile_action="purge-identity", profile_name="gone"))
+
+    assert exc.value.code not in (0, None)
+    assert "hermes profile purge-identity gone" in capsys.readouterr().err
+
+
+def test_purge_identity_refuses_a_same_name_profile_created_after_the_delete(profile_env, capsys):
+    """The retry must not purge identity out from under a profile that exists again.
+
+    The purge keys off the name alone, so the recovery flow — ``delete foo`` (settlement pending),
+    ``create foo``, ``purge-identity foo`` — would delete the NEW incarnation's routing/heartbeat
+    identity. The delete path tombstones the directory before it purges, so this refusal cannot
+    block the delete it belongs to (``TestDeleteProfile`` covers that path).
+    """
+    import json
+
+    from hermes_cli.profiles import create_profile
+    from hermes_state import SessionDB
+
+    create_profile("gone", no_alias=True)
+    scope = str(profile_env / ".hermes" / "sessions")
+    db = SessionDB(profile_env / ".hermes" / "state.db")
+    db.save_gateway_routing_entry(
+        "agent:gone:feishu:dm:chatA",
+        json.dumps({"session_key": "agent:gone:feishu:dm:chatA"}), scope=scope)
+    db.close()
+
+    with pytest.raises(SystemExit) as exc:
+        profile_cmd.cmd_profile(Namespace(profile_action="purge-identity", profile_name="gone"))
+
+    assert exc.value.code not in (0, None)
+    assert "purge-identity only settles the identity of a delete" in capsys.readouterr().out
+    check = SessionDB(profile_env / ".hermes" / "state.db")
+    try:
+        # The recreated profile still owns its routing key.
+        assert set(check.load_gateway_routing_entries(scope=scope)) == {
+            "agent:gone:feishu:dm:chatA"}
+    finally:
+        check.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_profile_install_env_encoding.py ===
+"""Regression: the distribution-install preview must read .env as UTF-8.
+
+`_render_distribution_plan` inspects the target profile's `.env` to decide
+whether a required env var is already set, so it doesn't nag the user. It
+used `Path.read_text()` with no encoding, which:
+
+  1. defaults to the system locale (cp1251/GBK on Windows) and raises
+     `UnicodeDecodeError` on any non-ASCII byte — and the surrounding
+     `except OSError` does NOT catch that (it's a `ValueError`), so a
+     mis-encoded .env aborts the whole install preview; and
+  2. even on a UTF-8 locale, a Notepad-added BOM prefixes the first key,
+     so the very first env var is mis-detected as "needs setting".
+
+The fix reads `utf-8-sig` and also catches `UnicodeDecodeError`.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_cli.profile_cmd import _render_distribution_plan
+
+
+def _make_plan(target_dir, env_requires):
+    manifest = SimpleNamespace(
+        name="demo",
+        version="1.0.0",
+        description="",
+        author="",
+        hermes_requires="",
+        env_requires=env_requires,
+    )
+    return SimpleNamespace(
+        manifest=manifest,
+        provenance="local",
+        target_dir=target_dir,
+        existing=False,
+        has_cron=False,
+    )
+
+
+def test_bom_prefixed_env_first_key_is_detected_as_set(tmp_path, monkeypatch, capsys):
+    """A required key on the first line of a BOM-prefixed .env reads as set."""
+    monkeypatch.delenv("FOO_TOKEN", raising=False)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    # utf-8-sig write == UTF-8 with a leading BOM, exactly what Notepad emits.
+    (profile / ".env").write_text("FOO_TOKEN=abc\nBAR=1\n", encoding="utf-8-sig")
+
+    plan = _make_plan(profile, [SimpleNamespace(name="FOO_TOKEN", required=True, description="")])
+    _render_distribution_plan(plan)
+
+    out = capsys.readouterr().out
+    foo_line = next(ln for ln in out.splitlines() if "FOO_TOKEN" in ln)
+    assert "✓ set" in foo_line, f"BOM must not hide the first key: {foo_line!r}"
+
+
+def test_non_utf8_env_does_not_abort_the_preview(tmp_path, monkeypatch, capsys):
+    """A .env with invalid UTF-8 bytes must not crash the install preview."""
+    monkeypatch.delenv("FOO_TOKEN", raising=False)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    # \xff is an invalid UTF-8 start byte -> UnicodeDecodeError on read.
+    (profile / ".env").write_bytes(b"FOO_TOKEN=\xff\xfe bad\n")
+
+    plan = _make_plan(profile, [SimpleNamespace(name="FOO_TOKEN", required=True, description="")])
+
+    # Must return normally (old `except OSError` let UnicodeDecodeError escape).
+    _render_distribution_plan(plan)
+
+    out = capsys.readouterr().out
+    assert any("FOO_TOKEN" in ln for ln in out.splitlines())
+

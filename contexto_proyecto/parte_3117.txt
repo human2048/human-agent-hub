@@ -1,0 +1,256 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_clear_stale_base_url.py ===
+"""Tests for _clear_stale_openai_base_url() cleanup after provider switch (#5161)."""
+
+from __future__ import annotations
+
+
+from hermes_cli.config import load_config, save_config, save_env_value, get_env_value
+
+
+def _write_provider(provider: str, model: str = "test-model"):
+    """Helper: write a provider + model to config.yaml."""
+    cfg = load_config()
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    model_cfg["provider"] = provider
+    model_cfg["default"] = model
+    cfg["model"] = model_cfg
+    save_config(cfg)
+
+
+class TestClearStaleOpenaiBaseUrl:
+    """_clear_stale_openai_base_url() removes OPENAI_BASE_URL when provider is not custom."""
+
+    def test_clears_when_provider_is_named(self, monkeypatch):
+        """OPENAI_BASE_URL is cleared when config provider is a named provider."""
+        from hermes_cli.main_provider_setup import _clear_stale_openai_base_url
+
+        _write_provider("openrouter")
+        save_env_value("OPENAI_BASE_URL", "http://localhost:11434/v1")
+
+        _clear_stale_openai_base_url()
+
+        result = get_env_value("OPENAI_BASE_URL")
+        assert not result, f"Expected OPENAI_BASE_URL to be cleared, got: {result!r}"
+
+    def test_preserves_when_provider_is_custom(self, monkeypatch):
+        """OPENAI_BASE_URL is NOT cleared when config provider is 'custom'."""
+        from hermes_cli.main_provider_setup import _clear_stale_openai_base_url
+
+        _write_provider("custom")
+        save_env_value("OPENAI_BASE_URL", "http://localhost:11434/v1")
+
+        _clear_stale_openai_base_url()
+
+        result = get_env_value("OPENAI_BASE_URL")
+        assert result == "http://localhost:11434/v1", \
+            f"Expected OPENAI_BASE_URL to be preserved, got: {result!r}"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_clipboard_text_write.py ===
+"""Tests for native clipboard text write (hermes_cli/clipboard.py).
+
+Mirrors the TUI's writeClipboardText fallback chain: pbcopy /
+PowerShell Set-Clipboard / wl-copy / xclip / xsel, with OSC 52 left to
+the caller when every backend fails.
+"""
+import base64
+import subprocess
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli import clipboard as clip
+
+
+def _completed(returncode=0):
+    return subprocess.CompletedProcess(args=[], returncode=returncode)
+
+
+@pytest.mark.macos_only
+def test_darwin_uses_pbcopy():
+    with patch.object(clip.subprocess, "run", return_value=_completed()) as run:
+        assert clip.write_clipboard_text("hello") is True
+    argv = run.call_args[0][0]
+    assert argv == ["pbcopy"]
+    assert run.call_args[1]["input"] == b"hello"
+
+
+@pytest.mark.linux_only
+def test_linux_falls_through_backends_until_success():
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv[0])
+        # xclip fails, xsel succeeds
+        return _completed(returncode=0 if argv[0] == "xsel" else 1)
+
+    with patch.object(clip, "_is_wsl", return_value=False), \
+         patch.dict(clip.os.environ, {}, clear=False), \
+         patch.object(clip.os.environ, "get", lambda k, d=None: None), \
+         patch.object(clip.subprocess, "run", side_effect=fake_run):
+        assert clip.write_clipboard_text("x") is True
+    assert calls == ["xclip", "xsel"]
+
+
+
+
+
+
+
+
+class TestOsc52MultiplexerWrapping:
+    """CLI _write_osc52_clipboard must wrap for tmux/screen passthrough
+    (mirrors ui-tui/src/lib/osc52.ts wrapForMultiplexer)."""
+
+    def _capture_seq(self, env):
+        import io
+        from unittest.mock import patch as _patch
+        from cli import HermesCLI
+
+        cli_obj = HermesCLI.__new__(HermesCLI)
+        cli_obj._app = None
+        buf = io.StringIO()
+        with _patch.dict(clip.os.environ, env, clear=False), \
+             _patch("cli.sys.stdout", buf):
+            for var in ("TMUX", "STY"):
+                if var not in env:
+                    clip.os.environ.pop(var, None)
+            cli_obj._write_osc52_clipboard("hello")
+        return buf.getvalue()
+
+    def test_tmux_wraps_in_dcs_passthrough(self, monkeypatch):
+        monkeypatch.setenv("TMUX", "/tmp/tmux-123/default,1,0")
+        monkeypatch.delenv("STY", raising=False)
+        seq = self._capture_seq({"TMUX": "/tmp/tmux-123/default,1,0"})
+        assert seq.startswith("\x1bPtmux;")
+        assert "]52;c;" in seq
+        assert seq.endswith("\x1b\\")
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_active_agent_ref_wiring.py ===
+"""Regression test for #49287 — the CLI memory-provider ``on_session_end``
+hook stopped firing on ``/exit`` after the god-file Phase 4 refactor
+(094aa85c37) moved agent construction into ``CLIAgentSetupMixin``.
+
+``_run_cleanup`` (in ``cli.py``) gates the memory-shutdown call on the
+module global ``cli._active_agent_ref``. The mixin used to set it with a
+bare ``global _active_agent_ref`` — correct while the code lived in
+``cli.py``, but after extraction that ``global`` binds the *mixin module's*
+namespace, leaving ``cli._active_agent_ref`` ``None`` forever. The cleanup
+``if _active_agent_ref:`` branch was then dead, so ``shutdown_memory_provider``
+(and therefore every provider's ``on_session_end``) never ran on CLI exit.
+
+The fix writes the reference onto the ``cli`` module explicitly. These tests
+assert that contract — the existing shutdown tests pass only because they
+hand-assign ``cli._active_agent_ref``, which is exactly what masked the bug.
+"""
+
+from __future__ import annotations
+
+import inspect
+
+
+def test_mixin_writes_active_agent_ref_to_cli_module():
+    """The mixin's agent-setup code must publish the agent reference where
+    ``_run_cleanup`` reads it — on the ``cli`` module, not the mixin module."""
+    import cli as cli_mod
+    from hermes_cli import cli_agent_setup_mixin as mixin_mod
+
+    sentinel = object()
+    prev_cli = getattr(cli_mod, "_active_agent_ref", None)
+    prev_mixin = getattr(mixin_mod, "_active_agent_ref", "<unset>")
+    try:
+        # Reproduce the exact assignment the mixin performs after building
+        # the agent (see CLIAgentSetupMixin near the AIAgent(...) construction).
+        import cli as _cli
+        _cli._active_agent_ref = sentinel
+
+        # The cleanup path reads cli._active_agent_ref — it must see the value.
+        assert cli_mod._active_agent_ref is sentinel
+    finally:
+        cli_mod._active_agent_ref = prev_cli
+        if prev_mixin == "<unset>":
+            if hasattr(mixin_mod, "_active_agent_ref"):
+                delattr(mixin_mod, "_active_agent_ref")
+        else:
+            mixin_mod._active_agent_ref = prev_mixin
+
+
+def test_mixin_does_not_use_bare_global_for_active_agent_ref():
+    """Guard against a regression to ``global _active_agent_ref`` inside the
+    mixin: a bare module-local global would write the wrong namespace and
+    silently re-break CLI memory shutdown. The source must target ``cli``."""
+    from hermes_cli import cli_agent_setup_mixin as mixin_mod
+
+    src = inspect.getsource(mixin_mod)
+    assert "_active_agent_ref = self.agent" in src, (
+        "mixin no longer publishes the agent reference for atexit cleanup"
+    )
+    # The assignment must go through the cli module, not a bare module global.
+    # Inspect executable lines only (a bare ``global _active_agent_ref``
+    # statement), ignoring prose in comments/docstrings that mention it.
+    code_lines = [ln.split("#", 1)[0].strip() for ln in src.splitlines()]
+    assert "global _active_agent_ref" not in code_lines, (
+        "bare `global _active_agent_ref` in the mixin binds the wrong module "
+        "namespace — cli._active_agent_ref stays None and memory shutdown dies "
+        "(#49287). Write `cli._active_agent_ref = self.agent` instead."
+    )
+    assert "_cli._active_agent_ref = self.agent" in src, (
+        "expected the agent reference to be published onto the cli module"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_active_session_limit.py ===
+from cli import HermesCLI
+from hermes_cli.active_sessions import (
+    active_session_registry_snapshot,
+    try_acquire_active_session,
+)
+
+
+def test_cli_claim_active_session_respects_global_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    cfg = {"max_concurrent_sessions": 1}
+    held, message = try_acquire_active_session(
+        session_id="held-session",
+        surface="tui",
+        config=cfg,
+    )
+    assert message is None
+    assert held is not None
+
+    cli = object.__new__(HermesCLI)
+    cli.session_id = "new-cli-session"
+    cli.config = cfg
+    cli._active_session_lease = None
+    printed: list[str] = []
+    cli._console_print = lambda text: printed.append(text)
+
+    try:
+        assert cli._claim_active_session("cli") is False
+        assert len(printed) == 1
+        assert "active session limit (1/1)" in printed[0]
+        # Names the holding surface ("tui"), not the blocked one.
+        assert "Held by: tui" in printed[0]
+
+        held.release()
+
+        assert cli._claim_active_session("cli") is True
+        assert [entry["session_id"] for entry in active_session_registry_snapshot()] == [
+            "new-cli-session"
+        ]
+    finally:
+        held.release()
+        cli._release_active_session()
+

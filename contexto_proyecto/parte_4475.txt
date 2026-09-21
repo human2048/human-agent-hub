@@ -1,0 +1,420 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_personality_clobbers_system_prompt.py ===
+"""Reproduction: /personality (desktop config.set) clobbers agent.system_prompt.
+
+The desktop/TUI backend exposes a `config.set key=personality` RPC
+(tui_gateway/server.py, the `@method("config.set")` handler). When the user
+selects a personality (the desktop "assistant style" picker routes here), the
+handler does:
+
+    _write_config_key("display.personality", pname)
+    _write_config_key("agent.system_prompt", new_prompt)   # <-- clobbers manual text
+
+`agent.system_prompt` is the user's GLOBAL manual system prompt (read by
+`/prompt` and the CLI's ephemeral-prompt path). Overwriting it with a
+personality's text destroys the manual prompt. The sibling in-chat slash path
+(server.py `/personality` handler) does NOT touch `agent.system_prompt` -- it
+only sets the in-session `agent.ephemeral_system_prompt` -- so the two paths
+disagree.
+
+Contract tested here:
+1. A pre-existing manual `agent.system_prompt` must survive selecting a
+   personality via `config.set key=personality` (the global manual prompt is
+   a SEPARATE concept from the per-session personality overlay).
+2. Selecting a different personality must not leave a stale personality's
+   text in `agent.system_prompt`.
+
+This test drives the REAL `_write_config_key` / `_save_cfg` against a temp
+HERMES_HOME config.yaml (no mocks of the persistence layer), so the captured
+config file is genuine proof of the write.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import tui_gateway.server as server
+import yaml
+
+
+MANUAL_PROMPT = "manual_prompt_1"
+PERSONALITY_1 = "personality_1"
+PERSONALITY_2 = "personality_2"
+
+
+def _seed_config(home: str) -> None:
+    cfg = {
+        "agent": {
+            "system_prompt": MANUAL_PROMPT,
+            "personalities": {
+                "personality_1": PERSONALITY_1,
+                "personality_2": PERSONALITY_2,
+            },
+        },
+        "display": {"personality": "none"},
+    }
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+
+
+def _read_saved_system_prompt(home: str) -> str:
+    with open(os.path.join(home, "config.yaml"), encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return (data.get("agent", {}) or {}).get("system_prompt", "")
+
+
+def _set(params: dict) -> dict:
+    return server._methods["config.set"]("rid-1", params)
+
+
+def _make_session(session_id: str):
+    """Mirror a live desktop session: real agent namespace + history buffer."""
+    agent = MagicMock()
+    agent.ephemeral_system_prompt = None
+    return {
+        "session_key": session_id,
+        "agent": agent,
+        "history": [],
+        "history_version": 0,
+        "history_lock": MagicMock(__enter__=lambda self: None, __exit__=lambda self, *a: None),
+    }
+
+
+def _run(home: str, session_id: str = ""):
+    """Select `personality_1` via the desktop personality RPC.
+
+    We stub the live-session pivot (_apply_personality_to_session) because the
+    bug under test is the *config write* at server.py:11328-11329, not the
+    in-session marker injection. Keeping it real would require a fully-built
+    agent; the write happens before it regardless.
+    """
+    sid = session_id or "s1"
+    session = _make_session(sid)
+    with (
+        patch.dict(
+            server._sessions, {sid: session}, clear=False
+        ),
+        patch.object(server, "_apply_personality_to_session", return_value=(False, None)),
+        # The handler calls these for the live-session pivot; not under test.
+        patch.object(server, "_persist_live_session_runtime"),
+        patch.object(server, "_emit"),
+    ):
+        resp = _set({"key": "personality", "value": "personality_1", "session_id": sid})
+    return resp
+
+
+def test_personality_selection_preserves_manual_system_prompt(tmp_path, monkeypatch):
+    """Selecting a personality must NOT overwrite the manual agent.system_prompt."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Force the server module to pick up the temp home for config reads/writes.
+    monkeypatch.setattr(server, "_hermes_home", Path(tmp_path))
+    monkeypatch.setattr(server, "_cfg_path", None)
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    _seed_config(str(tmp_path))
+
+    resp = _run(str(tmp_path))
+
+    assert resp["result"]["value"] == "personality_1", resp
+    # THE BUG: the manual system_prompt was overwritten by the personality.
+    saved = _read_saved_system_prompt(str(tmp_path))
+    assert saved == MANUAL_PROMPT, (
+        "agent.system_prompt was clobbered by the personality selection.\n"
+        f"  expected (manual): {MANUAL_PROMPT!r}\n"
+        f"  got (personality): {saved!r}"
+    )
+
+
+def test_switching_personality_leaves_no_stale_text(tmp_path, monkeypatch):
+    """After choosing `personality_2`, agent.system_prompt must retain the manual prompt.
+
+    The bug: selecting any personality overwrites agent.system_prompt with that
+    personality's text. So after `personality_1` then `personality_2`, the field
+    holds `personality_2`'s text -- still NOT the user's manual prompt. The field
+    should have been left untouched (the personality overlay belongs in the
+    in-session ephemeral prompt, not the durable global system prompt).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "_hermes_home", Path(tmp_path))
+    monkeypatch.setattr(server, "_cfg_path", None)
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    _seed_config(str(tmp_path))
+
+    _run(str(tmp_path), session_id="a")
+    # Now switch to a different personality.
+    session = _make_session("a")
+    with (
+        patch.dict(
+            server._sessions, {"a": session}, clear=False
+        ),
+        patch.object(server, "_apply_personality_to_session", return_value=(False, None)),
+        patch.object(server, "_persist_live_session_runtime"),
+        patch.object(server, "_emit"),
+    ):
+        resp = _set({"key": "personality", "value": "personality_2", "session_id": "a"})
+
+    assert resp["result"]["value"] == "personality_2", resp
+    saved = _read_saved_system_prompt(str(tmp_path))
+    assert saved == MANUAL_PROMPT, (
+        "agent.system_prompt still holds a personality's text after switching "
+        f"personalities; the manual prompt was lost.\n"
+        f"  expected (manual): {MANUAL_PROMPT!r}\n"
+        f"  got: {saved!r}"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_pet_generate_rpc.py ===
+"""Gateway RPC tests for pet generation (pet.generate / pet.hatch).
+
+Image generation is mocked, so these assert the RPC contract + staging behavior
+(draft tokens, data-URI previews, expiry, activation) without any API calls.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("PIL")
+from PIL import Image  # noqa: E402
+
+from tui_gateway import server  # noqa: E402
+
+
+def _png(path):
+    Image.new("RGBA", (64, 64), (200, 80, 80, 255)).save(path)
+
+
+def test_pet_generate_requires_prompt():
+    resp = server._methods["pet.generate"]("r1", {"prompt": "  "})
+    assert "error" in resp
+
+
+def _fake_drafts_factory(tmp_path):
+    def fake_drafts(prompt, *, n=4, style="auto", reference_images=None, provider=None, on_draft=None, is_cancelled=None):
+        paths = []
+        for i in range(n):
+            p = tmp_path / f"d{i}.png"
+            _png(p)
+            paths.append(p)
+            if on_draft is not None:
+                on_draft(i, p)
+        return paths
+
+    return fake_drafts
+
+
+def _fake_hatch_factory(captured):
+    """A hatch that registers a real local pet (so the preview payload populates)."""
+    import agent.pet.generate as gen
+    from agent.pet import store
+
+    def fake_hatch(*, base_image, slug, display_name="", description="", concept="", style="auto", on_progress=None, provider=None, is_cancelled=None):
+        captured["base_image"] = str(base_image)
+        captured["slug"] = slug
+        pet = store.register_local_pet(
+            Image.new("RGBA", (192, 208), (10, 20, 30, 255)),
+            slug=slug,
+            display_name=display_name,
+            description=description,
+        )
+        return gen.HatchResult(
+            slug=pet.slug,
+            display_name=display_name or pet.display_name,
+            spritesheet=pet.spritesheet,
+            states=["idle", "wave"],
+            validation={"ok": True, "warnings": ["state 'jump' has no frames"]},
+        )
+
+    return fake_hatch
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_ping_probe.py ===
+"""Tests for the ``ping`` liveness probe (tui_gateway/server.py).
+
+The desktop client probes ``ping`` after sleep/wake to distinguish a
+half-open TCP socket (connectionState still ``open`` while every RPC hangs)
+from a genuinely healthy connection. The contract is minimal on purpose:
+answered synchronously on the WS reader thread, no session, no IO, no agent.
+"""
+
+from __future__ import annotations
+
+import tui_gateway.server as srv
+
+
+def _call(method: str, params: dict) -> dict:
+    """Invoke a registered RPC method and return its result dict."""
+    envelope = srv._methods[method](1, params)
+    return envelope["result"]
+
+
+def test_ping_registered_and_answers_pong():
+    res = _call("ping", {})
+    assert res == {"pong": True}
+
+
+def test_ping_ignores_params_and_returns_ok_envelope():
+    # The probe must be parameter-agnostic: the client sends {} but a stray
+    # future caller must not be able to make it fail.
+    envelope = srv._methods["ping"](7, {"anything": "value"})
+    assert envelope["jsonrpc"] == "2.0"
+    assert envelope["id"] == 7
+    assert envelope["result"] == {"pong": True}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_plugins_manage_install.py ===
+"""Gateway plugins.manage install action."""
+
+from unittest.mock import patch
+
+from tui_gateway import server
+
+
+def test_plugins_manage_install_success():
+    payload = {
+        "ok": True,
+        "plugin_name": "hello-world",
+        "warnings": [],
+        "missing_env": [],
+        "after_install_path": None,
+        "enabled": True,
+    }
+    with patch(
+        "hermes_cli.plugins_cmd.dashboard_install_plugin",
+        return_value=payload,
+    ) as mock_install:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "plugins.manage",
+                "params": {
+                    "action": "install",
+                    "repo": "owner/hello-world",
+                    "force": True,
+                    "enable": False,
+                },
+            }
+        )
+
+    assert "result" in resp
+    assert resp["result"]["plugin_name"] == "hello-world"
+    mock_install.assert_called_once_with(
+        "owner/hello-world",
+        force=True,
+        enable=False,
+        catalog_name=None,
+        ref=None,
+    )
+
+
+def test_plugins_manage_install_missing_identifier():
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "plugins.manage",
+            "params": {"action": "install"},
+        }
+    )
+
+    assert "error" in resp
+    assert "identifier" in resp["error"]["message"]
+
+
+def test_plugins_manage_install_failure():
+    with patch(
+        "hermes_cli.plugins_cmd.dashboard_install_plugin",
+        return_value={"ok": False, "error": "Git clone failed"},
+    ):
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "plugins.manage",
+                "params": {
+                    "action": "install",
+                    "identifier": "bad/repo",
+                },
+            }
+        )
+
+    assert "error" in resp
+    assert "Git clone failed" in resp["error"]["message"]
+
+
+def test_plugins_manage_install_catalog_name_only():
+    """A catalog pick needs no identifier — the backend resolves repo + pin."""
+    payload = {"ok": True, "plugin_name": "weather-plugin", "enabled": False}
+    with patch(
+        "hermes_cli.plugins_cmd.dashboard_install_plugin",
+        return_value=payload,
+    ) as mock_install:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "plugins.manage",
+                "params": {
+                    "action": "install",
+                    "catalog_name": "weather-plugin",
+                    "enable": False,
+                },
+            }
+        )
+
+    assert "result" in resp
+    mock_install.assert_called_once_with(
+        "",
+        force=False,
+        enable=False,
+        catalog_name="weather-plugin",
+        ref=None,
+    )
+
+
+def test_plugins_manage_update_requires_catalog_sidecar(tmp_path, monkeypatch):
+    """Non-catalog installs are refused — their update flows stay CLI-owned."""
+    import hermes_cli.plugins_cmd as plugins_cmd
+
+    plugins_root = tmp_path / "plugins"
+    (plugins_root / "plain-git-plugin").mkdir(parents=True)
+    monkeypatch.setattr(plugins_cmd, "_plugins_dir", lambda: plugins_root)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "plugins.manage",
+            "params": {"action": "update", "name": "plain-git-plugin"},
+        }
+    )
+
+    assert "error" in resp
+    assert "not a catalog install" in resp["error"]["message"]
+
+
+def test_plugins_manage_list_reports_desktop_half(tmp_path):
+    """A unified package (plugin.yaml + desktop/plugin.js) is reported with ``has_desktop_half`` so the
+    desktop app can pair its app-level copy of that half with the agent row — one package, ONE row."""
+    unified = tmp_path / "media"
+    (unified / "desktop").mkdir(parents=True)
+    (unified / "desktop" / "plugin.js").write_text("export default {}")
+    agent_only = tmp_path / "snap"
+    agent_only.mkdir()
+    rows = [
+        ("media", "1.0", "Media", "user", unified, "media"),
+        ("snap", "1.0", "Snap", "user", agent_only, "snap"),
+    ]
+    with patch("hermes_cli.plugins_cmd._discover_all_plugins", return_value=rows), \
+         patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
+         patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()), \
+         patch("hermes_cli.plugins_cmd_catalog.catalog_pins", return_value={}):
+        resp = server.handle_request({"id": "1", "method": "plugins.manage", "params": {"action": "list"}})
+
+    by_name = {r["name"]: r for r in resp["result"]["plugins"]}
+    assert by_name["media"]["has_desktop_half"] is True
+    assert by_name["snap"]["has_desktop_half"] is False
+

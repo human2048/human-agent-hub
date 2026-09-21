@@ -1,0 +1,691 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\optional\mlops\mlops-llava.md ===
+---
+title: "Llava — 大型语言与视觉助手"
+sidebar_label: "Llava"
+description: "大型语言与视觉助手"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Llava
+
+大型语言与视觉助手。支持视觉指令微调（instruction tuning）和基于图像的对话。将 CLIP 视觉编码器与 Vicuna/LLaMA 语言模型相结合。支持多轮图像对话、视觉问答（VQA）和指令跟随。适用于视觉语言聊天机器人或图像理解任务。最适合对话式图像分析。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 可选 — 通过 `hermes skills install official/mlops/llava` 安装 |
+| 路径 | `optional-skills/mlops/llava` |
+| 版本 | `1.0.0` |
+| 作者 | Orchestra Research |
+| 许可证 | MIT |
+| 依赖项 | `transformers`, `torch`, `pillow` |
+| 平台 | linux, macos, windows |
+| 标签 | `LLaVA`, `Vision-Language`, `Multimodal`, `Visual Question Answering`, `Image Chat`, `CLIP`, `Vicuna`, `Conversational AI`, `Instruction Tuning`, `VQA` |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发该 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+:::
+
+# LLaVA - 大型语言与视觉助手
+
+用于对话式图像理解的开源视觉语言模型。
+
+## 何时使用 LLaVA
+
+**适用场景：**
+- 构建视觉语言聊天机器人
+- 视觉问答（VQA）
+- 图像描述与字幕生成
+- 多轮图像对话
+- 视觉指令跟随
+- 含图像的文档理解
+
+**指标**：
+- **GitHub 23,000+ 星标**
+- GPT-4V 级别能力（目标）
+- Apache 2.0 许可证
+- 多种模型规格（7B–34B 参数）
+
+**改用其他方案的情况**：
+- **GPT-4V**：质量最高，基于 API
+- **CLIP**：简单零样本分类
+- **BLIP-2**：更适合纯字幕生成
+- **Flamingo**：研究用途，非开源
+
+## 快速开始
+
+### 安装
+
+```bash
+# Clone repository
+git clone https://github.com/haotian-liu/LLaVA
+cd LLaVA
+
+# Install
+pip install -e .
+```
+
+### 基本用法
+
+```python
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.conversation import conv_templates
+from PIL import Image
+import torch
+
+# Load model
+model_path = "liuhaotian/llava-v1.5-7b"
+tokenizer, model, image_processor, context_len = load_pretrained_model(
+    model_path=model_path,
+    model_base=None,
+    model_name=get_model_name_from_path(model_path)
+)
+
+# Load image
+image = Image.open("image.jpg")
+image_tensor = process_images([image], image_processor, model.config)
+image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+
+# Create conversation
+conv = conv_templates["llava_v1"].copy()
+conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\nWhat is in this image?")
+conv.append_message(conv.roles[1], None)
+prompt = conv.get_prompt()
+
+# Generate response
+input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
+
+with torch.inference_mode():
+    output_ids = model.generate(
+        input_ids,
+        images=image_tensor,
+        do_sample=True,
+        temperature=0.2,
+        max_new_tokens=512
+    )
+
+response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+print(response)
+```
+
+## 可用模型
+
+| 模型 | 参数量 | 显存 | 质量 |
+|-------|------------|------|---------|
+| LLaVA-v1.5-7B | 7B | ~14 GB | 良好 |
+| LLaVA-v1.5-13B | 13B | ~28 GB | 较好 |
+| LLaVA-v1.6-34B | 34B | ~70 GB | 最佳 |
+
+```python
+# Load different models
+model_7b = "liuhaotian/llava-v1.5-7b"
+model_13b = "liuhaotian/llava-v1.5-13b"
+model_34b = "liuhaotian/llava-v1.6-34b"
+
+# 4-bit quantization for lower VRAM
+load_4bit = True  # Reduces VRAM by ~4×
+```
+
+## CLI 用法
+
+```bash
+# Single image query
+python -m llava.serve.cli \
+    --model-path liuhaotian/llava-v1.5-7b \
+    --image-file image.jpg \
+    --query "What is in this image?"
+
+# Multi-turn conversation
+python -m llava.serve.cli \
+    --model-path liuhaotian/llava-v1.5-7b \
+    --image-file image.jpg
+# Then type questions interactively
+```
+
+## Web UI（Gradio）
+
+```bash
+# Launch Gradio interface
+python -m llava.serve.gradio_web_server \
+    --model-path liuhaotian/llava-v1.5-7b \
+    --load-4bit  # Optional: reduce VRAM
+
+# Access at http://localhost:7860
+```
+
+## 多轮对话
+
+```python
+# Initialize conversation
+conv = conv_templates["llava_v1"].copy()
+
+# Turn 1
+conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\nWhat is in this image?")
+conv.append_message(conv.roles[1], None)
+response1 = generate(conv, model, image)  # "A dog playing in a park"
+
+# Turn 2
+conv.messages[-1][1] = response1  # Add previous response
+conv.append_message(conv.roles[0], "What breed is the dog?")
+conv.append_message(conv.roles[1], None)
+response2 = generate(conv, model, image)  # "Golden Retriever"
+
+# Turn 3
+conv.messages[-1][1] = response2
+conv.append_message(conv.roles[0], "What time of day is it?")
+conv.append_message(conv.roles[1], None)
+response3 = generate(conv, model, image)
+```
+
+## 常见任务
+
+### 图像字幕生成
+
+```python
+question = "Describe this image in detail."
+response = ask(model, image, question)
+```
+
+### 视觉问答
+
+```python
+question = "How many people are in the image?"
+response = ask(model, image, question)
+```
+
+### 目标检测（文本形式）
+
+```python
+question = "List all the objects you can see in this image."
+response = ask(model, image, question)
+```
+
+### 场景理解
+
+```python
+question = "What is happening in this scene?"
+response = ask(model, image, question)
+```
+
+### 文档理解
+
+```python
+question = "What is the main topic of this document?"
+response = ask(model, document_image, question)
+```
+
+## 训练自定义模型
+
+```bash
+# Stage 1: Feature alignment (558K image-caption pairs)
+bash scripts/v1_5/pretrain.sh
+
+# Stage 2: Visual instruction tuning (150K instruction data)
+bash scripts/v1_5/finetune.sh
+```
+
+## 量化（降低显存占用）
+
+```python
+# 4-bit quantization
+tokenizer, model, image_processor, context_len = load_pretrained_model(
+    model_path="liuhaotian/llava-v1.5-13b",
+    model_base=None,
+    model_name=get_model_name_from_path("liuhaotian/llava-v1.5-13b"),
+    load_4bit=True  # Reduces VRAM ~4×
+)
+
+# 8-bit quantization
+load_8bit=True  # Reduces VRAM ~2×
+```
+
+## 最佳实践
+
+1. **从 7B 模型开始** — 质量良好，显存需求可控
+2. **使用 4-bit 量化** — 显著降低显存占用
+3. **需要 GPU** — CPU 推理极慢
+4. **清晰的 prompt** — 具体问题能获得更好的答案
+5. **多轮对话** — 保持对话上下文
+6. **温度 0.2–0.7** — 平衡创造性与一致性
+7. **`max_new_tokens` 512–1024** — 用于详细回复
+8. **批量处理** — 按顺序处理多张图像
+
+## 性能
+
+| 模型 | 显存（FP16） | 显存（4-bit） | 速度（tokens/s） |
+|-------|-------------|--------------|------------------|
+| 7B | ~14 GB | ~4 GB | ~20 |
+| 13B | ~28 GB | ~8 GB | ~12 |
+| 34B | ~70 GB | ~18 GB | ~5 |
+
+*在 A100 GPU 上测试*
+
+## 基准测试
+
+LLaVA 在以下基准上取得了有竞争力的分数：
+- **VQAv2**：78.5%
+- **GQA**：62.0%
+- **MM-Vet**：35.4%
+- **MMBench**：64.3%
+
+## 局限性
+
+1. **幻觉** — 可能描述图像中不存在的内容
+2. **空间推理** — 难以精确定位位置
+3. **小字体文本** — 难以识别细小字体
+4. **目标计数** — 对大量目标计数不精确
+5. **显存需求** — 需要高性能 GPU
+6. **推理速度** — 比 CLIP 慢
+
+## 与框架集成
+
+### LangChain
+
+```python
+from langchain.llms.base import LLM
+
+class LLaVALLM(LLM):
+    def _call(self, prompt, stop=None):
+        # Custom LLaVA inference
+        return response
+
+llm = LLaVALLM()
+```
+
+### Gradio 应用
+
+```python
+import gradio as gr
+
+def chat(image, text, history):
+    response = ask_llava(model, image, text)
+    return response
+
+demo = gr.ChatInterface(
+    chat,
+    additional_inputs=[gr.Image(type="pil")],
+    title="LLaVA Chat"
+)
+demo.launch()
+```
+
+## 资源
+
+- **GitHub**：https://github.com/haotian-liu/LLaVA ⭐ 23,000+
+- **论文**：https://arxiv.org/abs/2304.08485
+- **演示**：https://llava.hliu.cc
+- **模型**：https://huggingface.co/liuhaotian
+- **许可证**：Apache 2.0
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\optional\mlops\mlops-modal.md ===
+---
+title: "Modal Serverless Gpu — 用于运行 ML 工作负载的无服务器 GPU 云平台"
+sidebar_label: "Modal Serverless Gpu"
+description: "用于运行 ML 工作负载的无服务器 GPU 云平台"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Modal Serverless Gpu
+
+用于运行 ML 工作负载的无服务器 GPU 云平台。适用于需要按需 GPU 访问而无需管理基础设施、将 ML 模型部署为 API，或运行具有自动扩缩容的批处理作业的场景。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 可选 — 通过 `hermes skills install official/mlops/modal` 安装 |
+| 路径 | `optional-skills/mlops/modal` |
+| 版本 | `1.0.0` |
+| 作者 | Orchestra Research |
+| 许可证 | MIT |
+| 依赖 | `modal>=0.64.0` |
+| 平台 | linux, macos, windows |
+| 标签 | `Infrastructure`, `Serverless`, `GPU`, `Cloud`, `Deployment`, `Modal` |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时所看到的指令内容。
+:::
+
+# Modal Serverless GPU
+
+在 Modal 无服务器 GPU 云平台上运行 ML 工作负载的完整指南。
+
+## 何时使用 Modal
+
+**在以下情况下使用 Modal：**
+- 运行 GPU 密集型 ML 工作负载而无需管理基础设施
+- 将 ML 模型部署为自动扩缩容 API
+- 运行批处理作业（训练、推理、数据处理）
+- 需要按秒计费的 GPU 定价，无空闲成本
+- 快速原型化 ML 应用
+- 运行定时作业（类 cron 工作负载）
+
+**主要特性：**
+- **无服务器 GPU**：按需提供 T4、L4、A10G、L40S、A100、H100、H200、B200
+- **Python 原生**：用 Python 代码定义基础设施，无需 YAML
+- **自动扩缩容**：缩容至零，或瞬间扩容至 100+ 个 GPU
+- **亚秒级冷启动**：基于 Rust 的基础设施，实现快速容器启动
+- **容器缓存**：镜像层缓存，支持快速迭代
+- **Web 端点**：将函数部署为 REST API，支持零停机更新
+
+**以下情况请使用替代方案：**
+- **RunPod**：适用于需要持久状态的长时间运行 pod
+- **Lambda Labs**：适用于预留 GPU 实例
+- **SkyPilot**：适用于多云编排和成本优化
+- **Kubernetes**：适用于复杂的多服务架构
+
+## 快速开始
+
+### 安装
+
+```bash
+pip install modal
+modal setup  # Opens browser for authentication
+```
+
+### GPU Hello World
+
+```python
+import modal
+
+app = modal.App("hello-gpu")
+
+@app.function(gpu="T4")
+def gpu_info():
+    import subprocess
+    return subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout
+
+@app.local_entrypoint()
+def main():
+    print(gpu_info.remote())
+```
+
+运行：`modal run hello_gpu.py`
+
+### 基础推理端点
+
+```python
+import modal
+
+app = modal.App("text-generation")
+image = modal.Image.debian_slim().pip_install("transformers", "torch", "accelerate")
+
+@app.cls(gpu="A10G", image=image)
+class TextGenerator:
+    @modal.enter()
+    def load_model(self):
+        from transformers import pipeline
+        self.pipe = pipeline("text-generation", model="gpt2", device=0)
+
+    @modal.method()
+    def generate(self, prompt: str) -> str:
+        return self.pipe(prompt, max_length=100)[0]["generated_text"]
+
+@app.local_entrypoint()
+def main():
+    print(TextGenerator().generate.remote("Hello, world"))
+```
+
+## 核心概念
+
+### 关键组件
+
+| 组件 | 用途 |
+|-----------|---------|
+| `App` | 函数和资源的容器 |
+| `Function` | 带计算规格的无服务器函数 |
+| `Cls` | 带生命周期 hook 的基于类的函数 |
+| `Image` | 容器镜像定义 |
+| `Volume` | 用于模型/数据的持久存储 |
+| `Secret` | 安全凭证存储 |
+
+### 执行模式
+
+| 命令 | 描述 |
+|---------|-------------|
+| `modal run script.py` | 执行后退出 |
+| `modal serve script.py` | 开发模式，支持热重载 |
+| `modal deploy script.py` | 持久化云端部署 |
+
+## GPU 配置
+
+### 可用 GPU
+
+| GPU | 显存 | 最适用于 |
+|-----|------|----------|
+| `T4` | 16GB | 经济型推理、小型模型 |
+| `L4` | 24GB | 推理，Ada Lovelace 架构 |
+| `A10G` | 24GB | 训练/推理，比 T4 快 3.3 倍 |
+| `L40S` | 48GB | 推荐用于推理（最佳性价比） |
+| `A100-40GB` | 40GB | 大型模型训练 |
+| `A100-80GB` | 80GB | 超大型模型 |
+| `H100` | 80GB | 最快，支持 FP8 + Transformer Engine |
+| `H200` | 141GB | 从 H100 自动升级，4.8TB/s 带宽 |
+| `B200` | 最新 | Blackwell 架构 |
+
+### GPU 规格配置模式
+
+```python
+# Single GPU
+@app.function(gpu="A100")
+
+# Specific memory variant
+@app.function(gpu="A100-80GB")
+
+# Multiple GPUs (up to 8)
+@app.function(gpu="H100:4")
+
+# GPU with fallbacks
+@app.function(gpu=["H100", "A100", "L40S"])
+
+# Any available GPU
+@app.function(gpu="any")
+```
+
+## 容器镜像
+
+```python
+# Basic image with pip
+image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "torch==2.1.0", "transformers==4.36.0", "accelerate"
+)
+
+# From CUDA base
+image = modal.Image.from_registry(
+    "nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04",
+    add_python="3.11"
+).pip_install("torch", "transformers")
+
+# With system packages
+image = modal.Image.debian_slim().apt_install("git", "ffmpeg").pip_install("whisper")
+```
+
+## 持久存储
+
+```python
+volume = modal.Volume.from_name("model-cache", create_if_missing=True)
+
+@app.function(gpu="A10G", volumes={"/models": volume})
+def load_model():
+    import os
+    model_path = "/models/llama-7b"
+    if not os.path.exists(model_path):
+        model = download_model()
+        model.save_pretrained(model_path)
+        volume.commit()  # Persist changes
+    return load_from_path(model_path)
+```
+
+## Web 端点
+
+### FastAPI 端点装饰器
+
+```python
+@app.function()
+@modal.fastapi_endpoint(method="POST")
+def predict(text: str) -> dict:
+    return {"result": model.predict(text)}
+```
+
+### 完整 ASGI 应用
+
+```python
+from fastapi import FastAPI
+web_app = FastAPI()
+
+@web_app.post("/predict")
+async def predict(text: str):
+    return {"result": await model.predict.remote.aio(text)}
+
+@app.function()
+@modal.asgi_app()
+def fastapi_app():
+    return web_app
+```
+
+### Web 端点类型
+
+| 装饰器 | 使用场景 |
+|-----------|----------|
+| `@modal.fastapi_endpoint()` | 简单函数 → API |
+| `@modal.asgi_app()` | 完整 FastAPI/Starlette 应用 |
+| `@modal.wsgi_app()` | Django/Flask 应用 |
+| `@modal.web_server(port)` | 任意 HTTP 服务器 |
+
+## 动态批处理
+
+```python
+@app.function()
+@modal.batched(max_batch_size=32, wait_ms=100)
+async def batch_predict(inputs: list[str]) -> list[dict]:
+    # Inputs automatically batched
+    return model.batch_predict(inputs)
+```
+
+## 密钥管理
+
+```bash
+# Create secret
+modal secret create huggingface HF_TOKEN=hf_xxx
+```
+
+```python
+@app.function(secrets=[modal.Secret.from_name("huggingface")])
+def download_model():
+    import os
+    token = os.environ["HF_TOKEN"]
+```
+
+## 定时任务
+
+```python
+@app.function(schedule=modal.Cron("0 0 * * *"))  # Daily midnight
+def daily_job():
+    pass
+
+@app.function(schedule=modal.Period(hours=1))
+def hourly_job():
+    pass
+```
+
+## 性能优化
+
+### 冷启动缓解
+
+```python
+@app.function(
+    container_idle_timeout=300,  # Keep warm 5 min
+    allow_concurrent_inputs=10,  # Handle concurrent requests
+)
+def inference():
+    pass
+```
+
+### 模型加载最佳实践
+
+```python
+@app.cls(gpu="A100")
+class Model:
+    @modal.enter()  # Run once at container start
+    def load(self):
+        self.model = load_model()  # Load during warm-up
+
+    @modal.method()
+    def predict(self, x):
+        return self.model(x)
+```
+
+## 并行处理
+
+```python
+@app.function()
+def process_item(item):
+    return expensive_computation(item)
+
+@app.function()
+def run_parallel():
+    items = list(range(1000))
+    # Fan out to parallel containers
+    results = list(process_item.map(items))
+    return results
+```
+
+## 常用配置
+
+```python
+@app.function(
+    gpu="A100",
+    memory=32768,              # 32GB RAM
+    cpu=4,                     # 4 CPU cores
+    timeout=3600,              # 1 hour max
+    container_idle_timeout=120,# Keep warm 2 min
+    retries=3,                 # Retry on failure
+    concurrency_limit=10,      # Max concurrent containers
+)
+def my_function():
+    pass
+```
+
+## 调试
+
+```python
+# Test locally
+if __name__ == "__main__":
+    result = my_function.local()
+
+# View logs
+# modal app logs my-app
+```
+
+## 常见问题
+
+| 问题 | 解决方案 |
+|-------|----------|
+| 冷启动延迟 | 增大 `container_idle_timeout`，使用 `@modal.enter()` |
+| GPU 内存溢出 | 使用更大 GPU（`A100-80GB`），启用梯度检查点 |
+| 镜像构建失败 | 固定依赖版本，检查 CUDA 兼容性 |
+| 超时错误 | 增大 `timeout`，添加检查点 |
+
+## 参考资料
+
+- **[高级用法](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/mlops/modal/references/advanced-usage.md)** - 多 GPU、分布式训练、成本优化
+- **[故障排查](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/mlops/modal/references/troubleshooting.md)** - 常见问题与解决方案
+
+## 资源
+
+- **文档**：https://modal.com/docs
+- **示例**：https://github.com/modal-labs/modal-examples
+- **定价**：https://modal.com/pricing
+- **Discord**：https://discord.gg/modal

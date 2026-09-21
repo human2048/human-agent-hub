@@ -1,0 +1,234 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_gateway_inactivity_timeout.py ===
+"""Tests for staged inactivity timeout in gateway agent runs.
+
+Tests cover:
+- Warning fires once when inactivity reaches gateway_timeout_warning threshold
+- Warning does not fire when gateway_timeout is 0 (unlimited)
+- Warning fires only once per run, not on every poll
+- Full timeout still fires at gateway_timeout threshold
+- Warning respects HERMES_AGENT_TIMEOUT_WARNING env var
+- Warning disabled when gateway_timeout_warning is 0
+"""
+
+import concurrent.futures
+import os
+import sys
+import time
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+
+class FakeAgent:
+    """Mock agent with controllable activity summary for timeout tests."""
+
+    def __init__(self, idle_seconds=0.0, activity_desc="tool_call",
+                 current_tool=None, api_call_count=5, max_iterations=90):
+        self._idle_seconds = idle_seconds
+        self._activity_desc = activity_desc
+        self._current_tool = current_tool
+        self._api_call_count = api_call_count
+        self._max_iterations = max_iterations
+        self._interrupted = False
+        self._interrupt_msg = None
+
+    def get_activity_summary(self):
+        return {
+            "last_activity_ts": time.time() - self._idle_seconds,
+            "last_activity_desc": self._activity_desc,
+            "seconds_since_activity": self._idle_seconds,
+            "current_tool": self._current_tool,
+            "api_call_count": self._api_call_count,
+            "max_iterations": self._max_iterations,
+        }
+
+    def interrupt(self, msg):
+        self._interrupted = True
+        self._interrupt_msg = msg
+
+    def run_conversation(self, prompt):
+        return {"final_response": "Done", "messages": []}
+
+
+class SlowFakeAgent(FakeAgent):
+    """Agent that runs for a while, then goes idle."""
+
+    def __init__(self, run_duration=0.5, idle_after=None, **kwargs):
+        super().__init__(**kwargs)
+        self._run_duration = run_duration
+        self._idle_after = idle_after
+        self._start_time = None
+
+    def get_activity_summary(self):
+        summary = super().get_activity_summary()
+        if self._idle_after is not None and self._start_time:
+            elapsed = time.time() - self._start_time
+            if elapsed > self._idle_after:
+                idle_time = elapsed - self._idle_after
+                summary["seconds_since_activity"] = idle_time
+                summary["last_activity_desc"] = "api_call_streaming"
+            else:
+                summary["seconds_since_activity"] = 0.0
+        return summary
+
+    def run_conversation(self, prompt):
+        self._start_time = time.time()
+        time.sleep(self._run_duration)
+        return {"final_response": "Completed after work", "messages": []}
+
+
+class TestStagedInactivityWarning:
+    """Test the staged inactivity warning before full timeout."""
+
+    def test_warning_fires_once_before_timeout(self):
+        """Warning fires when inactivity reaches warning threshold."""
+        agent = SlowFakeAgent(
+            run_duration=0.6,
+            idle_after=0.05,
+            activity_desc="api_call_streaming",
+        )
+
+        _agent_timeout = 20.0
+        _agent_warning = 0.15
+        _POLL_INTERVAL = 0.05
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(agent.run_conversation, "test prompt")
+        _inactivity_timeout = False
+        _warning_fired = False
+        _warning_send_count = 0
+
+        while True:
+            done, _ = concurrent.futures.wait({future}, timeout=_POLL_INTERVAL)
+            if done:
+                result = future.result()
+                break
+            _idle_secs = 0.0
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    _act = agent.get_activity_summary()
+                    _idle_secs = _act.get("seconds_since_activity", 0.0)
+                except Exception:
+                    pass
+            if (not _warning_fired and _agent_warning > 0
+                    and _idle_secs >= _agent_warning):
+                _warning_fired = True
+                _warning_send_count += 1
+            if _idle_secs >= _agent_timeout:
+                _inactivity_timeout = True
+                break
+
+        pool.shutdown(wait=False, cancel_futures=True)
+
+        assert _warning_fired
+        assert _warning_send_count == 1
+        assert not _inactivity_timeout
+
+
+
+    def test_full_timeout_still_fires_after_warning(self):
+        """Full timeout fires even after warning was sent."""
+        agent = SlowFakeAgent(
+            run_duration=5.0,
+            idle_after=0.05,
+            activity_desc="waiting for provider response (streaming)",
+        )
+
+        _agent_timeout = 0.4
+        _agent_warning = 0.15
+        _POLL_INTERVAL = 0.05
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(agent.run_conversation, "test")
+        _inactivity_timeout = False
+        _warning_fired = False
+
+        while True:
+            done, _ = concurrent.futures.wait({future}, timeout=_POLL_INTERVAL)
+            if done:
+                future.result()
+                break
+            _idle_secs = 0.0
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    _act = agent.get_activity_summary()
+                    _idle_secs = _act.get("seconds_since_activity", 0.0)
+                except Exception:
+                    pass
+            if (not _warning_fired and _agent_warning > 0
+                    and _idle_secs >= _agent_warning):
+                _warning_fired = True
+            if _idle_secs >= _agent_timeout:
+                _inactivity_timeout = True
+                break
+
+        pool.shutdown(wait=False, cancel_futures=True)
+        assert _warning_fired
+        assert _inactivity_timeout
+
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_gateway_mcp_oauth_unattended.py ===
+"""No gateway MCP path may start a browser OAuth flow (nobody can complete it), and the gateway
+tracks ``mcp_servers`` edits made after boot."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from gateway.config import GatewayConfig
+
+
+@pytest.mark.asyncio
+async def test_gateway_startup_discovery_suppresses_interactive_oauth(monkeypatch):
+    import gateway.run as gateway_run
+    from tools import mcp_tool_discovery as _mcp_discovery
+    from tools.mcp_oauth import _is_interactive, force_interactive_oauth
+
+    seen: list = []
+    monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", lambda: seen.append(_is_interactive()) or [])
+    with force_interactive_oauth():  # even a "forced interactive" parent context is overridden
+        await gateway_run._discover_gateway_mcp_tools(GatewayConfig(multiplex_profiles=False))
+    assert seen == [False]
+
+
+def test_mcp_config_reconciler_reconciles_every_tick_after_baseline(monkeypatch, tmp_path: Path):
+    """The chore reconciles on DRIFT, not only on a config edit (#112445): a server whose FIRST
+    connect failed never reached ``_servers`` and its config never changes, so a signature-gated
+    chore never came back for it. First tick is baseline only (startup discovery owns it); every
+    later tick reconciles with interactive OAuth suppressed; nothing to report stays silent."""
+    from gateway.run_profile_reconcile import _mcp_config_reconciler
+    from tools import mcp_tool_discovery as _mcp_discovery
+    from tools.mcp_oauth import _is_interactive
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("mcp_servers:\n  linear:\n    url: https://x/mcp\n")
+    calls: list = []
+    added: list = ["linear"]  # enabled in config, never connected, cooldown lapsed
+
+    def fake_reconcile():
+        calls.append(_is_interactive())
+        return {"removed": [], "added": list(added), "pending": []}
+
+    monkeypatch.setattr(_mcp_discovery, "reconcile_mcp_servers_with_config", fake_reconcile)
+    tick = _mcp_config_reconciler(runner=None)
+
+    tick()  # baseline only: startup discovery already reflects this file
+    assert calls == []
+    tick()  # config.yaml untouched -- the missing server is still retried
+    tick()
+    assert calls == [False, False], "reconcile runs each tick after the baseline, OAuth suppressed"
+    added.clear()  # it connected: the chore keeps checking, cheaply, and has nothing to report
+    tick()
+    assert calls == [False, False, False]
+

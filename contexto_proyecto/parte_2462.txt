@@ -1,0 +1,348 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_warning_execution_outcome.py ===
+"""Suppressed automatic diagnostics retain failed jobs without invented delivery receipts."""
+import pytest
+
+from cron import executions, incidents, jobs, scheduler
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+
+@pytest.mark.parametrize("mode", ["failure", "crash", "success"])
+@pytest.mark.parametrize("suppress", [False, True])
+@pytest.mark.parametrize("external_worker", [False, True])
+def test_real_run_ledger_and_incident_match_actual_presentation(tmp_path, monkeypatch, mode, suppress, external_worker):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"display: {{suppress_warning_notifications: {str(suppress).lower()}}}\n"
+    )
+    config = GatewayConfig()
+    config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    sent = []
+
+    async def send(platform, pconfig, chat_id, text, **kwargs):
+        sent.append(text)
+        return {"success": True, "message_id": "receipt"}
+
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", send)
+
+    def run(job, **kwargs):
+        if mode == "crash":
+            raise RuntimeError("isolated provider failure")
+        return (mode == "success", "retained raw output", "required result", None if mode == "success" else "isolated provider failure")
+
+    monkeypatch.setattr(scheduler, "run_job", run)
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:fixture")
+    if external_worker:
+        from cron import delivery_queue
+        execution = executions.create_execution(job["id"], source="fixture")
+        job["execution_id"] = execution["id"]
+        monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", execution["id"])
+        original_wait = delivery_queue.enqueue_and_wait
+
+        def drain_before_wait(execution_id, job, content, *, for_failure=False):
+            delivery_queue.enqueue(execution_id, job, content, for_failure=for_failure)
+            assert scheduler.drain_delivery_queue({}, None) == 1
+            return original_wait(execution_id, job, content, for_failure=for_failure)
+
+        monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_before_wait)
+    scheduler.run_one_job(job)
+    row = executions.latest_execution(job["id"])
+    expected_suppression = suppress and mode != "success"
+    assert len(sent) == (0 if expected_suppression else 1)
+    assert row["delivery_outcome"] == ("suppressed" if expected_suppression else "delivered")
+    saved = jobs.get_job(job["id"])
+    assert saved["last_status"] == ("ok" if mode == "success" else "error")
+    if mode != "success":
+        assert "isolated provider failure" in saved["last_error"]
+        incident = next(i for i in incidents.list_incidents() if i["job_id"] == job["id"])
+        assert incident["state"] == ("detected" if suppress else "alerted")
+    if mode != "crash":
+        outputs = list((tmp_path / "cron" / "output" / job["id"]).glob("*.md"))
+        assert outputs and "retained raw output" in outputs[0].read_text()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\test_warning_transport_contract.py ===
+"""Real cron router/queue with local transport doubles; no external network."""
+import asyncio
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+from cron import delivery_queue, scheduler
+from cron.scheduler_delivery import _deliver_result
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+
+@pytest.fixture
+def loop_thread():
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    def run():
+        asyncio.set_event_loop(loop)
+        loop.call_soon(started.set)
+        loop.run_forever()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert started.wait(5)
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(5)
+    assert not thread.is_alive()
+    loop.close()
+
+
+@pytest.mark.parametrize("lane", ["native", "relay", "native-fallback", "relay-failure", "standalone", "standalone-async"])
+@pytest.mark.parametrize("setting,for_failure", [(None, True), (False, True), (True, True), (True, False)])
+def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_thread, lane, setting, for_failure):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "delivery.db")
+    config_text = "cron: {wrap_response: false}\n"
+    if setting is not None:
+        config_text += f"display: {{suppress_warning_notifications: {str(setting).lower()}}}\n"
+    (tmp_path / "config.yaml").write_text(config_text)
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True)
+    config.platforms[Platform.RELAY] = PlatformConfig(enabled=True)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    sent = []
+    fallbacks = []
+
+    async def send(chat_id, content, metadata=None):
+        sent.append(("discord", chat_id, content))
+        if lane == "native-fallback":
+            raise RuntimeError("isolated live failure")
+        return {"success": True, "message_id": "native-id"}
+
+    async def relay_send(platform, chat_id, content, metadata=None):
+        sent.append((platform.value, chat_id, content))
+        if lane == "relay-failure":
+            raise RuntimeError("isolated relay failure")
+        return {"success": True, "message_id": "relay-id"}
+
+    async def standalone(platform, pconfig, chat_id, content, **kwargs):
+        fallbacks.append((platform.value, chat_id, content))
+        return {"success": True, "message_id": "direct-id"}
+
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone)
+    adapter = SimpleNamespace(send=send, send_for_platform=relay_send,
+                              fronts_platform=lambda p: p == Platform.DISCORD)
+    adapters = {} if lane.startswith("standalone") else {
+        Platform.RELAY if lane.startswith("relay") else Platform.DISCORD: adapter}
+    job = {"id": "fixture", "execution_id": "run", "deliver": "discord:fixture"}
+    payload = "Requested warning quotation" if not for_failure else "Automatic failure notice"
+    delivery_queue.enqueue("run", job, payload, for_failure=for_failure)
+
+    def drain():
+        assert scheduler.drain_delivery_queue(adapters, loop_thread) == 1
+
+    if lane == "standalone-async":
+        async def inside_loop():
+            drain()
+        asyncio.run(inside_loop())
+    else:
+        drain()
+    muted = setting is True and for_failure
+    assert sent == ([] if muted or lane.startswith("standalone") else [("discord", "fixture", payload)])
+    assert fallbacks == ([] if muted or lane not in ("standalone", "standalone-async", "native-fallback") else [("discord", "fixture", payload)])
+    expected = "suppressed" if muted else "failed" if lane == "relay-failure" else "delivered"
+    assert delivery_queue.get_status("run")["status"] == expected
+    # Duplicate category and policy changes cannot overwrite durable SQL queue outcomes.
+    (tmp_path / "config.yaml").write_text("display: {suppress_warning_notifications: false}\n")
+    delivery_queue.enqueue("run", job, payload, for_failure=not for_failure)
+    assert scheduler.drain_delivery_queue(adapters, loop_thread) == 0
+    assert delivery_queue.get_status("run")["status"] == expected
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\cron\__init__.py ===
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\dashboard\test_ws_client_host.py ===
+"""Regression tests for the in-container WebSocket client host resolution.
+
+Issue #58993: when the dashboard binds to a wildcard (``0.0.0.0`` / ``::``),
+the in-container WS clients built by ``_build_gateway_ws_url`` and
+``_build_sidecar_url`` used the bind host verbatim, so the child TUI
+dialed ``ws://0.0.0.0:9119/api/ws``. Behind a forward proxy whose
+``NO_PROXY`` does not list ``0.0.0.0`` that wildcard dial is routed through
+the proxy and fails the handshake.
+
+The contract these tests pin down:
+
+  * Wildcard bind (``0.0.0.0`` / ``::``) → client dials ``127.0.0.1``.
+  * Loopback bind (``127.0.0.1``) → client dials ``127.0.0.1`` (unchanged).
+  * LAN / non-wildcard bind (``192.168.1.5``) → client dials that exact
+    address (no rewrite to loopback — the bind was deliberate).
+  * Explicit ``HERMES_DASHBOARD_WS_HOST`` env var → wins always, regardless
+    of the bind host.
+  * ``app.state.bound_host`` is left untouched — the bind address used by
+    the listener doesn't change.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from hermes_cli import web_server
+import hermes_cli.web_server_chat as _web_server_chat
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def saved_app_state():
+    """Snapshot and restore the bits of ``app.state`` the tests mutate.
+
+    The dashboard's WS URL builders read three things off ``app.state``:
+    ``bound_host``, ``bound_port``, ``auth_required``. We capture them so
+    the suite doesn't leak state into other tests, then yield control.
+    """
+    saved = {
+        "bound_host": getattr(web_server.app.state, "bound_host", None),
+        "bound_port": getattr(web_server.app.state, "bound_port", None),
+        "auth_required": getattr(web_server.app.state, "auth_required", None),
+    }
+    yield saved
+    for key, value in saved.items():
+        setattr(web_server.app.state, key, value)
+
+
+@pytest.fixture
+def clear_ws_host_env(monkeypatch):
+    """Ensure no ``HERMES_DASHBOARD_WS_HOST`` leaks in from the test shell."""
+    monkeypatch.delenv("HERMES_DASHBOARD_WS_HOST", raising=False)
+    yield monkeypatch
+
+
+def _set_bound(saved_app_state, host: str, port: int = 9119):
+    web_server.app.state.bound_host = host
+    web_server.app.state.bound_port = port
+    web_server.app.state.auth_required = False
+
+
+def _netloc(ws_url: str) -> str:
+    """Pull the ``host:port`` (or ``[host]:port``) segment out of a ws URL."""
+    assert ws_url is not None, "expected a URL, got None"
+    # ws://host:port/path?qs — strip the scheme, then take netloc up to "/".
+    after_scheme = ws_url.split("://", 1)[1]
+    netloc = after_scheme.split("/", 1)[0]
+    return netloc
+
+
+# ---------------------------------------------------------------------------
+# _resolve_client_ws_host — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveClientWsHost:
+    def test_wildcard_ipv4_uses_loopback(self, saved_app_state, clear_ws_host_env):
+        _set_bound(saved_app_state, "0.0.0.0")
+        assert _web_server_chat._resolve_client_ws_host() == "127.0.0.1"
+
+    def test_wildcard_ipv6_uses_loopback(self, saved_app_state, clear_ws_host_env):
+        _set_bound(saved_app_state, "::")
+        assert _web_server_chat._resolve_client_ws_host() == "127.0.0.1"
+
+    def test_loopback_bind_unchanged(self, saved_app_state, clear_ws_host_env):
+        _set_bound(saved_app_state, "127.0.0.1")
+        assert _web_server_chat._resolve_client_ws_host() == "127.0.0.1"
+
+
+    def test_public_dns_bind_preserved(self, saved_app_state, clear_ws_host_env):
+        _set_bound(saved_app_state, "fly-app.example.dev")
+        assert _web_server_chat._resolve_client_ws_host() == "fly-app.example.dev"
+
+
+
+
+    def test_blank_env_falls_back_to_bind(
+        self, saved_app_state, monkeypatch
+    ):
+        """An explicitly empty override (e.g. ``HERMES_DASHBOARD_WS_HOST=``)
+        must NOT silently pin to loopback — it's an unset-by-accident, not
+        an intent. Treat whitespace-only as absent and fall through."""
+        monkeypatch.setenv("HERMES_DASHBOARD_WS_HOST", "   ")
+        _set_bound(saved_app_state, "0.0.0.0")
+        assert _web_server_chat._resolve_client_ws_host() == "127.0.0.1"
+
+
+    def test_bind_host_unchanged_after_wildcard_resolution(
+        self, saved_app_state, clear_ws_host_env
+    ):
+        """Resolution only affects the client netloc — ``bound_host`` on
+        ``app.state`` (used by the listener and host-header middleware) is
+        NOT mutated."""
+        _set_bound(saved_app_state, "0.0.0.0")
+        _web_server_chat._resolve_client_ws_host()
+        assert web_server.app.state.bound_host == "0.0.0.0"
+
+
+# ---------------------------------------------------------------------------
+# _build_gateway_ws_url — end-to-end URL contract
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayWsUrlHost:
+
+    def test_ipv6_wildcard_bind_dials_loopback(
+        self, saved_app_state, clear_ws_host_env
+    ):
+        _set_bound(saved_app_state, "::", port=9119)
+        url = _web_server_chat._build_gateway_ws_url()
+        assert url is not None
+        assert url.startswith("ws://127.0.0.1:9119/api/ws")
+        # The ``::`` must not leak into the client URL.
+        assert "::" not in url
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# _build_sidecar_url — end-to-end URL contract
+# ---------------------------------------------------------------------------
+
+
+class TestSidecarUrlHost:
+
+
+
+
+
+
+    def test_no_bound_host_returns_none(
+        self, saved_app_state, clear_ws_host_env
+    ):
+        web_server.app.state.bound_host = None
+        web_server.app.state.bound_port = None
+        assert _web_server_chat._build_sidecar_url("ch-1") is None
+
+
+# ---------------------------------------------------------------------------
+# _netloc helper is exposed only because it's useful for tests; if the
+# production code ever changes the URL shape the tests catch the regression
+# above without needing to assert on the full string.
+# ---------------------------------------------------------------------------
+
+
+def test_netloc_helper_handles_ipv6_bracket_form():
+    """The IPv6 netloc path is exercised by the production ``[host]:port``
+    branch when ``HERMES_DASHBOARD_WS_HOST`` points at an IPv6 address.
+    Verify the helper doesn't choke on the bracket form."""
+    assert _netloc("ws://[::1]:9119/api/ws?x=1") == "[::1]:9119"
+    assert _netloc("ws://127.0.0.1:9119/api/ws?x=1") == "127.0.0.1:9119"

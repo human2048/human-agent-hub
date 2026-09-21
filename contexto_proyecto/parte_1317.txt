@@ -1,0 +1,281 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\oss-forensics\references\evidence-types.md ===
+# Evidence Types Reference
+
+Taxonomy of all evidence types, IOC types, GitHub event types, and observation types
+used in OSS forensic investigations.
+
+---
+
+## Evidence Source Types
+
+| Type | Description | Example Sources |
+|------|-------------|-----------------|
+| `git` | Data from local git repository analysis | `git log`, `git fsck`, `git reflog`, `git blame` |
+| `gh_api` | Data from GitHub REST API responses | `/repos/.../commits`, `/repos/.../pulls`, `/repos/.../events` |
+| `gh_archive` | Data from GitHub Archive (BigQuery) | `githubarchive.month.*` BigQuery tables |
+| `web_archive` | Archived web pages from Wayback Machine | CDX API results, `web.archive.org/web/...` snapshots |
+| `ioc` | Indicator of Compromise from any source | Extracted from vendor reports, git history, network traces |
+| `analysis` | Derived insight from cross-source correlation | "SHA present in archive but absent from API" |
+| `vendor_report` | External security vendor or researcher report | CVE advisories, blog posts, NVD records |
+| `manual` | Manually recorded observation by investigator | Notes on behavioral patterns, timeline gaps |
+
+---
+
+## IOC Types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `COMMIT_SHA` | A git commit hash linked to malicious activity | `abc123def456...` |
+| `FILE_PATH` | A suspicious file inside the repository | `src/utils/crypto.js`, `dist/index.min.js` |
+| `API_KEY` | An API key accidentally committed | `AKIA...` (AWS), `ghp_...` (GitHub PAT) |
+| `SECRET` | A generic secret / credential | Database password, private key blob |
+| `IP_ADDRESS` | A C2 server or attacker IP | `192.0.2.1` |
+| `DOMAIN` | A malicious or suspicious domain | `evil-cdn.io`, typosquatted package registry domain |
+| `PACKAGE_NAME` | A malicious or squatted package name | `colo-rs` (typosquatting `color`), `lodash-utils` |
+| `ACTOR_USERNAME` | A GitHub handle linked to the attack | `malicious-bot-account` |
+| `MALICIOUS_URL` | A URL to a malicious resource | `https://evil.example.com/payload.sh` |
+| `WORKFLOW_FILE` | A suspicious CI/CD workflow file | `.github/workflows/release.yml` |
+| `BRANCH_NAME` | A suspicious branch | `refs/heads/temp-fix-do-not-merge` |
+| `TAG_NAME` | A suspicious git tag | `v1.0.0-security-patch` |
+| `RELEASE_NAME` | A suspicious release | Release with no associated tag or changelog |
+| `OTHER` | Catch-all for unclassified IOCs | — |
+
+---
+
+## GitHub Archive Event Types (12 Types)
+
+| Event Type | Forensic Relevance |
+|------------|-------------------|
+| `PushEvent` | Core: `payload.distinct_size=0` with `payload.size>0` → force push. `payload.before`/`payload.head` shows rewritten history. |
+| `PullRequestEvent` | Detects deleted PRs, rapid open→close patterns, PRs from new accounts |
+| `IssueEvent` | Detects deleted issues, coordinated labeling, rapid closure of vulnerability reports |
+| `IssueCommentEvent` | Deleted comments, rapid activity bursts |
+| `WatchEvent` | Star-farming campaigns (coordinated starring from new accounts) |
+| `ForkEvent` | Unusual fork patterns before malicious commit |
+| `CreateEvent` | Branch/tag creation: signals new release or code injection point |
+| `DeleteEvent` | Branch/tag deletion: critical — often used to hide traces |
+| `ReleaseEvent` | Unauthorized releases, release artifacts modified post-publish |
+| `MemberEvent` | Collaborator added/removed: maintainer compromise indicator |
+| `PublicEvent` | Repository made public (sometimes to drop malicious code briefly) |
+| `WorkflowRunEvent` | CI/CD pipeline executions: workflow injection, secret exfiltration |
+
+---
+
+## Evidence Verification States
+
+| State | Meaning |
+|-------|---------|
+| `unverified` | Collected from a single source, not cross-referenced |
+| `single_source` | The primary source has been confirmed directly (e.g., SHA resolves on GitHub), but no second source |
+| `multi_source_verified` | Confirmed from 2+ independent sources (e.g., GH Archive AND GitHub API both show the same event) |
+
+Only `multi_source_verified` evidence may be cited as fact in validated hypotheses.
+`unverified` and `single_source` evidence must be labeled `[UNVERIFIED]` or `[SINGLE-SOURCE]`.
+
+---
+
+## Observation Types (Patterned after RAPTOR)
+
+| Type | Description |
+|------|-------------|
+| `CommitObservation` | Specific commit SHA with metadata (author, date, files changed) |
+| `ForceWashObservation` | Evidence that commits were force-erased from a branch |
+| `DanglingCommitObservation` | SHA present in git object store but unreachable from any ref |
+| `IssueObservation` | A GitHub issue (current or archived) with title, body, timestamp |
+| `PRObservation` | A GitHub PR (current or archived) with diff summary, reviewers |
+| `IOC` | A single Indicator of Compromise with context |
+| `TimelineGap` | A period with unusual absence of expected activity |
+| `ActorAnomalyObservation` | Behavioral anomaly for a specific GitHub actor |
+| `WorkflowAnomalyObservation` | Suspicious CI/CD workflow change or unexpected run |
+| `CrossSourceDiscrepancy` | Item present in one source but absent in another (strong deletion indicator) |
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\oss-forensics\references\github-archive-guide.md ===
+# GitHub Archive Query Guide (BigQuery)
+
+GitHub Archive records every public event on GitHub as immutable JSON records. This data is accessible via Google BigQuery and is the most reliable source for forensic investigation — events cannot be deleted or modified after recording.
+
+## Public Dataset
+
+- **Project**: `githubarchive`
+- **Tables**: `day.YYYYMMDD`, `month.YYYYMM`, `year.YYYY`
+- **Cost**: $6.25 per TiB scanned. Always run dry runs first.
+- **Access**: Requires a Google Cloud account with BigQuery enabled. Free tier includes 1 TiB/month of queries.
+
+---
+
+## The 12 GitHub Event Types
+
+| Event Type | What It Records | Forensic Value |
+|------------|-----------------|----------------|
+| `PushEvent` | Commits pushed to a branch | Force-push detection, commit timeline, author attribution |
+| `PullRequestEvent` | PR opened, closed, merged, reopened | Deleted PR recovery, review timeline |
+| `IssuesEvent` | Issue opened, closed, reopened, labeled | Deleted issue recovery, social engineering traces |
+| `IssueCommentEvent` | Comments on issues and PRs | Deleted comment recovery, communication patterns |
+| `CreateEvent` | Branch, tag, or repository creation | Suspicious branch creation, tag timing |
+| `DeleteEvent` | Branch or tag deletion | Evidence of cleanup after compromise |
+| `MemberEvent` | Collaborator added or removed | Permission changes, access escalation |
+| `PublicEvent` | Repository made public | Accidental exposure of private repos |
+| `WatchEvent` | User stars a repository | Actor reconnaissance patterns |
+| `ForkEvent` | Repository forked | Exfiltration of code before cleanup |
+| `ReleaseEvent` | Release published, edited, deleted | Malicious release injection, deleted release recovery |
+| `WorkflowRunEvent` | GitHub Actions workflow triggered | CI/CD abuse, unauthorized workflow runs |
+
+---
+
+## Query Templates
+
+### Basic: All Events for a Repository
+
+```sql
+SELECT
+  created_at,
+  type,
+  actor.login,
+  repo.name,
+  payload
+FROM
+  `githubarchive.day.20240101`  -- Adjust date
+WHERE
+  repo.name = 'owner/repo'
+  AND type IN ('PushEvent', 'DeleteEvent', 'MemberEvent')
+ORDER BY
+  created_at ASC
+```
+
+### Force-Push Detection
+
+Force-pushes produce PushEvents where commits are overwritten. Key indicators:
+- `payload.distinct_size = 0` with `payload.size > 0` → commits were erased
+- `payload.before` contains the SHA before the rewrite (recoverable)
+
+```sql
+SELECT
+  created_at,
+  actor.login,
+  JSON_EXTRACT_SCALAR(payload, '$.before') AS before_sha,
+  JSON_EXTRACT_SCALAR(payload, '$.head') AS after_sha,
+  JSON_EXTRACT_SCALAR(payload, '$.size') AS total_commits,
+  JSON_EXTRACT_SCALAR(payload, '$.distinct_size') AS distinct_commits,
+  JSON_EXTRACT_SCALAR(payload, '$.ref') AS branch_ref
+FROM
+  `githubarchive.month.*`
+WHERE
+  _TABLE_SUFFIX BETWEEN '202401' AND '202403'
+  AND type = 'PushEvent'
+  AND repo.name = 'owner/repo'
+  AND CAST(JSON_EXTRACT_SCALAR(payload, '$.distinct_size') AS INT64) = 0
+ORDER BY
+  created_at ASC
+```
+
+### Deleted Branch/Tag Detection
+
+```sql
+SELECT
+  created_at,
+  actor.login,
+  JSON_EXTRACT_SCALAR(payload, '$.ref') AS deleted_ref,
+  JSON_EXTRACT_SCALAR(payload, '$.ref_type') AS ref_type
+FROM
+  `githubarchive.month.*`
+WHERE
+  _TABLE_SUFFIX BETWEEN '202401' AND '202403'
+  AND type = 'DeleteEvent'
+  AND repo.name = 'owner/repo'
+ORDER BY
+  created_at ASC
+```
+
+### Collaborator Permission Changes
+
+```sql
+SELECT
+  created_at,
+  actor.login,
+  JSON_EXTRACT_SCALAR(payload, '$.action') AS action,
+  JSON_EXTRACT_SCALAR(payload, '$.member.login') AS member
+FROM
+  `githubarchive.month.*`
+WHERE
+  _TABLE_SUFFIX BETWEEN '202401' AND '202403'
+  AND type = 'MemberEvent'
+  AND repo.name = 'owner/repo'
+ORDER BY
+  created_at ASC
+```
+
+### CI/CD Workflow Activity
+
+```sql
+SELECT
+  created_at,
+  actor.login,
+  JSON_EXTRACT_SCALAR(payload, '$.action') AS action,
+  JSON_EXTRACT_SCALAR(payload, '$.workflow_run.name') AS workflow_name,
+  JSON_EXTRACT_SCALAR(payload, '$.workflow_run.conclusion') AS conclusion,
+  JSON_EXTRACT_SCALAR(payload, '$.workflow_run.head_sha') AS head_sha
+FROM
+  `githubarchive.month.*`
+WHERE
+  _TABLE_SUFFIX BETWEEN '202401' AND '202403'
+  AND type = 'WorkflowRunEvent'
+  AND repo.name = 'owner/repo'
+ORDER BY
+  created_at ASC
+```
+
+### Actor Activity Profiling
+
+```sql
+SELECT
+  type,
+  COUNT(*) AS event_count,
+  MIN(created_at) AS first_event,
+  MAX(created_at) AS last_event
+FROM
+  `githubarchive.month.*`
+WHERE
+  _TABLE_SUFFIX BETWEEN '202301' AND '202412'
+  AND actor.login = 'suspicious-username'
+GROUP BY type
+ORDER BY event_count DESC
+```
+
+---
+
+## Cost Optimization (MANDATORY)
+
+1. **Always dry run first**: Add `--dry_run` flag to `bq query` to see estimated bytes scanned before executing.
+2. **Use `_TABLE_SUFFIX`**: Narrow the date range as much as possible. `day.*` tables are cheapest for narrow windows; `month.*` for broader sweeps.
+3. **Select only needed columns**: Avoid `SELECT *`. The `payload` column is large — only select specific JSON paths.
+4. **Add LIMIT**: Use `LIMIT 1000` during exploration. Remove only for final exhaustive queries.
+5. **Column filtering in WHERE**: Filter on indexed columns (`type`, `repo.name`, `actor.login`) before payload extraction.
+
+**Cost estimation**: A single month of GH Archive data is ~1-2 TiB uncompressed. Querying a specific repo + event type with `_TABLE_SUFFIX` typically scans 1-10 GiB ($0.006-$0.06).
+
+---
+
+## Accessing via Hermes
+
+**Option A: BigQuery CLI** (if `gcloud` is installed)
+```bash
+bq query --use_legacy_sql=false --format=json "YOUR QUERY"
+```
+
+**Option B: Python** (via `execute_code`)
+```python
+from google.cloud import bigquery
+client = bigquery.Client()
+query = "YOUR QUERY"
+results = client.query(query).result()
+for row in results:
+    print(dict(row))
+```
+
+**Option C: No GCP credentials available**
+If BigQuery is unavailable, document this limitation in the report. Use the other 4 investigators (Git, GitHub API, Wayback Machine, IOC Enrichment) — they cover most investigation needs without BigQuery.
+

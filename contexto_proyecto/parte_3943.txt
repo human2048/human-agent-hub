@@ -1,0 +1,243 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_venv_transaction_boundary.py ===
+"""Transaction-boundary regression for Windows venv recreation (#83149).
+
+Review finding on PR #83194 (egilewski): the rollback source (the parked
+previous venv) was deleted as soon as ``Install-Venv`` saw a working
+interpreter in the replacement — but ``Install-Dependencies`` is a separate,
+later stage (a separate *process* under the stage-per-process bootstrap) and
+every dependency tier or the baseline-import gate can still fail after that
+point. Deleting the backup early re-creates exactly the availability failure
+the transactional recreate exists to prevent.
+
+The contract locked here:
+
+* ``Install-Venv`` records the parked backup in ``venv.pending-backup``
+  instead of deleting it, and its stale-tree sweep excludes that backup.
+* ``Install-Dependencies`` restores the previous venv on failure
+  (``Restore-VenvBackup``) and commits the cleanup only after the
+  baseline-import gate passes (``Complete-VenvTransaction``).
+
+The script only runs on Windows, so Linux CI locks the contract at the
+source level, same approach as tests/scripts/install/test_install_ps1_venv_recreate_safety.py.
+"""
+
+from pathlib import Path
+
+INSTALL_PS1 = Path(__file__).resolve().parents[3] / "scripts" / "install.ps1"
+
+
+def _function_body(source: str, function_name: str) -> str:
+    start = source.index(f"function {function_name}")
+    opening_brace = source.index("{", start)
+    depth = 0
+    for index in range(opening_brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening_brace : index + 1]
+    raise AssertionError(f"unterminated function: {function_name}")
+
+
+def _source() -> str:
+    return INSTALL_PS1.read_text(encoding="ascii")
+
+
+def test_install_venv_does_not_delete_backup_before_dependency_stage() -> None:
+    """The parked previous venv must survive Install-Venv's success path."""
+    body = _function_body(_source(), "Install-Venv")
+
+    # The success path records the rollback source instead of deleting it.
+    assert "venv.pending-backup" in body
+    # The only backup deletion allowed inside Install-Venv is the *rollback*
+    # rename in the catch block; a Remove-Item of the backup must not appear.
+    assert "Remove-Item -LiteralPath $venvBackupName" not in body
+
+
+def test_install_venv_stale_sweep_excludes_current_backup() -> None:
+    """The venv.stale.* sweep must not delete this run's rollback source."""
+    body = _function_body(_source(), "Install-Venv")
+
+    sweep_at = body.index('Get-ChildItem -Directory -Filter "venv.stale.*"')
+    window = body[sweep_at : sweep_at + 400]
+    assert "$_.Name -ne $venvBackupName" in window, (
+        "the stale-tree sweep must exclude the backup parked by this run"
+    )
+
+
+def test_install_dependencies_restores_backup_on_failure() -> None:
+    """A failed dependency tier or import gate must restore the parked venv."""
+    body = _function_body(_source(), "Install-Dependencies")
+
+    assert "Restore-VenvBackup" in body
+    catch_at = body.index("Restore-VenvBackup")
+    assert "throw" in body[catch_at : catch_at + 400], (
+        "rollback must rethrow the original failure after restoring"
+    )
+
+
+def test_install_dependencies_commits_only_after_import_gate() -> None:
+    """Backup cleanup must come after the baseline-import verification."""
+    body = _function_body(_source(), "Install-Dependencies")
+
+    import_gate = body.index("Baseline imports verified in venv")
+    commit = body.index("Complete-VenvTransaction")
+    assert import_gate < commit, (
+        "the venv transaction must commit only after imports prove the "
+        "replacement usable"
+    )
+
+
+def test_restore_helper_parks_failed_replacement_and_restores_previous() -> None:
+    body = _function_body(_source(), "Restore-VenvBackup")
+
+    park = body.index("venv.failed.")
+    restore = body.index('-NewName "venv"')
+    assert park < restore, (
+        "the failed replacement must be parked before the previous venv is "
+        "renamed back into place"
+    )
+
+
+def test_commit_helper_deletes_backup_and_clears_marker() -> None:
+    body = _function_body(_source(), "Complete-VenvTransaction")
+
+    assert "Remove-Item" in body
+    assert "venv.pending-backup" in body
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_ps1_web_server_syntax_probe.py ===
+"""Regression: install.ps1 must syntax-check the dashboard backend source.
+
+Issue #59004 reported a fresh Windows desktop install crashing on launch
+because ``hermes_cli/web_server.py`` inside the installed checkout still
+contained merge-conflict markers. Import-only dependency probes (fastapi /
+uvicorn) do not catch that: the packages can be present while the backend
+source itself is unparsable.
+
+This test is source-level because Linux CI cannot execute the PowerShell
+installer. It locks the contract that install.ps1 runs ``py_compile`` against
+``hermes_cli/web_server.py`` and fails the stage when that syntax probe fails.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
+
+
+def test_install_ps1_compiles_web_server_source_after_web_deps_probe() -> None:
+    text = INSTALL_PS1.read_text(encoding="utf-8")
+
+    probe = re.search(
+        r'import fastapi, uvicorn[\s\S]{0,1200}?-m py_compile "\$InstallDir\\hermes_cli\\web_server\.py"',
+        text,
+    )
+    assert probe is not None, (
+        "install.ps1 must syntax-check hermes_cli/web_server.py after the "
+        "dashboard dependency probe so a fresh desktop install fails early on "
+        "merge-conflict markers or other SyntaxErrors."
+    )
+
+
+def test_install_ps1_fails_stage_when_web_server_syntax_probe_fails() -> None:
+    text = INSTALL_PS1.read_text(encoding="utf-8")
+
+    assert "if ($LASTEXITCODE -eq 0) { $webServerSyntaxOk = $true }" in text
+    assert "if (-not $webServerSyntaxOk) {" in text
+    assert (
+        'throw "dashboard backend source failed syntax check: hermes_cli/web_server.py"'
+        in text
+    ), (
+        "install.ps1 must fail the install stage when hermes_cli/web_server.py "
+        "does not compile, instead of writing a broken desktop/backend install."
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\scripts\install\test_install_scripts_computer_use.py ===
+"""Regression tests: installers provision cua-driver (Computer Use).
+
+Policy: choosing Computer Use should be a config flip, not a surprise
+multi-minute binary fetch. The installers pre-install cua-driver
+(best-effort, skippable), and the dashboard toggle auto-installs when the
+binary is still missing (see test_web_routers_tools_install_on_enable.py).
+"""
+
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
+
+
+class TestInstallSh:
+    def test_has_skip_flag(self) -> None:
+        text = INSTALL_SH.read_text()
+        assert "--skip-computer-use)" in text
+        assert "SKIP_COMPUTER_USE=true" in text
+        assert "SKIP_COMPUTER_USE=false" in text  # default off
+        assert "--skip-computer-use  Skip the cua-driver" in text
+
+    def test_install_function_wired_into_main_and_stage(self) -> None:
+        text = INSTALL_SH.read_text()
+        assert "install_computer_use_driver() {" in text
+        # main() flow and the node-deps stage both run it.
+        assert text.count("install_computer_use_driver\n") >= 2
+
+    def test_install_is_timeboxed_above_upstream_lock_window(self) -> None:
+        """The upstream installer serializes on a lock with a 600s stale
+        window; a ceiling below that reintroduces the self-perpetuating
+        wedge (#58762). Must stay >= 660."""
+        text = INSTALL_SH.read_text()
+        assert "run_with_timeout 660 /bin/bash -c" in text
+
+    def test_install_is_best_effort(self) -> None:
+        text = INSTALL_SH.read_text()
+        assert "Computer Use driver install failed" in text
+        assert "hermes computer-use install" in text
+
+    def test_skips_unwritable_applications_dir(self) -> None:
+        """Non-admin macOS accounts can't receive CuaDriver.app (#47865
+        class) — skip cleanly instead of failing every install."""
+        text = INSTALL_SH.read_text()
+        assert '[ -d /Applications ] && [ ! -w /Applications ]' in text
+
+
+class TestInstallPs1:
+    def test_has_skip_switch(self) -> None:
+        text = INSTALL_PS1.read_text()
+        assert "[switch]$SkipComputerUse," in text
+        assert "if ($SkipComputerUse)" in text
+
+    def test_install_function_wired_into_node_deps(self) -> None:
+        text = INSTALL_PS1.read_text()
+        assert "function Install-CuaDriver {" in text
+        assert "    Install-CuaDriver\n" in text
+
+    def test_install_is_timeboxed_above_upstream_lock_window(self) -> None:
+        text = INSTALL_PS1.read_text()
+        assert "Wait-Job $job -Timeout 660" in text
+
+    def test_install_is_best_effort(self) -> None:
+        text = INSTALL_PS1.read_text()
+        assert "Computer Use driver install timed out" in text
+        assert "hermes computer-use install" in text
+
+    def test_install_rechecks_runtime_contract_before_success(self) -> None:
+        text = INSTALL_PS1.read_text()
+        assert "$installedCuaDriver = Get-Command cua-driver" in text
+        assert (
+            "Test-CuaDriverRuntimeContract -DriverPath $installedCuaDriver.Source"
+            in text
+        )
+        assert "did not produce a compatible runtime" in text
+

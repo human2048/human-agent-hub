@@ -1,0 +1,404 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_budget_source.py ===
+"""Launch and growth decisions must price against CAPACITY, not live-free
+VRAM. Both execute through a server bounce — the outgoing instance's memory
+is freed before the new one loads — so a probe that reads the predecessor's
+(or the grown model's own) residency as 'gone' vetoes configurations that
+genuinely fit. Symptom when this regresses: a model the pane promised
+'144K on GPU' launches with its weights pinned to CPU and single-digit
+tokens/s while the card sits 60% empty."""
+
+from __future__ import annotations
+
+import ast
+import inspect
+
+
+def _planning_probe_calls(source: str) -> list[bool]:
+    """Every probe_budget(...) call's planning= value in the source."""
+    tree = ast.parse(source)
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "id", getattr(node.func, "attr", ""))
+                == "probe_budget"):
+            planning = any(
+                kw.arg == "planning"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords)
+            out.append(planning)
+    return out
+
+
+def test_bootstrap_presets_price_against_capacity():
+    import hermes_cli.local_runtime.bootstrap as bootstrap
+
+    calls = _planning_probe_calls(inspect.getsource(bootstrap))
+    assert calls, "bootstrap no longer probes a budget? update this test"
+    assert all(calls), (
+        "bootstrap prices launch decisions against live-free VRAM; a "
+        "restart/refresh probes while the outgoing server still holds the "
+        "card, pinning fitting models to CPU")
+
+
+def test_growth_refit_prices_against_capacity():
+    import hermes_cli.local_runtime.growth as growth
+
+    calls = _planning_probe_calls(inspect.getsource(growth))
+    assert calls, "growth no longer probes a budget? update this test"
+    assert all(calls), (
+        "growth re-fits against live-free VRAM; the grown model's own "
+        "residency reads as unavailable and vetoes rungs that fit the "
+        "post-bounce card")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_build_info.py ===
+"""Tests for hermes_cli.build_info — baked-in build SHA resolution.
+
+The build SHA is written by the Dockerfile's ``HERMES_GIT_SHA`` build-arg
+into ``<project_root>/.hermes_build_sha``.  These tests cover the read-side
+helper: missing file, malformed file, truncation, and error tolerance.
+"""
+
+from pathlib import Path
+from unittest.mock import patch
+
+
+def test_get_build_sha_returns_none_when_file_absent(tmp_path):
+    """Source installs: no file present → None, callers fall back to git."""
+    from hermes_cli import build_info
+
+    missing = tmp_path / ".hermes_build_sha"  # never created
+
+    with patch.object(build_info, "_BUILD_SHA_FILE", missing):
+        assert build_info.get_build_sha() is None
+
+
+def test_get_build_sha_respects_short_argument(tmp_path):
+    """``short=N`` truncates to N chars; ``short<=0`` returns full SHA."""
+    from hermes_cli import build_info
+
+    sha_file = tmp_path / ".hermes_build_sha"
+    full_sha = "abcdef1234567890abcdef1234567890abcdef12"
+    sha_file.write_text(full_sha + "\n")
+
+    with patch.object(build_info, "_BUILD_SHA_FILE", sha_file):
+        assert build_info.get_build_sha(short=12) == "abcdef123456"
+        assert build_info.get_build_sha(short=0) == full_sha
+        assert build_info.get_build_sha(short=-1) == full_sha
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_bundles.py ===
+"""Tests for hermes_cli/bundles.py — the `hermes bundles` CLI subcommand."""
+
+import argparse
+
+import pytest
+
+from hermes_cli.bundles import (
+    bundles_command,
+    register_cli,
+)
+
+
+@pytest.fixture
+def bundles_env(tmp_path, monkeypatch):
+    bundles_dir = tmp_path / "skill-bundles"
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    # Reset module-level cache between tests.
+    import agent.skill_bundles as mod
+    mod._bundles_cache = {}
+    mod._bundles_cache_mtime = None
+    return bundles_dir
+
+
+def _parse(argv):
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    return parser.parse_args(argv)
+
+
+class TestBundlesCli:
+
+
+
+    def test_create_refuses_overwrite(self, bundles_env, capsys):
+        bundles_command(_parse(["create", "dup", "--skill", "s1"]))
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as ei:
+            bundles_command(_parse(["create", "dup", "--skill", "s2"]))
+        assert ei.value.code == 1
+        out = capsys.readouterr().out
+        assert "already exists" in out.lower() or "--force" in out.lower()
+
+
+    def test_create_requires_skills(self, bundles_env, capsys, monkeypatch):
+        # Simulate user pressing Ctrl-D immediately at the interactive prompt.
+        monkeypatch.setattr("builtins.input", lambda *_a, **_kw: (_ for _ in ()).throw(EOFError()))
+        with pytest.raises(SystemExit):
+            bundles_command(_parse(["create", "empty"]))
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_busy_input_mode_command.py ===
+"""Tests for the /busy CLI command and busy-input-mode config handling."""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+def _import_cli():
+    import hermes_cli.config as config_mod
+
+    if not hasattr(config_mod, "save_env_value_secure"):
+        config_mod.save_env_value_secure = lambda key, value: {
+            "success": True,
+            "stored_as": key,
+            "validated": False,
+        }
+
+    import cli as cli_mod
+
+    return cli_mod
+
+
+class TestHandleBusyCommand(unittest.TestCase):
+    def _make_cli(self, busy_input_mode="interrupt"):
+        return SimpleNamespace(
+            busy_input_mode=busy_input_mode,
+            agent=None,
+        )
+
+    def test_no_args_shows_status(self):
+        cli_mod = _import_cli()
+        stub = self._make_cli("queue")
+        with (
+            patch.object(cli_mod, "_cprint") as mock_cprint,
+            patch.object(cli_mod, "save_config_value") as mock_save,
+        ):
+            cli_mod.HermesCLI._handle_busy_command(stub, "/busy")
+
+        mock_save.assert_not_called()
+        printed = " ".join(str(c) for c in mock_cprint.call_args_list)
+        self.assertIn("queue", printed)
+        self.assertIn("interrupt", printed)
+
+    def test_queue_argument_sets_queue_mode_and_saves(self):
+        cli_mod = _import_cli()
+        stub = self._make_cli("interrupt")
+        with (
+            patch.object(cli_mod, "_cprint"),
+            patch.object(cli_mod, "save_config_value", return_value=True) as mock_save,
+        ):
+            cli_mod.HermesCLI._handle_busy_command(stub, "/busy queue")
+
+        self.assertEqual(stub.busy_input_mode, "queue")
+        mock_save.assert_called_once_with("display.busy_input_mode", "queue")
+
+
+    def test_steer_argument_sets_steer_mode_and_saves(self):
+        cli_mod = _import_cli()
+        stub = self._make_cli("interrupt")
+        with (
+            patch.object(cli_mod, "_cprint") as mock_cprint,
+            patch.object(cli_mod, "save_config_value", return_value=True) as mock_save,
+        ):
+            cli_mod.HermesCLI._handle_busy_command(stub, "/busy steer")
+
+        self.assertEqual(stub.busy_input_mode, "steer")
+        mock_save.assert_called_once_with("display.busy_input_mode", "steer")
+        printed = " ".join(str(c) for c in mock_cprint.call_args_list)
+        self.assertIn("steer", printed.lower())
+
+
+    def test_invalid_argument_prints_usage(self):
+        cli_mod = _import_cli()
+        stub = self._make_cli()
+        with (
+            patch.object(cli_mod, "_cprint") as mock_cprint,
+            patch.object(cli_mod, "save_config_value") as mock_save,
+        ):
+            cli_mod.HermesCLI._handle_busy_command(stub, "/busy nonsense")
+
+        mock_save.assert_not_called()
+        printed = " ".join(str(c) for c in mock_cprint.call_args_list)
+        self.assertIn("Usage: /busy", printed)
+
+
+class TestBusyCommandRegistry(unittest.TestCase):
+    def test_busy_in_registry(self):
+        from hermes_cli.commands import COMMAND_REGISTRY
+
+        names = [c.name for c in COMMAND_REGISTRY]
+        assert "busy" in names
+
+    def test_busy_subcommands_documented(self):
+        from hermes_cli.commands import COMMAND_REGISTRY
+
+        busy = next(c for c in COMMAND_REGISTRY if c.name == "busy")
+        assert busy.args_hint == "[queue|steer|interrupt|status]"
+        assert busy.category == "Configuration"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_busy_policy_invariants.py ===
+"""Invariant tests for the declarative busy_policy on CommandDef.
+
+Guards the contract introduced by the Guard-2 refactor (gateway/run.py):
+every command's mid-run behavior is declared on its CommandDef via
+``busy_policy`` / ``busy_handler`` and the historical
+``ACTIVE_SESSION_BYPASS_COMMANDS`` frozenset is DERIVED from the registry
+rather than hand-maintained.
+"""
+
+from hermes_cli.commands import (
+    ACTIVE_SESSION_BYPASS_COMMANDS,
+    COMMAND_REGISTRY,
+    VALID_BUSY_POLICIES,
+    is_interrupt_then_dispatch,
+    should_bypass_active_session,
+)
+
+# The hand-written frozenset as it existed before the busy_policy refactor.
+# This is a behavior contract, not a snapshot: the derived set must remain a
+# SUPERSET of these names (each had an explicit mid-run handler in the old
+# Guard-2 if-chain and must keep bypassing the busy-reject catch-all).
+_HISTORICAL_BYPASS_NAMES = frozenset(
+    {
+        "agents",
+        "approve",
+        "bg",
+        "btw",
+        "commands",
+        "deny",
+        "help",
+        "new",
+        "profile",
+        "queue",
+        "restart",
+        "status",
+        "steer",
+        "stop",
+        "update",
+        "version",
+    }
+)
+
+
+
+
+
+
+def test_bypass_set_is_derived_from_registry():
+    expected = frozenset(
+        cmd.name for cmd in COMMAND_REGISTRY if cmd.busy_policy != "reject"
+    )
+    assert ACTIVE_SESSION_BYPASS_COMMANDS == expected
+
+
+def test_interrupt_then_dispatch_class():
+    # The cancel-handoff class (Guard 1, gateway/platforms/base.py) must
+    # contain exactly the /stop and /new (alias /reset) commands today.
+    assert is_interrupt_then_dispatch("stop")
+    assert is_interrupt_then_dispatch("new")
+    assert is_interrupt_then_dispatch("reset")  # alias of /new
+    assert not is_interrupt_then_dispatch("model")
+    assert not is_interrupt_then_dispatch("status")
+    assert not is_interrupt_then_dispatch(None)
+    assert not is_interrupt_then_dispatch("not-a-command")
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_bytecode_sweep.py ===
+"""Tests for the launch-time stale-bytecode sweep (checkout fingerprint guard).
+
+Bug class: the checkout's ``.py`` files change (``hermes update``, manual
+``git pull``, ZIP update) while ``__pycache__`` retains bytecode compiled
+from the previous revision; the next process to import trusts the stale
+``.pyc`` and dies with ``cannot import name ...`` (#6207, #60242).
+
+The launch-time guard compares the current checkout fingerprint against the
+last-validated stamp and sweeps ``__pycache__`` once when they diverge —
+covering paths no update-time clear can reach (manual pulls, pre-hardening
+updaters).
+"""
+
+from pathlib import Path
+
+from hermes_cli import main as hermes_main
+from hermes_cli import main_web_build
+
+
+def _make_repo(tmp_path: Path, sha: str = "a" * 40) -> Path:
+    """Minimal git checkout layout that _read_git_revision_fingerprint groks."""
+    repo = tmp_path / "repo"
+    git_dir = repo / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(sha + "\n", encoding="utf-8")
+    return repo
+
+
+def _make_pycache(repo: Path, subdir: str = "hermes_cli") -> Path:
+    cache = repo / subdir / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "main.cpython-311.pyc").write_bytes(b"stale")
+    return cache
+
+
+def test_sweep_clears_pycache_when_checkout_changed(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path, sha="b" * 40)
+    cache = _make_pycache(repo)
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo)
+    # Stamp records a different (older) fingerprint.
+    (repo / main_web_build._BYTECODE_FINGERPRINT_FILE).write_text(
+        "git:refs/heads/main:" + "a" * 40, encoding="utf-8"
+    )
+
+    hermes_main._sweep_stale_bytecode_if_checkout_changed()
+
+    assert not cache.exists()
+    # Stamp updated to the current fingerprint.
+    recorded = (repo / main_web_build._BYTECODE_FINGERPRINT_FILE).read_text(encoding="utf-8")
+    assert recorded.strip().endswith("b" * 40)
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Plugin-update sibling site: __pycache__ under ~/.hermes/plugins/<name>
+# ---------------------------------------------------------------------------
+
+def test_clear_plugin_bytecode_removes_nested_caches(tmp_path):
+    from hermes_cli import plugins_cmd
+
+    plugin = tmp_path / "myplugin"
+    top = plugin / "__pycache__"
+    nested = plugin / "sub" / "__pycache__"
+    top.mkdir(parents=True)
+    nested.mkdir(parents=True)
+    (top / "a.pyc").write_bytes(b"stale")
+    (nested / "b.pyc").write_bytes(b"stale")
+
+    removed = plugins_cmd._clear_plugin_bytecode(plugin)
+
+    assert removed == 2
+    assert not top.exists()
+    assert not nested.exists()
+
+
+

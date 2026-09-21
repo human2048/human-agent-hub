@@ -1,0 +1,302 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_transcript_offset.py ===
+"""Tests for transcript history offset fix.
+
+Regression tests for a bug where the gateway transcript lost 1 message
+per turn from turn 2 onwards.  The raw transcript history includes
+``session_meta`` entries that are filtered out before being passed to
+the agent.  The agent returns messages built from this filtered history
+plus new messages from the current turn.
+
+The old code used ``len(history)`` (raw count, includes session_meta)
+to slice ``agent_messages``, which caused the slice to skip valid new
+messages.  The fix adds ``history_offset`` (the filtered history length)
+to ``_run_agent``'s return dict and uses it for the slice.
+"""
+
+
+from gateway.run import _preserve_queued_followup_history_offset
+
+
+# ---------------------------------------------------------------------------
+# Helpers - replicate the filtering logic from _run_agent
+# ---------------------------------------------------------------------------
+
+def _filter_history(history: list) -> list:
+    """Replicate the agent_history filtering from GatewayRunner._run_agent.
+
+    Strips session_meta and system messages, exactly as the real code does.
+    """
+    agent_history = []
+    for msg in history:
+        role = msg.get("role")
+        if not role:
+            continue
+        if role in {"session_meta",}:
+            continue
+        if role == "system":
+            continue
+
+        has_tool_calls = "tool_calls" in msg
+        has_tool_call_id = "tool_call_id" in msg
+        is_tool_message = role == "tool"
+
+        if has_tool_calls or has_tool_call_id or is_tool_message:
+            clean_msg = {k: v for k, v in msg.items() if k != "timestamp"}
+            agent_history.append(clean_msg)
+        else:
+            content = msg.get("content")
+            if content:
+                agent_history.append({"role": role, "content": content})
+    return agent_history
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class TestTranscriptHistoryOffset:
+    """Verify the transcript extraction uses the filtered history length."""
+
+    def test_session_meta_causes_offset_mismatch(self):
+        """Turn 2: session_meta makes len(history) > len(agent_history).
+
+        - history (raw): 1 session_meta + 2 conversation = 3 entries
+        - agent_history (filtered): 2 entries
+        - Agent returns 2 old + 2 new = 4 messages
+        - OLD: agent_messages[3:] = 1 message (lost the user message)
+        - FIX: agent_messages[2:] = 2 messages (correct)
+        """
+        history = [
+            {"role": "session_meta", "tools": [], "model": "gpt-4",
+             "platform": "telegram", "timestamp": "t0"},
+            {"role": "user", "content": "Hello", "timestamp": "t1"},
+            {"role": "assistant", "content": "Hi there!", "timestamp": "t1"},
+        ]
+
+        agent_history = _filter_history(history)
+        assert len(agent_history) == 2  # session_meta stripped
+
+        # Agent returns: filtered history (2) + new turn (2)
+        agent_messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "What is Python?"},
+            {"role": "assistant", "content": "A programming language."},
+        ]
+
+        # OLD behavior: len(history) = 3, skips too many
+        old_offset = len(history)
+        old_new = (agent_messages[old_offset:]
+                   if len(agent_messages) > old_offset
+                   else agent_messages)
+        assert len(old_new) == 1  # BUG: lost the user message
+
+        # FIXED behavior: history_offset = 2
+        history_offset = len(agent_history)
+        fixed_new = (agent_messages[history_offset:]
+                     if len(agent_messages) > history_offset
+                     else [])
+        assert len(fixed_new) == 2
+        assert fixed_new[0]["content"] == "What is Python?"
+        assert fixed_new[1]["content"] == "A programming language."
+
+    def test_no_session_meta_same_result(self):
+        """First turn has no session_meta, so both approaches agree."""
+        history = []
+        agent_history = _filter_history(history)
+        assert len(agent_history) == 0
+
+        agent_messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"},
+        ]
+
+        old_new = (agent_messages[len(history):]
+                   if len(agent_messages) > len(history)
+                   else agent_messages)
+        fixed_new = (agent_messages[len(agent_history):]
+                     if len(agent_messages) > len(agent_history)
+                     else [])
+
+        assert old_new == fixed_new
+        assert len(fixed_new) == 2
+
+
+    def test_recursive_queued_followup_keeps_outer_history_offset(self):
+        """Queued drain persistence must include every turn in the chain.
+
+        ``_run_agent()`` recurses when a follow-up arrived while the current turn
+        was running. The recursive call naturally returns a later
+        ``history_offset`` because it received the previous turn as part of its
+        input history. If the outer caller persists transcript rows using that
+        later offset, it only sees the *last* queued turn as new and drops the
+        earlier queued turn from the transcript.
+        """
+        history_before_chain = [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Earlier answer"},
+        ]
+        first_followup_turn = [
+            {"role": "user", "content": "First follow-up question"},
+            {"role": "assistant", "content": "First follow-up answer"},
+        ]
+        second_followup_turn = [
+            {"role": "user", "content": "Second follow-up question"},
+            {"role": "assistant", "content": "Second follow-up answer"},
+        ]
+
+        current_result = {
+            "history_offset": len(history_before_chain),
+            "messages": history_before_chain + first_followup_turn,
+        }
+        followup_result = {
+            "history_offset": len(history_before_chain + first_followup_turn),
+            "messages": (
+                history_before_chain
+                + first_followup_turn
+                + second_followup_turn
+            ),
+        }
+
+        merged = _preserve_queued_followup_history_offset(
+            current_result,
+            followup_result,
+        )
+        assert merged["history_offset"] == len(history_before_chain)
+
+        persisted = merged["messages"][merged["history_offset"]:]
+        assert persisted == first_followup_turn + second_followup_turn
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_transcript_read_failure.py ===
+"""A failed transcript read must not masquerade as an empty history (#100788).
+
+The gateway restore path (``_handle_message``) already fails closed on
+current main (#100910). This file covers the surviving half of PR #100887:
+the slash-command handlers, which used to let ``TranscriptReadError``
+propagate into the dispatch wrapper and reply with nothing at all.
+
+Incident shape: a malformed ``state.db`` made every
+``SessionStore.load_transcript`` raise; the except-block swallowed it and
+returned ``[]``.  Restore then rebuilt the turn from "no history", so a
+long-running chat silently restarted as a brand-new conversation and the
+model happily answered as if nothing had ever been discussed.
+
+Two guarantees under test:
+  A. ``load_transcript`` raises ``TranscriptReadError`` on a read failure,
+     while a genuinely empty session still returns ``[]``.
+  B. Slash-command handlers that read the transcript reply with
+     ``HISTORY_UNREADABLE`` instead of raising into the dispatch wrapper
+     (which logs and sends nothing).
+
+Offline: SQLite on tmp_path only, no network.
+"""
+
+import sqlite3
+
+import pytest
+
+from gateway.config import GatewayConfig
+from gateway.session import SessionStore
+from gateway.session_transcript import TranscriptReadError
+
+
+@pytest.fixture
+def store(tmp_path):
+    return SessionStore(sessions_dir=tmp_path / "gw", config=GatewayConfig())
+
+
+# --------------------------------------------------------------------------
+# A. read failure != empty transcript (landed on main via #100910; kept as
+#    the contract the slash-command handlers below rely on)
+# --------------------------------------------------------------------------
+
+
+class TestLoadTranscriptReadFailure:
+    def test_read_failure_raises_instead_of_returning_empty(self, store, monkeypatch):
+        db = store._db
+        assert db is not None
+        db.create_session("s1", "telegram", session_key="telegram:1")
+        db.append_message("s1", "user", "the conversation we must not forget")
+
+        boom = sqlite3.DatabaseError("database disk image is malformed")
+
+        def _raise(*_args, **_kwargs):
+            raise boom
+
+        monkeypatch.setattr(db, "get_messages_as_conversation", _raise)
+
+        with pytest.raises(TranscriptReadError) as excinfo:
+            store.load_transcript("s1")
+
+        assert excinfo.value.session_id == "s1"
+        assert excinfo.value.__cause__ is boom
+
+    def test_genuinely_empty_session_still_returns_empty_list(self, store):
+        db = store._db
+        assert db is not None
+        db.create_session("s2", "telegram", session_key="telegram:2")
+
+        assert store.load_transcript("s2") == []
+
+    def test_no_db_still_returns_empty_list(self, store):
+        # "No DB for this session" really is an empty transcript, not a
+        # failure — that path must keep its [] contract.
+        store._db = None
+        assert store.load_transcript("nope") == []
+
+
+# --------------------------------------------------------------------------
+# B. slash-command handlers surface the failure instead of dying silently.
+#    Before: the handler raised, base.py's dispatch wrapper logged
+#    "Command '/x' dispatch failed" and the user got NO reply at all.
+# --------------------------------------------------------------------------
+
+
+class TestSlashCommandsOnUnreadableTranscript:
+    def test_history_unreadable_text_is_explicit(self):
+        from gateway.slash_commands_status import HISTORY_UNREADABLE
+
+        # Says the history exists (not a fresh chat), avoids the internal file name, and names a fix.
+        assert "earlier messages exist" in HISTORY_UNREADABLE
+        assert "state.db" not in HISTORY_UNREADABLE
+        assert "hermes doctor --fix" in HISTORY_UNREADABLE and "/new" in HISTORY_UNREADABLE
+
+    @pytest.mark.asyncio
+    async def test_btw_replies_history_unreadable_on_read_failure(self):
+        """The except-branch must actually run: after the Sep 2026 decomposition the
+        constant lived in slash_commands_status but was not imported by slash_commands,
+        so this path raised NameError (#102117 follow-up)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.slash_commands_status import HISTORY_UNREADABLE
+        from tests.gateway.test_background_command import _make_event, _make_runner
+
+        runner = _make_runner()
+        store = AsyncMock()
+        store.get_or_create_session.return_value = MagicMock(session_id="s1")
+        store.load_transcript.side_effect = TranscriptReadError("malformed")
+        store._store = runner.session_store
+        runner._async_session_store = store
+
+        result = await runner._handle_btw_command(_make_event(text="/btw what?"))
+        assert result == HISTORY_UNREADABLE
+
+    def test_every_transcript_reading_handler_catches_the_error(self):
+        """No `await ...load_transcript(` in the mixin may be left uncaught."""
+        import inspect
+        import re
+
+        from gateway import slash_commands as sc
+
+        src = inspect.getsource(sc)
+        # Each awaited load_transcript must sit inside a try: whose handlers
+        # include TranscriptReadError within the following ~6 lines.
+        for m in re.finditer(r"await self\.async_session_store\.load_transcript\(", src):
+            window = src[m.end() : m.end() + 400]
+            assert "except TranscriptReadError" in window, src[m.start() - 200 : m.end() + 100]
+

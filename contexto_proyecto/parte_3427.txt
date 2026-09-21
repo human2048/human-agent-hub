@@ -1,0 +1,319 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_openai_listing_authority.py ===
+"""Live-listing authority on official OpenAI hosts (model switching).
+
+Coatue data-residency report, issue 2: on an API key whose project only
+grants a subset of models, ``/model`` accepted a curated-catalog model that
+the live ``/v1/models`` listing (which is access-scoped and authoritative on
+official OpenAI hosts) did not contain — manufacturing a selection that is
+guaranteed to 400 at first use.
+
+Contract: for ``openai``/``openai-api`` against an official OpenAI host
+(canonical or data-residency regional), a successful live listing is
+authoritative — a model absent from it is rejected, not soft-accepted from
+the curated catalog. Custom OpenAI-compatible proxies and other providers
+keep the #46850 curated-fallback behavior (their listings are often
+incomplete).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch as mock_patch
+
+import pytest
+
+from hermes_cli import models as models_mod
+from hermes_cli import models_validate
+
+
+def _validate(requested: str, base_url: str, live: list[str], provider: str = "openai-api"):
+    with mock_patch.object(models_mod, "fetch_api_models", return_value=live):
+        return models_validate.validate_requested_model(
+            requested,
+            provider=provider,
+            api_key="sk-test",
+            base_url=base_url,
+        )
+
+
+class TestOfficialHostAuthority:
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://api.openai.com/v1",
+            "https://us.api.openai.com/v1",
+            "https://eu.api.openai.com/v1",
+        ],
+    )
+    def test_absent_model_rejected_on_official_hosts(self, base_url):
+        result = _validate("gpt-5.5", base_url, live=["gpt-5.6-terra"])
+        assert result["accepted"] is False
+
+    def test_present_model_accepted_on_regional_host(self):
+        result = _validate("gpt-5.6-terra", "https://us.api.openai.com/v1", live=["gpt-5.6-terra"])
+        assert result["accepted"] is True
+
+
+class TestCuratedFallbackPreserved:
+    def test_custom_proxy_keeps_curated_fallback(self):
+        # gpt-5.5 is in the curated openai catalog; a custom proxy's listing
+        # may be incomplete, so the #46850 soft-accept stays.
+        result = _validate("gpt-5.5", "https://proxy.corp.test/v1", live=["some-other-model"])
+        assert result["accepted"] is True
+        assert "curated catalog" in (result.get("message") or "")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_openai_picker_curated.py ===
+"""Regression tests for two OpenAI/OpenRouter model-picker bugs.
+
+Bug 1 — OpenAI picker dumped the raw ``/v1/models`` catalog
+    ``provider_model_ids("openai")`` hit ``api.openai.com/v1/models`` and
+    returned the full 120+ entry catalog (embeddings, whisper, tts, dall-e,
+    moderation, gpt-3.5, …). The ``hermes model`` CLI shows only the curated
+    agentic list. The picker now intersects the live default-endpoint catalog
+    with the curated list (preserving curated order) so both surfaces match.
+    Custom OpenAI-compatible endpoints (proxies, gateways) keep the live list
+    verbatim so discovery still works.
+
+Bug 2 — OpenRouter appeared authenticated whenever OPENAI_API_KEY was set
+    OpenRouter's HermesOverlay carried ``extra_env_vars=("OPENAI_API_KEY",)``.
+    ``list_authenticated_providers`` reads ``extra_env_vars`` to decide whether
+    a provider has credentials, so any OpenAI user saw a phantom OpenRouter
+    row. The overlay entry is removed; runtime credential resolution still
+    falls back to OPENAI_API_KEY for explicitly-selected OpenRouter (handled
+    in runtime_provider.py, independent of the overlay).
+"""
+
+import os
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli import models as M
+from hermes_cli.providers import HERMES_OVERLAYS
+
+
+# --- Bug 2: overlay no longer lists OPENAI_API_KEY --------------------------
+
+def test_openrouter_overlay_does_not_list_openai_api_key():
+    overlay = HERMES_OVERLAYS["openrouter"]
+    assert "OPENAI_API_KEY" not in overlay.extra_env_vars
+
+
+# --- Bug 1: default OpenAI endpoint filters to curated agentic models -------
+
+def test_default_openai_endpoint_filters_to_curated(monkeypatch):
+    """The 126-model /v1/models dump is intersected with the curated list."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    curated = M._PROVIDER_MODELS["openai-api"]
+    # Live catalog: every curated model PLUS a pile of non-agentic junk.
+    live = list(curated) + [
+        "text-embedding-3-large", "whisper-1", "tts-1", "dall-e-3",
+        "gpt-3.5-turbo", "davinci-002", "omni-moderation-latest",
+    ]
+    with patch.object(M, "fetch_api_models", return_value=live):
+        result = M.provider_model_ids("openai-api", force_refresh=True)
+
+    # Only curated models survive, in curated order, no junk.
+    assert result == list(curated)
+    for m in result:
+        assert m in curated
+
+
+def test_default_openai_endpoint_intersects_account_access(monkeypatch):
+    """Curated models the account can't access are dropped (intersection)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    curated = M._PROVIDER_MODELS["openai-api"]
+    # Account only serves the first two curated models.
+    live = list(curated[:2]) + ["text-embedding-3-large", "whisper-1"]
+    with patch.object(M, "fetch_api_models", return_value=live):
+        result = M.provider_model_ids("openai-api", force_refresh=True)
+
+    assert result == list(curated[:2])
+
+
+def test_astra_is_offered_only_by_successful_account_discovery(monkeypatch):
+    """A gated preview may enrich the picker only when this API key lists it."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    with patch.object(M, "fetch_api_models", return_value=["gpt-5.6-sol", "gpt-6-astra"]):
+        discovered = M.provider_model_ids("openai-api", force_refresh=True)
+    with patch.object(M, "fetch_api_models", return_value=["gpt-5.6-sol"]):
+        not_entitled = M.provider_model_ids("openai-api", force_refresh=True)
+    with patch.object(M, "fetch_api_models", side_effect=RuntimeError("discovery unavailable")):
+        discovery_failed = M.provider_model_ids("openai-api", force_refresh=True)
+
+    assert "gpt-6-astra" in discovered
+    assert "gpt-6-astra" not in not_entitled
+    assert "gpt-6-astra" not in discovery_failed
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_opencode_go_flat_namespace.py ===
+"""Tests for opencode-go / opencode-zen flat-namespace model handling.
+
+OpenCode Go is NOT a vendor/model aggregator like OpenRouter — its
+``/v1/models`` endpoint returns bare IDs (``minimax-m2.7``, ``deepseek-v4-flash``)
+and the inference API rejects vendor-prefixed names with HTTP 401
+"Model not supported".
+
+Two bugs this exercises:
+
+1. ``switch_model('deepseek-v4-flash', current_provider='opencode-go')`` used
+   to silently switch the user off opencode-go to native ``deepseek`` because
+   ``detect_provider_for_model`` matched the bare name against the static
+   deepseek catalog.  Fix: once step d matches the model in the current
+   aggregator's live catalog, skip ``detect_provider_for_model``.
+
+2. ``normalize_model_for_provider('minimax/minimax-m2.7', 'opencode-go')``
+   used to pass the ``minimax/`` prefix through unchanged.  When user configs
+   contained prefixed fallback entries (commonly copied from aggregator slugs),
+   the fallback activation path sent ``minimax/minimax-m2.7`` to opencode-go
+   which returned HTTP 401.  Fix: opencode-go/opencode-zen strip ANY leading
+   ``vendor/`` prefix because their APIs are flat-namespace.
+"""
+
+from unittest.mock import patch
+
+from hermes_cli.model_normalize import normalize_model_for_provider
+from hermes_cli.model_switch import switch_model
+
+
+# Live catalog opencode-go currently returns from /v1/models (snapshot).
+_OPENCODE_GO_LIVE = [
+    "minimax-m2.7", "minimax-m2.5",
+    "kimi-k2.6", "kimi-k2.5",
+    "glm-5.1", "glm-5",
+    "deepseek-v4-pro", "deepseek-v4-flash",
+    "qwen3.6-plus", "qwen3.5-plus",
+    "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro", "mimo-v2.5",
+]
+
+
+# ---------------------------------------------------------------------------
+# normalize_model_for_provider: strip vendor prefix for flat-namespace providers
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_go_strips_deepseek_prefix():
+    assert normalize_model_for_provider(
+        "deepseek/deepseek-v4-flash", "opencode-go"
+    ) == "deepseek-v4-flash"
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# switch_model: live-catalog match on opencode-go must not trigger
+# cross-provider auto-switch via detect_provider_for_model
+# ---------------------------------------------------------------------------
+
+
+def _run_switch(raw_input: str, **extra):
+    """Call switch_model with opencode-go as current provider, mocking the
+    live catalog so the test doesn't hit the network."""
+    defaults = dict(
+        current_provider="opencode-go",
+        current_model="kimi-k2.6",
+        current_base_url="https://opencode.ai/zen/go/v1",
+        current_api_key="sk-test-opencode-go",
+        is_global=False,
+    )
+    defaults.update(extra)
+
+    def fake_list_provider_models(provider: str):
+        if provider == "opencode-go":
+            return list(_OPENCODE_GO_LIVE)
+        # For other providers, return empty so tests don't depend on them.
+        return []
+
+    with patch(
+        "hermes_cli.model_switch.list_provider_models",
+        side_effect=fake_list_provider_models,
+    ):
+        return switch_model(raw_input=raw_input, **defaults)
+
+
+
+
+
+
+def test_kimi_k2_6_stays_on_opencode_go():
+    """Regression guard: this path was always working, keep it working."""
+    result = _run_switch("kimi-k2.6", current_model="deepseek-v4-pro")
+    assert result.target_provider == "opencode-go"
+    assert result.new_model == "kimi-k2.6"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_opencode_go_in_model_list.py ===
+"""Test that opencode-go appears in /model list when credentials are set."""
+
+import os
+from unittest.mock import patch
+
+from hermes_cli.model_switch import list_authenticated_providers
+
+
+# Minimum set of models that must be present for opencode-go no matter
+# whether the picker sourced its list from curated-only or curated+models.dev.
+# The curated list in hermes_cli/models.py defines the floor; models.dev only
+# ever adds names on top of it via _merge_with_models_dev.
+_OPENCODE_GO_REQUIRED = {
+    "kimi-k2.6",
+    "kimi-k2.5",
+    "glm-5.1",
+    "glm-5",
+    "mimo-v2-pro",
+    "mimo-v2-omni",
+    "minimax-m2.7",
+    "minimax-m2.5",
+}
+
+
+@patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}, clear=False)
+def test_opencode_go_appears_when_api_key_set():
+    """opencode-go should appear in list_authenticated_providers when OPENCODE_GO_API_KEY is set."""
+    providers = list_authenticated_providers(current_provider="openrouter", max_models=50)
+
+    # Find opencode-go in results
+    opencode_go = next((p for p in providers if p["slug"] == "opencode-go"), None)
+
+    assert opencode_go is not None, "opencode-go should appear when OPENCODE_GO_API_KEY is set"
+    # Behavior check: the curated floor must be present. The list may also
+    # include extra models.dev entries (e.g. mimo-v2.5-pro) when the registry
+    # is reachable — that's the whole point of the models.dev-preferred merge
+    # introduced for opencode-go, so don't pin to an exact list here.
+    present = set(opencode_go["models"])
+    missing = _OPENCODE_GO_REQUIRED - present
+    assert not missing, (
+        f"opencode-go picker should include the curated floor; missing: {sorted(missing)}. "
+        f"Got: {opencode_go['models']}"
+    )
+    # opencode-go can appear as "built-in" (from PROVIDER_TO_MODELS_DEV when
+    # models.dev is reachable) or "hermes" (from HERMES_OVERLAYS fallback when
+    # the API is unavailable, e.g. in CI).
+    assert opencode_go["source"] in {"built-in", "hermes"}
+
+
+def test_opencode_go_not_appears_when_no_creds():
+    """opencode-go should NOT appear when no credentials are set."""
+    # Ensure OPENCODE_GO_API_KEY is not set
+    env_without_key = {k: v for k, v in os.environ.items() if k != "OPENCODE_GO_API_KEY"}
+
+    with patch.dict(os.environ, env_without_key, clear=True):
+        providers = list_authenticated_providers(current_provider="openrouter")
+
+        # opencode-go should not be in results
+        opencode_go = next((p for p in providers if p["slug"] == "opencode-go"), None)
+        assert opencode_go is None, "opencode-go should not appear without credentials"
+

@@ -1,0 +1,368 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_status_bar_goal.py ===
+"""Status-bar goal segment (⊙ goal N/M) — active-goal-only rendering.
+
+The segment mirrors the desktop composer goal indicator: it appears only
+while a /goal is ACTIVE, shows turns used vs the turn budget, and stays out
+of the bar entirely for paused/done/absent goals (those already print their
+own glyph lines in the conversation thread).
+"""
+
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+
+from cli import HermesCLI
+
+
+def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj.model = model
+    cli_obj.session_start = datetime.now() - timedelta(minutes=14, seconds=32)
+    cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
+    cli_obj.agent = None
+    return cli_obj
+
+
+def _attach_goal(cli_obj, *, active: bool, turns_used: int = 3, max_turns: int = 20):
+    """Bind a fake GoalManager the way _get_goal_manager caches one."""
+    cli_obj.session_id = "sess-goal-test"
+    cli_obj._goal_manager = SimpleNamespace(
+        session_id="sess-goal-test",
+        is_active=lambda: active,
+        state=SimpleNamespace(turns_used=turns_used, max_turns=max_turns),
+    )
+    return cli_obj
+
+
+class TestStatusBarGoalSegment:
+    def test_goal_segment_composition(self):
+        cli_obj = _attach_goal(_make_cli(), active=True, turns_used=3, max_turns=20)
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["goal_active"] is True
+        assert snapshot["goal_turns_used"] == 3
+        assert snapshot["goal_max_turns"] == 20
+        assert cli_obj._status_bar_goal_segment(snapshot) == "⊙ goal 3/20"
+
+
+    def test_goal_segment_absent_when_paused(self):
+        # Paused goals must NOT occupy the status bar (active-only contract).
+        cli_obj = _attach_goal(_make_cli(), active=False)
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["goal_active"] is False
+        assert cli_obj._status_bar_goal_segment(snapshot) == ""
+
+
+    def test_active_goal_rendered_in_wide_status_bar(self):
+        cli_obj = _attach_goal(_make_cli(), active=True, turns_used=5, max_turns=20)
+
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert "⊙ goal 5/20" in text
+
+    def test_active_goal_rendered_in_medium_status_bar(self):
+        cli_obj = _attach_goal(_make_cli(), active=True, turns_used=1, max_turns=20)
+
+        text = cli_obj._build_status_bar_text(width=60)
+
+        assert "⊙ goal 1/20" in text
+
+    def test_active_goal_rendered_in_narrow_status_bar(self):
+        cli_obj = _attach_goal(_make_cli(), active=True, turns_used=2, max_turns=20)
+
+        text = cli_obj._build_status_bar_text(width=50)
+
+        assert "⊙ goal" in text
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_status_command.py ===
+"""Tests for CLI /status command behavior."""
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from cli import HermesCLI
+from hermes_cli.commands import resolve_command
+
+
+def _make_cli():
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj.config = {}
+    cli_obj.console = MagicMock()
+    cli_obj.agent = None
+    cli_obj.conversation_history = []
+    cli_obj.session_id = "session-123"
+    cli_obj._pending_input = MagicMock()
+    cli_obj._status_bar_visible = True
+    cli_obj.model = "openai/gpt-5.4"
+    cli_obj.provider = "openai"
+    cli_obj.session_start = datetime(2026, 4, 9, 19, 24)
+    cli_obj._agent_running = False
+    cli_obj._session_db = MagicMock()
+    cli_obj._session_db.get_session.return_value = None
+    return cli_obj
+
+
+def test_status_command_is_available_in_cli_registry():
+    cmd = resolve_command("status")
+    assert cmd is not None
+    assert cmd.gateway_only is False
+
+
+def test_egress_command_is_available_in_cli_registry():
+    cmd = resolve_command("egress")
+    assert cmd is not None
+    assert cmd.gateway_only is False
+    assert "status" in cmd.subcommands
+
+
+
+
+def test_process_command_egress_prints_proxy_status(monkeypatch):
+    cli_obj = _make_cli()
+    monkeypatch.setattr(
+        "hermes_cli.proxy_cli.format_status_text",
+        lambda: "Egress proxy status\nEnabled: no",
+    )
+
+    assert cli_obj.process_command("/egress") is True
+
+    cli_obj.console.print.assert_called()
+    printed = "\n".join(str(call.args[0]) for call in cli_obj.console.print.call_args_list)
+    assert "Egress proxy status" in printed
+
+
+
+
+def test_status_prefix_prefers_status_command_over_statusbar_toggle():
+    cli_obj = _make_cli()
+
+    with patch.object(cli_obj, "_show_session_status") as mock_status:
+        assert cli_obj.process_command("/sta") is True
+
+    mock_status.assert_called_once_with()
+    assert cli_obj._status_bar_visible is True
+
+
+def test_show_session_status_prints_gateway_style_summary():
+    cli_obj = _make_cli()
+    cli_obj.agent = SimpleNamespace(
+        session_total_tokens=321,
+        session_api_calls=4,
+    )
+    cli_obj._session_db.get_session.return_value = {
+        "title": "My titled session",
+        "started_at": 1775791440,
+    }
+
+    with patch("hermes_constants.display_hermes_home", return_value="~/.hermes"):
+        cli_obj._show_session_status()
+
+    printed = "\n".join(str(call.args[0]) for call in cli_obj.console.print.call_args_list)
+    assert "Hermes CLI Status" in printed
+    assert "Session ID: session-123" in printed
+    assert "Path: ~/.hermes" in printed
+    assert "Title: My titled session" in printed
+    assert "Model: openai/gpt-5.4 (openai)" in printed
+    assert "Tokens: 321" in printed
+    assert "Agent Running: No" in printed
+    _, kwargs = cli_obj.console.print.call_args
+    assert kwargs.get("highlight") is False
+    assert kwargs.get("markup") is False
+
+
+def test_show_session_status_includes_reasoning_approvals_context():
+    """C-02: /status surfaces reasoning level, approval mode, and context %."""
+    cli_obj = _make_cli()
+    cli_obj.agent = SimpleNamespace(session_total_tokens=1000, session_api_calls=2,
+                                    reasoning_config={"enabled": True, "effort": "high"})
+    cli_obj.reasoning_config = {"enabled": True, "effort": "high"}
+    cli_obj.show_reasoning = True
+    cli_obj.session_key = ""
+    cli_obj._session_db.get_session.return_value = {"started_at": 1775791440}
+    cli_obj._get_status_bar_snapshot = lambda: {
+        "context_tokens": 50000, "context_length": 200000, "context_percent": 25,
+    }
+
+    with patch("hermes_constants.display_hermes_home", return_value="~/.hermes"), \
+         patch("tools.approval_context._get_approval_mode", return_value="manual"), \
+         patch("tools.approval.is_approval_bypass_active_for_session", return_value=False):
+        cli_obj._show_session_status()
+
+    printed = "\n".join(str(call.args[0]) for call in cli_obj.console.print.call_args_list)
+    assert "Reasoning: high (display: on)" in printed
+    assert "Approvals: manual" in printed
+    assert "Context: 75% left · 50,000 / 200,000 tokens used" in printed
+
+
+def test_profile_command_reports_custom_root_profile(monkeypatch, tmp_path, capsys):
+    """Profile detection works for custom-root deployments (not under ~/.hermes)."""
+    cli_obj = _make_cli()
+    profile_home = tmp_path / "profiles" / "coder"
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "unrelated-home")
+
+    cli_obj._handle_profile_command()
+
+    out = capsys.readouterr().out
+    assert "Profile: coder" in out
+    assert f"Home:    {profile_home}" in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_cli_steer_busy_path.py ===
+"""Regression tests for classic-CLI mid-run /steer dispatch.
+
+Background
+----------
+/steer sent while the agent is running used to be queued through
+``self._pending_input`` alongside ordinary user input.  ``process_loop``
+pulls from that queue and calls ``process_command()`` — but while the
+agent is running, ``process_loop`` is blocked inside ``self.chat()``.
+By the time the queued /steer was pulled, ``_agent_running`` had
+already flipped back to False, so ``process_command()`` took the idle
+fallback (``"No agent running; queued as next turn"``) and delivered
+the steer as an ordinary next-turn message.
+
+The fix dispatches /steer inline on the UI thread when the agent is
+running — matching the existing pattern for /model — so the steer
+reaches ``agent.steer()`` (thread-safe) without touching the queue.
+
+These tests exercise the detector + inline dispatch without starting a
+prompt_toolkit app.
+"""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from unittest.mock import MagicMock, patch
+
+
+def _make_cli():
+    """Create a HermesCLI instance with prompt_toolkit stubbed out."""
+    _clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {"compact": False, "tool_progress": "all"},
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    prompt_toolkit_stubs = {
+        "prompt_toolkit": MagicMock(),
+        "prompt_toolkit.history": MagicMock(),
+        "prompt_toolkit.styles": MagicMock(),
+        "prompt_toolkit.patch_stdout": MagicMock(),
+        "prompt_toolkit.application": MagicMock(),
+        "prompt_toolkit.layout": MagicMock(),
+        "prompt_toolkit.layout.processors": MagicMock(),
+        "prompt_toolkit.filters": MagicMock(),
+        "prompt_toolkit.layout.dimension": MagicMock(),
+        "prompt_toolkit.layout.menus": MagicMock(),
+        "prompt_toolkit.widgets": MagicMock(),
+        "prompt_toolkit.key_binding": MagicMock(),
+        "prompt_toolkit.completion": MagicMock(),
+        "prompt_toolkit.formatted_text": MagicMock(),
+        "prompt_toolkit.auto_suggest": MagicMock(),
+    }
+    with patch.dict(sys.modules, prompt_toolkit_stubs), patch.dict(
+        "os.environ", clean_env, clear=False
+    ):
+        import cli as _cli_mod
+
+        _cli_mod = importlib.reload(_cli_mod)
+        with patch.object(_cli_mod, "get_tool_definitions", return_value=[]), patch.dict(
+            _cli_mod.__dict__, {"CLI_CONFIG": _clean_config}
+        ):
+            return _cli_mod.HermesCLI()
+
+
+class TestSteerInlineDetector:
+    """_should_handle_steer_command_inline gates the busy-path fast dispatch."""
+
+    def test_detects_steer_when_agent_running(self):
+        cli = _make_cli()
+        cli._agent_running = True
+        assert cli._should_handle_steer_command_inline("/steer focus on error handling") is True
+
+    def test_ignores_steer_when_agent_idle(self):
+        """Idle-path /steer should fall through to the normal process_loop
+        dispatch so the queue-style fallback message is emitted."""
+        cli = _make_cli()
+        cli._agent_running = False
+        assert cli._should_handle_steer_command_inline("/steer do something") is False
+
+    def test_ignores_non_slash_input(self):
+        cli = _make_cli()
+        cli._agent_running = True
+        assert cli._should_handle_steer_command_inline("steer without slash") is False
+        assert cli._should_handle_steer_command_inline("") is False
+
+    def test_ignores_other_slash_commands(self):
+        cli = _make_cli()
+        cli._agent_running = True
+        assert cli._should_handle_steer_command_inline("/queue hello") is False
+        assert cli._should_handle_steer_command_inline("/stop") is False
+        assert cli._should_handle_steer_command_inline("/help") is False
+
+    def test_ignores_steer_with_attached_images(self):
+        """Image payloads take the normal path; steer doesn't accept images."""
+        cli = _make_cli()
+        cli._agent_running = True
+        assert cli._should_handle_steer_command_inline("/steer text", has_images=True) is False
+
+
+class TestSteerBusyPathDispatch:
+    """When the detector fires, process_command('/steer ...') must call
+    agent.steer() directly rather than the idle-path fallback."""
+
+    def test_process_command_routes_to_agent_steer(self):
+        """With _agent_running=True and agent.steer present, /steer reaches
+        agent.steer(payload), NOT _pending_input."""
+        cli = _make_cli()
+        cli._agent_running = True
+        cli.agent = MagicMock()
+        cli.agent.steer = MagicMock(return_value=True)
+        # Make sure the idle-path fallback would be observable if taken
+        cli._pending_input = MagicMock()
+
+        cli.process_command("/steer focus on errors")
+
+        cli.agent.steer.assert_called_once_with("focus on errors")
+        cli._pending_input.put.assert_not_called()
+
+    def test_idle_path_queues_as_next_turn(self):
+        """Control — when the agent is NOT running, /steer correctly falls
+        back to next-turn queue semantics.  Demonstrates why the fix was
+        needed: the queue path only works when you can actually drain it."""
+        cli = _make_cli()
+        cli._agent_running = False
+        cli.agent = MagicMock()
+        cli.agent.steer = MagicMock(return_value=True)
+        cli._pending_input = MagicMock()
+
+        cli.process_command("/steer would-be-next-turn")
+
+        # Idle path does NOT call agent.steer
+        cli.agent.steer.assert_not_called()
+        # It puts the payload in the queue as a normal next-turn message
+        cli._pending_input.put.assert_called_once_with("would-be-next-turn")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import pytest
+
+    pytest.main([__file__, "-v"])
+

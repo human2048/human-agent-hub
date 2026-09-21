@@ -1,0 +1,255 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_profile_rebuild_commit.py ===
+"""Session-only tools ingress and rebuild failure preserve profile isolation."""
+import threading
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+
+@pytest.mark.parametrize("explicit_profile", [None, "default"])
+def test_tools_configure_uses_live_session_profile(tmp_path, monkeypatch, explicit_profile):
+    from tui_gateway import server
+    from hermes_constants import get_hermes_home
+
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    config = {"platform_toolsets": {"cli": ["terminal", "web"]}}
+    for path in (home, profile):
+        (path / "config.yaml").write_text(yaml.safe_dump(config))
+    launch_before = (home / "config.yaml").read_bytes()
+    seen = []
+    monkeypatch.setattr(server, "_reset_session_agent", lambda *_: seen.append(get_hermes_home()) or {})
+    monkeypatch.setitem(server._sessions, "profile-tools", {"profile_home": str(profile)})
+    params = {"session_id": "profile-tools", "action": "disable", "names": ["terminal"]}
+    if explicit_profile is not None:
+        params["profile"] = explicit_profile
+    response = server._methods["tools.configure"](1, params)
+    assert "error" not in response
+    assert (home / "config.yaml").read_bytes() == launch_before
+    assert "terminal" not in yaml.safe_load((profile / "config.yaml").read_text())["platform_toolsets"]["cli"]
+    assert seen == [profile]
+    assert get_hermes_home() == home
+    worker_before = (profile / "config.yaml").read_bytes()
+    monkeypatch.delitem(server._sessions, "profile-tools")
+    response = server._methods["tools.configure"](2, params)
+    assert response["error"]["code"] == 4001
+    assert (home / "config.yaml").read_bytes() == launch_before
+    assert (profile / "config.yaml").read_bytes() == worker_before
+    response = server._methods["tools.configure"](3, {"action": "disable", "names": ["terminal"]})
+    assert "error" not in response and not response["result"]["reset"]
+    assert (home / "config.yaml").read_bytes() != launch_before
+    assert (profile / "config.yaml").read_bytes() == worker_before
+
+
+@pytest.mark.parametrize("path", ["reset", "capabilities"])
+@pytest.mark.parametrize("has_agent_db", [True, False])
+def test_rebuild_preparation_failure_keeps_reachable_owner(tmp_path, monkeypatch, path, has_agent_db):
+    from tui_gateway import server
+    from hermes_state import SessionDB
+    from hermes_constants import get_hermes_home
+
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    db = SessionDB(db_path=profile / "state.db")
+    old = SimpleNamespace(_session_db=db if has_agent_db else None,
+                          _owns_session_db=has_agent_db, _session_title_hint="Bot Chat")
+    session = {"agent": old, "profile_home": str(profile), "session_key": "profile-key",
+               "bot_caps_seen": "before", "source": "desktop", "cwd": str(tmp_path),
+               "history": [], "history_lock": threading.Lock(), "history_version": 0}
+    built = []
+    def make_agent(*_args, session_db=None, **_kwargs):
+        replacement = SimpleNamespace(_session_db=session_db, _owns_session_db=False)
+        built.append(replacement)
+        return replacement
+    def fail_config():
+        raise RuntimeError("preparation failed")
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(server, "_config_model_target", fail_config)
+    monkeypatch.setattr("tools.bot_mode_probe.capability_fingerprint", lambda _: "after")
+    try:
+        if path == "reset":
+            with pytest.raises(RuntimeError, match="preparation failed"):
+                server._reset_session_agent("profile-tools", session)
+        else:
+            server._sync_bot_capabilities("profile-tools", session)
+        assert session["agent"] is old
+        assert old._owns_session_db is has_agent_db
+        assert not built, "prepare config before allocating a replacement"
+        assert get_hermes_home() == home
+        db.create_session("still-owned", "tui")
+    finally:
+        db.close()
+        for agent in built:
+            if agent._session_db is not db and agent._owns_session_db:
+                agent._session_db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_profile_shell_hooks.py ===
+"""Profile-bound agent construction must arm real shell policy."""
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def test_agent_build_arms_only_consented_profile_policy(tmp_path, monkeypatch):
+    from agent import shell_hooks
+    from hermes_cli import plugins
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tui_gateway import server
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HOME', str(tmp_path / 'os-home'))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path / 'os-home')
+    monkeypatch.setenv('HERMES_IGNORE_RULES', '1')
+    monkeypatch.delenv('HERMES_ACCEPT_HOOKS', raising=False)
+    monkeypatch.setattr(server, '_hermes_home', tmp_path)
+    monkeypatch.setattr(server, '_get_db', lambda: None)
+    # Only provider resolution is a fixture; registration, agent, hook process,
+    # consent, manager selection and public dispatch are the real implementation.
+    monkeypatch.setattr(server, '_resolve_agent_model_runtime', lambda *_a: (
+        'fixture-model', {'provider': 'openai-compat', 'base_url': 'http://127.0.0.1:18019/v1', 'api_key': 'fixture-key'}))
+    plugins._reset_plugin_managers_for_tests()
+    shell_hooks.reset_for_tests()
+    try:
+        for label, consent in [('alpha', True), ('beta', True), ('unapproved', False)]:
+            home = tmp_path / label
+            home.mkdir()
+            script = home / 'guard.py'
+            script.write_text('import json\nprint(json.dumps({"decision":"block","reason":' + repr(label) + '}))\n', encoding='utf-8')
+            quote_command = subprocess.list2cmdline if os.name == 'nt' else shlex.join
+            cfg = {'hooks_auto_accept': consent, 'hooks': {'pre_tool_call': [{
+                'command': quote_command([sys.executable, str(script)]), 'matcher': 'write_file', 'fail_closed': True}]},
+                'toolsets': ['file'], 'memory': {'memory_enabled': False, 'user_profile_enabled': False}}
+            (home / 'config.yaml').write_text(yaml.safe_dump(cfg), encoding='utf-8')
+        for label in ['alpha', 'beta', 'alpha', 'unapproved']:
+            token = set_hermes_home_override(tmp_path / label)
+            try:
+                agent = server._make_agent(label, label, context_cwd_is_launch_artifact=False)
+                assert agent is not None
+                block = plugins.get_pre_tool_call_block_message('write_file', {'path': str(tmp_path / 'protected'), 'content': 'x'})
+                assert block == (None if label == 'unapproved' else label)
+                assert plugins.get_pre_tool_call_block_message('read_file', {'path': str(tmp_path / 'protected')}) is None
+            finally:
+                reset_hermes_home_override(token)
+    finally:
+        plugins._reset_plugin_managers_for_tests()
+        shell_hooks.reset_for_tests()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_profile_target_unavailable.py ===
+"""An unavailable explicit target must never become the launch profile."""
+from pathlib import Path
+
+import pytest
+
+
+def test_explicit_profile_target_never_falls_back(tmp_path, monkeypatch):
+    from tui_gateway import server
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    worker = home / "profiles" / "worker"
+    worker.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(server, "_hermes_home", home)
+    for path, marker in ((home, "launch"), (worker, "worker")):
+        (path / "config.yaml").write_text(f"terminal:\n  cwd: /{marker}\n")
+        with SessionDB(db_path=path / "state.db") as db:
+            db.create_session(marker, "tui")
+    for name, marker in ((None, "launch"), ("default", "launch"), ("DEFAULT", "launch"), ("worker", "worker")):
+        with server._profile_db({"profile": name}) as db:
+            assert db.get_session(marker)
+        response = server._methods["config.get"](1, {"profile": name, "key": "full"})
+        assert response["result"]["config"]["terminal"]["cwd"] == f"/{marker}"
+    before = (home / "config.yaml").read_bytes()
+    worker.rename(worker.with_name("gone"))
+    for name in ("worker", "unknown"):
+        with pytest.raises(FileNotFoundError):
+            with server._profile_db({"profile": name}):
+                pytest.fail("unavailable profile reached a database")
+        with pytest.raises(FileNotFoundError):
+            server._methods["config.set"](2, {"profile": name, "key": "busy", "value": "steer"})
+        assert (home / "config.yaml").read_bytes() == before
+    # A real resolution I/O failure must propagate, too (no predicate patch).
+    profiles = home / "profiles"
+    profiles.rename(home / "saved-profiles")
+    profiles.symlink_to("profiles")
+    with pytest.raises((OSError, RuntimeError)):
+        server._profile_home("worker")
+
+
+def test_custom_root_basename_target_fails_closed_when_unavailable(tmp_path, monkeypatch):
+    """An explicit profile request matching a custom root basename fails closed."""
+    from tui_gateway import server
+
+    custom_home = tmp_path / "customer-data"
+    custom_home.mkdir()
+    (custom_home / "config.yaml").write_text("terminal:\n  cwd: /custom\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(custom_home))
+    monkeypatch.setattr(server, "_hermes_home", custom_home)
+
+    with pytest.raises(FileNotFoundError):
+        server._profile_home("customer-data")
+
+    with pytest.raises(FileNotFoundError):
+        with server._profile_db({"profile": "customer-data"}):
+            pass
+
+
+@pytest.mark.parametrize("name", ["..", "../outside", "../../tmp", "a/b", "a\\b", ".hidden"])
+def test_profile_param_traversal_fails_closed(tmp_path, monkeypatch, name):
+    """A traversal-shaped ``profile`` param must never resolve outside profiles/."""
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)   # a real directory the traversal could land on
+    home.mkdir()
+    (home / "config.yaml").write_text("terminal:\n  cwd: /launch\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(server, "_hermes_home", home)
+
+    with pytest.raises(FileNotFoundError):
+        server._profile_home(name)
+    with pytest.raises(FileNotFoundError):
+        with server._profile_db({"profile": name}):
+            pass
+
+
+def test_unavailable_profile_is_a_typed_rpc_error_not_a_dispatch_crash(tmp_path, monkeypatch):
+    """A client still holding a deleted profile gets JSON-RPC 4064 from every profile-scoped
+    method (#107829) — the method itself keeps raising, the dispatcher chokepoint maps it."""
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("terminal:\n  cwd: /launch\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(server, "_hermes_home", home)
+
+    for method, params in (("session.create", {"profile": "gone"}),
+                           ("config.get", {"profile": "gone", "key": "full"})):
+        resp = server.handle_request({"jsonrpc": "2.0", "id": 7, "method": method, "params": params})
+        assert resp["error"]["code"] == 4064, resp
+        assert "gone" in resp["error"]["message"]
+    assert server._response_profile_name("gone") == server._current_profile_name()
+

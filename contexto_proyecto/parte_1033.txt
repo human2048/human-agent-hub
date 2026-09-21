@@ -1,0 +1,421 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\workflows\README.md ===
+# Example Workflows
+
+These are starter API-format workflows for the most common tasks. They're
+ready to run with `scripts/run_workflow.py` once you've installed (or have
+cloud access to) the listed models.
+
+| File | Purpose | Required models | Min VRAM |
+|------|---------|-----------------|----------|
+| `sd15_txt2img.json` | SD 1.5 text-to-image (512×512) | SD1.5 checkpoint, e.g. `v1-5-pruned-emaonly.safetensors` | 4 GB |
+| `sdxl_txt2img.json` | SDXL text-to-image (1024×1024) | `sd_xl_base_1.0.safetensors` | 8 GB |
+| `flux_dev_txt2img.json` | Flux Dev text-to-image (1024×1024) | `flux1-dev.safetensors`, `t5xxl_fp16.safetensors`, `clip_l.safetensors`, `ae.safetensors` | 24 GB (or use `flux1-dev-fp8`) |
+| `sdxl_img2img.json` | SDXL image-to-image | SDXL checkpoint | 8 GB |
+| `sdxl_inpaint.json` | SDXL inpainting (image + mask) | SDXL checkpoint | 8 GB |
+| `upscale_4x.json` | Standalone 4× ESRGAN upscale | `4x-UltraSharp.pth` (or any upscaler) | 4 GB |
+| `animatediff_video.json` | AnimateDiff text-to-video (16 frames) | SD1.5 checkpoint, `mm_sd_v15_v2.ckpt` motion module | 8 GB |
+| `wan_video_t2v.json` | Wan 2.x text-to-video (~33 frames) | `wan2.2_t2v_1.3B_fp16.safetensors`, `umt5_xxl_fp16.safetensors`, `wan_2.1_vae.safetensors` | 24 GB |
+
+## Quick start
+
+```bash
+# Run a workflow with prompt injection
+python3 ../scripts/run_workflow.py \
+  --workflow sdxl_txt2img.json \
+  --args '{"prompt": "majestic eagle in flight", "seed": 12345, "steps": 35}' \
+  --output-dir ./out
+
+# Img2img: upload an input image first via the script's helper
+python3 ../scripts/run_workflow.py \
+  --workflow sdxl_img2img.json \
+  --input-image image=./photo.png \
+  --args '{"prompt": "make it watercolor", "denoise": 0.6}' \
+  --output-dir ./out
+
+# Cloud (set API key once)
+export COMFY_CLOUD_API_KEY="comfyui-..."
+python3 ../scripts/run_workflow.py \
+  --workflow flux_dev_txt2img.json \
+  --args '{"prompt": "a fox in a misty forest"}' \
+  --host https://cloud.comfy.org \
+  --output-dir ./out
+
+# What can I tweak in this workflow?
+python3 ../scripts/extract_schema.py sdxl_txt2img.json --summary-only
+
+# Are all required models / nodes installed?
+python3 ../scripts/check_deps.py wan_video_t2v.json
+```
+
+## Notes
+
+- **Inpaint masks**: white pixels = "regenerate this region", black = preserve.
+  ComfyUI's `LoadImageMask` reads the **red channel** by default; export your
+  mask as a single-channel image or as a normal RGB where red==intensity.
+
+- **Denoise strength** in img2img: `0.0` = output identical to input,
+  `1.0` = ignore input entirely. Sweet spot is usually 0.4–0.7.
+
+- **Flux Dev** needs ~24 GB VRAM in its base form. The `flux1-dev-fp8.safetensors`
+  variant (already on Comfy Cloud) cuts that roughly in half.
+
+- **Video workflows** can take many minutes. The skill auto-detects video
+  output nodes and bumps the default timeout to 900s. Override with `--timeout 1800`.
+
+- These JSON files are deliberately **API format** (top-level keys are node IDs
+  with `class_type`), not editor format. To open them in ComfyUI's web UI for
+  visual editing, use `Workflow → Load (API Format)` or `Workflow → Open` and
+  follow the prompt.
+
+## Cloud vs local model names
+
+Comfy Cloud's preinstalled checkpoints sometimes have a `-fp16` suffix
+(`v1-5-pruned-emaonly-fp16.safetensors`) while the canonical local download
+keeps the original name (`v1-5-pruned-emaonly.safetensors`). The example
+workflows use the local-canonical names. When running on cloud, override with:
+
+```bash
+python3 ../scripts/run_workflow.py \
+  --workflow sd15_txt2img.json \
+  --args '{"ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors", "prompt": "..."}' \
+  --host https://cloud.comfy.org
+```
+
+The `ckpt_name`, `vae_name`, `lora_name`, `unet_name`, etc. are all exposed
+as controllable parameters by `extract_schema.py` — discover what's installed
+with `comfy model list` (local) or `curl /api/experiment/models/checkpoints`
+(cloud).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\workflows\sd15_txt2img.json ===
+{
+  "_comment": "SD 1.5 text-to-image. Smallest model, fastest. Required model: v1-5-pruned-emaonly.safetensors (or any SD1.5 checkpoint)",
+  "3": {
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler"},
+    "inputs": {
+      "seed": 156680208700286,
+      "steps": 20,
+      "cfg": 8.0,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "model": ["4", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["5", 0]
+    }
+  },
+  "4": {
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Load Checkpoint"},
+    "inputs": {"ckpt_name": "v1-5-pruned-emaonly.safetensors"}
+  },
+  "5": {
+    "class_type": "EmptyLatentImage",
+    "_meta": {"title": "Empty Latent"},
+    "inputs": {"width": 512, "height": 512, "batch_size": 1}
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Positive Prompt"},
+    "inputs": {"text": "a beautiful landscape painting, masterpiece, highly detailed", "clip": ["4", 1]}
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative Prompt"},
+    "inputs": {"text": "ugly, blurry, low quality, deformed", "clip": ["4", 1]}
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"},
+    "inputs": {"samples": ["3", 0], "vae": ["4", 2]}
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save Image"},
+    "inputs": {"filename_prefix": "sd15", "images": ["8", 0]}
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\workflows\sdxl_img2img.json ===
+{
+  "_comment": "SDXL img2img: load an input image, encode to latent, denoise partially. Use --input-image image=./photo.png with run_workflow.py. Lower 'denoise' value preserves more of the source image.",
+  "1": {
+    "class_type": "LoadImage",
+    "_meta": {"title": "Load Source Image"},
+    "inputs": {"image": "REPLACE_WITH_UPLOADED_FILENAME.png"}
+  },
+  "3": {
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler"},
+    "inputs": {
+      "seed": 42,
+      "steps": 30,
+      "cfg": 7.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 0.65,
+      "model": ["4", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["12", 0]
+    }
+  },
+  "4": {
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Load SDXL Base"},
+    "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Positive Prompt"},
+    "inputs": {"text": "make it cyberpunk, neon lights, futuristic", "clip": ["4", 1]}
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative Prompt"},
+    "inputs": {"text": "ugly, blurry, low quality, deformed", "clip": ["4", 1]}
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"},
+    "inputs": {"samples": ["3", 0], "vae": ["4", 2]}
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save Image"},
+    "inputs": {"filename_prefix": "sdxl_img2img", "images": ["8", 0]}
+  },
+  "12": {
+    "class_type": "VAEEncode",
+    "_meta": {"title": "VAE Encode"},
+    "inputs": {"pixels": ["1", 0], "vae": ["4", 2]}
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\workflows\sdxl_inpaint.json ===
+{
+  "_comment": "SDXL inpainting: given an image + mask, regenerate the masked region. Upload both: --input-image image=./photo.png --input-image mask_image=./mask.png. White pixels in mask = regenerate; black = preserve.",
+  "1": {
+    "class_type": "LoadImage",
+    "_meta": {"title": "Load Source"},
+    "inputs": {"image": "REPLACE_WITH_UPLOADED_FILENAME.png"}
+  },
+  "2": {
+    "class_type": "LoadImageMask",
+    "_meta": {"title": "Load Mask"},
+    "inputs": {"image": "REPLACE_WITH_UPLOADED_MASK.png", "channel": "red"}
+  },
+  "3": {
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler"},
+    "inputs": {
+      "seed": 42,
+      "steps": 30,
+      "cfg": 7.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 1.0,
+      "model": ["4", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["12", 0]
+    }
+  },
+  "4": {
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Checkpoint"},
+    "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Positive Prompt"},
+    "inputs": {"text": "fill with blooming flowers, photorealistic", "clip": ["4", 1]}
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative Prompt"},
+    "inputs": {"text": "ugly, blurry, deformed, bad anatomy", "clip": ["4", 1]}
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"},
+    "inputs": {"samples": ["3", 0], "vae": ["4", 2]}
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save"},
+    "inputs": {"filename_prefix": "sdxl_inpaint", "images": ["8", 0]}
+  },
+  "12": {
+    "class_type": "VAEEncodeForInpaint",
+    "_meta": {"title": "VAE Encode for Inpaint"},
+    "inputs": {"pixels": ["1", 0], "mask": ["2", 0], "vae": ["4", 2], "grow_mask_by": 6}
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\workflows\sdxl_txt2img.json ===
+{
+  "_comment": "SDXL text-to-image at 1024x1024. Required model: sd_xl_base_1.0.safetensors (or any SDXL checkpoint).",
+  "3": {
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler"},
+    "inputs": {
+      "seed": 42,
+      "steps": 30,
+      "cfg": 7.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 1.0,
+      "model": ["4", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["5", 0]
+    }
+  },
+  "4": {
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Load SDXL Base"},
+    "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}
+  },
+  "5": {
+    "class_type": "EmptyLatentImage",
+    "_meta": {"title": "Empty Latent"},
+    "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Positive Prompt"},
+    "inputs": {"text": "cinematic photograph, dramatic lighting, intricate detail", "clip": ["4", 1]}
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative Prompt"},
+    "inputs": {"text": "ugly, blurry, low quality, deformed, watermark", "clip": ["4", 1]}
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"},
+    "inputs": {"samples": ["3", 0], "vae": ["4", 2]}
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save Image"},
+    "inputs": {"filename_prefix": "sdxl", "images": ["8", 0]}
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\workflows\upscale_4x.json ===
+{
+  "_comment": "Standalone 4x upscale of an input image using ESRGAN. Required model: 4x-UltraSharp.pth (or any upscaler in models/upscale_models/). Upload with --input-image image=./photo.png.",
+  "1": {
+    "class_type": "LoadImage",
+    "_meta": {"title": "Load Image"},
+    "inputs": {"image": "REPLACE_WITH_UPLOADED_FILENAME.png"}
+  },
+  "2": {
+    "class_type": "UpscaleModelLoader",
+    "_meta": {"title": "Load Upscale Model"},
+    "inputs": {"model_name": "4x-UltraSharp.pth"}
+  },
+  "3": {
+    "class_type": "ImageUpscaleWithModel",
+    "_meta": {"title": "Upscale Image (with Model)"},
+    "inputs": {
+      "upscale_method": "lanczos",
+      "upscale_model": ["2", 0],
+      "image": ["1", 0]
+    }
+  },
+  "4": {
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save"},
+    "inputs": {"filename_prefix": "upscaled_4x", "images": ["3", 0]}
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\workflows\wan_video_t2v.json ===
+{
+  "_comment": "Wan 2.1 text-to-video. Cloud: confirmed available. Local: download wan2.1_t2v_1.3B_fp16.safetensors → models/diffusion_models/ (or models/unet/), umt5_xxl_fp16.safetensors → models/text_encoders/ (or models/clip/), wan_2.1_vae.safetensors → models/vae/. Output: MP4. Large model — only on cloud or 24 GB+ local GPU.",
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Prompt"},
+    "inputs": {
+      "text": "a graceful crane taking flight from a misty lake at dawn, slow motion, 4k",
+      "clip": ["38", 0]
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative Prompt"},
+    "inputs": {
+      "text": "static, blurry, watermark, low quality",
+      "clip": ["38", 0]
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"},
+    "inputs": {"samples": ["3", 0], "vae": ["39", 0]}
+  },
+  "37": {
+    "class_type": "UNETLoader",
+    "_meta": {"title": "Wan UNET"},
+    "inputs": {"unet_name": "wan2.1_t2v_1.3B_fp16.safetensors", "weight_dtype": "default"}
+  },
+  "38": {
+    "class_type": "CLIPLoader",
+    "_meta": {"title": "Wan CLIP"},
+    "inputs": {"clip_name": "umt5_xxl_fp16.safetensors", "type": "wan"}
+  },
+  "39": {
+    "class_type": "VAELoader",
+    "_meta": {"title": "Wan VAE"},
+    "inputs": {"vae_name": "wan_2.1_vae.safetensors"}
+  },
+  "3": {
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler"},
+    "inputs": {
+      "seed": 42, "steps": 30, "cfg": 6.0,
+      "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1.0,
+      "model": ["37", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["40", 0]
+    }
+  },
+  "40": {
+    "class_type": "EmptyHunyuanLatentVideo",
+    "_meta": {"title": "Latent Video (33 frames)"},
+    "inputs": {"width": 832, "height": 480, "length": 33, "batch_size": 1}
+  },
+  "9": {
+    "class_type": "VHS_VideoCombine",
+    "_meta": {"title": "Video Combine"},
+    "inputs": {
+      "frame_rate": 16.0,
+      "loop_count": 0,
+      "filename_prefix": "wan_t2v",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true,
+      "images": ["8", 0]
+    }
+  }
+}
+

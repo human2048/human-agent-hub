@@ -1,0 +1,153 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_standalone_gateway_launch_scope.py ===
+"""A standalone gateway (``multiplex_profiles`` off) keeps resolving the launch profile's credentials
+after a native hosted room activated the process-wide secret guard (#112878).
+
+``tui_gateway.launch_profile_policy.activate_multi_profile_hosting`` runs inside the messaging
+gateway process when a hosted room serves a second profile; ``get_secret`` then fails closed for
+every unscoped read. The standalone gateway's turns and handler entry points must bind the launch
+profile's OWN scope (``.env`` over the env frozen at activation) — not skip binding because the
+config flag is off, and not rebuild from ``.env`` alone (systemd / ``op run`` injection has no file).
+"""
+import asyncio
+from contextlib import nullcontext
+from unittest import mock
+
+import pytest
+
+from agent import secret_scope
+from agent.secret_scope import UnscopedSecretError, current_secret_scope, get_secret
+from gateway.config import GatewayConfig
+from gateway.run import GatewayRunner
+from tui_gateway import launch_profile_policy
+
+INJECTED = "HOSTEDROOM_TEST_INJECTED_KEY"
+
+
+@pytest.fixture
+def standalone(tmp_path, monkeypatch):
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / ".env").write_text("OPENAI_API_KEY=launch-dotenv-key\n", encoding="utf-8")
+    secondary = tmp_path / "profiles" / "roomie"
+    secondary.mkdir(parents=True)
+    (secondary / ".env").write_text("OPENAI_API_KEY=secondary-key\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv(INJECTED, "launch-env-injected")  # systemd / `op run` style injection
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    return runner, secondary
+
+
+def _keys():
+    return get_secret("OPENAI_API_KEY"), get_secret(INJECTED)
+
+
+def test_standalone_turn_binds_launch_profile_scope_after_hosted_activation(standalone):
+    runner, secondary = standalone
+    from tui_gateway.server import _session_profile_runtime_scope
+
+    # A native hosted room ran a second profile: real activation, real secondary scope entered and left.
+    launch_profile_policy.activate_multi_profile_hosting()
+    with _session_profile_runtime_scope({"profile_home": str(secondary)}):
+        assert get_secret("OPENAI_API_KEY") == "secondary-key"
+        assert get_secret(INJECTED) is None  # the launch env never leaks into a secondary
+    assert secret_scope.is_multiplex_active()
+
+    source = mock.MagicMock(profile=None)
+    with runner._profile_scope_for_source(source):
+        assert _keys() == ("launch-dotenv-key", "launch-env-injected")
+    runner._handle_message = mock.AsyncMock(side_effect=lambda event: _keys())
+    assert asyncio.run(runner._primary_message_handler()(mock.MagicMock(source=source))) == (
+        "launch-dotenv-key", "launch-env-injected")
+    with pytest.raises(UnscopedSecretError):  # the guard itself is not weakened
+        get_secret("OPENAI_API_KEY")
+
+
+def test_standalone_without_hosted_activation_stays_unscoped(standalone):
+    runner, _secondary = standalone
+    source = mock.MagicMock(profile=None)
+    assert isinstance(runner._profile_scope_for_source(source), nullcontext)
+    runner._handle_message = mock.AsyncMock(side_effect=lambda event: current_secret_scope())
+    assert asyncio.run(runner._primary_message_handler()(mock.MagicMock(source=source))) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_standalone_send_redaction.py ===
+"""Invariant: a standalone sender's failure envelope never carries vendor secrets to the model.
+
+Every ``plugins/platforms/*/adapter.py::_standalone_send`` used to build ``{"error": f"... {e}"}``
+by hand; a token or signed URL inside an httpx/aiohttp exception went straight into the tool
+result. They now share ``gateway.platforms._shared.send_error`` (the ``send_message`` redactor).
+This drives two real senders end-to-end with a transport that raises a secret-bearing error.
+"""
+
+import pytest
+
+import agent.redact as _redact
+from gateway.config import PlatformConfig
+from gateway.platforms._shared import send_error
+from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+_FAKE_TOKEN = "hermes-test-bearer-credential-ABCDEFGHIJKLMNOPQRSTUVWX"
+_FAKE_URL_SECRET = "https://hooks.example/send?access_token=sk_live_ABCDEF0123456789"
+
+
+@pytest.fixture(autouse=True)
+def _redaction_on(monkeypatch):
+    # The switch is snapshotted at import; a developer shell with HERMES_REDACT_SECRETS=false must not
+    # turn this contract test into a no-op.
+    monkeypatch.setattr(_redact, "_REDACT_ENABLED", True)
+
+
+def test_send_error_redacts_token_and_signed_url():
+    out = send_error(f"upstream said 401 for Authorization: Bearer {_FAKE_TOKEN} at {_FAKE_URL_SECRET}")
+    assert set(out) == {"error"}
+    assert _FAKE_TOKEN not in out["error"]
+    assert "sk_live_ABCDEF0123456789" not in out["error"]
+    assert "401" in out["error"]  # the diagnostic shape survives
+
+
+@pytest.mark.asyncio
+async def test_ntfy_standalone_failure_is_redacted(monkeypatch):
+    ntfy = load_plugin_adapter("ntfy")
+    monkeypatch.setenv("NTFY_TOPIC", "hermes-test")
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            raise RuntimeError(f"connect failed: Authorization: Bearer {_FAKE_TOKEN} {_FAKE_URL_SECRET}")
+
+    monkeypatch.setattr(ntfy, "HTTPX_AVAILABLE", True)
+    monkeypatch.setattr(ntfy.httpx, "AsyncClient", _Boom)
+    result = await ntfy._standalone_send(PlatformConfig(enabled=True, extra={}), "hermes-test", "hi")
+    assert "error" in result
+    assert _FAKE_TOKEN not in result["error"] and "sk_live_ABCDEF0123456789" not in result["error"]
+    assert "connect failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_irc_standalone_failure_is_redacted(monkeypatch):
+    irc = load_plugin_adapter("irc")
+
+    async def _boom(*a, **k):
+        raise OSError(f"refused; proxy Authorization: Basic {_FAKE_TOKEN}")
+
+    monkeypatch.setattr(irc.asyncio, "open_connection", _boom)
+    result = await irc._standalone_send(
+        PlatformConfig(enabled=True, extra={"server": "irc.example", "channel": "#x", "nickname": "h"}), "#x", "hi")
+    assert "error" in result
+    assert _FAKE_TOKEN not in result["error"]
+    assert "refused" in result["error"]
+

@@ -1,0 +1,273 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\terminal_env_provider.py ===
+"""Terminal Environment Provider ABC.
+
+Pluggable-backend interface for terminal execution environments (cloud sandboxes, remote
+runners). Providers register via :meth:`PluginContext.register_terminal_environment_provider`;
+:func:`tools.terminal_tool_backends._create_environment` consults the registry for any ``TERMINAL_ENV``
+/ ``terminal.backend`` value that is not a built-in (built-ins stay in ``tools/environments/``;
+third-party sandbox vendors do NOT have to live in core). :meth:`create_environment` returns
+any ``BaseEnvironment`` duck type (``execute()``, ``cleanup()`` …); the factory stamps
+``_hermes_backend_name`` on the result so file-path resolution can identify plugin backends.
+"""
+
+from __future__ import annotations
+
+import abc
+from typing import Any, Dict, List, Optional, Tuple
+
+from agent.provider_base import ProviderBase
+
+
+class TerminalEnvironmentProvider(ProviderBase):
+    """Abstract base class for a pluggable terminal execution backend.
+
+    :attr:`name` is the ``terminal.backend`` / ``TERMINAL_ENV`` value (``[a-z0-9_]``); the
+    registry rejects built-in backend names.
+
+    Classification contract — each core policy decision that was historically a frozenset of
+    built-in names is a declarative attribute so a new backend cannot silently miss one:
+
+    * ``is_remote`` — commands run off-host: suppresses host OS/home/cwd hints in the system
+      prompt, the host Python probe, and remote-aware skill env handling.
+    * ``is_container`` — own filesystem rooted away from the host: container resource config
+      passed through, host-looking cwds sanitized, file tools use container path resolution.
+    * ``skip_container_guards`` — sandbox disposable enough to skip dangerous-command approval
+      prompts. Defaults to ``is_container``; backends that can mount host paths override to False.
+    * ``cache_path_base`` — where auto-synced ``~/.hermes/cache`` files land inside the backend
+      (``"~/.hermes"``, ``"/root/.hermes"``), or ``None`` when host paths remain correct.
+    * ``strip_env_keys`` — vendor credential env vars, stripped from every subprocess the agent
+      spawns so a model-authored command can never read them.
+    * ``session_isolated_when_nonpersistent`` — non-persistent mode gives each session its own
+      sandbox identity; opt in when a shared name would let two ephemeral runs destroy each other.
+    """
+
+    is_remote: bool = True
+    is_container: bool = True
+    session_isolated_when_nonpersistent: bool = False
+
+    @property
+    def description(self) -> str:
+        """One-line description shown in backend pickers."""
+        return f"Run commands in a {self.display_name} environment."
+
+    @property
+    def skip_container_guards(self) -> bool:
+        return self.is_container
+
+    @property
+    def cache_path_base(self) -> Optional[str]:
+        return None
+
+    @property
+    def strip_env_keys(self) -> frozenset:
+        return frozenset()
+
+    @property
+    def env_description(self) -> str:
+        """Prompt-builder fallback for where commands run when the live probe fails (e.g. ``"a Daytona workspace (Linux)"``)."""
+        return f"a {self.display_name} environment (likely Linux)"
+
+    @abc.abstractmethod
+    def is_available(self) -> bool:
+        """True when this backend can service commands. Cheap, NO network calls: runs during UI paints."""
+
+    def check_requirements(self, config: Dict[str, Any]) -> bool:
+        """Full requirements check with the merged terminal env config; log actionable errors before returning False."""
+        return self.is_available()
+
+    def probe(self) -> Tuple[str, str]:
+        """Dashboard picker health ``(status, detail)``; status ``ready``/``needs_setup``/``unavailable``. Never raise; <~2s."""
+        return ("ready", "") if self.is_available() else ("needs_setup", f"{self.display_name} is not configured.")
+
+    def setup_instructions(self) -> List[str]:
+        """Lines printed by ``hermes setup`` after selection (the wizard persists ``terminal.backend`` itself)."""
+        return []
+
+    def post_setup(self) -> None:
+        """Optional interactive hook run by ``hermes setup`` after selection (prompt for tokens, install SDKs)."""
+
+    def doctor_checks(self) -> List[Tuple[bool, str, str]]:
+        """``hermes doctor`` rows ``(ok, label, detail)``; default reflects :meth:`is_available`."""
+        try:
+            ok = bool(self.is_available())
+        except Exception:
+            ok = False
+        return [(ok, f"{self.display_name} backend", "(configured)" if ok else "(not configured — see setup instructions)")]
+
+    @abc.abstractmethod
+    def create_environment(
+        self, *, cwd: str, timeout: int, task_id: str = "default", image: Optional[str] = None,
+        container_config: Optional[Dict[str, Any]] = None, **kwargs: Any,
+    ):
+        """Create an execution environment (``BaseEnvironment`` duck type). MUST accept ``**kwargs`` and ignore
+        unknown keys so the factory can evolve without breaking older plugins. ``task_id`` keys reuse/persistence;
+        ``container_config`` carries ``container_cpu/memory/disk/persistent`` when :attr:`is_container`."""
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\terminal_env_registry.py ===
+"""Terminal Environment Registry.
+
+Central map of registered pluggable terminal backends, populated by plugins via
+:meth:`PluginContext.register_terminal_environment_provider` and consumed by
+:func:`tools.terminal_tool_backends._create_environment` plus the classification helpers across the
+terminal/file/approval/prompt surfaces. Unlike the image/video/web/browser registries there
+is **no active-provider resolution**: the active backend is whatever ``TERMINAL_ENV`` /
+``terminal.backend`` names. Built-in names are reserved (registration raises) so a plugin can
+never shadow the in-tree docker/modal/... implementations. Scope semantics mirror
+:mod:`agent.browser_registry` (per-profile scope or the global base map).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import List, Optional
+
+from agent.provider_registry import ProviderRegistry, lower_key
+from agent.terminal_env_provider import TerminalEnvironmentProvider
+
+logger = logging.getLogger(__name__)
+
+
+#: Names owned by in-tree backends in tools/environments/ — never
+#: registrable by plugins. Includes internal-mode aliases (managed_modal).
+BUILTIN_BACKEND_NAMES = frozenset({
+    "local", "docker", "singularity", "modal", "managed_modal",
+    "daytona", "vercel_sandbox", "ssh",
+})
+
+
+def _reject_builtin_collision(name: str) -> None:
+    raise ValueError(f"Terminal backend name '{name}' is reserved for the built-in {name} backend "
+                     "and cannot be registered by a plugin")
+
+
+_registry: ProviderRegistry[TerminalEnvironmentProvider] = ProviderRegistry(
+    label="Terminal environment",
+    provider_cls=TerminalEnvironmentProvider,
+    logger=logger,
+    normalize=lower_key,
+    builtin_names=BUILTIN_BACKEND_NAMES,
+    on_builtin_collision=_reject_builtin_collision,
+)
+_registry.export(globals())
+
+
+def plugin_backend_names(*, scope: Optional[str] = None) -> List[str]:
+    """Names of all registered plugin backends (sorted)."""
+    return [p.name.strip().lower() for p in _registry.list_providers(scope=scope)]
+
+
+def provider_flag(name: str, attr: str, default=False):
+    """Read a classification attribute off the provider for *name*.
+
+    Fail-soft: unknown backend or a raising property returns *default* so a misbehaving
+    plugin degrades to built-in-equivalent behavior instead of taking the terminal tool down.
+    """
+    provider = _registry.get_provider(name)
+    if provider is None:
+        return default
+    try:
+        return getattr(provider, attr, default)
+    except Exception:
+        logger.debug("Terminal environment provider '%s' attribute '%s' raised", name, attr, exc_info=True)
+        return default
+
+
+def plugin_strip_env_keys() -> frozenset:
+    """Union of every registered provider's ``strip_env_keys`` — across ALL scopes, not
+    just the active backend: a token in the process environment is strippable regardless of
+    which backend is selected (as MODAL_*/DAYTONA_API_KEY sit in the static tier-1 set)."""
+    keys: set = set()
+    with _registry._lock:
+        all_providers = list(_registry._providers.values())
+        for scoped in _registry._scoped_providers.values():
+            all_providers.extend(scoped.values())
+    for provider in all_providers:
+        try:
+            keys.update(provider.strip_env_keys)
+        except Exception:
+            logger.debug("Terminal environment provider strip_env_keys raised", exc_info=True)
+    return frozenset(keys)
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from typing import Dict  # noqa: F401,E402
+import threading  # noqa: F401,E402
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'hermes_home_key': ('hermes_constants', 'hermes_home_key'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\thinking_timeout_guidance.py ===
+"""Thinking-timeout detection and user-facing guidance for reasoning models.
+
+A known reasoning model hitting a transport-layer error before the first content token was
+almost certainly idle-killed mid-think by the upstream proxy — not a context overflow — so
+the generic stream-drop guidance in conversation_loop is wrong for that case.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+
+# Transport-layer failure signatures: the classifier's server-disconnect set plus the OS-level
+# ``broken pipe`` / ``errno 32`` the upstream kill surfaces through the OpenAI SDK wrapper.
+_THINKING_TIMEOUT_SUBSTRINGS: tuple[str, ...] = (
+    "broken pipe", "errno 32", "remote protocol", "connection reset", "connection lost",
+    "peer closed", "server disconnected",
+)
+
+
+def is_thinking_timeout(classified: object, model: str, error_msg: str) -> bool:
+    """True when a reasoning model's thinking phase hit a transport kill.
+
+    All must hold: ``classified.reason`` is the ``timeout`` FailoverReason (duck-typed via
+    ``.value`` to avoid importing error_classifier), ``model`` is in the reasoning allowlist,
+    and ``error_msg`` carries a transport-kill substring. The caller gates on the error having
+    no HTTP ``status_code``.
+    """
+    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
+    if getattr(getattr(classified, "reason", None), "value", None) != "timeout":
+        return False
+    if get_reasoning_stale_timeout_floor(model) is None:
+        return False
+    return any(p in (error_msg or "").lower() for p in _THINKING_TIMEOUT_SUBSTRINGS)
+
+
+def build_thinking_timeout_guidance(provider: str, model: str, model_label: Optional[str] = None) -> str:
+    """User-facing guidance appended to the final response: easiest fix first (``/reasoning
+    low``), the config knob last. ``model`` is used verbatim in the config path so it is
+    copy-pasteable; ``model_label`` is the optional prose name."""
+    from hermes_constants import display_hermes_home
+
+    label = model_label or model
+    return (
+        f"{label} was thinking for so long that the connection timed out before it wrote anything "
+        "(common for reasoning models behind cloud gateways such as NVIDIA NIM, OpenAI, Anthropic, "
+        "DeepSeek). Easiest fixes: `/reasoning low`, or switch to a faster model with /model. "
+        f"Advanced: set `providers.{provider}.models.{model}.stale_timeout_seconds: 900` in "
+        f"`{display_hermes_home()}/config.yaml` to allow a longer wait."
+    )
+

@@ -1,0 +1,305 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_output_transform_hook.py ===
+import json
+import os
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import hermes_cli.plugins as plugins_mod
+import tools.terminal_tool as terminal_tool_module
+from tools.environments.local import LocalEnvironment
+
+
+_UNSET = object()
+
+
+def _make_env_config(tmp_path, **overrides):
+    config = {
+        "env_type": "local",
+        "timeout": 30,
+        "cwd": str(tmp_path),
+        "host_cwd": None,
+        "modal_mode": "auto",
+        "docker_image": "",
+        "singularity_image": "",
+        "modal_image": "",
+        "daytona_image": "",
+    }
+    config.update(overrides)
+    return config
+
+
+def _run_terminal(
+    monkeypatch,
+    tmp_path,
+    *,
+    output,
+    returncode=0,
+    invoke_hook=_UNSET,
+    approval=None,
+    command="echo hello",
+):
+    mock_env = MagicMock()
+    mock_env.execute.return_value = {"output": output, "returncode": returncode}
+
+    monkeypatch.setattr(
+        terminal_tool_module, "_get_env_config", lambda: _make_env_config(tmp_path)
+    )
+    monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: approval or {"approved": True},
+    )
+    monkeypatch.setitem(terminal_tool_module._active_environments, "default", mock_env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+
+    if invoke_hook is not _UNSET:
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+
+    result = json.loads(terminal_tool_module.terminal_tool(command=command))
+    return result, mock_env
+
+
+def test_terminal_output_unchanged_when_transform_hook_not_registered(monkeypatch, tmp_path):
+    result, _mock_env = _run_terminal(monkeypatch, tmp_path, output="plain output")
+
+    assert result["output"] == "plain output"
+    assert result["exit_code"] == 0
+    assert result["error"] is None
+
+
+def test_terminal_output_transform_still_runs_strip_and_redact(monkeypatch, tmp_path):
+    # Ensure redaction is active regardless of host HERMES_REDACT_SECRETS state
+    # or collection-time import order (the module snapshots env at import).
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+
+    secret = "sk-proj-abc123def456ghi789jkl012mno345"
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output="plain output",
+        invoke_hook=lambda hook_name, **kwargs: [f" \x1b[31mOPENAI_API_KEY={secret}\x1b[0m "],
+    )
+
+    assert "\x1b" not in result["output"]
+    # Terminal output now passes code_file=True: ENV-assignment redaction is
+    # skipped (so code constants like MAX_TOKENS=100 aren't corrupted), but a
+    # real sk-/ghp_/JWT-shaped value is STILL masked by _PREFIX_RE. The full
+    # secret never survives; only the leading prefix marker remains. (#33801)
+    assert secret not in result["output"]
+    assert "OPENAI_API_KEY=" in result["output"]
+    assert "sk-pro" in result["output"]  # prefix marker from _mask_token
+    assert "abc123def456" not in result["output"]  # secret body is gone
+
+
+def test_large_process_output_is_bounded_before_sudo_and_plugin_hooks(
+    monkeypatch, tmp_path
+):
+    limit = 10_000
+    monkeypatch.setattr("tools.tool_output_limits.get_max_bytes", lambda: limit)
+    monkeypatch.setattr(
+        terminal_tool_module, "_get_env_config", lambda: _make_env_config(tmp_path)
+    )
+    monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {"approved": True},
+    )
+
+    sudo_input_lengths = []
+    hook_inputs = []
+
+    def _sudo_spy(output):
+        sudo_input_lengths.append(len(output))
+        return False
+
+    def _hook_spy(hook_name, **kwargs):
+        if hook_name == "transform_terminal_output":
+            hook_inputs.append(kwargs["output"])
+        return []
+
+    monkeypatch.setattr(
+        "tools.terminal_tool_sudo._sudo_wrong_password_failure", _sudo_spy
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook_spy)
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+    monkeypatch.setitem(terminal_tool_module._active_environments, "default", env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    try:
+        command = (
+            "python3 -c \"import sys; "
+            "sys.stdout.write('HEAD-SENTINEL\\n' + 'x' * 2000000 + "
+            "'\\nTAIL-SENTINEL')\""
+        )
+        result = json.loads(terminal_tool_module.terminal_tool(command=command))
+    finally:
+        env.cleanup()
+
+    assert sudo_input_lengths
+    assert max(sudo_input_lengths) <= limit
+    assert len(hook_inputs) == 1
+    assert len(hook_inputs[0]) <= limit
+    assert hook_inputs[0].startswith("HEAD-SENTINEL")
+    assert hook_inputs[0].endswith("TAIL-SENTINEL")
+    assert "[OUTPUT TRUNCATED" in hook_inputs[0]
+    assert len(result["output"]) <= limit
+
+
+def test_terminal_output_transform_does_not_change_approval_or_exit_code_meaning(monkeypatch, tmp_path):
+    approval = {
+        "approved": True,
+        "user_approved": True,
+        "description": "dangerous command",
+    }
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output="original output",
+        returncode=1,
+        approval=approval,
+        command="grep foo bar",
+        invoke_hook=lambda hook_name, **kwargs: ["replaced output"],
+    )
+
+    assert result["output"] == "replaced output"
+    assert result["approval"] == (
+        "Command required approval (dangerous command) and was approved by the user."
+    )
+    assert result["exit_code_meaning"] == "No matches found (not an error)"
+
+
+def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp_path):
+    import yaml
+
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    plugins_dir = hermes_home / "plugins"
+    plugin_dir = plugins_dir / "terminal_transform"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text("name: terminal_transform\n", encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "def register(ctx):\n"
+        '    ctx.register_hook("transform_terminal_output", '
+        'lambda **kw: "PLUGIN-HEAD\\n" + kw["output"] + "\\nPLUGIN-TAIL")\n',
+        encoding="utf-8",
+    )
+    # Plugins are opt-in — must be listed in plugins.enabled to load.
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["terminal_transform"]}}),
+        encoding="utf-8",
+    )
+
+    # Force a fresh plugin manager so the new config is picked up.
+    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod.discover_plugins()
+
+    long_output = "X" * 60000
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output=long_output,
+    )
+
+    assert "PLUGIN-HEAD" in result["output"]
+    assert "PLUGIN-TAIL" in result["output"]
+    assert "[OUTPUT TRUNCATED" in result["output"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_pre_guard_deadline.py ===
+"""Terminal pre-execution guards share the command's wall-clock deadline (#111922).
+
+The supervised-gateway identity probe inside ``_pre_exec_block`` ends in a kernel process
+query that can wedge; before the deadline wrap, ``terminal_tool`` never returned and the
+cron run held its slot forever.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from types import SimpleNamespace
+
+import pytest
+
+import tools.terminal_tool as terminal_module
+
+
+def _plan(timeout: float = 0.05) -> SimpleNamespace:
+    return SimpleNamespace(
+        config={},
+        env_type="local",
+        effective_task_id="pre-guard-deadline-test",
+        cwd="/tmp",
+        effective_timeout=timeout,
+        promoted_from_foreground_timeout=None,
+    )
+
+
+@pytest.fixture
+def stubbed_pipeline(monkeypatch):
+    """Stub planning/env/approval/execution; returns the list of executions that happened."""
+    calls: list[str] = []
+    monkeypatch.setattr(terminal_module, "_PRE_EXEC_GUARD_MIN_TIMEOUT_S", 0)
+    monkeypatch.setattr(terminal_module, "_plan_execution", lambda *_a, **_k: _plan())
+    monkeypatch.setattr(terminal_module, "_acquire_env", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        terminal_module, "_run_approval_guards", lambda *_a, **_k: terminal_module._ApprovalVerdict(),
+    )
+    monkeypatch.setattr(
+        terminal_module, "_run_foreground", lambda *_a, **_k: calls.append("foreground") or "foreground-ran",
+    )
+    return calls
+
+
+def test_wedged_pre_execution_guard_returns_bounded_error_without_running(monkeypatch, stubbed_pipeline):
+    """A stalled identity probe returns a retryable error within the deadline; the command does not run."""
+
+    def _wedged_probe(*_a, **_k):
+        time.sleep(1)
+
+    monkeypatch.setattr(terminal_module, "_pre_exec_block", _wedged_probe)
+
+    start = time.monotonic()
+    result = json.loads(terminal_module.terminal_tool("echo ok"))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.5, f"pre-execution guard wedged terminal_tool for {elapsed:.2f}s"
+    assert result["status"] == "error"
+    assert "did not finish" in result["error"]
+    assert stubbed_pipeline == [], "a guard with no verdict must not fail open into execution"
+
+
+def test_completed_pre_execution_guard_verdicts_pass_through(monkeypatch, stubbed_pipeline):
+    """A finished guard keeps its outcome: pass → execution, rejection → its own blocked result."""
+    monkeypatch.setattr(terminal_module, "_pre_exec_block", lambda *_a, **_k: None)
+    assert terminal_module.terminal_tool("echo ok") == "foreground-ran"
+
+    def _rejecting_probe(*_a, **_k):
+        raise terminal_module._Rejected('{"status":"blocked"}')
+
+    monkeypatch.setattr(terminal_module, "_pre_exec_block", _rejecting_probe)
+    assert terminal_module.terminal_tool("echo ok") == '{"status":"blocked"}'
+    assert stubbed_pipeline == ["foreground"]
+
+
+def test_pre_execution_guard_on_the_deadline_worker_sees_the_tool_threads_interrupt(monkeypatch, stubbed_pipeline):
+    """/stop keys on the tool thread's tid; the guard chain moved onto a worker must still see it."""
+    from tools.interrupt import is_interrupted, set_interrupt
+
+    seen: list[bool] = []
+    monkeypatch.setattr(terminal_module, "_pre_exec_block", lambda *_a, **_k: seen.append(is_interrupted()))
+
+    set_interrupt(True)
+    try:
+        terminal_module.terminal_tool("echo ok")
+    finally:
+        set_interrupt(False)
+
+    assert seen == [True], "guard on the deadline worker was blind to the tool thread's interrupt bit"
+    assert is_interrupted() is False, "the tool thread's own interrupt view must not leak past the guard"
+

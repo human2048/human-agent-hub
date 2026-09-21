@@ -1,0 +1,320 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_backup_all_profiles.py ===
+"""Tests for the #66140 fix: pre-update snapshots cover every profile."""
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+import hermes_cli.backup as backup
+
+
+def _mk_profile(home: Path, jobs: int = 0) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    if jobs:
+        cron = home / "cron"
+        cron.mkdir(exist_ok=True)
+        payload = {"jobs": [{"id": f"j{i}"} for i in range(jobs)]}
+        (cron / "jobs.json").write_text(json.dumps(payload), encoding="utf-8")
+    return home
+
+
+@pytest.fixture()
+def profiles(monkeypatch, tmp_path):
+    """default (invoking) + work + sparks profile homes."""
+    default_home = _mk_profile(tmp_path / "home", jobs=3)
+    work = _mk_profile(tmp_path / "home" / "profiles" / "work", jobs=5)
+    sparks = _mk_profile(tmp_path / "home" / "profiles" / "sparks", jobs=0)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: default_home
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "home" / "profiles"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles._PROFILE_ID_RE",
+        re.compile(r"^[a-z0-9][a-z0-9_-]*$"),
+        raising=False,
+    )
+    return {"default": default_home, "work": work, "sparks": sparks}
+
+
+class TestSiblingEnumeration:
+    def test_excludes_invoking_profile(self, profiles):
+        names = [n for n, _ in backup._sibling_profile_homes(profiles["default"])]
+        assert names == ["sparks", "work"]
+
+    def test_invoked_from_named_profile_includes_default(self, profiles):
+        names = [n for n, _ in backup._sibling_profile_homes(profiles["work"])]
+        assert names == ["default", "sparks"]
+
+    def test_never_raises(self, monkeypatch, tmp_path):
+        def _boom():
+            raise RuntimeError("no profiles module")
+
+        monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", _boom)
+        assert backup._sibling_profile_homes(tmp_path) == []
+
+
+class TestAllProfileSnapshots:
+    def test_each_sibling_snapshotted_into_own_home(self, profiles):
+        result = backup.create_pre_update_snapshots_all_profiles(
+            invoking_home=profiles["default"], keep=1
+        )
+        assert set(result) == {"work", "sparks"}
+        for name, snap_id in result.items():
+            snap_dir = profiles[name] / "state-snapshots" / snap_id
+            assert snap_dir.is_dir()
+            assert (snap_dir / "config.yaml").is_file()
+            assert "pre-update" in snap_id
+        # invoking profile untouched by THIS call
+        assert not (profiles["default"] / "state-snapshots").exists()
+
+    def test_size_cap_forwarded(self, profiles):
+        big = profiles["work"] / "state.db"
+        big.write_bytes(b"\x00" * 4096)
+        result = backup.create_pre_update_snapshots_all_profiles(
+            invoking_home=profiles["default"], keep=1, max_file_size=1024
+        )
+        snap_dir = profiles["work"] / "state-snapshots" / result["work"]
+        assert not (snap_dir / "state.db").exists()  # capped out
+        assert (snap_dir / "config.yaml").is_file()  # small files captured
+
+    def test_one_failing_sibling_does_not_block_others(self, profiles, monkeypatch):
+        real = backup.create_quick_snapshot
+
+        def _flaky(label=None, hermes_home=None, keep=None, max_file_size=None):
+            if hermes_home == profiles["work"]:
+                raise OSError("disk full")
+            return real(
+                label=label, hermes_home=hermes_home, keep=keep,
+                max_file_size=max_file_size,
+            )
+
+        monkeypatch.setattr(backup, "create_quick_snapshot", _flaky)
+        result = backup.create_pre_update_snapshots_all_profiles(
+            invoking_home=profiles["default"]
+        )
+        assert "sparks" in result and "work" not in result
+
+
+class TestPerProfileCronRestore:
+    def test_lost_jobs_restored_from_own_snapshot(self, profiles):
+        snaps = backup.create_pre_update_snapshots_all_profiles(
+            invoking_home=profiles["default"], keep=1
+        )
+        # simulate the migration emptying work's jobs.json
+        jobs_path = profiles["work"] / "cron" / "jobs.json"
+        jobs_path.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+
+        restored = backup.restore_cron_jobs_all_profiles(
+            snaps, invoking_home=profiles["default"]
+        )
+        assert len(restored) == 1
+        assert restored[0]["profile"] == "work"
+        assert restored[0]["job_count"] == 5
+        live = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert len(live["jobs"]) == 5
+
+    def test_healthy_profiles_untouched(self, profiles):
+        snaps = backup.create_pre_update_snapshots_all_profiles(
+            invoking_home=profiles["default"], keep=1
+        )
+        assert backup.restore_cron_jobs_all_profiles(
+            snaps, invoking_home=profiles["default"]
+        ) == []
+
+    def test_empty_map_is_noop(self, profiles):
+        assert backup.restore_cron_jobs_all_profiles({}) == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_backup_path_errors.py ===
+"""Regression test: `hermes backup -o <bad path>` errors cleanly (round-3 SUB-01).
+
+Before, an unwritable/nonexistent-parent output path raised a raw
+PermissionError traceback from the unguarded is_dir()/mkdir() calls. It must
+print a one-line error and exit 1 instead.
+"""
+
+from argparse import Namespace
+from pathlib import Path
+
+import pytest
+
+
+def _make_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: {}\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def test_backup_unwritable_parent_errors_cleanly(tmp_path, monkeypatch, capsys):
+    _make_home(tmp_path, monkeypatch)
+    import hermes_cli.backup as backup_mod
+
+    # A parent directory that cannot be created (a file stands where the dir
+    # would go) reliably triggers an OSError on mkdir without needing root.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a dir")
+    bad_out = blocker / "sub" / "backup.zip"
+
+    with pytest.raises(SystemExit) as exc:
+        backup_mod.run_backup(Namespace(output=str(bad_out)))
+
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "cannot write backup" in out.lower()
+    assert "Traceback" not in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_backup_stability.py ===
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import stat
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.backup import (
+    BackupInProgressError,
+    _atomic_output_path,
+    _backup_operation_lock,
+    _write_full_zip_backup,
+    create_quick_snapshot,
+    list_quick_snapshots,
+)
+
+
+def test_backup_lock_rejects_a_second_operation(tmp_path) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+
+    with _backup_operation_lock(home):
+        with pytest.raises(BackupInProgressError):
+            with _backup_operation_lock(home, timeout_seconds=0):
+                raise AssertionError("second backup unexpectedly acquired the lock")
+
+
+def test_atomic_output_publishes_only_after_clean_close(tmp_path) -> None:
+    final = tmp_path / "backup.zip"
+    final.write_bytes(b"previous")
+
+    with _atomic_output_path(final) as partial:
+        partial.write_bytes(b"complete")
+        assert final.read_bytes() == b"previous"
+
+    assert final.read_bytes() == b"complete"
+    assert not partial.exists()
+
+
+def test_atomic_output_keeps_previous_file_after_failure(tmp_path) -> None:
+    final = tmp_path / "backup.zip"
+    final.write_bytes(b"previous")
+
+    with pytest.raises(RuntimeError):
+        with _atomic_output_path(final) as partial:
+            partial.write_bytes(b"incomplete")
+            raise RuntimeError("compression failed")
+
+    assert final.read_bytes() == b"previous"
+    assert not partial.exists()
+
+
+def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    published: list[tuple[Path, Path]] = []
+
+    from hermes_cli import backup
+
+    real_replace = backup.os.replace
+
+    def replace(source, destination) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path.parent == home / "state-snapshots":
+            assert source_path.name.endswith(".partial")
+            assert (source_path / "manifest.json").is_file()
+            assert not destination_path.exists()
+            published.append((source_path, destination_path))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(backup.os, "replace", replace)
+    snapshot_id = create_quick_snapshot(hermes_home=home)
+
+    assert snapshot_id is not None
+    assert len(published) == 1
+    manifest = json.loads(
+        (home / "state-snapshots" / snapshot_id / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["id"] == snapshot_id
+    assert manifest["files"] == {"config.yaml": 10}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_quick_snapshot_tree_is_owner_only_under_permissive_umask(tmp_path) -> None:
+    """Recovery snapshots must never inherit world-readable default modes.
+
+    A normal 0022 umask creates SQLite databases and JSON files as 0644 and
+    directories as 0755.  Quick snapshots contain session state, credentials,
+    pairing records, and cron data, so every published file must be 0600 and
+    every directory 0700 regardless of the caller's umask or source modes.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+
+    old_umask = os.umask(0o022)
+    try:
+        snapshot_id = create_quick_snapshot(hermes_home=home)
+    finally:
+        os.umask(old_umask)
+
+    assert snapshot_id is not None
+    root = home / "state-snapshots"
+    snapshot = root / snapshot_id
+    directories = [root, snapshot, *(p for p in snapshot.rglob("*") if p.is_dir())]
+    files = [p for p in snapshot.rglob("*") if p.is_file()]
+
+    assert directories
+    assert files
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in directories)
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files)
+
+
+def test_quick_snapshot_listing_ignores_partial_directories(tmp_path) -> None:
+    home = tmp_path / ".hermes"
+    partial = home / "state-snapshots" / ".unfinished.1.partial"
+    partial.mkdir(parents=True)
+    (partial / "manifest.json").write_text('{"id":"unfinished"}', encoding="utf-8")
+
+    assert list_quick_snapshots(hermes_home=home) == []
+
+
+def test_failed_automatic_backup_preserves_previous_archive(tmp_path, monkeypatch) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "state.db").write_bytes(b"not-a-database")
+    archive = tmp_path / "automatic.zip"
+    archive.write_bytes(b"previous-valid-backup")
+
+    monkeypatch.setattr("hermes_cli.backup._safe_copy_db", lambda _src, _dst: False)
+
+    assert _write_full_zip_backup(archive, home) is None
+    assert archive.read_bytes() == b"previous-valid-backup"
+    assert list(tmp_path.glob(".*.partial")) == []
+

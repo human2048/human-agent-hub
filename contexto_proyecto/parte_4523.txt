@@ -1,0 +1,393 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\website\test_generate_llms_txt.py ===
+"""`llms.txt` is how an LLM learns what Hermes can do.
+
+It is the index every model reads when pointed at our docs — including Hermes
+itself, whose `hermes-agent` skill routes unknown-feature questions there.
+`website/` is never packaged, so there is no shipped copy to fall back on.
+
+The index used to be a hand-written list of page paths, and it rotted to 53%
+coverage: Bot Mode, the desktop app, computer use, web search, and 22 messaging
+platforms were all absent, which is why an agent asked how to make bots talk to
+each other answered that it couldn't. These tests hold the two directions of
+that contract — every page reachable, every link real — so the index tracks the
+docs tree instead of someone's memory of it.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+GENERATOR = REPO_ROOT / "website" / "scripts" / "generate-llms-txt.py"
+
+
+@pytest.fixture(scope="module")
+def gen():
+    spec = importlib.util.spec_from_file_location("generate_llms_txt", GENERATOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def index(gen) -> str:
+    return gen.emit_llms_index()
+
+
+def _linked(gen, index: str) -> set[str]:
+    return set(re.findall(rf"\]\({re.escape(gen.SITE_BASE)}/([^)]+)\)", index))
+
+
+def _pages_on_disk(gen) -> set[str]:
+    """Walk the docs tree directly, duplicating only the two documented
+    exclusions.
+
+    Deliberately does not call `iter_docs()`: the index is built from that
+    enumeration, so checking one against the other would pass even if the
+    enumerator went blind to a whole tree — which is the failure being guarded.
+    """
+    pages = set()
+    for path in (*gen.DOCS.rglob("*.md"), *gen.DOCS.rglob("*.mdx")):
+        rel = path.relative_to(gen.DOCS).with_suffix("")
+        slug = str(rel.parent) if rel.name == "index" else str(rel)
+        # The docs landing page is the index's subject; per-skill pages are
+        # summarized by the two catalog reference pages.
+        if slug == "." or slug.startswith(("user-guide/skills/bundled", "user-guide/skills/optional")):
+            continue
+        pages.add(slug)
+    return pages
+
+
+def test_every_docs_page_is_indexed(gen, index):
+    """The regression: a page the index omits is a feature the agent denies."""
+    pages = _pages_on_disk(gen)
+    assert len(pages) > 100, "docs root resolved wrong — the rest of this file proves nothing"
+
+    missing = pages - _linked(gen, index)
+    assert not missing, (
+        f"{len(missing)} docs pages missing from llms.txt: {sorted(missing)} — "
+        "they should have been absorbed into a section automatically"
+    )
+
+
+def test_the_enumerator_sees_the_whole_docs_tree(gen):
+    """Everything downstream trusts `iter_docs()`, so pin it to the filesystem."""
+    assert set(gen.iter_docs()) == _pages_on_disk(gen)
+
+
+def test_every_indexed_page_exists(gen, index):
+    """The other direction: a renamed page leaves the index pointing at a 404."""
+    for slug in sorted(_linked(gen, index)):
+        assert gen.doc_path(slug) is not None, (
+            f"llms.txt links {slug}, which is not in the docs tree — "
+            "drop the SECTIONS row and let the page be absorbed under its new path"
+        )
+
+
+def test_pages_are_listed_once(gen, index):
+    """Curating a page must promote it, not duplicate it."""
+    entries = re.findall(rf"^- \[.*?\]\({re.escape(gen.SITE_BASE)}/([^)]+)\)", index, re.MULTILINE)
+    duplicated = {slug for slug in entries if entries.count(slug) > 1}
+    assert not duplicated, f"listed more than once in llms.txt: {sorted(duplicated)}"
+
+
+def test_curation_orders_pages_without_gatekeeping_them(gen):
+    """SECTIONS decides what leads a section, never what the index contains."""
+    curated = {slug for _section, items in gen.SECTIONS for slug, _t, _d in items}
+    pages = set(gen.iter_docs())
+
+    assert curated < pages, "every page is curated — absorption is no longer exercised"
+    assert gen.section_for("user-guide/features/some-feature-shipped-tomorrow") in dict(gen.ABSORB)
+    assert gen.section_for("a-tree-nobody-anticipated/page") == gen.MISC_SECTION
+
+
+def test_section_landing_pages_resolve_to_their_directory(gen):
+    """`messaging/index.md` is served at `/messaging`; `/messaging/index` 404s."""
+    assert gen.slug_for(gen.DOCS / "user-guide" / "messaging" / "index.md") == "user-guide/messaging"
+    assert "user-guide/messaging/index" not in _linked(gen, gen.emit_llms_index())
+
+
+def test_mdx_pages_are_indexed_without_their_imports(gen):
+    """MDX docs are real pages; their component imports are not prose."""
+    mdx = [p for p in gen.DOCS.rglob("*.mdx") if gen.slug_for(p)]
+    assert mdx, "no .mdx docs — this test no longer guards anything"
+    assert {gen.slug_for(p) for p in mdx} <= set(gen.iter_docs())
+
+    _meta, body = gen.read_frontmatter(mdx[0])
+    assert not re.search(r"^import\s", body, re.MULTILINE)
+
+
+def test_per_skill_catalog_pages_stay_out(gen):
+    """~195 generated skill pages would bury the product docs in the index."""
+    assert not [slug for slug in gen.iter_docs() if slug.startswith(gen.SKILL_CATALOG)]
+    assert "reference/skills-catalog" in gen.iter_docs(), "the summary page must remain"
+
+
+def test_bot_mode_is_reachable(gen, index):
+    """The page behind the original complaint, and the answer it has to carry."""
+    assert "user-guide/bot-mode" in _linked(gen, index)
+    assert "hermes peer dm" in (gen.DOCS / "user-guide" / "bot-mode.md").read_text(encoding="utf-8")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\website\test_generate_skill_docs.py ===
+"""Tests for website/scripts/generate-skill-docs.py.
+
+The generator turns every `skills/**/SKILL.md` into a Docusaurus page before
+the `docs-site-checks` CI workflow runs `ascii-guard lint` on the result. If
+a SKILL.md contains ASCII diagrams (box-drawing chars in a fenced code block)
+without its own `<!-- ascii-guard-ignore -->` markers, the generator must
+add them defensively — otherwise every PR touching `website/**` fails lint
+on unrelated skill content.
+
+Regression for issue #15305.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+GENERATOR = REPO_ROOT / "website" / "scripts" / "generate-skill-docs.py"
+
+
+@pytest.fixture(scope="module")
+def gen_module():
+    """Load generate-skill-docs.py as a module (hyphenated filename, not importable via normal import)."""
+    spec = importlib.util.spec_from_file_location("generate_skill_docs", GENERATOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_code_block_without_box_chars_is_not_wrapped(gen_module):
+    """Plain bash/python code blocks should stay uncluttered."""
+    body = "Intro.\n\n```bash\npip install foo\nfoo --run\n```\n\nOutro."
+    result = gen_module.mdx_escape_body(body)
+    assert "ascii-guard-ignore" not in result
+    assert "pip install foo" in result
+
+
+def test_code_block_with_box_chars_gets_wrapped(gen_module):
+    """A code fence containing Unicode box-drawing chars must be wrapped in
+    ascii-guard-ignore comments so the docs-site-checks lint can't fail on
+    a skill's own diagram (issue #15305)."""
+    body = (
+        "Some text.\n\n"
+        "```\n"
+        "┌─────────┐\n"
+        "│ diagram │\n"
+        "└─────────┘\n"
+        "```\n\n"
+        "More text."
+    )
+    result = gen_module.mdx_escape_body(body)
+    assert "<!-- ascii-guard-ignore -->" in result
+    assert "<!-- ascii-guard-ignore-end -->" in result
+    # The wrapper must sit OUTSIDE the fence, not inside.
+    wrap_open = result.index("<!-- ascii-guard-ignore -->")
+    fence_open = result.index("```\n┌")
+    assert wrap_open < fence_open
+
+
+def test_multiple_code_blocks_only_box_ones_wrapped(gen_module):
+    """Mixed body: plain code stays plain, box code gets wrapped."""
+    body = (
+        "```bash\necho hi\n```\n\n"
+        "```\n┌──┐\n│  │\n└──┘\n```\n\n"
+        "```python\nprint('ok')\n```"
+    )
+    result = gen_module.mdx_escape_body(body)
+    # exactly one wrap pair
+    assert result.count("<!-- ascii-guard-ignore -->") == 1
+    assert result.count("<!-- ascii-guard-ignore-end -->") == 1
+    # plain blocks untouched
+    assert "echo hi" in result
+    assert "print('ok')" in result
+
+
+def test_tilde_fenced_box_is_wrapped(gen_module):
+    """The generator supports both ``` and ~~~ fences — both must be covered."""
+    body = "~~~\n│ box │\n~~~"
+    result = gen_module.mdx_escape_body(body)
+    assert "<!-- ascii-guard-ignore -->" in result
+
+
+def test_already_wrapped_source_double_wraps_harmlessly(gen_module):
+    """If the SKILL.md already has ascii-guard-ignore markers, the generator's
+    extra wrap is harmless (ascii-guard tolerates adjacent duplicate markers).
+    The test just verifies we don't crash and the content survives."""
+    body = (
+        "<!-- ascii-guard-ignore -->\n"
+        "```\n┌─┐\n└─┘\n```\n"
+        "<!-- ascii-guard-ignore-end -->"
+    )
+    result = gen_module.mdx_escape_body(body)
+    assert "┌─┐" in result
+    # At least one marker pair survives
+    assert "<!-- ascii-guard-ignore -->" in result
+    assert "<!-- ascii-guard-ignore-end -->" in result
+
+
+def test_box_drawing_detection_covers_common_chars(gen_module):
+    """Smoke-test that the char set covers box-drawing ranges actually used
+    in skill diagrams."""
+    # Sample from real SKILL.md diagrams (segment-anything, research-paper-writing, etc.)
+    for ch in "┌┐└┘─│├┤┬┴┼═║╔╗╚╝╭╮╯╰▶◀▲▼":
+        assert ch in gen_module._BOX_DRAWING_CHARS, f"missing: {ch!r}"
+
+
+def test_bundled_catalog_explains_missing_local_skills(gen_module):
+    """The bundled catalog should explain how to restore a listed skill that
+    was removed from the local profile's skills tree."""
+    result = gen_module.build_catalog_md_bundled([])
+    assert "respects local deletions and user edits" in result
+    assert "hermes skills reset <name> --restore" in result
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\website\test_slash_commands_doc_parity.py ===
+"""Doc-fact contract: slash-commands.md must match the command registry.
+
+Parse the real surface and cross-check the published doc in both directions.
+This class of drift has bitten before: ``/loop`` shipped with a feature page
+(user-guide/features/loops.md) but never got a row in the slash-commands
+reference, and the zh-Hans doc carried retired ``/credits``/``/billing`` rows
+for months (PR #69639).
+
+Two directions, both driven by ``hermes_cli.commands.COMMAND_REGISTRY``
+(the single source every surface derives from):
+
+1. Every registered command must be documented under at least one visible
+   form — its canonical name or any declared alias. (IronClaw rule: "any
+   visible alias form counts".) This keeps new CommandDefs from shipping
+   undocumented.
+2. Every command token that appears as a table row in the doc must resolve
+   to a registered name or alias. This keeps retired commands from
+   lingering in the doc after they leave the registry.
+
+Only the English doc is gated: i18n copies lag by design and are synced
+in dedicated passes.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DOC_PATH = REPO_ROOT / "website" / "docs" / "reference" / "slash-commands.md"
+
+# Table rows look like:  | `/name ...` | description |
+# Only the leading command token of a row is a doc-fact claim; command
+# mentions in prose or descriptions are not rows.
+_ROW_CMD_RE = re.compile(r"^\|\s*`/([a-z0-9_-]+)", re.MULTILINE)
+
+
+def _mentioned(form: str, doc_text: str) -> bool:
+    """``/form`` as a whole command token — a bare substring test would let the
+    alias ``/q`` be "documented" by ``/queue`` and ``/v`` by ``/version``."""
+    return re.search(rf"/{re.escape(form)}(?![A-Za-z0-9_-])", doc_text) is not None
+
+# Doc rows that are deliberately not CommandDef entries.
+_NON_REGISTRY_ROWS = {
+    # Dynamic skill invocation — every installed skill becomes /<skill-name>.
+    "skill-name",
+}
+
+
+@pytest.fixture(scope="module")
+def registry():
+    from hermes_cli.commands import COMMAND_REGISTRY
+
+    return COMMAND_REGISTRY
+
+
+@pytest.fixture(scope="module")
+def doc_text() -> str:
+    assert DOC_PATH.is_file(), f"missing doc: {DOC_PATH}"
+    return DOC_PATH.read_text(encoding="utf-8")
+
+
+def test_every_registered_command_is_documented(registry, doc_text):
+    """Each command must appear in the doc as /name or any /alias."""
+    missing = []
+    for cmd in registry:
+        forms = [cmd.name, *(cmd.aliases or ())]
+        if not any(_mentioned(form, doc_text) for form in forms):
+            missing.append(cmd.name)
+    assert not missing, (
+        "Commands registered in hermes_cli/commands.py but absent from "
+        f"website/docs/reference/slash-commands.md: {missing}. "
+        "Add a table row (Session/Configuration/Tools & Skills/Info for the "
+        "CLI table, and the messaging table if the command works on the "
+        "gateway), or document one of its aliases."
+    )
+
+
+def test_every_documented_row_is_registered(registry, doc_text):
+    """Each doc table row's command token must exist in the registry."""
+    known = {c.name for c in registry}
+    for c in registry:
+        known.update(c.aliases or ())
+    known |= _NON_REGISTRY_ROWS
+
+    unknown = sorted(
+        {tok for tok in _ROW_CMD_RE.findall(doc_text) if tok not in known}
+    )
+    assert not unknown, (
+        "slash-commands.md documents commands that no longer exist in "
+        f"COMMAND_REGISTRY: {unknown}. Remove the stale rows (or register "
+        "the command)."
+    )
+
+
+def test_doc_parses_at_least_the_known_surface(doc_text):
+    """Sanity: the row regex actually sees the tables (guards against a
+    format change silently turning both contracts vacuous)."""
+    rows = set(_ROW_CMD_RE.findall(doc_text))
+    assert len(rows) >= 60, (
+        f"only {len(rows)} command rows parsed from slash-commands.md — "
+        "table format may have changed; update _ROW_CMD_RE."
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\website\__init__.py ===
+
+
+
+=== ARCHIVO: .\hermes-agent\tests-js\package.json ===
+{
+  "name": "@hermes/root-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run lint",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "fix": "npm run lint:fix"
+  },
+  "devDependencies": {
+    "@types/plist": "3.0.5",
+    "plist": "3.1.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10"
+  }
+}
+

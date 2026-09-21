@@ -1,0 +1,346 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_username_chat_id.py ===
+"""Tests for Telegram username (non-numeric) chat_id handling (#13206).
+
+When ``TELEGRAM_HOME_CHANNEL`` is an ``@username`` rather than a numeric chat
+ID, webhook/cron deliveries that fall back to the home channel used to crash
+with ``ValueError: invalid literal for int()`` because the adapter coerced
+every chat_id with ``int()``. Telegram's Bot API accepts both forms, so the
+adapter now normalizes instead of force-casting.
+"""
+
+import sys
+import types
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.config import PlatformConfig, Platform
+from plugins.platforms.telegram.telegram_ids import (
+    looks_like_telegram_username,
+    normalize_telegram_chat_id,
+    parse_telegram_username_target,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helper-level behavior (no telegram import needed)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("123456789", 123456789),             # positive numeric DM id
+        ("-1001234567890", -1001234567890),   # negative channel/supergroup id
+        (123456789, 123456789),               # already int
+        ("  42 ", 42),                        # surrounding whitespace
+        ("@some_user", "@some_user"),         # username passes through as str
+        ("@a_channel", "@a_channel"),
+        ("not_numeric", "not_numeric"),       # any other non-numeric string
+    ],
+)
+def test_normalize_returns_int_or_passthrough_string(value, expected):
+    assert normalize_telegram_chat_id(value) == expected
+
+
+def test_numeric_normalizes_to_int_type():
+    assert isinstance(normalize_telegram_chat_id("123"), int)
+
+
+# ---------------------------------------------------------------------------
+# Fake telegram module tree (mirrors test_telegram_thread_fallback.py)
+# ---------------------------------------------------------------------------
+
+class FakeNetworkError(Exception):
+    pass
+
+
+class FakeBadRequest(FakeNetworkError):
+    pass
+
+
+class FakeTimedOut(FakeNetworkError):
+    pass
+
+
+class _FakeInlineKeyboardButton:
+    def __init__(self, text, callback_data=None, **kwargs):
+        self.text = text
+        self.callback_data = callback_data
+
+
+class _FakeInlineKeyboardMarkup:
+    def __init__(self, inline_keyboard):
+        self.inline_keyboard = inline_keyboard
+
+
+_fake_telegram = types.ModuleType("telegram")
+_fake_telegram.Update = object
+_fake_telegram.Bot = object
+_fake_telegram.Message = object
+_fake_telegram.InlineKeyboardButton = _FakeInlineKeyboardButton
+_fake_telegram.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup
+_fake_telegram.InputMediaPhoto = object
+_fake_telegram_error = types.ModuleType("telegram.error")
+_fake_telegram_error.NetworkError = FakeNetworkError
+_fake_telegram_error.BadRequest = FakeBadRequest
+_fake_telegram_error.TimedOut = FakeTimedOut
+_fake_telegram.error = _fake_telegram_error
+_fake_telegram_constants = types.ModuleType("telegram.constants")
+_fake_telegram_constants.ParseMode = SimpleNamespace(
+    MARKDOWN_V2="MarkdownV2", MARKDOWN="Markdown", HTML="HTML",
+)
+_fake_telegram_constants.ChatType = SimpleNamespace(
+    GROUP="group", SUPERGROUP="supergroup", CHANNEL="channel", PRIVATE="private",
+)
+_fake_telegram.constants = _fake_telegram_constants
+_fake_telegram_ext = types.ModuleType("telegram.ext")
+for _attr in (
+    "Application", "CommandHandler", "CallbackQueryHandler", "InlineQueryHandler",
+    "MessageHandler", "TypeHandler",
+):
+    setattr(_fake_telegram_ext, _attr, object)
+_fake_telegram_ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
+_fake_telegram_ext.filters = object
+_fake_telegram_request = types.ModuleType("telegram.request")
+_fake_telegram_request.HTTPXRequest = object
+
+
+@pytest.fixture(autouse=True)
+def _inject_fake_telegram(monkeypatch):
+    monkeypatch.setitem(sys.modules, "telegram", _fake_telegram)
+    monkeypatch.setitem(sys.modules, "telegram.error", _fake_telegram_error)
+    monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
+    monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
+    monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+
+
+def _make_adapter():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    config = PlatformConfig(enabled=True, token="fake-token")
+    adapter = object.__new__(TelegramAdapter)
+    adapter.config = config
+    adapter._config = config
+    adapter._platform = Platform.TELEGRAM
+    adapter._connected = True
+    adapter._dm_topics = {}
+    adapter._dm_topics_config = []
+    adapter._reply_to_mode = "first"
+    adapter._fallback_ips = []
+    adapter._polling_conflict_count = 0
+    adapter._polling_network_error_count = 0
+    adapter._polling_error_callback_ref = None
+    adapter.platform = Platform.TELEGRAM
+    return adapter
+
+
+# ---------------------------------------------------------------------------
+# Adapter send path: username chat_id reaches the Bot API without int() crash
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_passes_username_chat_id_through_unchanged():
+    """adapter.send(@username) calls the Bot API with the username string
+    rather than crashing on int() coercion (the #13206 regression)."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=99)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="@some_user", content="hello world")
+
+    assert result.success is True
+    assert call_log, "send_message was never called"
+    assert call_log[0]["chat_id"] == "@some_user"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_voice_caption_markdown.py ===
+"""Telegram voice-message captions must render markdown (#32029).
+
+``TelegramAdapter.send_voice`` used to pass captions raw with no
+``parse_mode``, so auto-TTS captions carrying the agent's markdown reply
+showed literal *asterisks*, backticks and [links](...). It now formats the
+caption to MarkdownV2 (when the formatted text fits the 1024-char caption
+cap) and falls back to the plain truncated caption when the Bot API rejects
+the entities or formatting overflows.
+"""
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from plugins.platforms.telegram import adapter as telegram_mod  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+def _make_adapter() -> TelegramAdapter:
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._bot = MagicMock()
+    adapter._bot.send_voice = AsyncMock(return_value=MagicMock(message_id=1))
+    adapter._bot.send_audio = AsyncMock(return_value=MagicMock(message_id=2))
+    return adapter
+
+
+def _write_ogg(tmp_path):
+    audio = tmp_path / "reply.ogg"
+    audio.write_bytes(b"\x00" * 16)
+    return audio
+
+
+@pytest.mark.asyncio
+async def test_voice_caption_falls_back_to_plain_on_entity_rejection(
+    monkeypatch, tmp_path
+):
+    """A Bot API entity-parse rejection retries with the plain caption."""
+    monkeypatch.setattr(
+        telegram_mod, "_probe_voice_duration_seconds", lambda _p: 3
+    )
+    adapter = _make_adapter()
+    adapter._bot.send_voice = AsyncMock(
+        side_effect=[
+            Exception("Bad Request: can't parse entities"),
+            MagicMock(message_id=7),
+        ]
+    )
+
+    result = await adapter.send_voice(
+        "123", str(_write_ogg(tmp_path)), caption="*bold* reply"
+    )
+
+    assert result.success is True
+    assert adapter._bot.send_voice.await_count == 2
+    retry_kwargs = adapter._bot.send_voice.await_args_list[1].kwargs
+    assert retry_kwargs["parse_mode"] is None
+    assert retry_kwargs["caption"] == "*bold* reply"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_voice_duration.py ===
+"""Telegram voice/audio messages must carry an explicit duration.
+
+Telegram only auto-derives a clip's duration from container metadata for short
+recordings; longer ones (~5 min+) are sent with duration 0 and render as
+``0:00`` in the player. ``TelegramAdapter.send_voice`` now probes the length
+locally and passes ``duration=`` to ``sendVoice`` / ``sendAudio`` so the
+bubble shows the real time.
+
+These tests confirm:
+  1. ``_probe_voice_duration_seconds`` rounds to whole seconds (real WAV via
+     stdlib ``wave``), reads OGG/MP3 lengths via mutagen, and degrades to
+     ``None`` (omit duration) when nothing can read the file.
+  2. The ``.ogg`` voice path forwards the probed duration to ``bot.send_voice``.
+  3. The ``.mp3`` audio path forwards the probed duration to ``bot.send_audio``.
+
+Hermetic: no real mutagen / ffprobe required. The WAV path uses stdlib only;
+the mutagen path is exercised with a fake module injected into ``sys.modules``.
+"""
+import sys
+import wave
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from plugins.platforms.telegram import adapter as telegram_mod  # noqa: E402
+from plugins.platforms.telegram.adapter import (  # noqa: E402
+    TelegramAdapter,
+    _coerce_duration_seconds,
+    _probe_voice_duration_seconds,
+)
+from tools.send_message_tool import _send_telegram  # noqa: E402
+
+
+def _write_wav(path, *, rate, frames):
+    """Write a silent mono WAV of ``frames`` samples at ``rate`` Hz."""
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(1)
+        wf.setframerate(rate)
+        wf.writeframes(b"\x00" * frames)
+
+
+# ---------------------------------------------------------------------------
+# 1a. WAV path — real stdlib read, rounding to whole seconds
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "rate,frames,expected",
+    [
+        (10, 2900, 290),   # 290.0 -> 290
+        (10, 2904, 290),   # 290.4 -> 290
+        (10, 2906, 291),   # 290.6 -> 291
+        (10, 12, 1),       # 1.2   -> 1
+    ],
+)
+def test_probe_wav_rounds_to_whole_seconds(tmp_path, rate, frames, expected):
+    f = tmp_path / "clip.wav"
+    _write_wav(f, rate=rate, frames=frames)
+    assert _probe_voice_duration_seconds(str(f)) == expected
+
+
+# ---------------------------------------------------------------------------
+# 1b. mutagen path — fake module so ogg/mp3 work without the real dependency
+# ---------------------------------------------------------------------------
+
+def _inject_fake_mutagen(monkeypatch, length):
+    fake = SimpleNamespace(
+        File=lambda _p: SimpleNamespace(info=SimpleNamespace(length=length))
+    )
+    monkeypatch.setitem(sys.modules, "mutagen", fake)
+
+
+# ---------------------------------------------------------------------------
+# 1c. _coerce_duration_seconds rounding/guard contract
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(290.0, 290), (290.6, 291), ("12.7", 13), (0, None), (-3, None),
+     (None, None), ("", None), ("x", None)],
+)
+def test_coerce_duration_seconds(value, expected):
+    assert _coerce_duration_seconds(value) == expected
+
+
+# ---------------------------------------------------------------------------
+# 2 + 3. send_voice forwards the probed duration to the Bot API
+# ---------------------------------------------------------------------------
+
+def _make_adapter() -> TelegramAdapter:
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._bot = MagicMock()
+    adapter._bot.send_voice = AsyncMock(return_value=MagicMock(message_id=1))
+    adapter._bot.send_audio = AsyncMock(return_value=MagicMock(message_id=2))
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_voice_send_forwards_duration(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        telegram_mod, "_probe_voice_duration_seconds", lambda _p: 314
+    )
+    audio = tmp_path / "reply.ogg"
+    audio.write_bytes(b"\x00" * 16)
+
+    adapter = _make_adapter()
+    result = await adapter.send_voice("123", str(audio))
+
+    assert result.success is True
+    adapter._bot.send_voice.assert_awaited_once()
+    assert adapter._bot.send_voice.await_args.kwargs["duration"] == 314
+    adapter._bot.send_audio.assert_not_awaited()
+
+
+

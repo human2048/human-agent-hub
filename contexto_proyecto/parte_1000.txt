@@ -1,0 +1,407 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\fantasy-animation.md ===
+# fantasy-animation
+
+Whimsical hand-drawn animation style inspired by Ghibli/Disney
+
+## Design Aesthetic
+
+Charming hand-drawn animation aesthetic reminiscent of classic Disney, Studio Ghibli, or European storybook illustration. Soft, painterly textures with warm, inviting colors. Friendly characters, magical elements, and storybook feel. Enchanting, nostalgic, and emotionally engaging.
+
+## Background
+
+- Color: Soft Sky Blue (#E8F4FC) or Warm Cream (#FFF8E7)
+- Texture: Subtle watercolor wash, soft brush strokes
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Soft Sky Blue | #E8F4FC | Primary background |
+| Alt Background | Warm Cream | #FFF8E7 | Secondary areas |
+| Primary Text | Deep Forest | #2D5A3D | Headlines |
+| Body Text | Warm Brown | #5D4E37 | Content |
+| Accent 1 | Golden Yellow | #F4D03F | Magic, highlights |
+| Accent 2 | Rose Pink | #E8A0BF | Warmth, charm |
+| Accent 3 | Sage Green | #87A96B | Nature elements |
+| Accent 4 | Sky Blue | #7EC8E3 | Air, water, dreams |
+| Accent 5 | Coral | #F08080 | Emphasis, life |
+
+## Visual Elements
+
+- Central illustrated character (friendly, expressive)
+- Small companion creatures (animals, magical beings)
+- Storybook-style environment backgrounds
+- Magical floating objects (books, orbs, sparkles)
+- Decorative elements: stars, flowers, leaves
+- Soft shadows and gentle highlights
+- Layered depth with foreground/background
+
+## Style Rules
+
+### Do
+
+- Create warm, inviting compositions
+- Use soft edges and painterly textures
+- Include charming character illustrations
+- Add magical decorative touches
+- Maintain storybook narrative feel
+
+### Don't
+
+- Use harsh geometric shapes
+- Create dark or intimidating imagery
+- Add photorealistic elements
+- Use cold color palettes
+- Make it look digital/computerized
+
+## Best For
+
+Educational content, children's articles, storytelling, creative topics, fantasy/gaming, inspirational pieces, family-friendly content
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\flat-doodle.md ===
+# flat-doodle
+
+Cute flat doodle illustration style with bold outlines
+
+## Design Aesthetic
+
+Cheerful and approachable visual style combining flat design with doodle charm. Features bold black outlines around simple shapes. Bright pastel colors with no gradients or shading. Cute rounded proportions that feel friendly. Clean white backgrounds create focus and clarity.
+
+## Background
+
+- Color: Clean White (#FFFFFF)
+- Texture: None - pure white isolated background
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | White | #FFFFFF | Primary background |
+| Primary | Pastel Pink | #FFB6C1 | Main elements |
+| Secondary | Mint | #98D8C8 | Supporting elements |
+| Tertiary | Lavender | #C8A2C8 | Accent elements |
+| Accent 1 | Butter Yellow | #FFFACD | Highlight pop |
+| Accent 2 | Sky Blue | #87CEEB | Cool accent |
+| Accent 3 | Soft Coral | #F88379 | Warm accent |
+| Outline | Bold Black | #000000 | All outlines |
+| Text | Black | #1A1A1A | Text elements |
+
+## Visual Elements
+
+- Bold black outlines around all shapes
+- Simple flat color fills
+- Cute rounded proportions
+- Minimal geometric shapes
+- Productivity icons (laptops, calendars, checkmarks)
+- Isolated elements on white
+- No shading or gradients
+- Hand-drawn quality with clean edges
+
+## Style Rules
+
+### Do
+
+- Use bold black outlines consistently
+- Keep shapes simple and rounded
+- Use bright pastel palette
+- Isolate elements on white background
+- Maintain cute proportions
+- Keep minimal shading
+
+### Don't
+
+- Add shadows or depth effects
+- Use gradients or textures
+- Create complex detailed illustrations
+- Overlap too many elements
+- Use dark or moody backgrounds
+- Add realistic proportions
+
+## Best For
+
+Productivity articles, SaaS and app content, workflow tutorials, beginner guides, casual business content, tool introductions, lifestyle productivity
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\flat.md ===
+# flat
+
+Modern flat vector illustration style for contemporary content
+
+## Design Aesthetic
+
+Contemporary flat design aesthetic with bold shapes and limited depth. Clean geometric forms with no gradients or shadows. Modern, accessible, and highly readable. Optimized for digital consumption with scalable vector quality.
+
+## Background
+
+- Color: White (#FFFFFF) or Soft Gray (#F5F5F5)
+- Texture: None - clean solid backgrounds
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | White | #FFFFFF | Primary background |
+| Alt Background | Soft Gray | #F5F5F5 | Accent areas |
+| Primary | Vibrant Blue | #3B82F6 | Main elements |
+| Secondary | Coral | #F97316 | Supporting elements |
+| Tertiary | Emerald | #10B981 | Accent elements |
+| Accent 1 | Purple | #8B5CF6 | Additional accent |
+| Accent 2 | Amber | #F59E0B | Highlight |
+| Text | Dark Slate | #1E293B | Text elements |
+| Light | Light Gray | #E5E7EB | Subtle elements |
+
+## Visual Elements
+
+- Bold geometric shapes
+- Flat color fills with no gradients
+- Simple character illustrations
+- Clean icon designs
+- Minimal line work
+- Overlapping shape compositions
+- Abstract concept visualizations
+- Consistent stroke weights
+
+## Style Rules
+
+### Do
+
+- Use flat solid colors
+- Create clean geometric shapes
+- Keep elements simple
+- Maintain consistent styling
+- Use bold color combinations
+
+### Don't
+
+- Add shadows or depth
+- Use gradients or textures
+- Create realistic illustrations
+- Add unnecessary details
+- Use photographic elements
+
+## Best For
+
+Modern articles, app and product content, startup stories, digital topics, contemporary business, tech company blogs, social media content
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\ink-notes.md ===
+# ink-notes
+
+Professional black-ink visual notes on pure white, in the tradition of Mike Rohde's sketchnoting
+
+## Compared to sketch-notes
+
+`ink-notes` and `sketch-notes` are distinct styles. Pick the right one:
+
+| | `sketch-notes` | `ink-notes` |
+|---|---|---|
+| Background | Warm Off-White #FAF8F0 with paper grain | Pure White #FFFFFF, clean, no texture |
+| Palette | Soft warm accents (orange, mustard, sage, light blue) | Black ink dominant + sparse semantic accents |
+| Feel | Soft, warm, educational, approachable | Professional, structured, whiteboard-presentation |
+| Best For | Friendly tutorials, onboarding, casual explainers | Before/After essays, tech manifestos, framework analogies |
+
+When in doubt: warm & friendly → `sketch-notes`. Disciplined & professional → `ink-notes`.
+
+## Design Aesthetic
+
+Disciplined hand-drawn visual note. Confident black ink line work with slight wobble, hand-lettered typography, and sparse color accents used only for semantic emphasis. Feels like a skilled visual notetaker's whiteboard presentation — clean, structured, intentionally hand-drawn rather than decorative.
+
+## Background
+
+- Color: Pure White (#FFFFFF)
+- Texture: Clean, no grain, no tint
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Pure White | #FFFFFF | Canvas |
+| Primary Ink | Near Black | #1A1A1A | All lines, text, figures, arrows |
+| Accent Warm | Coral Red | #E8655A | Risk, problem, gap, emphasis |
+| Accent Cool | Muted Teal | #5FA8A8 | Positive, solution, "after" state |
+| Accent Neutral | Dusty Lavender | #9B8AB5 | Neutral tags, category labels |
+| Soft Fill | Pale Gray | #F0F0F0 | Subtle zone backgrounds (optional) |
+
+Color accents must remain under 10% of canvas area and only carry semantic meaning. Black ink does the structural work.
+
+## Visual Elements
+
+- Black ink line work with intentional slight wobble on all strokes
+- Hand-lettered titles (bold, oversized) and handwritten body annotations
+- Simple stick-figure characters with expressive poses (pointing, thinking, walking)
+- Role labels above characters (e.g., "Tech Lead", "Compliance Officer")
+- Thought bubbles and speech bubbles with hand-drawn outlines
+- Rounded-rectangle frames for content groupings
+- Dashed-border rectangles for placeholder, "coming next", or empty states
+- Curvy hand-drawn arrows with small inline labels
+- Vertical or horizontal dividers between comparison zones ("Before" | "After")
+- "Mindset shift" curved arrow bridging two zones
+- Bottom tagline: single-line hand-lettered conclusion that points the takeaway
+- Stars, asterisks, underlines for emphasis — used sparingly
+
+## Style Rules
+
+### Do
+
+- Keep background pure white with no texture or tint
+- Let black ink dominate outlines, text, and figures
+- Use accent colors only for semantic highlighting
+- Keep all type hand-lettered — no computer-generated fonts
+- Maintain confident line quality (wobble, not mess)
+- Include a bottom tagline summarizing the main takeaway
+- Structure content into clear zones with visible dividers
+- Use dashed boxes for future, empty, or placeholder states
+
+### Don't
+
+- Use warm off-white or paper-textured backgrounds (that is sketch-notes' territory)
+- Fill large zones with color blocks
+- Use more than 3 accent colors per image
+- Use perfect geometric shapes — preserve hand-drawn wobble
+- Clutter with decorative doodles; every element must carry meaning
+- Use gradients, shadows, or computer-generated fonts
+
+## Type Compatibility
+
+| Type | Rating | Notes |
+|------|--------|-------|
+| comparison | ✓✓ | Best fit — Before/After, Traditional vs New, side-by-side contrasts |
+| framework | ✓✓ | OS-style command centers, layered architectures, organizational models |
+| flowchart | ✓✓ | Process explainers with labeled stages, workforce pipelines |
+| infographic | ✓ | Multi-zone technical summaries, manifesto-style posters |
+| timeline | ✓ | Hand-drawn horizontal arrow with era markers and milestones |
+| scene | ✗ | Not recommended — lacks scenic space |
+
+## Best For
+
+Product and engineering essays, tech manifestos, framework introductions, Before/After narratives, OS-level comparisons, workforce and organizational analogies, visual summaries of talks, thought-leadership articles
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\intuition-machine.md ===
+# intuition-machine
+
+Technical briefing infographic style with aged paper and bilingual labels
+
+## Design Aesthetic
+
+Academic/technical briefing style with clean 2D or isometric technical illustrations. Information-dense but organized with clear visual hierarchy. Vintage blueprint aesthetic with modern clarity. Multiple explanatory elements with bilingual callouts.
+
+## Background
+
+- Color: Aged Cream (#F5F0E6)
+- Texture: Subtle paper texture with light creases, vintage technical print feel
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Aged Cream | #F5F0E6 | Primary background |
+| Paper Texture | Warm White | #F5F0E1 | Blueprint effect |
+| Primary Text | Dark Maroon | #5D3A3A | Headlines, titles |
+| Body Text | Near Black | #1A1A1A | Content text |
+| Accent 1 | Teal | #2F7373 | Primary illustrations |
+| Accent 2 | Warm Brown | #8B7355 | Secondary elements |
+| Accent 3 | Maroon | #722F37 | Emphasis |
+| Outline | Deep Charcoal | #2D2D2D | Element outlines |
+
+## Visual Elements
+
+- Isometric 3D or flat 2D technical diagrams
+- Explanatory text boxes with labeled content
+- Bilingual callout labels (English + Chinese)
+- Faded thematic background patterns
+- Clean black outlines on elements
+- Split or triptych layouts
+- Key insight boxes
+
+## Style Rules
+
+### Do
+
+- Include multiple text boxes with content
+- Use bilingual labels for key elements
+- Add faded thematic background patterns
+- Maintain aged paper texture
+- Create clear visual hierarchy
+
+### Don't
+
+- Create photorealistic 3D renders
+- Leave illustrations without explanatory text
+- Add stamps or watermarks in corners
+- Use gradients or glossy effects
+- Make it look too modern/digital
+
+## Best For
+
+Technical explanations, concept breakdowns, academic content, research summaries, bilingual audiences, knowledge documentation
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\minimal.md ===
+# minimal
+
+Ultra-clean, zen-like illustration style for focused content
+
+## Design Aesthetic
+
+Maximum simplicity with purposeful restraint. Every element serves a function. Zen-like calm and focus through extensive negative space. Single focal point approach that guides attention naturally. Quiet elegance through reduction.
+
+## Background
+
+- Color: Pure White (#FFFFFF) or Off-White (#FAFAFA)
+- Texture: None - clean solid backgrounds
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | White | #FFFFFF | Primary background |
+| Alt Background | Off-White | #FAFAFA | Subtle variation |
+| Primary | Pure Black | #000000 | Main elements |
+| Accent | Content-Derived | varies | Single accent color |
+| Text | Black | #000000 | Text elements |
+| Alt Text | Medium Gray | #6B6B6B | Secondary text |
+
+Note: Accent color is derived from content context. Use sparingly.
+
+## Visual Elements
+
+- Single focal element per illustration
+- Maximum negative space
+- Thin, precise lines
+- Simple geometric forms
+- Subtle shadows if any
+- Typography as primary element
+- Strategic use of single accent
+- Clean, uncluttered compositions
+
+## Style Rules
+
+### Do
+
+- Embrace empty space
+- Use single focal points
+- Keep lines thin and precise
+- Let content breathe
+- Question every element
+
+### Don't
+
+- Add decorative elements
+- Use multiple accent colors
+- Fill available space
+- Add textures or patterns
+- Create visual complexity
+
+## Best For
+
+Philosophy articles, minimalism content, focused explanations, meditation and mindfulness, essential concepts, clarity-focused writing
+

@@ -1,0 +1,286 @@
+
+
+=== ARCHIVO: .\hermes-agent\gateway\turn_context.py ===
+"""Per-turn context shared between ``GatewayRunner._run_agent_inner`` and ``TurnRunner``.
+
+Each ex-closure local is a field, written once by ``_run_agent_inner`` while wiring the turn.
+``message`` (ex-``nonlocal``) is the only rebindable field; other mutable state uses
+single-element lists so mutation stays visible to the outer body.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Optional
+
+
+@dataclass
+class TurnContext:
+    # read-only turn identity / wiring
+    source: Any = None
+    # Scheduled heartbeats are proactive work, not replies to the source message that
+    # registered the watch.  Their routine delivery surfaces stay quiet.
+    scheduled_heartbeat: bool = False
+    _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
+    _live_status_adapter: Any = None
+    _live_status_mode: str = "off"
+    _thinking_enabled: bool = False
+    progress_mode: str = "off"
+    progress_grouping: str = "grouped"
+    tool_progress_enabled: bool = False
+    progress_queue: Any = None
+    log_queue: Any = None
+    # mutable single-element containers (shared with the outer body)
+    last_progress_msg: list = field(default_factory=lambda: [None])
+    last_tool: list = field(default_factory=lambda: [None])
+    last_was_terminal_block: list = field(default_factory=lambda: [False])
+    repeat_count: list = field(default_factory=lambda: [0])
+    long_tool_hint_fired: list = field(default_factory=lambda: [False])
+    agent_holder: list = field(default_factory=lambda: [None])
+    _LONG_TOOL_THRESHOLD_S: float = 30.0
+    _cleanup_progress: bool = False
+    _cleanup_msg_ids: List[str] = field(default_factory=list)
+    _progress_metadata: Optional[dict] = None
+    _progress_reply_to: Optional[Any] = None
+    message: Optional[str] = None  # the only rebindable field
+    # turn parameters / config snapshots (read-only in run_sync)
+    history: Any = None
+    context_prompt: Optional[str] = None
+    channel_prompt: Optional[str] = None
+    session_id: Optional[str] = None
+    session_key: Optional[str] = None
+    run_generation: Optional[int] = None
+    process_task_id: str = ""
+    process_baseline: frozenset[str] = field(default_factory=frozenset)
+    _interrupt_depth: int = 0
+    event_message_id: Optional[str] = None
+    # Raw inbound platform id (not the event_message_id reply anchor); stamped on the user turn.
+    inbound_message_id: Optional[str] = None
+    moa_config: Optional[dict] = None
+    persist_user_message: Optional[Any] = None
+    persist_user_timestamp: Optional[float] = None
+    # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.
+    # "internal_notification" for async-delegation/background notifications (#82888).
+    persist_user_display_kind: Optional[str] = None
+    persist_user_display_metadata: Optional[dict] = None
+    user_config: Any = None
+    mute_notification_reply: bool = False
+    enabled_toolsets: Any = None
+    disabled_toolsets: Any = None
+    log_mode_enabled: bool = False
+    interim_assistant_messages_enabled: bool = False
+    needs_progress_queue: bool = False
+    AIAgent: Any = None
+    resolve_display_setting: Any = None
+    result_holder: list = field(default_factory=lambda: [None])
+    tools_holder: list = field(default_factory=lambda: [None])
+    stream_consumer_holder: list = field(default_factory=lambda: [None])
+    streaming_tts_consumer_holder: list = field(default_factory=lambda: [None])
+    # voice-ack wiring
+    _voice_ack_fired: list = field(default_factory=lambda: [False])
+    _voice_ack_guild: list = field(default_factory=lambda: [None])
+    _voice_ack_loop: Any = None
+    # hook / status bridge wiring
+    _loop_for_step: Any = None
+    _hooks_ref: Any = None
+    _status_adapter: Any = None
+    _status_chat_id: Any = None
+    _status_thread_metadata: Optional[dict] = None
+    # bound TurnRunner callbacks read via ctx
+    progress_callback: Optional[Callable] = None
+    voice_ack_callback: Optional[Callable] = None
+    _step_callback_sync: Optional[Callable] = None
+    _event_callback_sync: Optional[Callable] = None
+    _status_callback_sync: Optional[Callable] = None
+    # Slack-native task cards (opt-in); ID-bearing callbacks correlate start/complete by call ID
+    # --- Slack-native task-card progress (opt-in; #29483) ------------------ True when the Slack adapter's
+    # ``native_task_cards_enabled()`` opt-in is set for this turn's platform. The ID-bearing lifecycle
+    # callbacks are published by TurnRunner (like voice_ack_callback above) so tool starts and completions
+    # correlate by real tool-call ID instead of tool name.
+    _native_slack_task_cards: bool = False
+    native_tool_start_callback: Optional[Callable] = None
+    native_tool_complete_callback: Optional[Callable] = None
+
+
+
+=== ARCHIVO: .\hermes-agent\gateway\turn_lease.py ===
+"""Per-session turn lease — serializes the [load history -> run -> flush] region.
+
+Busy guards are keyed by ROUTING KEY but the transcript is owned by SESSION_ID, and
+``switch_session()`` makes key->id many-to-one (/resume from a second chat, CLI-continuity,
+delegation pinning, topic tip-walks), so two keys could interleave flushes on one transcript
+(``user;user`` wedge). The lease serializes per RESOLVED session_id: acquired right before the
+transcript load, released in the dispatch layer's ``finally``; identity-checked release; a
+timed-out waiter fails CLOSED (:class:`TurnLeaseTimeoutError`); only idle entries evict. Limits:
+CLI-continuity processes are outside this lock; mid-turn rotation alias is closed by ``rebind``.
+"""
+
+import asyncio
+import logging
+import time
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+# Cap on tracked leases. Idle entries evict oldest-first; live leases never do, so a burst of
+# distinct sessions may transiently exceed the cap rather than break serialization.
+DEFAULT_MAX_LEASES = 512
+# Fallback wait (seconds) when the caller passes no positive timeout (bridged via
+# HERMES_TURN_LEASE_TIMEOUT — lease contention is not agent inactivity). Fail-closed but short:
+# never pin a sequential platform updater for minutes.
+DEFAULT_LEASE_WAIT = 5.0
+
+
+def _holder_desc(holder: Optional["TurnLeaseToken"]) -> tuple:
+    return (holder.owner_key, holder.generation) if holder else ("?", "?")
+
+
+class TurnLeaseTimeoutError(TimeoutError):
+    """Lease held for the full wait budget; fail-closed: caller must not enter the turn region."""
+
+    def __init__(self, session_id: str, *, owner_key: str, generation: int, wait_seconds: float):
+        self.session_id, self.owner_key = session_id, owner_key
+        self.generation, self.wait_seconds = generation, wait_seconds
+        super().__init__(f"turn lease wait timed out after {wait_seconds:.0f}s on session "
+                         f"{session_id} for routing key {owner_key} (gen {generation})")
+
+
+class TurnLeaseToken:
+    """Held-lease handle from :meth:`SessionTurnLeaseRegistry.acquire`; ``released`` makes
+    release idempotent."""
+
+    __slots__ = ("session_id", "owner_key", "generation", "released", "lease")
+
+    def __init__(self, session_id: str, owner_key: str, generation: int, lease: "_SessionLease") -> None:
+        self.session_id, self.owner_key, self.generation = session_id, owner_key, generation
+        self.released = False
+        # The concrete lease, so release resolves by identity even after a rotation re-aliases
+        # ``session_id`` (both ids map to this same lease).
+        self.lease = lease
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (f"TurnLeaseToken(session_id={self.session_id!r}, owner_key={self.owner_key!r}, "
+                f"generation={self.generation}, released={self.released})")
+
+
+class _SessionLease:
+    __slots__ = ("lock", "holder", "acquired_at", "last_used", "pending_acquires")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.holder: Optional[TurnLeaseToken] = None
+        self.acquired_at, self.last_used, self.pending_acquires = 0.0, time.time(), 0
+
+    @property
+    def idle(self) -> bool:
+        """True when evictable: nobody holds or awaits it."""
+        return self.holder is None and not self.lock.locked() and self.pending_acquires == 0
+
+
+class SessionTurnLeaseRegistry:
+    """Asyncio lease per resolved session_id. Process-local, single-event-loop by design (same
+    visibility scope as the routing-key guards it extends); call only from the gateway loop."""
+
+    def __init__(self, max_entries: int = DEFAULT_MAX_LEASES) -> None:
+        self._leases: Dict[str, _SessionLease] = {}
+        self._max_entries = max(1, int(max_entries))
+
+    def _get_or_create(self, session_id: str) -> _SessionLease:
+        if (lease := self._leases.get(session_id)) is None:
+            self._evict_idle()
+            lease = self._leases[session_id] = _SessionLease()
+        lease.last_used = time.time()
+        return lease
+
+    def _evict_idle(self) -> None:
+        """Drop oldest idle entries to fit a new lease under the cap; never a held/contended one."""
+        if (overflow := len(self._leases) - self._max_entries + 1) <= 0:
+            return
+        idle = sorted((sid for sid, l in self._leases.items() if l.idle),
+                      key=lambda sid: self._leases[sid].last_used)
+        for sid in idle[:overflow]:
+            self._leases.pop(sid, None)
+
+    async def acquire(
+        self, session_id: str, *, owner_key: str, generation: int, timeout: Optional[float] = None
+    ) -> Optional[TurnLeaseToken]:
+        """Acquire the lease for ``session_id``, waiting if held. Raises
+        :class:`TurnLeaseTimeoutError` when the wait budget expires; None for a falsy id."""
+        if not session_id:
+            return None
+        wait = float(timeout) if timeout and timeout > 0 else DEFAULT_LEASE_WAIT
+        lease = self._get_or_create(session_id)
+        token = TurnLeaseToken(session_id, owner_key, int(generation), lease=lease)
+        if lease.lock.locked():
+            logger.warning(
+                "turn lease contention on session %s: routing key %s (gen %s) waiting behind "
+                "in-flight turn held by routing key %s (gen %s, held %.0fs) — two routing keys "
+                "are mapped to one session_id (#64934); serializing this turn behind the previous "
+                "turn's flush",
+                session_id, owner_key, generation, *_holder_desc(lease.holder),
+                time.time() - lease.acquired_at if lease.acquired_at else -1.0)
+        # Lock.release() wakes a waiter while leaving the lock momentarily unlocked. Count every
+        # in-progress acquire across that handoff (even apparently-uncontended ones — wait_for()
+        # may schedule them before the lock coroutine runs) so eviction cannot orphan the old
+        # lock and create a second lock for the same session.
+        lease.pending_acquires += 1
+        try:
+            await asyncio.wait_for(lease.lock.acquire(), timeout=wait)
+        except asyncio.TimeoutError:
+            logger.error(
+                "turn lease wait timed out after %.0fs on session %s (waiter: routing key %s gen "
+                "%s; holder: routing key %s gen %s) — failing closed: refusing to run this turn "
+                "UNSERIALIZED against the still-held lease",
+                wait, session_id, owner_key, generation, *_holder_desc(lease.holder))
+            raise TurnLeaseTimeoutError(
+                session_id, owner_key=owner_key, generation=generation, wait_seconds=wait) from None
+        finally:
+            lease.pending_acquires -= 1
+        # Lock held and no await before holder publication, so the lease cannot become
+        # evictable after the pending count is cleared.
+        lease.holder = token
+        lease.acquired_at = lease.last_used = time.time()
+        return token
+
+    def rebind(self, token: Optional[TurnLeaseToken], new_session_id: str) -> bool:
+        """Alias a HELD lease onto ``new_session_id`` after mid-turn rotation (compression) so the
+        flush target stays serialized: the SAME ``_SessionLease`` is registered under the new id
+        (old mapping idle-evicts later), only the holder may rebind, the token follows. A live
+        lease on the new id: log loudly, keep the old id (fail-open)."""
+        if (token is None or token.released or not new_session_id
+                or new_session_id == token.session_id):
+            return False
+        lease = token.lease
+        if lease.holder is not token:
+            return False
+        existing = self._leases.get(new_session_id)
+        if existing is not None and existing is not lease and not existing.idle:
+            logger.warning(
+                "turn lease rebind blocked: session %s rotated to %s mid-turn (holder: routing key "
+                "%s gen %s) but the target session's lease is already live (holder: routing key %s "
+                "gen %s) — keeping the lease on the old id; transcript writes on %s may "
+                "interleave (#64934 rotation-alias edge)",
+                token.session_id, new_session_id, token.owner_key, token.generation,
+                *_holder_desc(existing.holder), new_session_id)
+            return False
+        self._leases[new_session_id] = lease
+        lease.last_used = time.time()
+        token.session_id = new_session_id
+        return True
+
+    def release(self, token: Optional[TurnLeaseToken]) -> bool:
+        """Release ``token``'s lease. Idempotent; True only when this exact token was the current
+        holder (a re-release or a stale token whose slot went to a newer turn is a safe no-op)."""
+        if token is None or token.released:
+            return False
+        token.released = True
+        lease = token.lease
+        if lease.holder is not token:
+            logger.debug("turn lease release skipped on session %s: token (key %s gen %s) is not "
+                         "the current holder", token.session_id, token.owner_key, token.generation)
+            return False
+        lease.holder, lease.acquired_at, lease.last_used = None, 0.0, time.time()
+        if lease.lock.locked():
+            lease.lock.release()
+        return True
+

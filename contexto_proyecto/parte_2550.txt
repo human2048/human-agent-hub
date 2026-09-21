@@ -1,0 +1,305 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_cleanup_off_loop.py ===
+"""Regression test for #53175: gateway event loop wedged by synchronous
+agent-resource cleanup run inline from loop coroutines.
+
+#35994 fixed the /new reset path, but the same synchronous
+``_cleanup_agent_resources`` (agent.close() tears down terminal sandboxes /
+browser daemons / background processes; shutdown_memory_provider() may do
+SQLite / network IO via a memory plugin) was still called INLINE on the event
+loop from three other places:
+
+  * ``_session_housekeeping_watcher`` (the 5-minute idle sweep) — live loop
+  * ``_handle_message_with_agent`` cache-hygiene re-eviction — live loop
+  * ``_finalize_shutdown_agents`` / ``stop()`` idle-cache loop — shutdown
+
+A wedged provider on any of these froze the whole loop: the bot went silent,
+the runtime-status ``updated_at`` heartbeat stopped advancing (the symptom the
+reporter's watchdog keyed on), and SIGTERM could not be serviced (requiring
+``kill -9``).
+
+The fix routes all four call sites through ``_cleanup_agent_resources_off_loop``
+which offloads to a worker thread under a bounded ``asyncio.wait_for``, so the
+loop is never blocked and a stuck teardown degrades gracefully.
+
+These tests drive that shared helper directly — it is the single chokepoint
+every fixed call site now uses.
+"""
+import asyncio
+import logging
+import threading
+from contextvars import copy_context
+from types import SimpleNamespace
+
+import pytest
+
+
+def _make_runner():
+    """Bare GatewayRunner with a real thread-pool-backed executor helper."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    from concurrent.futures import ThreadPoolExecutor
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    runner._get_executor = lambda: executor
+
+    async def _run_in_executor_with_context(func, *args):
+        loop = asyncio.get_running_loop()
+        ctx = copy_context()
+        return await loop.run_in_executor(executor, lambda: ctx.run(func, *args))
+
+    runner._run_in_executor_with_context = _run_in_executor_with_context
+    return runner, executor
+
+
+def _agent_with_close(close_fn):
+    return SimpleNamespace(
+        close=close_fn,
+        shutdown_memory_provider=lambda *a, **k: None,
+        _session_messages=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_off_loop_does_not_block_event_loop():
+    """A slow agent.close() must NOT freeze the loop. A concurrent heartbeat
+    keeps ticking WHILE close() blocks in its worker thread — proving the
+    cleanup was offloaded, not run inline (which would freeze the loop and
+    stall the runtime-status updated_at heartbeat, #53175)."""
+    runner, executor = _make_runner()
+    close_started = threading.Event()
+    release = threading.Event()
+
+    def slow_close():
+        close_started.set()
+        release.wait(timeout=5)  # block the WORKER thread, not the loop
+
+    agent = _agent_with_close(slow_close)
+
+    ticks = {"n": 0}
+    stop = threading.Event()
+
+    async def _heartbeat():
+        while not stop.is_set():
+            ticks["n"] += 1
+            await asyncio.sleep(0.005)
+
+    hb = asyncio.create_task(_heartbeat())
+    cleanup_task = asyncio.create_task(
+        runner._cleanup_agent_resources_off_loop(agent, context="test")
+    )
+
+    for _ in range(200):
+        if close_started.is_set():
+            break
+        await asyncio.sleep(0.005)
+    assert close_started.is_set(), "close() never ran"
+
+    ticks_at_block = ticks["n"]
+    await asyncio.sleep(0.1)
+    ticks_during_block = ticks["n"] - ticks_at_block
+
+    release.set()
+    await cleanup_task
+    stop.set()
+    await hb
+    executor.shutdown(wait=False)
+
+    assert ticks_during_block >= 5, (
+        f"event loop was blocked during agent cleanup (#53175): only "
+        f"{ticks_during_block} ticks while close() was running"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_off_loop_times_out_gracefully(caplog):
+    """A cleanup that exceeds the bounded timeout logs a warning and returns —
+    the caller (sweep / shutdown / hygiene) proceeds rather than hanging."""
+    runner, executor = _make_runner()
+
+    async def _instant_timeout(aw, timeout=None):
+        if asyncio.iscoroutine(aw):
+            aw.close()
+        raise asyncio.TimeoutError
+
+    import gateway.run as _run
+
+    agent = _agent_with_close(lambda: None)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        # Patch the wait_for the helper uses so we don't actually wait 30s.
+        orig = _run.asyncio.wait_for
+        _run.asyncio.wait_for = _instant_timeout
+        try:
+            await runner._cleanup_agent_resources_off_loop(agent, context="sweep")
+        finally:
+            _run.asyncio.wait_for = orig
+    executor.shutdown(wait=False)
+
+    assert any(
+        "exceeded" in r.message and "#53175" in r.message for r in caplog.records
+    ), "expected the timeout warning to be logged"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_off_loop_swallows_executor_failure(caplog):
+    """If the offloaded cleanup raises, the helper logs and returns — a
+    teardown failure must never abort the loop coroutine that triggered it."""
+    runner, executor = _make_runner()
+
+    def boom():
+        raise RuntimeError("provider shutdown blew up")
+
+    # _cleanup_agent_resources swallows its own internal errors, so to reach
+    # the helper's except branch make the offloaded call itself raise.
+    def _boom_cleanup(agent):
+        raise RuntimeError("boom")
+
+    runner._cleanup_agent_resources = _boom_cleanup
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await runner._cleanup_agent_resources_off_loop(
+            _agent_with_close(boom), context="shutdown finalize"
+        )
+    executor.shutdown(wait=False)
+
+    assert any(
+        "failed" in r.message and "#53175" in r.message for r in caplog.records
+    ), "expected the cleanup-failure warning to be logged"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_clean_shutdown_marker.py ===
+"""Tests for the clean shutdown marker that prevents unwanted session auto-resets.
+
+When the gateway shuts down gracefully (hermes update, gateway restart, /restart),
+it writes a .clean_shutdown marker.  On the next startup, if the marker exists,
+suspend_recently_active() is skipped so users don't lose their sessions.
+
+After a crash (no marker), suspension still fires as a safety net for stuck sessions.
+"""
+
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionSource, SessionStore
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
+    return SessionSource(platform=platform, chat_id=chat_id, user_id=user_id)
+
+
+def _make_store(tmp_path):
+    config = GatewayConfig()
+    return SessionStore(sessions_dir=tmp_path, config=config)
+
+
+# ---------------------------------------------------------------------------
+# SessionStore.suspend_recently_active
+# ---------------------------------------------------------------------------
+
+class TestSuspendRecentlyActive:
+    """Verify suspend_recently_active only marks recent sessions."""
+
+    def test_suspends_recently_active_sessions(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        assert not entry.suspended
+
+        count = store.suspend_recently_active()
+        assert count == 1
+
+        # Re-fetch — should be resume_pending (preserved, not wiped)
+        refreshed = store.get_or_create_session(source)
+        assert refreshed.resume_pending
+        assert refreshed.session_id == entry.session_id  # same session preserved
+
+
+# ---------------------------------------------------------------------------
+# Clean shutdown marker integration
+# ---------------------------------------------------------------------------
+
+class TestCleanShutdownMarker:
+    """Test that the marker file controls session suspension on startup."""
+
+    def test_marker_written_on_graceful_stop(self, tmp_path, monkeypatch):
+        """stop() should write .clean_shutdown marker."""
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        marker = tmp_path / ".clean_shutdown"
+        assert not marker.exists()
+
+        # Create a minimal runner and call the shutdown logic directly
+        from gateway.run import GatewayRunner
+        runner = object.__new__(GatewayRunner)
+        runner._restart_requested = False
+        runner._restart_detached = False
+        runner._restart_via_service = False
+        runner._restart_task_started = False
+        runner._running = True
+        runner._draining = False
+        runner._stop_task = None
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._pending_approvals = {}
+        runner._background_tasks = set()
+        runner._shutdown_event = MagicMock()
+        runner._restart_drain_timeout = 5
+        runner._exit_code = None
+        runner._exit_reason = None
+        runner.adapters = {}
+        runner.config = GatewayConfig()
+
+        # Mock heavy dependencies
+        with patch("gateway.run.GatewayRunner._drain_active_agents", new_callable=AsyncMock, return_value=([], False)), \
+             patch("gateway.run.GatewayRunner._finalize_shutdown_agents"), \
+             patch("gateway.run.GatewayRunner._update_runtime_status"), \
+             patch("gateway.status.remove_pid_file"), \
+             patch("tools.process_registry.process_registry") as mock_proc_reg, \
+             patch("tools.terminal_tool.cleanup_all_environments"), \
+             patch("tools.browser_tool_lifecycle.cleanup_all_browsers"):
+            mock_proc_reg.kill_all = MagicMock()
+
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(runner.stop())
+
+        assert marker.exists(), ".clean_shutdown marker should exist after graceful stop"
+
+
+    def test_no_marker_triggers_suspension(self, tmp_path, monkeypatch):
+        """Without .clean_shutdown marker (crash), suspension should fire."""
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        marker = tmp_path / ".clean_shutdown"
+        assert not marker.exists()
+
+        # Create a store with a recently active session
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        assert not entry.suspended
+
+        # Simulate what start() does:
+        if marker.exists():
+            marker.unlink()
+        else:
+            store.suspend_recently_active()
+
+        # Session SHOULD be resume_pending (crash recovery preserves history)
+        with store._lock:
+            store._ensure_loaded_locked()
+            resume_count = sum(1 for e in store._entries.values() if e.resume_pending)
+        assert resume_count == 1, "Session should be resume_pending after crash (no marker)"
+
+
+# ---------------------------------------------------------------------------
+# resume_pending freshness gate (#46934)
+# ---------------------------------------------------------------------------
+

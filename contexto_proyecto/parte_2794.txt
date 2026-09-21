@@ -1,0 +1,323 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_relay_upstream_authz.py ===
+"""Tests for relay upstream-enforced authorization at the gateway layer.
+
+Background: the relay adapter fronts the Team Gateway connector over a
+per-instance-authenticated WebSocket. The connector performs owner-only
+author-binding resolution BEFORE delivering an inbound event — a message only
+reaches this gateway because the connector resolved it to THIS instance's bound
+user (``user_instance_binding``, keyed on the connector-observed author id,
+never a gateway claim). So a relay inbound is already authorized by a trusted,
+authenticated upstream.
+
+Before this fix, ``_is_user_authorized`` had no notion of upstream
+authorization: ``Platform.RELAY`` matched no ``*_ALLOWED_USERS`` allowlist and
+isn't in the HA/WEBHOOK always-authorized set, so every relay user hit the
+default-deny ("No user allowlists configured. All unauthorized users will be
+denied.") and the agent never saw the message. This was the live staging bug:
+the message routed correctly through the connector to the instance, then the
+instance's authz layer dropped it as ``Unauthorized user``.
+
+The fix adds a generic ``BasePlatformAdapter.authorization_is_upstream``
+capability (default ``False``) that the relay adapter overrides to ``True``,
+plus a dedicated trusted branch in ``_is_user_authorized``. It is delegation to
+a trusted upstream, NOT a fail-open: it fires only for an adapter that
+explicitly declares the flag; every direct network-exposed adapter leaves it
+``False`` and the env-allowlist default-deny is unchanged.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import Platform
+from gateway.session import SessionSource
+
+
+def _clear_auth_env(monkeypatch) -> None:
+    for key in (
+        "DISCORD_ALLOWED_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "DISCORD_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def _make_runner(*, platform: Platform, authorization_is_upstream: bool):
+    """Build a bare GatewayRunner with one adapter for *platform*.
+
+    ``authorization_is_upstream`` controls whether that adapter declares the
+    upstream-authz capability.
+    """
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(
+        send=AsyncMock(),
+        authorization_is_upstream=authorization_is_upstream,
+        enforces_own_access_policy=False,
+    )
+    runner.adapters = {platform: adapter}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_store._is_rate_limited.return_value = False
+    return runner, adapter
+
+
+def _relay_source(**kw) -> SessionSource:
+    base = dict(
+        platform=Platform.RELAY,
+        user_id="428014785045725184",
+        chat_id="1400724139874058314",
+        user_name="definitely_not_cthulhu",
+        chat_type="group",
+    )
+    base.update(kw)
+    return SessionSource(**base)
+
+
+# ---------------------------------------------------------------------------
+# Capability contract
+# ---------------------------------------------------------------------------
+
+
+def test_base_adapter_defaults_to_not_upstream_authorized():
+    """The base property is False — direct adapters keep env default-deny."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    assert BasePlatformAdapter.authorization_is_upstream.fget(object()) is False
+
+
+# ---------------------------------------------------------------------------
+# Authorization behavior
+# ---------------------------------------------------------------------------
+
+
+def test_non_upstream_adapter_still_default_denies(monkeypatch):
+    """A direct adapter that does NOT declare the flag still default-denies.
+
+    Guards against the fix becoming a blanket fail-open: an adapter with
+    authorization_is_upstream=False and no env allowlist must remain denied.
+    """
+    _clear_auth_env(monkeypatch)
+    runner, _ = _make_runner(platform=Platform.DISCORD, authorization_is_upstream=False)
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="123",
+        chat_id="456",
+        user_name="someone",
+        chat_type="dm",
+    )
+    assert runner._is_user_authorized(src) is False
+
+
+# ---------------------------------------------------------------------------
+# The underlying-platform regression: a relay *message* inbound carries the
+# UNDERLYING platform (source.platform == Platform.DISCORD), not Platform.RELAY,
+# because the connector's wire payload sets platform="discord" and
+# ws_transport._event_from_wire maps it straight onto SessionSource. The relay
+# adapter is registered ONLY under Platform.RELAY, so keying upstream-authz off
+# source.platform misses and the user hits default-deny ("Unauthorized user
+# <id> (<name>) on discord"). The authentic trust signal is that the event was
+# delivered over the per-instance-authenticated relay WS — carried by
+# source.delivered_via_upstream_relay, set by the relay transport, NOT by
+# source.platform.
+# ---------------------------------------------------------------------------
+
+
+def test_relay_message_with_underlying_discord_platform_authorized(monkeypatch):
+    """The live message path: source.platform=DISCORD + relay-delivered marker.
+
+    Reproduces the staging bug exactly — a relay-delivered Discord message whose
+    source.platform is the underlying "discord" (not "relay"). The relay adapter
+    is registered only under Platform.RELAY, so the OLD source.platform-keyed
+    check missed and default-denied. Authorization must come from the
+    relay-delivery marker instead.
+    """
+    _clear_auth_env(monkeypatch)
+    runner, _ = _make_runner(platform=Platform.RELAY, authorization_is_upstream=True)
+    src = SessionSource(
+        platform=Platform.DISCORD,  # underlying platform off the wire
+        user_id="267171776755269633",
+        chat_id="1400724139874058314",
+        user_name="rewbs",
+        chat_type="dm",
+        delivered_via_upstream_relay=True,
+    )
+    assert runner._is_user_authorized(src) is True
+
+
+def test_event_from_wire_stamps_routed_profile():
+    """A connector-routed profile on the wire source lands on SessionSource.
+
+    In multiplex mode the connector resolves the target HERMES profile for a
+    Team-Gateway message and stamps ``profile`` on the wire source. The relay
+    transport must carry it through so build_session_key namespaces the session
+    and the agent turn resolves that profile's config/credentials.
+    """
+    from gateway.relay.ws_transport import _event_from_wire
+
+    event = _event_from_wire(
+        {
+            "text": "hello!",
+            "source": {
+                "platform": "discord",
+                "chat_id": "123",
+                "chat_type": "dm",
+                "user_id": "267171776755269633",
+                "user_name": "rewbs",
+                "profile": "reviewer",
+            },
+        }
+    )
+    assert event.source.profile == "reviewer"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_reload_skills_command.py ===
+"""Tests for the ``/reload-skills`` gateway slash command handler.
+
+Verifies:
+  * dispatcher routes ``/reload-skills`` to ``_handle_reload_skills_command``
+  * the underscored alias ``/reload_skills`` is not flagged as unknown
+  * the handler invokes ``agent.skill_commands.reload_skills`` and renders a
+    human-readable diff
+  * when any skills changed, a one-shot note is queued on
+    ``runner._pending_skills_reload_notes[session_key]`` (the agent loop
+    consumes and clears it on the next user turn — see ``gateway/run.py``
+    near the ``_has_fresh_tool_tail`` block)
+  * the handler does NOT append to the session transcript out-of-band —
+    message alternation must not be broken by a phantom user turn
+"""
+
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionEntry, SessionSource, build_session_key
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_event(text: str) -> MessageEvent:
+    return MessageEvent(text=text, source=_make_source(), message_id="m1")
+
+
+def _make_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(
+        emit=AsyncMock(),
+        emit_collect=AsyncMock(return_value=[]),
+        loaded_hooks=False,
+    )
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._show_reasoning = False
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    # Use the real _session_key_for_source binding so the key matches what
+    # the agent-loop consumer will look up later.
+    from gateway.run import GatewayRunner as _GR
+    runner._session_key_for_source = _GR._session_key_for_source.__get__(runner, _GR)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_reload_skills_handler_queues_note_on_diff(monkeypatch):
+    """Diff non-empty → handler queues a one-shot note and does NOT touch transcript."""
+    fake_result = {
+        "added": [
+            {"name": "alpha", "description": "Run alpha to do xyz"},
+            {"name": "beta", "description": "Run beta to do abc"},
+        ],
+        "removed": [
+            {"name": "gamma", "description": "Old removed skill"},
+        ],
+        "unchanged": ["delta"],
+        "total": 3,
+        "commands": 3,
+    }
+
+    import agent.skill_commands as skill_commands_mod
+    monkeypatch.setattr(skill_commands_mod, "reload_skills", lambda: fake_result)
+
+    runner = _make_runner()
+    event = _make_event("/reload-skills")
+    out = await runner._handle_reload_skills_command(event)
+
+    assert out is not None
+    assert "Skills Reloaded" in out
+    assert "Added Skills:" in out
+    assert "- alpha: Run alpha to do xyz" in out
+    assert "- beta: Run beta to do abc" in out
+    assert "Removed Skills:" in out
+    assert "- gamma: Old removed skill" in out
+    assert "3 skill(s) available" in out
+
+    # MUST NOT write to the session transcript — that would break alternation.
+    runner.session_store.append_to_transcript.assert_not_called()
+
+    # MUST have queued a one-shot note keyed on the session.
+    pending = getattr(runner, "_pending_skills_reload_notes", None)
+    assert pending is not None
+    session_key = runner._session_key_for_source(event.source)
+    assert session_key in pending
+    note = pending[session_key]
+    assert note.startswith("[USER INITIATED SKILLS RELOAD:")
+    assert note.endswith("Use skills_list to see the updated catalog.]")
+    assert "Added Skills:" in note
+    assert "    - alpha: Run alpha to do xyz" in note
+    assert "    - beta: Run beta to do abc" in note
+    assert "Removed Skills:" in note
+    assert "    - gamma: Old removed skill" in note
+
+
+

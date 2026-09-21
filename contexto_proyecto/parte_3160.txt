@@ -1,0 +1,359 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_compress_flags.py ===
+"""Tests for /compress --preview/--dry-run/--aggressive flags and the
+/compact alias (PR #3243 salvage).
+
+Covers the pure helpers in ``hermes_cli.partial_compress`` plus alias
+resolution in the command registry. The CLI and gateway surfaces both
+route through these helpers, so the flag semantics are pinned here once.
+"""
+
+from hermes_cli.commands import COMMANDS, resolve_command
+from hermes_cli.partial_compress import (
+    DEFAULT_KEEP_LAST,
+    extract_compress_flags,
+    parse_partial_compress_args,
+    summarize_compress_preview,
+)
+
+
+def _history(n_pairs: int) -> list[dict[str, str]]:
+    h: list[dict[str, str]] = []
+    for i in range(n_pairs):
+        h.append({"role": "user", "content": f"u{i}"})
+        h.append({"role": "assistant", "content": f"a{i}"})
+    return h
+
+
+# ── /compact alias resolution ─────────────────────────────────────────
+
+
+def test_compact_resolves_to_compress():
+    cmd = resolve_command("compact")
+    assert cmd is not None
+    assert cmd.name == "compress"
+    assert "compact" in cmd.aliases
+
+
+
+
+def test_compact_listed_in_flat_commands():
+    assert "/compact" in COMMANDS
+    assert "alias for /compress" in COMMANDS["/compact"]
+
+
+
+
+# ── extract_compress_flags ────────────────────────────────────────────
+
+
+
+
+
+
+def test_dry_run_is_preview():
+    for form in ("--dry-run", "--dryrun", "--DRY-RUN"):
+        _, preview, _ = extract_compress_flags(form)
+        assert preview is True, form
+
+
+
+
+
+
+def test_flags_coexist_with_focus_topic():
+    rest, preview, _ = extract_compress_flags("database schema --dry-run")
+    assert rest == "database schema"
+    assert preview is True
+    partial, _, focus = parse_partial_compress_args(rest)
+    assert partial is False and focus == "database schema"
+
+
+
+
+
+
+# ── summarize_compress_preview ────────────────────────────────────────
+
+
+def test_preview_full_compress_counts():
+    hist = _history(5)
+    report = summarize_compress_preview(hist, False, DEFAULT_KEEP_LAST, None, 1234)
+    assert report["head_count"] == 10
+    assert report["tail_count"] == 0
+    assert report["total"] == 10
+    assert report["partial"] is False
+    joined = "\n".join(report["lines"])
+    assert "no changes made" in joined.lower()
+    assert "10 of 10" in joined
+    assert "1,234" in joined
+
+
+def test_preview_partial_boundary_counts():
+    hist = _history(5)
+    report = summarize_compress_preview(hist, True, 2, None, 999)
+    # Keeping last 2 exchanges = 4 tail messages, 6 head messages.
+    assert report["head_count"] == 6
+    assert report["tail_count"] == 4
+    assert report["partial"] is True
+    joined = "\n".join(report["lines"])
+    assert "last 2 exchange" in joined
+
+
+
+
+
+
+def test_preview_is_side_effect_free():
+    hist = _history(4)
+    before = [dict(m) for m in hist]
+    summarize_compress_preview(hist, True, 1, None, 10)
+    assert hist == before
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_compress_focus.py ===
+"""Tests for /compress <focus> — guided compression with focus topic.
+
+Inspired by Claude Code's /compact <focus> feature.
+"""
+
+from unittest.mock import MagicMock, patch
+
+from tests.hermes_cli.test_cli_init import _make_cli
+
+
+def _make_history() -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+
+
+def test_focus_topic_extracted_and_passed(capsys):
+    """Focus topic is extracted from the command and passed to _compress_context."""
+    shell = _make_cli()
+    history = _make_history()
+    compressed = [history[0], history[-1]]
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent._compress_context.return_value = (compressed, "")
+
+    def _estimate(messages):
+        if messages is history:
+            return 100
+        return 50
+
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=_estimate):
+        shell._manual_compress("/compress database schema")
+
+    output = capsys.readouterr().out
+    assert 'focus: "database schema"' in output
+
+    # Verify focus_topic was passed through
+    shell.agent._compress_context.assert_called_once()
+    call_kwargs = shell.agent._compress_context.call_args
+    assert call_kwargs.kwargs.get("focus_topic") == "database schema"
+
+
+def test_no_focus_topic_when_bare_command(capsys):
+    """When no focus topic is provided, None is passed."""
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent._compress_context.return_value = (list(history), "")
+
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100):
+        shell._manual_compress("/compress")
+
+    shell.agent._compress_context.assert_called_once()
+    call_kwargs = shell.agent._compress_context.call_args
+    assert call_kwargs.kwargs.get("focus_topic") is None
+
+
+def test_empty_focus_after_command_treated_as_none(capsys):
+    """Trailing whitespace after /compress does not produce a focus topic."""
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent._compress_context.return_value = (list(history), "")
+
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100):
+        shell._manual_compress("/compress   ")
+
+    shell.agent._compress_context.assert_called_once()
+    call_kwargs = shell.agent._compress_context.call_args
+    assert call_kwargs.kwargs.get("focus_topic") is None
+
+
+def test_focus_topic_printed_in_compression_banner(capsys):
+    """The focus topic shows in the compression progress banner."""
+    shell = _make_cli()
+    history = _make_history()
+    compressed = [history[0], history[-1]]
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent._compress_context.return_value = (compressed, "")
+
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100):
+        shell._manual_compress("/compress API endpoints")
+
+    output = capsys.readouterr().out
+    assert 'focus: "API endpoints"' in output
+
+
+def test_no_focus_prints_standard_banner(capsys):
+    """Without focus, the standard banner (no focus: line) is printed."""
+    shell = _make_cli()
+    history = _make_history()
+    compressed = [history[0], history[-1]]
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent._compress_context.return_value = (compressed, "")
+
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100):
+        shell._manual_compress("/compress")
+
+    output = capsys.readouterr().out
+    assert "focus:" not in output
+    assert "Compressing" in output
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_compress_here.py ===
+"""Tests for /compress here [N] — boundary-aware partial compression.
+
+Verifies the CLI handler (_manual_compress) splits the history, compresses
+only the head, and re-appends the verbatim tail. Inspired by Claude Code's
+Rewind "Summarize up to here" action (v2.1.139, May 2026).
+"""
+
+from unittest.mock import MagicMock, patch
+
+from tests.hermes_cli.test_cli_init import _make_cli
+
+
+def _make_history() -> list[dict[str, str]]:
+    # 8 messages = 4 exchanges.
+    h: list[dict[str, str]] = []
+    for i in range(4):
+        h.append({"role": "user", "content": f"u{i}"})
+        h.append({"role": "assistant", "content": f"a{i}"})
+    return h
+
+
+def _wire_agent(shell, compressed_head):
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent.session_id = None
+    shell.agent.tools = None
+    shell.agent._compress_context.return_value = (compressed_head, "")
+    shell.agent._compression_skipped_due_to_lock = False
+
+
+def test_compress_here_compresses_head_only(capsys):
+    """/compress here 2 passes only the head to _compress_context."""
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    # Pretend compression collapses the head into a single summary message.
+    summary = [{"role": "user", "content": "[summary of earlier turns]"}]
+    _wire_agent(shell, summary)
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress here 2")
+
+    # _compress_context should have been called with the HEAD only
+    # (everything before the last 2 user-starts = first 4 messages).
+    shell.agent._compress_context.assert_called_once()
+    call = shell.agent._compress_context.call_args
+    passed_head = call.args[0]
+    assert passed_head == history[:4]
+    # focus_topic must be None in partial mode (modes are exclusive).
+    assert call.kwargs.get("focus_topic") is None
+
+
+def test_compress_here_reappends_verbatim_tail(capsys):
+    """The most recent exchanges are preserved verbatim after the summary."""
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    # Head compresses to an assistant-role summary so the seam
+    # (assistant -> user tail) is already valid — tail rides along whole.
+    summary = [{"role": "assistant", "content": "[summary]"}]
+    _wire_agent(shell, summary)
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress here 2")
+
+    # Result = compressed head + verbatim tail (last 2 exchanges).
+    assert shell.conversation_history == summary + history[4:]
+    # Tail boundary keeps role alternation valid (tail starts on user).
+    assert history[4]["role"] == "user"
+    # No consecutive same-role user/assistant messages anywhere.
+    roles = [m["role"] for m in shell.conversation_history
+             if m["role"] in ("user", "assistant")]
+    assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
+
+
+def test_compress_here_banner_mentions_summarizing_up_to_here(capsys):
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    _wire_agent(shell, [{"role": "user", "content": "[summary]"}])
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress here")
+
+    out = capsys.readouterr().out
+    assert "Summarizing up to here" in out
+    assert "verbatim" in out
+
+
+def test_bare_compress_still_full(capsys):
+    """/compress with no args compresses the whole history (full mode)."""
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    _wire_agent(shell, list(history))
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress")
+
+    call = shell.agent._compress_context.call_args
+    # Full mode passes the entire history as the head.
+    assert call.args[0] == history
+    out = capsys.readouterr().out
+    assert "Summarizing up to here" not in out
+
+
+def test_focus_still_works(capsys):
+    """/compress <focus> keeps the existing focus behavior."""
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    _wire_agent(shell, list(history))
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress database schema")
+
+    call = shell.agent._compress_context.call_args
+    assert call.args[0] == history
+    assert call.kwargs.get("focus_topic") == "database schema"
+

@@ -1,0 +1,352 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_memory_setup_env_denylist.py ===
+"""Tests for the env-write denylist on the memory-setup ``.env`` writer.
+
+``hermes_cli.memory_setup._write_env_vars`` persists provider plugin
+credentials to ``~/.hermes/.env``. It previously called ``Path.write_text``
+directly, bypassing the ``_ENV_VAR_NAME_DENYLIST`` / ``_ENV_VAR_NAME_RE`` /
+CR-LF-stripping gates that ``save_env_value`` enforces for every other
+``.env`` writer in the codebase, and left the file at the default umask
+between the write and a later ``chmod`` (a TOCTOU permission window).
+
+A memory provider plugin schema declaring ``env_var: "LD_PRELOAD"`` (or any
+other subprocess-influencing or Hermes-runtime-location name) could
+otherwise plant a value into ``.env`` via the interactive memory-setup
+wizard. The next Hermes process would load it through the
+``env_loader.py`` ``.env -> os.environ`` chain and execute attacker code
+before ``main()``.
+
+The fix routes through ``save_env_value`` so the same gates fire.
+"""
+
+import os
+
+import pytest
+
+from hermes_cli.config import ensure_hermes_home, get_env_path, load_env
+from hermes_cli.memory_setup import _write_env_vars
+
+
+def _env_file_keys() -> set[str]:
+    """Parse ``~/.hermes/.env`` directly and return the set of keys present.
+
+    Used by tests that want to verify a key was NOT written to disk without
+    going through ``load_env()`` (whose sanitization/caching could mask the
+    underlying file state).
+    """
+    env_path = get_env_path()
+    if not env_path.exists():
+        return set()
+    keys: set[str] = set()
+    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, _ = line.partition("=")
+            keys.add(key.strip())
+    return keys
+
+
+@pytest.fixture(autouse=True)
+def _hermes_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ensure_hermes_home()
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    "denied_key",
+    [
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "NODE_OPTIONS",
+        "PATH",
+        "EDITOR",
+        "GIT_SSH_COMMAND",
+        "HERMES_HOME",
+        "HERMES_PROFILE",
+        "HERMES_CONFIG",
+        "HERMES_ENV",
+    ],
+)
+def test_denylisted_key_is_skipped(denied_key, capsys):
+    """Each denylisted name must not land in .env even though the
+    memory-setup wizard accepted it from a (hypothetically malicious)
+    provider schema. The wizard prints a warning and continues."""
+    _write_env_vars({denied_key: "/tmp/evil.so"})
+
+    # Assert directly against ``.env`` file contents so the test isn't
+    # coupled to ``load_env()``'s sanitization or any future merge with
+    # ``os.environ`` (where common names like ``PATH``/``EDITOR`` would
+    # always appear and trivially satisfy a ``not in env`` check).
+    assert denied_key not in _env_file_keys()
+
+    captured = capsys.readouterr()
+    assert denied_key in captured.out
+    assert "denylist" in captured.out.lower() or "Skipping" in captured.out
+
+
+def test_denylisted_key_does_not_block_other_writes(capsys):
+    """If a single batch contains one denylisted key plus legitimate
+    integration credentials, the denylisted one is skipped but the
+    legitimate ones still land. The wizard must not abort mid-batch."""
+    _write_env_vars({
+        "LD_PRELOAD": "/tmp/evil.so",
+        "HERMES_LANGFUSE_PUBLIC_KEY": "pk-test-123",
+        "OPENROUTER_API_KEY": "sk-or-test-456",
+    })
+
+    assert "LD_PRELOAD" not in _env_file_keys()
+    env = load_env()
+    assert env["HERMES_LANGFUSE_PUBLIC_KEY"] == "pk-test-123"
+    assert env["OPENROUTER_API_KEY"] == "sk-or-test-456"
+
+
+def test_legitimate_hermes_integration_key_still_writable():
+    """``HERMES_*`` overall is NOT blocked — only the four runtime
+    location names (HOME/PROFILE/CONFIG/ENV). Integration credentials
+    following the ``HERMES_*`` convention (HERMES_LANGFUSE_*,
+    HERMES_SPOTIFY_*, HERMES_QWEN_BASE_URL, ...) must keep working or
+    the memory-setup wizard regresses for every plugin that follows
+    the convention."""
+    _write_env_vars({
+        "HERMES_LANGFUSE_PUBLIC_KEY": "pk-lf-789",
+        "HERMES_QWEN_BASE_URL": "https://example.com/v1",
+    })
+
+    env = load_env()
+    assert env["HERMES_LANGFUSE_PUBLIC_KEY"] == "pk-lf-789"
+    assert env["HERMES_QWEN_BASE_URL"] == "https://example.com/v1"
+
+
+def test_malformed_key_name_is_skipped(capsys):
+    """The canonical writer also enforces ``_ENV_VAR_NAME_RE`` —
+    identifiers must match ``[A-Za-z_][A-Za-z0-9_]*``. A plugin schema
+    declaring ``env_var: "FOO BAR"`` (space) was previously persisted
+    verbatim, producing a malformed ``.env`` line."""
+    _write_env_vars({"FOO BAR": "value"})
+
+    keys = _env_file_keys()
+    assert "FOO BAR" not in keys
+    assert "FOO" not in keys  # not silently truncated either
+
+    captured = capsys.readouterr()
+    assert "Skipping" in captured.out or "FOO BAR" in captured.out
+
+
+def test_legitimate_value_writes_round_trip():
+    """Negative control — the gate must not regress on a normal write."""
+    _write_env_vars({"MEM0_API_KEY": "m0-test-key-abc"})
+
+    env = load_env()
+    assert env["MEM0_API_KEY"] == "m0-test-key-abc"
+
+
+def test_explicit_hermes_home_writes_to_that_env_file(tmp_path):
+    """Plugin ``post_setup`` hooks (e.g. Supermemory) pass an explicit
+    Hermes home; keep that target while still routing through
+    ``save_env_value`` validation instead of writing directly."""
+    home = tmp_path / "plugin-home"
+
+    _write_env_vars({"MEM0_API_KEY": "m0-test-key-abc"}, hermes_home=home)
+
+    assert "MEM0_API_KEY=m0-test-key-abc\n" in (home / ".env").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_value_with_embedded_newline_is_stripped():
+    """``save_env_value`` strips CR/LF from the value to prevent
+    .env-file structure injection (a value containing ``\\n`` would
+    otherwise split the line and inject an arbitrary follow-on key).
+    Routing through it gives the memory-setup wizard the same
+    protection."""
+    _write_env_vars({"MEM0_API_KEY": "key1\nEVIL=injected\n"})
+
+    env = load_env()
+    # CR/LF stripped, value still lands intact (minus the newlines)
+    assert env["MEM0_API_KEY"] == "key1EVIL=injected"
+    # And no smuggled key landed — assert against the file too so the test
+    # holds even if ``load_env()`` ever starts merging ``os.environ``.
+    assert "EVIL" not in _env_file_keys()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced on Windows")
+def test_env_file_created_with_secure_permissions(tmp_path):
+    """Regression guard for the TOCTOU window the direct ``Path.write_text``
+    + post-hoc ``chmod`` implementation had: ``save_env_value`` creates the
+    temp file with 0o600 before any content is written and atomically
+    replaces the target, so the file is never briefly world/group-readable
+    at the process umask."""
+    import stat
+
+    _write_env_vars({"MEM0_API_KEY": "m0-test-key-abc"})
+
+    env_path = get_env_path()
+    mode = stat.S_IMODE(env_path.stat().st_mode)
+    assert mode == stat.S_IRUSR | stat.S_IWUSR
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_memory_setup_provider_arg.py ===
+"""Tests for `hermes memory setup [provider]` routing.
+
+The `memory setup` subcommand accepts an optional positional ``provider`` so a
+fresh install can configure a specific provider directly (e.g.
+``hermes memory setup honcho``) without the interactive picker — which matters
+because the per-provider ``hermes <provider>`` subcommand is only registered
+once that provider is active.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from hermes_cli import memory_setup
+
+
+class TestMemorySetupProviderRouting:
+    def test_setup_with_provider_arg_skips_picker(self):
+        """`memory setup honcho` routes straight to cmd_setup_provider."""
+        args = SimpleNamespace(memory_command="setup", provider="honcho")
+        with patch.object(memory_setup, "cmd_setup_provider") as direct, \
+             patch.object(memory_setup, "cmd_setup") as picker:
+            memory_setup.memory_command(args)
+        direct.assert_called_once_with("honcho")
+        picker.assert_not_called()
+
+
+    def test_unknown_provider_reports_and_returns_early(self, capsys):
+        """An unknown provider name surfaces a helpful message and returns
+        before any config load/save (the not-found guard precedes those imports)."""
+        memory_setup.cmd_setup_provider("notaprovider")
+        out = capsys.readouterr().out
+        assert "not found" in out
+        assert "hermes memory setup" in out
+
+
+class TestInstallDependenciesRunner:
+    """`_install_dependencies` must route through the canonical
+    ``_pip_install`` ladder (uv → pip → ensurepip): uv when present, standard
+    pip when uv is unavailable, and an ensurepip bootstrap for pip-less venvs
+    instead of dead-ending with "cannot install"."""
+
+    def _run_with_missing_dep(self, tmp_path, which_side_effect, run_behavior=None):
+        """Drive _install_dependencies for a plugin that declares one missing
+        pip dep, capturing every subprocess.run argv issued by the ladder."""
+        import os
+        import sys
+        from unittest.mock import patch as _patch
+
+        (tmp_path / "plugin.yaml").write_text(
+            "pip_dependencies:\n  - definitely-not-installed-xyz\n", encoding="utf-8"
+        )
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if run_behavior:
+                return run_behavior(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        # The hermetic conftest sets HERMES_DISABLE_LAZY_INSTALLS=1 so no test
+        # can trigger a real mid-run pip install. These tests exercise the
+        # install ladder itself (against a fully mocked subprocess.run), so
+        # they opt back in — the same both-directions override
+        # tests/tools/test_lazy_deps.py uses.
+        with _patch.dict(os.environ, {"HERMES_DISABLE_LAZY_INSTALLS": "0"}), \
+             patch("plugins.memory.find_provider_dir", return_value=tmp_path), \
+             patch("hermes_cli.tools_config_cua.shutil.which", side_effect=which_side_effect), \
+             patch("hermes_cli.tools_config_cua.subprocess.run", fake_run):
+            memory_setup._install_dependencies("x")
+        return calls, sys.executable
+
+    def test_uses_uv_when_available(self, tmp_path):
+        calls, _ = self._run_with_missing_dep(
+            tmp_path, lambda b: "/usr/bin/uv" if b == "uv" else None
+        )
+        assert calls
+        assert calls[0][:3] == ["/usr/bin/uv", "pip", "install"]
+
+    def test_falls_back_to_pip_when_uv_missing(self, tmp_path):
+        """No uv but pip importable -> python -m pip install."""
+        calls, py = self._run_with_missing_dep(tmp_path, lambda b: None)
+        assert calls
+        # Ladder probes pip first, then installs with it.
+        assert calls[0][:3] == [py, "-m", "pip"]
+        assert calls[-1][:4] == [py, "-m", "pip", "install"]
+
+    def test_bootstraps_pip_via_ensurepip_when_missing(self, tmp_path):
+        """Neither uv nor pip -> ensurepip bootstrap, then pip install."""
+        def behavior(cmd):
+            if cmd[-1] == "--version":
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        calls, py = self._run_with_missing_dep(tmp_path, lambda b: None, behavior)
+        assert any("ensurepip" in c for c in calls)
+        assert calls[-1][:4] == [py, "-m", "pip", "install"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_memory_status.py ===
+"""Tests for `hermes memory status` CLI command.
+
+Covers:
+- Status output shows config-aware indicators instead of hardcoded 'always active'
+- memory_enabled, user_profile_enabled, and memory tool are each reflected
+- Memory tool resolution uses the canonical _get_platform_tools resolver
+- Original issue: 'Built-in: always active' was misleading when features were disabled
+"""
+
+import pytest
+from unittest.mock import patch
+
+
+def _run_cmd_status(capfd, mem_config=None, memory_tools=None):
+    """Run cmd_status with a mocked config and return captured stdout.
+
+    Args:
+        mem_config: The "memory" section of config.
+        memory_tools: Set of tool names returned by _get_platform_tools.
+                      Defaults to {"memory"} (tool enabled).
+    """
+    from hermes_cli.memory_setup import cmd_status
+
+    config = {"memory": mem_config or {}}
+    if memory_tools is None:
+        memory_tools = {"memory"}
+
+    with patch("hermes_cli.config.load_config", return_value=config):
+        with patch("hermes_cli.memory_setup._get_available_providers", return_value=[]):
+            with patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                return_value=memory_tools,
+            ):
+                cmd_status(args=None)
+
+    captured = capfd.readouterr()
+    return captured.out
+
+
+class TestMemoryStatusLabels:
+    """Status output should reflect actual config, not a hardcoded string."""
+
+
+    def test_shows_memory_injection_enabled_by_default(self, capfd):
+        """Memory injection defaults to enabled."""
+        out = _run_cmd_status(capfd)
+        assert "Memory injection:" in out
+        assert "enabled ✓" in out
+
+    def test_shows_memory_injection_disabled(self, capfd):
+        """When memory_enabled is false, status reflects it."""
+        out = _run_cmd_status(capfd, mem_config={"memory_enabled": False})
+        assert "Memory injection:" in out
+        assert "disabled ✗" in out
+
+
+
+

@@ -1,0 +1,172 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_slash_command_profile_scope.py ===
+"""Gateway slash commands must do their blocking work inside the routed profile.
+
+The multiplexed inbound handler wraps the whole message in
+``_profile_runtime_scope``, which installs the routed profile's ``HERMES_HOME``
+override and its secret scope as **contextvars**. A bare
+``loop.run_in_executor(None, ...)`` starts the worker with an EMPTY context, so
+``SessionDB()`` / ``get_hermes_home()`` inside the worker resolve the LAUNCH
+home — /insights reported the default profile's conversations from another
+profile's chat. ``/compress`` already routes through
+``_run_in_executor_with_context``; every other hop in the mixin must too.
+
+Drives the real mixin methods and the real ``_profile_runtime_scope``: the
+contextvar loss is a property of the hop, so mocking the hop away would test
+nothing.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def profile_home(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    home = root / "profiles" / "coder"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    return home
+
+
+@pytest.fixture
+def runner():
+    """Minimal host exposing the mixin plus the runner's executor helpers."""
+    from gateway.run import GatewayRunner
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    class _Runner(GatewaySlashCommandsMixin):
+        _run_in_executor_with_context = GatewayRunner._run_in_executor_with_context
+        _get_executor = GatewayRunner._get_executor
+
+    r = _Runner()
+    r.adapters = {}
+    r._pending_skills_reload_notes = {}
+    return r
+
+
+class _Event:
+    def __init__(self, args: str = ""):
+        self._args = args
+        self.source = None
+
+    def get_command_args(self) -> str:
+        return self._args
+
+
+@pytest.mark.asyncio
+async def test_insights_opens_session_db_under_the_routed_home(
+    runner, profile_home, monkeypatch
+):
+    import agent.insights as insights_mod
+    import hermes_state
+    from gateway.run import _profile_runtime_scope
+    from hermes_constants import get_hermes_home
+
+    seen: dict = {}
+
+    class _RecordingDB:
+        def __init__(self, *a, **kw):
+            seen["home"] = str(get_hermes_home())
+
+        def close(self):
+            pass
+
+    class _Engine:
+        def __init__(self, db):
+            pass
+
+        def generate(self, **kw):
+            return {}
+
+        def format_gateway(self, report):
+            return "ok"
+
+    monkeypatch.setattr(hermes_state, "SessionDB", _RecordingDB)
+    monkeypatch.setattr(insights_mod, "InsightsEngine", _Engine)
+
+    with _profile_runtime_scope(profile_home):
+        result = await runner._handle_insights_command(_Event(""))
+
+    assert result == "ok"
+    assert seen["home"] == str(profile_home)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_slash_config_writes_routed_profile.py ===
+"""Slash-command config writes must land in the routed profile's config.yaml.
+
+Regression for #87939 / #75684: the multiplexed inbound handler already runs
+every slash handler inside ``_profile_runtime_scope`` (routed HERMES_HOME
+override), but several handlers built their write path from the module
+constant ``gateway.run._hermes_home`` — the LAUNCH home — so ``/reasoning
+--global``, ``/fast``, ``/memory approval``, ``/skills approval``, ``/verbose``
+and ``/footer`` persisted into the default profile's config.yaml. They now go
+through ``_gateway_config_home()`` like the reads do.
+"""
+
+from __future__ import annotations
+
+import pytest
+import yaml
+
+import gateway.run as gateway_run
+from gateway.run import GatewayRunner, _profile_runtime_scope
+from gateway.slash_commands import GatewaySlashCommandsMixin
+
+
+class _Runner(GatewaySlashCommandsMixin):
+    _run_in_executor_with_context = GatewayRunner._run_in_executor_with_context
+    _get_executor = GatewayRunner._get_executor
+
+    def _session_key_for_source(self, _source):
+        return "k"
+
+    def _evict_cached_agent(self, _session_key):
+        pass
+
+
+class _Event:
+    def __init__(self, args: str = ""):
+        self._args = args
+        self.source = None
+
+    def get_command_args(self) -> str:
+        return self._args
+
+
+@pytest.fixture
+def homes(tmp_path, monkeypatch):
+    default_home = tmp_path / "default"
+    routed_home = tmp_path / "profiles" / "beta"
+    default_home.mkdir()
+    routed_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n")
+    (routed_home / "config.yaml").write_text("agent:\n  reasoning_effort: none\n")
+    monkeypatch.setattr(gateway_run, "_hermes_home", default_home)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    return default_home, routed_home
+
+
+@pytest.mark.asyncio
+async def test_slash_config_writes_hit_routed_profile_and_leave_default_untouched(homes):
+    default_home, routed_home = homes
+    default_before = (default_home / "config.yaml").read_bytes()
+    runner = _Runner()
+
+    with _profile_runtime_scope(routed_home):
+        assert runner._save_gateway_config_key("agent.reasoning_effort", "high")
+        await runner._handle_memory_command(_Event("approval on"))
+        await runner._handle_skills_command(_Event("approval on"))
+
+    routed = yaml.safe_load((routed_home / "config.yaml").read_text())
+    assert routed["agent"]["reasoning_effort"] == "high"
+    assert routed["memory"]["write_approval"] is True
+    assert routed["skills"]["write_approval"] is True
+    assert (default_home / "config.yaml").read_bytes() == default_before
+

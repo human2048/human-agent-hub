@@ -1,0 +1,316 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\lsp\protocol.py ===
+"""Minimal LSP JSON-RPC 2.0 framer over async streams.
+
+Wire format: ``Content-Length: <bytes>\\r\\n\\r\\n<utf-8 JSON body>`` where the
+body is a JSON-RPC 2.0 request, response, or notification.  Just the framer
+plus envelope helpers, so :class:`agent.lsp.client.LSPClient` can focus on
+protocol semantics.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any, Optional, Tuple
+
+logger = logging.getLogger("agent.lsp.protocol")
+
+# LSP error codes we care about (spec 3.17 #errorCodes).
+ERROR_CONTENT_MODIFIED = -32801
+ERROR_METHOD_NOT_FOUND = -32601
+
+_MAX_HEADER_BYTES = 8192  # a well-behaved server fits in well under 200 bytes
+_MAX_BODY_BYTES = 64 * 1024 * 1024
+
+
+class LSPProtocolError(Exception):
+    """The framing or envelope itself is broken (vs. :class:`LSPRequestError`, a conformant error response)."""
+
+
+class LSPRequestError(Exception):
+    """An LSP request returned a JSON-RPC error response; carries ``code``, ``message``, ``data``."""
+
+    def __init__(self, code: int, message: str, data: Any = None) -> None:
+        super().__init__(f"LSP error {code}: {message}")
+        self.code, self.message, self.data = code, message, data
+
+
+def encode_message(obj: dict) -> bytes:
+    """Encode an envelope as compact UTF-8 JSON with an exact Content-Length header."""
+    body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+
+
+async def _read_headers(reader: asyncio.StreamReader) -> Optional[dict]:
+    """Read the header block; ``None`` on clean EOF before any header started."""
+    headers: dict = {}
+    header_bytes = 0
+    while True:
+        try:
+            line = await reader.readuntil(b"\r\n")
+        except asyncio.IncompleteReadError as e:
+            # EOF before any header started is a clean close; mid-block is bad framing.
+            if not e.partial and not headers:
+                return None
+            raise LSPProtocolError(f"unexpected EOF while reading LSP headers (partial={e.partial!r})") from e
+        # Cap against a server streaming headers without ever emitting CRLF-CRLF.
+        header_bytes += len(line)
+        if header_bytes > _MAX_HEADER_BYTES:
+            raise LSPProtocolError("LSP header block exceeded 8 KiB without terminator")
+        line = line[:-2]  # strip CRLF
+        if not line:
+            return headers  # blank line ends header block
+        try:
+            key, _, value = line.decode("ascii").partition(":")
+        except UnicodeDecodeError as e:
+            raise LSPProtocolError(f"non-ASCII LSP header: {line!r}") from e
+        if not key:
+            raise LSPProtocolError(f"malformed LSP header line: {line!r}")
+        headers[key.strip().lower()] = value.strip()
+
+
+async def read_message(reader: asyncio.StreamReader) -> Optional[dict]:
+    """Read one framed message.
+
+    ``None`` on clean EOF between messages (typical shutdown); :class:`LSPProtocolError` on malformed framing.
+    """
+    headers = await _read_headers(reader)
+    if headers is None:
+        return None
+
+    cl = headers.get("content-length")
+    if cl is None:
+        raise LSPProtocolError(f"LSP message missing Content-Length: {headers!r}")
+    try:
+        n = int(cl)
+    except ValueError as e:
+        raise LSPProtocolError(f"non-integer Content-Length: {cl!r}") from e
+    if n < 0 or n > _MAX_BODY_BYTES:
+        raise LSPProtocolError(f"unreasonable Content-Length: {n}")
+    try:
+        body = await reader.readexactly(n)
+    except asyncio.IncompleteReadError as e:
+        raise LSPProtocolError(f"truncated LSP body: expected {n} bytes, got {len(e.partial)}") from e
+    try:
+        return json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        raise LSPProtocolError(f"invalid JSON in LSP body: {e}") from e
+    except UnicodeDecodeError as e:
+        raise LSPProtocolError(f"non-UTF-8 LSP body: {e}") from e
+
+
+def make_notification(method: str, params: Any) -> dict:
+    """Build a JSON-RPC 2.0 notification envelope (no ``id``)."""
+    return {"jsonrpc": "2.0", "method": method, **({} if params is None else {"params": params})}
+
+
+def make_request(req_id: int, method: str, params: Any) -> dict:
+    """Build a JSON-RPC 2.0 request envelope."""
+    return {"jsonrpc": "2.0", "id": req_id, "method": method, **({} if params is None else {"params": params})}
+
+
+def make_response(req_id: Any, result: Any) -> dict:
+    """Build a JSON-RPC 2.0 success response envelope."""
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def make_error_response(req_id: Any, code: int, message: str, data: Any = None) -> dict:
+    """Build a JSON-RPC 2.0 error response envelope."""
+    err = {"code": code, "message": message, **({} if data is None else {"data": data})}
+    return {"jsonrpc": "2.0", "id": req_id, "error": err}
+
+
+def classify_message(msg: dict) -> Tuple[str, Any]:
+    """Return ``(kind, key)``: kind ∈ request/response/notification/invalid; key is the id (request/response),
+    the method (notification) or ``None`` (invalid)."""
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+        return "invalid", None
+    if "id" in msg:
+        if "method" in msg:
+            return "request", msg["id"]
+        return ("response", msg["id"]) if ("result" in msg or "error" in msg) else ("invalid", None)
+    return ("notification", msg["method"]) if "method" in msg else ("invalid", None)
+
+
+__all__ = [
+    "ERROR_CONTENT_MODIFIED", "ERROR_METHOD_NOT_FOUND", "LSPProtocolError", "LSPRequestError",
+    "encode_message", "read_message", "make_request", "make_notification", "make_response",
+    "make_error_response", "classify_message",
+]
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+ERROR_REQUEST_CANCELLED = -32800
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\lsp\range_shift.py ===
+"""Diff-aware line-shift map for cross-edit LSP delta filtering.
+
+An edit that inserts/deletes lines moves every diagnostic below it, and the delta
+filter keys on ``(severity, code, source, message, range)`` — so shifted-but-identical
+diagnostics would look brand-new.  We build a pre→post line map from
+``difflib.SequenceMatcher.get_opcodes()`` and apply it to the baseline before the
+set-difference; diagnostics in a deleted region map to ``None`` and drop out.
+Keeping range in the key preserves the "same error at a new line" signal.
+"""
+from __future__ import annotations
+
+import difflib
+from typing import Any, Callable, Dict, List, Optional
+
+_Shift = Callable[[int], Optional[int]]
+
+
+def build_line_shift(pre_text: str, post_text: str) -> _Shift:
+    """Return ``shift(pre_line) -> post_line | None`` over 0-indexed lines (LSP convention).
+
+    ``None`` means the line was deleted.  One ``get_opcodes()`` call up front;
+    the closure scans the (small) opcode list per lookup.
+    """
+    pre_lines = pre_text.splitlines() if pre_text else []
+    post_lines = post_text.splitlines() if post_text else []
+    if pre_lines == post_lines:
+        return lambda line: line
+    # Opcodes are (tag, i1, i2, j1, j2): i-range in pre, j-range in post.
+    opcodes = difflib.SequenceMatcher(a=pre_lines, b=post_lines, autojunk=False).get_opcodes()
+
+    def shift(line: int) -> Optional[int]:
+        for tag, i1, i2, j1, _j2 in opcodes:
+            if i1 <= line < i2:
+                # 'equal' maps by offset; 'delete'/'replace' lines have no
+                # post counterpart.  'insert' has i1 == i2 and can't match.
+                return line - i1 + j1 if tag == "equal" else None
+            if line < i1:
+                break
+        # Past the last pre line: anchor at end of post.
+        return max(0, len(post_lines) - 1) if post_lines else None
+
+    return shift
+
+
+def shift_diagnostic_range(diag: Dict[str, Any], shift: _Shift) -> Optional[Dict[str, Any]]:
+    """Copy of ``diag`` with its line range remapped; ``None`` if the start line was deleted.
+
+    A multi-line diagnostic whose end straddles the deletion collapses to a
+    single-line range at the shifted start so it stays in the baseline.
+    """
+    rng = diag.get("range") or {}
+    start = rng.get("start") or {}
+    end = rng.get("end") or {}
+    pre_start_line = int(start.get("line", 0))
+    new_start_line = shift(pre_start_line)
+    if new_start_line is None:
+        return None
+    new_end_line = shift(int(end.get("line", pre_start_line)))
+    if new_end_line is None:
+        new_end_line = new_start_line
+    return {
+        **diag,
+        "range": {
+            "start": {"line": new_start_line, "character": int(start.get("character", 0))},
+            "end": {"line": new_end_line, "character": int(end.get("character", 0))},
+        },
+    }
+
+
+def shift_baseline(baseline: List[Dict[str, Any]], shift: _Shift) -> List[Dict[str, Any]]:
+    """Apply ``shift`` to every diagnostic in ``baseline``, dropping deleted entries."""
+    shifted = (shift_diagnostic_range(d, shift) for d in baseline if isinstance(d, dict))
+    return [s for s in shifted if s is not None]
+
+
+__all__ = ["build_line_shift", "shift_diagnostic_range", "shift_baseline"]
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\lsp\reporter.py ===
+"""Format LSP diagnostics for inclusion in tool output.
+
+The model sees a compact, severity-filtered, line-bounded ``<diagnostics>``
+block (1-indexed line/column, capped at ``MAX_PER_FILE``) for diagnostics
+introduced by the latest edit.
+"""
+from __future__ import annotations
+
+import html
+from typing import Any, Dict, List
+
+# ERROR only by default — warnings/info/hints would flood the agent.
+SEVERITY_NAMES = {1: "ERROR", 2: "WARN", 3: "INFO", 4: "HINT"}
+DEFAULT_SEVERITIES = frozenset({1})
+
+MAX_PER_FILE = 20
+MAX_TOTAL_CHARS = 4000
+
+# Per-field caps bound any single attacker-controlled identifier that can
+# ride into the model's tool output via an LSP diagnostic message.
+MAX_MESSAGE_CHARS = 300
+MAX_CODE_CHARS = 80
+MAX_SOURCE_CHARS = 80
+
+
+def _sanitize_field(value: Any, *, limit: int) -> str:
+    """Make a language-server field safe to embed in a tool-result block.
+
+    ``message``/``code``/``source`` come from a server that just parsed user-controlled code, so a
+    hostile repo can smuggle instruction-shaped text through identifier names.  We collapse CR/LF,
+    drop control chars, cap the length, and HTML-escape ``< > &`` so the text can't close
+    ``<diagnostics>`` early.  ``None``/empty → ``""`` so callers can omit the part.
+    """
+    if value is None:
+        return ""
+    raw = str(value).replace("\r", " ").replace("\n", " ")
+    raw = "".join(ch for ch in raw if ch == " " or ch.isprintable())
+    return html.escape(raw.strip()[:limit], quote=False)
+
+
+def format_diagnostic(d: Dict[str, Any]) -> str:
+    """One-line representation of a single diagnostic (fields sanitized)."""
+    sev = SEVERITY_NAMES.get(d.get("severity") or 1, "ERROR")
+    start = (d.get("range") or {}).get("start") or {}
+    line = int(start.get("line", 0)) + 1
+    col = int(start.get("character", 0)) + 1
+    msg = _sanitize_field(d.get("message"), limit=MAX_MESSAGE_CHARS)
+    code = _sanitize_field(d.get("code"), limit=MAX_CODE_CHARS)
+    source = _sanitize_field(d.get("source"), limit=MAX_SOURCE_CHARS)
+    return f"{sev} [{line}:{col}] {msg}{f' [{code}]' if code else ''}{f' ({source})' if source else ''}"
+
+
+def report_for_file(
+    file_path: str,
+    diagnostics: List[Dict[str, Any]],
+    *,
+    severities: frozenset = DEFAULT_SEVERITIES,
+    max_per_file: int = MAX_PER_FILE,
+) -> str:
+    """Build a ``<diagnostics file=...>`` block; ``""`` when nothing passes the severity filter."""
+    filtered = [d for d in diagnostics or [] if (d.get("severity") or 1) in severities]
+    if not filtered:
+        return ""
+    body = "\n".join(format_diagnostic(d) for d in filtered[:max_per_file])
+    if len(filtered) > max_per_file:
+        body += f"\n... and {len(filtered) - max_per_file} more"
+    # quote=True also escapes ``"`` so a crafted file name can't break out of
+    # the ``file="..."`` attribute and synthesize new tags.
+    safe_path = html.escape(file_path, quote=True)
+    return f"<diagnostics file=\"{safe_path}\">\n{body}\n</diagnostics>"
+
+
+def truncate(s: str, *, limit: int = MAX_TOTAL_CHARS) -> str:
+    """Hard-cap a formatted summary string."""
+    if len(s) <= limit:
+        return s
+    marker = "\n…[truncated]"
+    return s[: limit - len(marker)] + marker
+
+
+__all__ = ["SEVERITY_NAMES", "DEFAULT_SEVERITIES", "MAX_PER_FILE", "format_diagnostic", "report_for_file", "truncate"]
+

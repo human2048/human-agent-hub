@@ -1,0 +1,390 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_slack_plugin_action_handlers.py ===
+"""Tests for plugin-registered Slack Block Kit action handlers.
+
+Covers:
+* ``PluginContext.register_slack_action_handler`` validation + queuing
+* ``PluginManager.get_slack_action_handlers`` accessor
+* ``SlackAdapter.connect`` wiring those handlers into the AsyncApp
+* Defensive wrapping: a plugin handler that raises does NOT take down
+  the gateway and Slack still gets an ack.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Ensure the repo root is importable when this test runs directly
+# ---------------------------------------------------------------------------
+_repo = str(Path(__file__).resolve().parents[2])
+if _repo not in sys.path:
+    sys.path.insert(0, _repo)
+
+
+# ---------------------------------------------------------------------------
+# Mock slack-bolt so SlackAdapter can be imported even without the package
+# ---------------------------------------------------------------------------
+
+def _ensure_slack_mock() -> None:
+    if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
+        return
+    slack_bolt = MagicMock()
+    slack_bolt.async_app.AsyncApp = MagicMock
+    slack_bolt.adapter.socket_mode.async_handler.AsyncSocketModeHandler = MagicMock
+
+    slack_sdk = MagicMock()
+    slack_sdk.web.async_client.AsyncWebClient = MagicMock
+
+    for name, mod in [
+        ("slack_bolt", slack_bolt),
+        ("slack_bolt.async_app", slack_bolt.async_app),
+        ("slack_bolt.adapter", slack_bolt.adapter),
+        ("slack_bolt.adapter.socket_mode", slack_bolt.adapter.socket_mode),
+        ("slack_bolt.adapter.socket_mode.async_handler",
+         slack_bolt.adapter.socket_mode.async_handler),
+        ("slack_sdk", slack_sdk),
+        ("slack_sdk.web", slack_sdk.web),
+        ("slack_sdk.web.async_client", slack_sdk.web.async_client),
+    ]:
+        sys.modules.setdefault(name, mod)
+    sys.modules.setdefault("aiohttp", MagicMock())
+
+
+_ensure_slack_mock()
+
+import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
+_slack_mod.SLACK_AVAILABLE = True
+
+from gateway.config import PlatformConfig  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+
+from hermes_cli.plugins import (  # noqa: E402
+    PluginContext,
+    PluginManager,
+    PluginManifest,
+)
+
+
+# ---------------------------------------------------------------------------
+# PluginContext.register_slack_action_handler — input validation + queuing
+# ---------------------------------------------------------------------------
+
+def _make_ctx(name: str = "test_plugin") -> tuple[PluginManager, PluginContext]:
+    """Build a fresh PluginManager + PluginContext bound to it."""
+    mgr = PluginManager()
+    manifest = PluginManifest(
+        name=name,
+        version="0.1.0",
+        description="test",
+    )
+    ctx = PluginContext(manifest=manifest, manager=mgr)
+    return mgr, ctx
+
+
+class TestRegisterSlackActionHandlerAPI:
+    """Behaviour of ctx.register_slack_action_handler()."""
+
+    def test_string_action_id_is_queued(self):
+        mgr, ctx = _make_ctx()
+
+        async def cb(ack, body, action):  # pragma: no cover - never called here
+            await ack()
+
+        ctx.register_slack_action_handler("inbox_sweep_approve", cb)
+
+        handlers = mgr.get_slack_action_handlers()
+        assert len(handlers) == 1
+        action_id, callback, plugin_name = handlers[0]
+        assert action_id == "inbox_sweep_approve"
+        assert callback is cb
+        assert plugin_name == "test_plugin"
+
+    def test_regex_action_id_is_accepted(self):
+        """slack_bolt accepts re.Pattern matchers — so should the plugin API."""
+        import re as _re
+        mgr, ctx = _make_ctx()
+
+        async def cb(ack, body, action):  # pragma: no cover
+            await ack()
+
+        pat = _re.compile(r"^inbox_sweep_.*$")
+        ctx.register_slack_action_handler(pat, cb)
+        handlers = mgr.get_slack_action_handlers()
+        assert handlers[0][0] is pat
+
+    def test_constraint_dict_action_id_is_accepted(self):
+        """slack_bolt also accepts {"action_id": ..., "block_id": ...} dicts."""
+        mgr, ctx = _make_ctx()
+
+        async def cb(ack, body, action):  # pragma: no cover
+            await ack()
+
+        constraint = {"action_id": "approve", "block_id": "row_3"}
+        ctx.register_slack_action_handler(constraint, cb)
+        handlers = mgr.get_slack_action_handlers()
+        assert handlers[0][0] == constraint
+
+
+# ---------------------------------------------------------------------------
+# SlackAdapter.connect wires plugin-registered handlers into AsyncApp
+# ---------------------------------------------------------------------------
+
+
+def _connect_with_recording_app(
+    adapter: SlackAdapter,
+    *,
+    plugin_handlers: list,
+) -> tuple[bool, list]:
+    """Run adapter.connect() with mocks and return (result, registered_actions).
+
+    Captures every action_id passed to ``app.action()`` so tests can
+    assert that built-in handlers AND plugin-supplied handlers were
+    wired up.
+    """
+    registered_actions: list = []  # list of (action_id, callback)
+
+    def mock_action(action_id):
+        def decorator(fn):
+            registered_actions.append((action_id, fn))
+            return fn
+        return decorator
+
+    def mock_event(_event_type):
+        def decorator(fn):
+            return fn
+        return decorator
+
+    def mock_command(_cmd):
+        def decorator(fn):
+            return fn
+        return decorator
+
+    mock_app = MagicMock()
+    mock_app.event = mock_event
+    mock_app.command = mock_command
+    mock_app.action = mock_action
+    mock_app.client = AsyncMock()
+
+    mock_web_client = AsyncMock()
+    mock_web_client.auth_test = AsyncMock(return_value={
+        "user_id": "U_BOT",
+        "user": "testbot",
+        "team_id": "T_FAKE",
+        "team": "FakeTeam",
+    })
+
+    fake_mgr = MagicMock()
+    fake_mgr.get_slack_action_handlers.return_value = plugin_handlers
+
+    with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+         patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+         patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+         patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+         patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+         patch("gateway.status.release_scoped_lock"), \
+         patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr), \
+         patch("asyncio.create_task"):
+        result = asyncio.run(adapter.connect())
+
+    return result, registered_actions
+
+
+class TestSlackAdapterPluginActionWiring:
+    """connect() must register plugin-supplied action handlers on AsyncApp."""
+
+
+    def test_no_plugin_handlers_does_not_break_connect(self):
+        """An empty plugin handler list is the common case — must be a no-op."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        result, registered = _connect_with_recording_app(
+            adapter, plugin_handlers=[],
+        )
+        assert result is True
+        # Built-ins still wired
+        action_ids = [aid for aid, _cb in registered]
+        assert "hermes_approve_once" in action_ids
+
+
+    def test_plugin_loader_failure_does_not_break_connect(self):
+        """If get_plugin_manager() blows up, connect() must still succeed.
+
+        Defensive belt-and-suspenders: the gateway should not refuse to
+        start because the plugin layer is unhealthy.
+        """
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        registered_actions: list = []
+
+        def mock_action(action_id):
+            def decorator(fn):
+                registered_actions.append((action_id, fn))
+                return fn
+            return decorator
+
+        def _noop(_):
+            def decorator(fn): return fn
+            return decorator
+
+        mock_app = MagicMock()
+        mock_app.event = _noop
+        mock_app.command = _noop
+        mock_app.action = mock_action
+        mock_app.client = AsyncMock()
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        })
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("gateway.status.release_scoped_lock"), \
+             patch("hermes_cli.plugins.get_plugin_manager",
+                   side_effect=RuntimeError("plugins broken")), \
+             patch("asyncio.create_task"):
+            result = asyncio.run(adapter.connect())
+
+        assert result is True
+        # Built-ins still wired even when plugin loader failed.
+        action_ids = [aid for aid, _cb in registered_actions]
+        assert "hermes_approve_once" in action_ids
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_slack_plugin_setup.py ===
+"""Tests for the Slack plugin's interactive_setup wizard.
+
+These cover the home-channel save logic that previously lived in
+``hermes_cli/setup.py::_setup_slack`` before the Slack adapter migrated to a
+bundled plugin (#41112). ``interactive_setup`` lazy-imports its CLI helpers
+from ``hermes_cli.config`` (get_env_value / save_env_value / remove_env_value)
+and ``hermes_cli.cli_output`` (prompt / prompt_yes_no / print_*), so we patch
+those source modules.
+"""
+import hermes_cli.config as config_mod
+import hermes_cli.cli_output as cli_output_mod
+from plugins.platforms.slack.adapter import interactive_setup
+
+
+def _patch_setup_io(monkeypatch, prompts, saved, removed, existing):
+    """Wire interactive_setup's lazy-imported CLI helpers to test doubles."""
+    prompt_iter = iter(prompts)
+    monkeypatch.setattr(config_mod, "get_env_value", lambda key: existing.get(key, ""))
+    monkeypatch.setattr(config_mod, "save_env_value", lambda k, v: saved.update({k: v}))
+
+    # Mirror remove_env_value's real semantics: True if removed, False if absent.
+    def _remove(key):
+        removed.append(key)
+        return existing.pop(key, None) is not None
+
+    monkeypatch.setattr(config_mod, "remove_env_value", _remove)
+    monkeypatch.setattr(cli_output_mod, "prompt", lambda *_a, **_kw: next(prompt_iter))
+    monkeypatch.setattr(cli_output_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    for name in ("print_header", "print_info", "print_success", "print_warning"):
+        monkeypatch.setattr(cli_output_mod, name, lambda *_a, **_kw: None)
+    # Manifest writing reaches out to hermes_cli.slack_cli + filesystem; stub it.
+    import hermes_cli.slack_cli as slack_cli_mod
+    monkeypatch.setattr(slack_cli_mod, "_build_full_manifest", lambda **_kw: {"display_information": {}})
+
+
+def test_interactive_setup_saves_home_channel(monkeypatch, tmp_path):
+    """interactive_setup() saves SLACK_HOME_CHANNEL when the user provides one."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    saved, removed = {}, []
+    # prompts: bot token, app token, allowed users (empty), home channel
+    _patch_setup_io(
+        monkeypatch,
+        ["«redacted:xox…»", "xapp-test-token", "", "C01ABC2DE3F"],
+        saved,
+        removed,
+        existing={},
+    )
+
+    interactive_setup()
+
+    assert saved.get("SLACK_HOME_CHANNEL") == "C01ABC2DE3F"
+    assert "SLACK_HOME_CHANNEL" not in removed
+
+
+class TestSlackHomeChannelClear:
+    """Blank home-channel answer must clear SLACK_HOME_CHANNEL (#12423)."""
+
+    def test_blank_removes_existing_home_channel(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        saved, removed = {}, []
+        _patch_setup_io(
+            monkeypatch,
+            ["«redacted:xox…»", "xapp-test-token", "", ""],
+            saved,
+            removed,
+            existing={"SLACK_HOME_CHANNEL": "C01OLDHOMEXYZ"},
+        )
+        interactive_setup()
+        assert "SLACK_HOME_CHANNEL" in removed
+        assert "SLACK_HOME_CHANNEL" not in saved
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_slack_relay_parent_command.py ===
+import pytest
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageType
+from gateway.relay.ws_transport import _event_from_wire
+
+
+def _wire(text: str, *, platform: str = "slack") -> dict:
+    return {
+        "text": text,
+        "message_type": "command",
+        "source": {
+            "platform": platform,
+            "chat_id": "D123",
+            "chat_type": "dm",
+            "user_id": "U123",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("wire_text", "expected"),
+    [
+        ("/hermes sethome", "/sethome"),
+        ("/hermes\tsethome", "/sethome"),
+        (
+            "/hermes model gpt-5.6 --provider openai",
+            "/model gpt-5.6 --provider openai",
+        ),
+        ("/hermes", "/help"),
+    ],
+)
+def test_slack_relay_parent_becomes_gateway_command(wire_text: str, expected: str):
+    event = _event_from_wire(_wire(wire_text))
+
+    assert event.text == expected
+    assert event.message_type == MessageType.COMMAND
+    assert event.source.platform == Platform.SLACK
+    assert event.source.delivered_via_upstream_relay is True
+
+
+

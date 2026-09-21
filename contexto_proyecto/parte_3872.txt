@@ -1,0 +1,246 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\image_gen\__init__.py ===
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\memory\test_bom_tolerant_config_reads.py ===
+"""User-editable plugin/auth JSON survives a Windows-editor BOM.
+
+Notepad and PowerShell ``>`` prepend U+FEFF when saving; ``json.loads`` rejects it
+("Unexpected UTF-8 BOM") and every loader below degrades to defaults, so a user who
+edited mem0.json / honcho.json / hindsight config.json / supermemory.json lost the
+whole config with no error (Qwen CLI creds raised ``qwen_auth_read_failed``). Same
+class as the auth-store/.env sweep; these were the missed sibling readers.
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+def _write_bom_json(path: Path, payload: dict) -> Path:
+    path.write_text(json.dumps(payload), encoding="utf-8-sig")
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")  # the BOM must really be on disk
+    return path
+
+
+def _via_shared_reader(p: Path, monkeypatch) -> dict:
+    from utils import read_json_or_empty  # mem0 / hindsight / honcho CLI all read through this
+    return read_json_or_empty(p)
+
+
+def _via_supermemory(p: Path, monkeypatch) -> dict:
+    from plugins.memory.supermemory import _load_supermemory_config
+    return _load_supermemory_config(str(p.parent))
+
+
+def _via_hindsight_runtime_deps(p: Path, monkeypatch) -> dict:
+    import hermes_cli.memory_setup as ms
+    monkeypatch.setattr(ms, "get_hermes_home", lambda: p.parent.parent)  # <home>/hindsight/config.json
+    deps = ms._provider_pip_dependencies("hindsight", ["hindsight-client"])
+    return {"workspace": "bom-ws" if "hindsight-all" in deps else None, "container_tag": None}
+
+
+def _via_honcho_client(p: Path, monkeypatch) -> dict:
+    from plugins.memory.honcho.client import HonchoClientConfig
+    cfg = HonchoClientConfig.from_global_config(config_path=p)
+    return {"workspace": cfg.workspace_id, "container_tag": None}
+
+
+@pytest.mark.parametrize("filename, loader", [
+    ("mem0.json", _via_shared_reader),
+    ("supermemory.json", _via_supermemory),
+    ("honcho.json", _via_honcho_client),
+    ("hindsight/config.json", _via_hindsight_runtime_deps),
+])
+def test_plugin_config_json_tolerates_bom(tmp_path, monkeypatch, filename, loader):
+    target = tmp_path / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _write_bom_json(target, {"workspace": "bom-ws", "container_tag": "bom-tag", "enabled": True, "mode": "local_embedded"})
+    loaded = loader(target, monkeypatch)
+    assert "bom" in str(loaded.get("workspace") or loaded.get("container_tag"))
+
+
+def test_qwen_cli_tokens_tolerate_bom(tmp_path, monkeypatch):
+    import hermes_cli.auth as auth_mod
+
+    creds = _write_bom_json(tmp_path / "oauth_creds.json", {"access_token": "tok", "expiry_date": 4102444800000})
+    monkeypatch.setattr(auth_mod, "_qwen_cli_auth_path", lambda: creds)
+    assert auth_mod._read_qwen_cli_tokens()["access_token"] == "tok"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\memory\test_byterover_multiplex_child_env.py ===
+"""ByteRover's ``brv`` child carries the SERVED profile's cloud identity, never the launch profile's.
+
+Regression for #108993: ``_run_brv`` built the child env from raw ``os.environ``, which under
+``gateway.multiplex_profiles`` is the default profile's ``.env`` — a secondary's turn curated into
+the default's ByteRover cloud account while its local context tree was already profile-scoped."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from agent import secret_scope
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from plugins.memory import byterover
+
+
+@pytest.fixture
+def two_profiles(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    prof_b = root / "profiles" / "b"
+    prof_b.mkdir(parents=True)
+    (root / ".env").write_text("BRV_API_KEY=DEFAULT-PROFILE-KEY\nHERMES_MODEL=default-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("BRV_API_KEY", "DEFAULT-PROFILE-KEY")  # the gateway loaded default's .env at boot
+    monkeypatch.setenv("HERMES_MODEL", "default-model")
+    monkeypatch.setattr(byterover, "_resolve_brv_path", lambda: "/opt/brv/bin/brv")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+
+        class _R:
+            returncode, stdout, stderr = 0, "", ""
+
+        return _R()
+
+    monkeypatch.setattr(byterover.subprocess, "run", fake_run)
+    return root, prof_b, captured
+
+
+def _served_turn(prof_home: Path, scope: dict):
+    secret_scope.set_multiplex_active(True)
+    home_tok = set_hermes_home_override(str(prof_home))
+    scope_tok = secret_scope.set_secret_scope(scope)
+    return home_tok, scope_tok
+
+
+def _end_turn(tokens):
+    home_tok, scope_tok = tokens
+    secret_scope.reset_secret_scope(scope_tok)
+    reset_hermes_home_override(home_tok)
+    secret_scope.set_multiplex_active(False)
+
+
+def test_secondary_profile_child_uses_its_own_key_not_defaults(two_profiles):
+    _root, prof_b, captured = two_profiles
+    tokens = _served_turn(prof_b, {"BRV_API_KEY": "PROFILE-B-KEY"})
+    try:
+        byterover._run_brv(["query", "--", "hello"], cwd=str(prof_b / "byterover"))
+    finally:
+        _end_turn(tokens)
+    env = captured["env"]
+    assert env["BRV_API_KEY"] == "PROFILE-B-KEY"
+    assert env["HERMES_HOME"] == str(prof_b)
+    assert "HERMES_MODEL" not in env  # launch profile's .env residue is stripped too
+    assert env["PATH"].startswith("/opt/brv/bin")
+
+
+def test_secondary_without_key_gets_no_key_never_defaults(two_profiles):
+    _root, prof_b, captured = two_profiles
+    tokens = _served_turn(prof_b, {"OTHER": "x"})
+    try:
+        byterover._run_brv(["curate", "--", "note"], cwd=str(prof_b / "byterover"))
+    finally:
+        _end_turn(tokens)
+    assert "BRV_API_KEY" not in captured["env"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\memory\test_byterover_provider.py ===
+"""Tests for the ByteRover memory provider config gates."""
+
+from plugins.memory.byterover import ByteRoverMemoryProvider
+
+
+def test_auto_extract_false_skips_sync_turn(monkeypatch):
+    calls = []
+    provider = ByteRoverMemoryProvider({"auto_extract": False})
+    provider.initialize("session-1")
+
+    monkeypatch.setattr("plugins.memory.byterover._run_brv", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    provider.sync_turn("please remember this detail", "acknowledged")
+
+    assert calls == []
+    assert provider._sync_thread is None
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\memory\test_config_schema.py ===
+"""Tests for config-schema loading from memory provider plugin dirs."""
+
+import plugins.memory.config_schema as config_schema
+from plugins.memory.config_schema import get_provider_config_schema
+
+
+def test_unknown_provider_is_none():
+    assert get_provider_config_schema("builtin") is None
+
+
+def test_plugin_without_schema_is_none():
+    # mem0 is a real plugin dir that declares no config_schema.py.
+    assert get_provider_config_schema("mem0") is None
+
+
+def test_schemas_are_cached_per_provider():
+    assert get_provider_config_schema("honcho") is get_provider_config_schema("honcho")
+
+
+def test_cache_keys_on_schema_path_not_name(monkeypatch, tmp_path):
+    # User-installed plugins are per-profile; two profiles' plugins sharing a
+    # name must not answer for each other.
+    import plugins.memory as memory
+
+    schemas = {}
+    for label in ("A", "B"):
+        plugin_dir = tmp_path / label / "custom"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "config_schema.py").write_text(
+            "from plugins.memory.config_schema import ProviderConfigSchema\n"
+            f'CONFIG_SCHEMA = ProviderConfigSchema(name="custom", label="{label}")\n',
+            encoding="utf-8",
+        )
+        schemas[label] = plugin_dir
+
+    monkeypatch.setattr(config_schema, "_SCHEMA_CACHE", {})
+    monkeypatch.setattr(memory, "find_provider_dir", lambda name: schemas["A"])
+    assert get_provider_config_schema("custom").label == "A"
+
+    monkeypatch.setattr(memory, "find_provider_dir", lambda name: schemas["B"])
+    assert get_provider_config_schema("custom").label == "B"
+
+
+def test_broken_schema_is_not_cached(monkeypatch, tmp_path):
+    # A load failure must retry on the next request, not pin an empty panel.
+    broken_dir = tmp_path / "broken"
+    broken_dir.mkdir()
+    schema_file = broken_dir / "config_schema.py"
+    schema_file.write_text("this is not python(", encoding="utf-8")
+
+    monkeypatch.setattr(config_schema, "_SCHEMA_CACHE", {})
+    import plugins.memory as memory
+
+    monkeypatch.setattr(memory, "find_provider_dir", lambda name: broken_dir)
+
+    assert get_provider_config_schema("broken") is None
+    assert not config_schema._SCHEMA_CACHE
+
+    schema_file.write_text(
+        "from plugins.memory.config_schema import ProviderConfigSchema\n"
+        'CONFIG_SCHEMA = ProviderConfigSchema(name="broken", label="Broken")\n',
+        encoding="utf-8",
+    )
+
+    recovered = get_provider_config_schema("broken")
+    assert recovered is not None
+    assert recovered.label == "Broken"
+

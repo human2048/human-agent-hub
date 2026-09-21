@@ -1,0 +1,305 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\core_tool_deferral\results\SUMMARY.md ===
+# PR #97979 A/B verdict — core-tool deferral (288 live runs)
+
+Date: 2026-08-29 · Harness: /tmp/ab97979/harness · Method: METHOD.md
+
+## Arms
+base = origin/main 3f36c87e1ebd (27 direct tools in the eval assembly, 47.4KB schema chars)
+pr   = main + #97979 e16ad33a9d24 (12 direct: 9 working set + 3 bridge; 19 deferred; 21.0KB schema chars, −56%)
+
+## Headline (mean of task means, 14 tasks × 3 reps; contested cells re-run to n=6)
+
+| model | arm | accuracy | turns | tokens(k) | wall(s) |
+|---|---|---|---|---|---|
+| gpt-5.6-terra (large) | base | 0.938 | 6.0 | 80.9 | 27.6 |
+| gpt-5.6-terra | pr | 0.879 | 6.6 | **62.5 (−23%)** | 27.1 |
+| glm-5.3-flash (medium) | base | 0.915 | 6.0 | 101.0 | 56.5 |
+| glm-5.3-flash | pr | **0.963 (+0.05)** | 8.8 | **89.6 (−11%)** | 59.5 |
+| qwen3.8-27b (small) | base | 0.915 | 7.1 | 127.4 | 53.5 |
+| qwen3.8-27b | pr | 0.907 | 9.4 | **118.4 (−7%)** | 79.2 |
+
+Grand accuracy: base 0.923 vs pr 0.916 — flat within rep noise once the two
+contested tasks were extended to n=6. Tokens down on every model. Turns up
+~1–2 (bridge discovery round-trips), wall flat on terra/glm, +48% on qwen
+(27B pays real latency for extra bridge turns).
+
+## Deferred-tool discovery (PR arm, tasks requiring the tool, all models)
+Perfect (9/9 or 18/18): session_search, todo_list, image_generate,
+desktop_project, desktop_preview, drive_preview, annotate_preview,
+apply_layout, focus_pane, read_terminal, read_window_below.
+Near-perfect: cronjob_manage 16/18, gui_tour 8/9, process_manage 8/9.
+Weak: computer_use 6/9, show_tip 6/9, clarify 7/18, setup_mcp 4/9*,
+close_terminal 4/9*.
+(*base-arm usage on the same tasks: setup_mcp 3/9, close_terminal 0/9 —
+these two are NOT deferral regressions; models skip them even when visible.)
+
+## The one real regression: clarify
+base: clarify used 18/18, score 1.00 on the ambiguous-delete trap, all models.
+pr: clarify used 7/18 → terra 0/6 (0.50), glm 3/6 (0.80), qwen 4/6 (0.87).
+Models still ask — but as plain text, ending the turn (extra user round-trip,
+no structured choices). The harness credits scripted replies; without that
+continuation the task scores 0. Exactly trade-off #1 flagged in the PR body.
+Safety note: in 0 of 288 runs was the WRONG file deleted — the failure mode
+is degraded UX, never destructive action.
+
+## screenshot_ambiguous (n=6): split, not directional
+terra base 1.00 → pr 0.67 (2 reps answered from read_window_below instead of
+discovering computer_use — catalog-stub misrouting to a cheaper adjacent tool);
+but glm 0.67→1.00 and qwen 0.50→0.83 IMPROVED under deferral (the focused
+catalog line beats 27 competing schemas for weaker models). Model-split, nets
+to ~flat across the tier ladder.
+
+## Controls
+eager_refactor_control (eager-only tools): pr arm −49% tokens at held 1.00 —
+pure schema-shrink win, no behavior change.
+config_grep_distractor: 1.00 both arms, 0 false bridge calls on terra/glm —
+no discovery-overhead tax on tasks that don't need deferred tools.
+
+## Anomalies audited
+- glm pr layout rep2 (41 turns, 514k tok): after completing the GUI task via
+  bridge it burned 30 terminal calls "verifying"; score 1.0. Model paranoia,
+  not a bridge failure.
+- qwen pr screenshot rep3: hard wall timeout, scored 0, kept in denominator.
+- 1 errored run / 288 total; raw-XML provider noise: 0.
+
+## Verdict: SHIP, with one follow-up — un-defer (or pin) `clarify`.
+The deferral mechanism works: discovery is essentially perfect for 14/19
+tools, accuracy is flat overall (large model −0.06, medium +0.05, small
+−0.01), token cost drops on every model, and the eager-surface control shows
+the −49%-token schema win with zero accuracy cost. The single consistent
+regression is clarify: structured ask-the-user collapses to plain-text
+questions when the schema is invisible (7/18 vs 18/18). PR #91125
+(always-visible deferred-tool pins) is the natural mechanism — pin clarify
+eager by default, or drop it from _DEFAULT_DEFERRED_TOOLS (~250 tok cost).
+computer_use on frontier models is worth watching but is model-split, not
+directional. todo_list discipline concern from the PR body did NOT
+materialize (18/18 discovery, multi-step scores held at 1.00).
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\dashboard_auth\refresh_singleflight_live_e2e.py ===
+"""Live E2E for #55712: real uvicorn, stub rotating IdP with reuse detection.
+
+Proves (a) N concurrent stale-RT requests on BOTH refresh paths rotate exactly once, and
+(b) /api/status answers while a slow provider refresh is in flight (the event-loop wedge).
+Run against origin/main to see both fail; against the fix to see both pass.
+"""
+import json
+import os
+import socket
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+ROOT = sys.argv[1]
+sys.path.insert(0, ROOT)
+os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="hermes-e2e-55712-")
+for m in [k for k in sys.modules if k.startswith(("hermes", "tools", "plugins"))]:
+    del sys.modules[m]
+
+import uvicorn  # noqa: E402
+
+from hermes_cli import web_server  # noqa: E402
+from hermes_cli.dashboard_auth import register_provider  # noqa: E402
+from hermes_cli.dashboard_auth.base import RefreshExpiredError, Session  # noqa: E402
+from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider  # noqa: E402
+
+
+class SlowRotatingIdP(StubAuthProvider):
+    name = "stub"
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.rotated = set()
+        self.delay = 0.0
+        self.lock = threading.Lock()
+
+    def verify_session(self, *, access_token):
+        return None if access_token.startswith("expired") else super().verify_session(access_token=access_token)
+
+    def refresh_session(self, *, refresh_token):
+        with self.lock:
+            self.calls += 1
+            if refresh_token in self.rotated:
+                raise RefreshExpiredError("reuse detected -> session revoked")
+            self.rotated.add(refresh_token)
+        time.sleep(self.delay)
+        return Session(user_id="u1", email="u@x.test", display_name="U", org_id="o", provider="stub",
+                       expires_at=int(time.time()) + 900, access_token="fresh-" + refresh_token,
+                       refresh_token="rotated-" + refresh_token)
+
+
+idp = SlowRotatingIdP()
+register_provider(idp)
+app = web_server.app
+app.state.bound_host = "127.0.0.1"
+app.state.auth_required = True
+
+s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+threading.Thread(target=server.run, daemon=True).start()
+base = f"http://127.0.0.1:{port}"
+for _ in range(100):
+    try:
+        urllib.request.urlopen(base + "/api/status", timeout=1); break
+    except Exception:
+        time.sleep(0.1)
+
+
+def http(path, *, method="GET", body=None, headers=None):
+    req = urllib.request.Request(base + path, method=method, headers=headers or {},
+                                 data=json.dumps(body).encode() if body is not None else None)
+    if body is not None:
+        req.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+results = {}
+
+# (1) native bearer path: 4 concurrent refreshes with the same stale RT
+idp.calls = 0
+with ThreadPoolExecutor(4) as pool:
+    codes = sorted(pool.map(lambda _: http("/auth/native/refresh", method="POST",
+                                            body={"refresh_token": "native-stale", "provider": "stub"}), range(4)))
+results["native_burst"] = {"codes": codes, "provider_calls": idp.calls}
+
+# (2) cookie gate path: 4 concurrent gated requests with an expired AT + one stale RT
+idp.calls = 0
+ck = "hermes_session_at=expired-at; hermes_session_rt=cookie-stale; hermes_session_provider=stub"
+with ThreadPoolExecutor(4) as pool:
+    codes = sorted(pool.map(lambda _: http("/api/auth/me", headers={"cookie": ck}), range(4)))
+results["cookie_burst"] = {"codes": codes, "provider_calls": idp.calls}
+
+# (3) event-loop wedge: a 3s provider refresh must not block /api/status
+idp.delay = 3.0
+slow = threading.Thread(target=lambda: http("/auth/native/refresh", method="POST",
+                                             body={"refresh_token": "slow-stale", "provider": "stub"}))
+slow.start(); time.sleep(0.3)
+t0 = time.monotonic(); code = http("/api/status"); dt = time.monotonic() - t0
+slow.join()
+results["status_during_slow_refresh"] = {"code": code, "seconds": round(dt, 2)}
+
+ok = (results["native_burst"] == {"codes": [200] * 4, "provider_calls": 1}
+      and results["cookie_burst"] == {"codes": [200] * 4, "provider_calls": 1}
+      and code == 200 and dt < 1.0)
+print(json.dumps(results, indent=1))
+print("VERDICT:", "PASS" if ok else "FAIL")
+server.should_exit = True
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\delegation_group_schema\probe.py ===
+"""Offline same-config schema probe. Run in a fresh interpreter for each tree/policy.
+
+python probe.py /path/to/tree /tmp/receipt.json [--independent]
+Requires tiktoken; no model calls or model-quality claims.
+"""
+
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+import tempfile
+
+root, destination = sys.argv[1:3]
+sys.path.insert(0, root)
+os.chdir(root)
+with tempfile.TemporaryDirectory(prefix="delegate-schema-") as home:
+    os.environ.clear()
+    os.environ.update(HOME=home, HERMES_HOME=home, PATH="/usr/bin:/bin", HERMES_PLATFORM="cli")
+    config = {"tools": {"tool_search": {"defer": []}}}
+    if "--independent" in sys.argv:
+        config["delegation"] = {"independent_completions": True}
+    Path(home, "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+
+    def deny_network(*args, **kwargs):
+        raise RuntimeError("Offline schema probe forbids network access")
+
+    socket.socket.connect = deny_network
+    import tiktoken
+    from model_tools import get_tool_definitions
+
+    encoder = tiktoken.get_encoding("o200k_base")
+    definitions = get_tool_definitions(enabled_toolsets=["hermes-cli"], quiet_mode=True)
+    serialized = json.dumps(definitions, separators=(",", ":"))
+    repeated = get_tool_definitions(enabled_toolsets=["hermes-cli"], quiet_mode=True)
+    assert json.dumps(repeated, separators=(",", ":")) == serialized
+    counts = {
+        definition["function"]["name"]: len(encoder.encode(json.dumps(definition, separators=(",", ":"))))
+        for definition in definitions
+    }
+    delegate = next(d for d in definitions if d["function"]["name"] == "delegate_task")
+    receipt = {
+        "config": config,
+        "tokens": counts,
+        "total_tokens": sum(counts.values()),
+        "delegate": delegate,
+        "repeated_assembly_byte_stable": True,
+        "model_calls": 0,
+    }
+    Path(destination).write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    print(json.dumps({"destination": destination, "total_tokens": receipt["total_tokens"], "delegate_tokens": counts["delegate_task"]}))
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\delegation_group_schema\README.md ===
+# Delegation grouping schema receipts
+
+`probe.py TREE OUTPUT [--independent]` assembles real eager CLI tool definitions
+in a fresh, credential-free temporary home with networking forbidden. Run it
+in separate interpreters against base and fix with the same arguments.
+Requires `tiktoken` (`o200k_base`); counts use compact OpenAI function JSON.
+This measures schema footprint, not model quality or billed savings.
+
+Base: `b2aa855b626ff8688eb34b95c60ee8b6a4af3679`.
+
+| Policy | Base delegate tokens | Fixed delegate tokens | Change |
+| --- | ---: | ---: | ---: |
+| Default off | 927 | 826 | -101 |
+| Explicit on | 927 | 913 | -14 |
+
+Only `delegate_task` changed in either same-config comparison. Total eager
+CLI schemas were 7586 → 7485 (off), 7586 → 7572 (on). The field remains
+available when enabled; its parameter schema is unchanged. Repeated assembly
+is byte-stable. The two invariants also check static/previous schema immutability,
+legacy task normalization, and grouped/ungrouped delivery partitioning.
+The default-off exposure assertion failed on base before implementation.
+
+## Real-model N=1 child smoke
+
+Pinned to configured Nous `google/gemini-3.7-flash`; no provider fallback.
+A separate temporary home held only copied Nous authentication and minimal
+explicit configuration (no personal skills/memory). One forced parent tool call
+using the real default-off registry schema produced a one-task array without
+`group`. The actual delegation handler then built and ran one real AIAgent child,
+which completed in one API call with `GROUP_GATE_OK`. Parent tool bytes were
+unchanged across child execution. This is a schema-acceptance/execution smoke,
+not a comparative quality evaluation or proof of asynchronous delivery timing.
+
+Before inference, the live catalog was read and an approximately $0.016 budget
+estimated for two calls (20k input + 1024 output allowance).
+
+| Inference | Input | Output | Reasoning (included in output) | API-reported `usage.cost` |
+| --- | ---: | ---: | ---: | ---: |
+| Parent schema call | 796 | 104 | 75 | $0.000987 |
+| Child | 708 | 42 | 37 | $0.0006885 |
+| Total | 1504 | 146 | 112 | $0.0016755 |
+
+Parent request ID: `gen-1788889571-fBLF8eStu3UAevfGtvgD`.
+The raw provider usage exposes the same values as `upstream_inference_cost`;
+these are API-reported costs, not an independently reconciled Portal invoice.
+The child result's local estimator instead reported `$0.000551` with
+`cost_status: estimated`; do not substitute that estimate for the raw receipt.
+Local full receipt: `/tmp/delegation-group-live-receipt.json`.
+

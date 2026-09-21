@@ -1,0 +1,327 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_http_body_cap.py ===
+"""Wire-body cap for MCP HTTP/SSE transports.
+
+Exercises ``_make_mcp_body_cap_transport`` with a real httpx AsyncClient over
+a MockTransport: oversized finite bodies and oversized SSE events fail with a
+ReadError naming the byte cap; bodies/events under the cap pass; long-lived
+SSE connections reset accounting at event boundaries so cumulative keepalive
+traffic is unlimited.
+"""
+
+import httpx
+import pytest
+
+from tools.mcp_tool_errors import _MCP_HTTP_MAX_BODY_BYTES, _make_mcp_body_cap_transport
+
+LIMIT = 1024  # small cap for tests
+
+
+def _client_for(handler, limit=LIMIT):
+    inner = httpx.MockTransport(handler)
+    capped = _make_mcp_body_cap_transport(httpx, inner, limit=limit)
+    return httpx.AsyncClient(transport=capped)
+
+
+@pytest.mark.asyncio
+async def test_small_json_body_passes():
+    async def handler(request):
+        return httpx.Response(200, json={"ok": True})
+    async with _client_for(handler) as client:
+        resp = await client.get("http://mcp.test/rpc")
+        assert resp.json() == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_oversized_body_rejected_via_content_length():
+    body = b"x" * (LIMIT + 1)
+    async def handler(request):
+        return httpx.Response(200, content=body)
+    async with _client_for(handler) as client:
+        with pytest.raises(httpx.ReadError, match=r"Content-Length"):
+            await client.get("http://mcp.test/rpc")
+
+
+@pytest.mark.asyncio
+async def test_oversized_streamed_body_rejected_without_content_length():
+    # A streaming body with no Content-Length must still trip the cap.
+    async def gen():
+        for _ in range(8):
+            yield b"y" * (LIMIT // 4)
+
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            async for c in gen():
+                yield c
+
+    async def handler(request):
+        return httpx.Response(200, stream=_Stream())
+    async with _client_for(handler) as client:
+        with pytest.raises(httpx.ReadError, match=r"HTTP response exceeds"):
+            await client.get("http://mcp.test/rpc")
+
+
+@pytest.mark.asyncio
+async def test_sse_event_over_cap_rejected():
+    async def gen():
+        yield b"data: " + b"z" * (LIMIT + 64)  # one giant unterminated event
+
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            async for c in gen():
+                yield c
+
+    async def handler(request):
+        return httpx.Response(
+            200, stream=_Stream(),
+            headers={"content-type": "text/event-stream"},
+        )
+    async with _client_for(handler) as client:
+        with pytest.raises(httpx.ReadError, match=r"SSE event exceeds"):
+            async with client.stream("GET", "http://mcp.test/sse") as resp:
+                async for _ in resp.aiter_bytes():
+                    pass
+
+
+@pytest.mark.asyncio
+async def test_sse_cumulative_keepalives_unlimited():
+    # Many small completed events whose TOTAL far exceeds the cap must all
+    # pass: accounting resets at every completed event boundary.
+    async def gen():
+        for i in range(64):
+            yield b": keepalive %d\n\n" % i + b"data: {\"n\": %d}\n\n" % i
+
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            async for c in gen():
+                yield c
+
+    async def handler(request):
+        return httpx.Response(
+            200, stream=_Stream(),
+            headers={"content-type": "text/event-stream"},
+        )
+    total = 0
+    async with _client_for(handler, limit=64) as client:
+        async with client.stream("GET", "http://mcp.test/sse") as resp:
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+    assert total > 64  # cumulative traffic exceeded the per-event cap
+
+
+@pytest.mark.asyncio
+async def test_sse_event_split_across_chunks_counts_prefix():
+    # An event streamed in pieces (no boundary) accumulates until it
+    # crosses the cap.
+    async def gen():
+        for _ in range(6):
+            yield b"data: " + b"q" * (LIMIT // 4)
+
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            async for c in gen():
+                yield c
+
+    async def handler(request):
+        return httpx.Response(
+            200, stream=_Stream(),
+            headers={"content-type": "text/event-stream"},
+        )
+    async with _client_for(handler) as client:
+        with pytest.raises(httpx.ReadError, match=r"SSE event exceeds"):
+            async with client.stream("GET", "http://mcp.test/sse") as resp:
+                async for _ in resp.aiter_bytes():
+                    pass
+
+
+def _sse_client(chunks, limit=64):
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for c in chunks:
+                yield c
+
+    async def handler(request):
+        return httpx.Response(
+            200, stream=_Stream(),
+            headers={"content-type": "text/event-stream"},
+        )
+    return _client_for(handler, limit=limit)
+
+
+_EVENT1 = b"data: " + b"a" * 40
+_EVENT2 = b"data: " + b"b" * 40
+# SSE allows CR, LF or CRLF line terminators (mixed too), so a blank line -- the event boundary --
+# is any terminator pair. Every shape, cut at every seam between two chunks.
+_SPLIT_BOUNDARY_CASES = [
+    pytest.param([_EVENT1 + sep[:cut], sep[cut:] + _EVENT2 + sep], id=f"{sep!r}@{cut}")
+    for sep in (b"\n\n", b"\r\r", b"\n\r", b"\r\n\r\n", b"\r\n\n", b"\r\n\r", b"\n\r\n", b"\r\r\n")
+    for cut in range(1, len(sep))
+] + [
+    # A CRLF CRLF boundary dribbled across three chunks.
+    pytest.param([_EVENT1 + b"\r", b"\n\r", b"\n" + _EVENT2 + b"\r\n\r\n"], id="three-way"),
+    # Two completed events in ONE chunk are two budgets, not one lumped charge.
+    pytest.param([_EVENT1 + b"\n\n" + _EVENT2 + b"\n\n"], id="two-events-one-chunk"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunks", _SPLIT_BOUNDARY_CASES)
+async def test_sse_boundary_split_across_chunks_still_resets(chunks):
+    # Each event is under the cap while the two together exceed it: the per-event counter must
+    # reset at every completed boundary regardless of where the network chunked the bytes.
+    # Otherwise the finished event's bytes are charged to the next one and the cap trips early.
+    async with _sse_client(chunks) as client:
+        async with client.stream("GET", "http://mcp.test/sse") as resp:
+            async for _ in resp.aiter_bytes():
+                pass
+
+
+@pytest.mark.asyncio
+async def test_sse_crlf_split_across_chunks_inside_event_is_not_a_boundary():
+    # A lone CRLF ends a line, not the event, even with the \r and \n straddling the chunk seam:
+    # the carry must not turn a mid-event line ending into a boundary, or a multi-line event over
+    # the cap would evade it.
+    chunks = [_EVENT1 + b"\r", b"\n" + _EVENT2 + b"\r\n\r\n"]
+    async with _sse_client(chunks) as client:
+        with pytest.raises(httpx.ReadError, match=r"SSE event exceeds"):
+            async with client.stream("GET", "http://mcp.test/sse") as resp:
+                async for _ in resp.aiter_bytes():
+                    pass
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_http_proxy.py ===
+"""Proxy support for MCP HTTP/SSE transports (#111794).
+
+httpx auto-detects environment/OS proxies only when ``transport is None``; both MCP HTTP
+transports pass a custom transport (the wire-body cap), so HTTP_PROXY / HTTPS_PROXY were silently
+ignored for every HTTP/SSE MCP server. The fix hands the SDK client explicit ``mounts``.
+
+Invariants: (1) a proxy that applies to the server URL becomes a mount and a NO_PROXY host
+(including the CIDR form only ``agent.proxy_bypass`` understands) stays direct; (2) both client
+builders carry the mounts next to the body-cap transport, with headers/auth passthrough intact.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import urllib.request
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+URL = "https://mcp.example.com/mcp"
+PROXY = "http://127.0.0.1:10808"
+_PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy")
+
+
+@pytest.fixture
+def env_only_proxy(monkeypatch):
+    """Environment-only proxy discovery so the host's OS/registry proxy can't leak in."""
+    for key in _PROXY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(urllib.request, "getproxies", urllib.request.getproxies_environment)
+    monkeypatch.setattr(urllib.request, "proxy_bypass", urllib.request.proxy_bypass_environment)
+    from tools.mcp_tool import _ensure_mcp_sdk, sdk_httpx
+
+    if not _ensure_mcp_sdk() or sdk_httpx() is None:
+        pytest.skip("mcp SDK not installed")
+
+
+def test_proxy_env_becomes_a_mount_and_no_proxy_stays_direct(env_only_proxy, monkeypatch):
+    from tools.mcp_tool import sdk_httpx
+    from tools.mcp_tool_transport import _mcp_proxy_mounts
+
+    httpx = sdk_httpx()
+    assert _mcp_proxy_mounts(httpx, URL, True, None) is None  # no proxy configured: direct
+
+    monkeypatch.setenv("HTTPS_PROXY", PROXY)
+    mounts = _mcp_proxy_mounts(httpx, URL, True, None)
+    # The mount wins over transport= for matching URLs, so it must carry the wire-body cap itself.
+    assert set(mounts) == {"https://"} and type(mounts["https://"]).__name__ == "_BodyCapTransport"
+
+    monkeypatch.setenv("HTTP_PROXY", PROXY)  # loopback is never dialed through a proxy, NO_PROXY or not
+    assert _mcp_proxy_mounts(httpx, "http://127.0.0.1:5000/mcp", True, None) is None
+
+    monkeypatch.setenv("NO_PROXY", "mcp.example.com")
+    assert _mcp_proxy_mounts(httpx, URL, True, None) is None
+    monkeypatch.setenv("NO_PROXY", "10.0.0.0/8")  # CIDR: only the repo matcher understands it
+    assert _mcp_proxy_mounts(httpx, "https://10.1.2.3/mcp", True, None) is None
+    assert _mcp_proxy_mounts(httpx, "https://11.1.2.3/mcp", True, None) is not None
+
+
+class _RecordingClient:
+    """Stands in for the SDK's AsyncClient and records the kwargs it was built with."""
+
+    captured: dict = {}
+
+    def __init__(self, **kwargs):
+        type(self).captured = dict(kwargs)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _async_cm(value):
+    class _CM:
+        async def __aenter__(self):
+            return value
+
+        async def __aexit__(self, *args):
+            return False
+
+    return _CM()
+
+
+async def _drive(streams):
+    async with streams:
+        pass
+
+
+def test_both_client_builders_carry_proxy_mounts_next_to_the_body_cap(env_only_proxy, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", PROXY)
+    from tools.mcp_tool import MCPServerTask, sdk_httpx
+
+    server = MCPServerTask("remote")
+    streams = server._streamable_http_transport(URL, {}, 5.0, True, None, None, False, set())
+    _RecordingClient.captured = {}
+    with patch.object(sdk_httpx(), "AsyncClient", _RecordingClient), \
+         patch("tools.mcp_tool.streamable_http_client", MagicMock(return_value=_async_cm((MagicMock(), MagicMock())))):
+        asyncio.run(_drive(streams))
+    captured = _RecordingClient.captured
+    assert captured["mounts"]["https://"] is not None  # proxy restored
+    assert captured["transport"] is not None  # wire-body cap still the default transport
+
+    _RecordingClient.captured = {}
+    with patch("tools.mcp_tool.sse_client", MagicMock(return_value=_async_cm((MagicMock(), MagicMock())))) as sse, \
+         patch.object(sdk_httpx(), "AsyncClient", _RecordingClient):
+        server._sse_transport(URL, {}, 5.0, True, None, None, False)
+        sse.call_args.kwargs["httpx_client_factory"](headers={"X-Test": "1"}, timeout=None, auth=None)
+    captured = _RecordingClient.captured
+    assert captured["mounts"]["https://"] is not None
+    assert captured["headers"] == {"X-Test": "1"}  # SDK passthrough intact
+    assert captured["transport"] is not None
+
+
+def test_preflight_probe_uses_the_same_proxy_mounts_as_the_connect_client(env_only_proxy, monkeypatch):
+    """The content-type preflight must reach the server the way the SDK client will: explicit mounts
+    (repo NO_PROXY/loopback rules), not httpx's own env auto-detection."""
+    import httpx
+
+    monkeypatch.setenv("HTTPS_PROXY", PROXY)
+    from tools.mcp_tool import MCPServerTask
+
+    class _Probe(_RecordingClient):
+        async def head(self, *a, **k):
+            raise httpx.ConnectError("stub")
+
+    with patch.object(httpx, "AsyncClient", _Probe):
+        asyncio.run(MCPServerTask("remote")._preflight_content_type(URL, timeout=1.0))
+    captured = _Probe.captured
+    assert type(captured["mounts"]["https://"]).__name__ == "_BodyCapTransport"
+    assert captured["transport"] is not None  # explicit transport: httpx env proxy auto-detection is off
+

@@ -1,0 +1,325 @@
+
+
+=== ARCHIVO: .\hermes-agent\gateway\stream_dispatch.py ===
+"""Adapter-driven dispatch of structured stream events (gateway/stream_events.py).
+
+Message events flow into the consumer; tool events are formatted by the adapter (None
+= eat it on platforms without tool chrome) and enqueued onto the same tool-progress
+queue the gateway drains, so the two paths never race.  Synchronous: callable from
+the agent's worker thread.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Optional
+
+from gateway.stream_events import (
+    Commentary, GatewayNotice, LongToolHint, MessageChunk, MessageStop, StreamEvent, ToolCallChunk,
+)
+
+logger = logging.getLogger("gateway.stream_events")
+
+
+class GatewayEventDispatcher:
+    """Route typed stream events through an adapter onto a delivery sink.
+
+    sink: the GatewayStreamConsumer, or None when streaming is disabled (message
+    events dropped; the final still goes out normally).  enqueue_tool_line: None
+    when tool progress is disabled.  tool_mode: "all"/"new"/"verbose"/"off";
+    preview_max_len: ``tool_preview_length`` (0 = no cap in verbose).
+    on_long_tool / on_notice: the gateway owns the "surface this here?" decision.
+    """
+
+    def __init__(
+        self,
+        adapter: Any,
+        sink: Any = None,
+        *,
+        enqueue_tool_line: Optional[Callable[[Any], None]] = None,
+        tool_mode: str = "all",
+        preview_max_len: int = 40,
+        on_long_tool: Optional[Callable[[LongToolHint], None]] = None,
+        on_notice: Optional[Callable[[GatewayNotice], None]] = None,
+    ) -> None:
+        self.adapter = adapter
+        self.sink = sink
+        self._enqueue_tool_line = enqueue_tool_line
+        self.tool_mode = tool_mode or "all"
+        self.preview_max_len = preview_max_len
+        self._on_long_tool = on_long_tool
+        self._on_notice = on_notice
+        self._last_tool: Optional[str] = None  # "new"-mode dedup
+
+    def dispatch(self, event: StreamEvent) -> None:
+        """Route a single event.  Never raises into the agent's worker thread."""
+        try:
+            self._dispatch(event)
+        except Exception:  # presentation must never break the agent loop
+            logger.debug("stream-event dispatch error", exc_info=True)
+
+    def _dispatch(self, event: StreamEvent) -> None:
+        # ToolCallFinished: no chrome on completion (only "started" is rendered);
+        # completion only drives onboarding hints (LongToolHint).
+        if isinstance(event, (MessageChunk, MessageStop, Commentary)):
+            if self.sink is not None:
+                self.adapter.render_message_event(event, self.sink)
+        elif isinstance(event, ToolCallChunk):
+            self._dispatch_tool_call(event)
+        elif isinstance(event, LongToolHint) and self._on_long_tool is not None:
+            self._on_long_tool(event)
+        elif isinstance(event, GatewayNotice) and self._on_notice is not None:
+            self._on_notice(event)
+
+    def _dispatch_tool_call(self, event: ToolCallChunk) -> None:
+        if self.tool_mode == "off" or self._enqueue_tool_line is None:
+            return
+        if self.tool_mode == "new" and event.tool_name == self._last_tool:
+            return
+        self._last_tool = event.tool_name
+        line = self.adapter.format_tool_event(
+            event, mode=self.tool_mode, preview_max_len=self.preview_max_len,
+        )
+        if line:  # None/"" == adapter chose to eat this event
+            self._enqueue_tool_line(line)
+
+
+__all__ = ["GatewayEventDispatcher"]
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'ToolCallFinished': ('gateway.stream_events', 'ToolCallFinished'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\gateway\stream_events.py ===
+"""Structured streaming events — the agent→gateway delivery contract.
+
+Typed *what happened* events (frozen dataclasses, no I/O) emitted from the agent's
+worker thread; ``GatewayStreamConsumer`` is the sink and the adapter decides rendering.
+Events describe *transport*, never *context*: whatever the gateway "eats" must never
+diverge from the agent-owned message history.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Union
+
+
+@dataclass(frozen=True)
+class MessageChunk:
+    """A delta of streamed assistant text (think-block content is filtered upstream)."""
+    text: str
+
+
+@dataclass(frozen=True)
+class MessageStop:
+    """Assistant text segment complete.  ``final`` only for the turn's terminal stop; an
+    intermediate stop (text → tool → text) starts a fresh segment below tool chrome."""
+    final: bool = False
+
+
+@dataclass(frozen=True)
+class Commentary:
+    """A complete interim assistant message between tool iterations (not a delta)."""
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolCallChunk:
+    """A tool invocation started. Raw facts only; the adapter decides presentation."""
+    tool_name: str
+    preview: Optional[str] = None
+    args: Optional[Dict[str, Any]] = None
+    index: int = 0  # monotonic per-turn index: correlates a finish with its start
+
+
+@dataclass(frozen=True)
+class ToolCallFinished:
+    """A tool invocation completed (drives bubble settling + LongToolHint).  Tool *output*
+    never travels here — it is history."""
+    tool_name: str
+    duration: float = 0.0  # wall-clock seconds
+    ok: bool = True        # returned without raising
+    index: int = 0
+
+
+@dataclass(frozen=True)
+class LongToolHint:
+    """One-shot onboarding nudge for a long tool run; the gateway gates it on platform
+    capability (/verbose usable) and first-time use."""
+    tool_name: str = ""
+    duration: float = 0.0
+
+
+@dataclass(frozen=True)
+class GatewayNotice:
+    """Gateway-originated control message; ``kind`` is a stable string adapters switch on
+    (``"restart"`` / ``"online"`` / ``"long_run"`` / …), ``text`` the default rendering."""
+    kind: str
+    text: str = ""
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+# Explicit union (not a marker base class) so a missing ``case`` in an
+# exhaustive match is a visible type error rather than a silent fall-through.
+StreamEvent = Union[
+    MessageChunk, MessageStop, Commentary,
+    ToolCallChunk, ToolCallFinished, LongToolHint, GatewayNotice,
+]
+
+__all__ = [
+    "MessageChunk", "MessageStop", "Commentary", "ToolCallChunk",
+    "ToolCallFinished", "LongToolHint", "GatewayNotice", "StreamEvent",
+]
+
+
+
+=== ARCHIVO: .\hermes-agent\gateway\systemd_notify.py ===
+"""Minimal, optional systemd ``sd_notify`` support for the gateway."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import math
+import os
+import socket
+
+
+def _notify_socket() -> str:
+    return os.environ.get("NOTIFY_SOCKET", "").strip() if hasattr(socket, "AF_UNIX") else ""
+
+
+def notify(message: str) -> bool:
+    """Send an sd_notify datagram if systemd configured it; failures never block gateway startup."""
+    if not (address := _notify_socket()) or not isinstance(message, str) or not message:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+            sender.setblocking(False)  # a full receiver buffer must not stall the event loop
+            # systemd's ``@abstract`` notation -> Python's leading-NUL address form
+            sender.connect("\0" + address[1:] if address.startswith("@") else address)
+            sender.send(message.encode("utf-8"))
+        return True
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def watchdog_interval_seconds() -> float | None:
+    try:
+        interval = float(os.environ.get("WATCHDOG_USEC", "") if _notify_socket() else "") / 1e6
+    except (TypeError, ValueError):
+        return None
+    return interval if math.isfinite(interval) and interval > 0 else None
+
+
+class SystemdWatchdog:
+    """Feed systemd while the asyncio event loop continues to make progress."""
+
+    def __init__(self, *, config_enabled: bool = True, lag_tolerance_seconds: float | None = None):
+        self._config_enabled = bool(config_enabled)
+        self.interval_seconds = watchdog_interval_seconds()
+        self._lag_tolerance_seconds = lag_tolerance_seconds
+        self._task: asyncio.Task[None] | None = None
+        self._unhealthy = self._stopping = self._stopping_notified = False
+
+    enabled = property(lambda self: self._config_enabled and self.interval_seconds is not None)
+    unhealthy = property(lambda self: self._unhealthy)
+    task = property(lambda self: self._task)
+
+    def _lag_tolerance(self) -> float:
+        default = max(0.1, (self.interval_seconds or 0.0) * 0.25)
+        with contextlib.suppress(TypeError, ValueError):
+            value = float(self._lag_tolerance_seconds)
+            return max(0.0, value) if math.isfinite(value) else default
+        return default
+
+    def start(self) -> bool:
+        if not self.enabled:
+            return False
+        if self._task is not None and not self._task.done():
+            return True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        self._stopping = self._unhealthy = self._stopping_notified = False
+        self._task = asyncio.create_task(self._run(), name="hermes-systemd-watchdog")
+        return True
+
+    def ready(self, status: str = "Gateway running") -> bool:
+        safe_status = str(status or "Gateway running").replace("\n", " ")
+        return self.enabled and notify(f"READY=1\nSTATUS={safe_status}")
+
+    def record_tick(self, *, scheduled_at: float, now: float) -> bool:
+        """Feed systemd only when the event loop woke within its lag budget."""
+        if not self.enabled or self._stopping or self._unhealthy:
+            return False
+        try:
+            lag = float(now) - float(scheduled_at)
+        except (TypeError, ValueError):
+            lag = float("inf")
+        if not math.isfinite(lag) or lag > self._lag_tolerance():
+            self._unhealthy = True
+            notify("STATUS=watchdog unhealthy: event loop progress is late")
+            return False
+        notify("WATCHDOG=1")
+        return True
+
+    async def _run(self) -> None:
+        if self.interval_seconds is None:
+            return
+        cadence = max(0.01, self.interval_seconds / 2.0)
+        loop = asyncio.get_running_loop()
+        scheduled_at = loop.time() + cadence
+        with contextlib.suppress(asyncio.CancelledError):
+            while not self._stopping and not self._unhealthy:
+                await asyncio.sleep(max(0.0, scheduled_at - loop.time()))
+                now = loop.time()
+                if not self.record_tick(scheduled_at=scheduled_at, now=now):
+                    return
+                scheduled_at += cadence
+                if scheduled_at < now:
+                    scheduled_at = now + cadence
+
+    async def stop(self) -> None:
+        """Stop feeding systemd and emit ``STOPPING=1`` at most once."""
+        self._stopping = True
+        task = self._task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()  # no-op on a finished task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._task = None
+        if self.enabled and not self._stopping_notified:
+            notify("STOPPING=1")
+            self._stopping_notified = True
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from typing import Optional  # noqa: F401,E402
+# ---- END PLUGIN-COMPAT ----
+

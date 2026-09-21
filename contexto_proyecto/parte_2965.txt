@@ -1,0 +1,239 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_timestamp_sidecar_replay.py ===
+"""Timestamp rendering must not discard the exact sent user-message prefix."""
+
+from copy import deepcopy
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import json
+
+import pytest
+
+from gateway.message_timestamps import render_user_content_with_timestamp
+from gateway.run import _build_gateway_agent_history, _select_cached_agent_history
+
+
+STAMP = datetime(2026, 8, 20, 12, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+POLICY = "## Recall policy\nUse the retrieval tool when earlier details are needed."
+NOTE = "[System note: Your previous turn was interrupted. Continue the old task.]"
+
+
+def _render(text, timestamp=STAMP):
+    from hermes_time import get_timezone
+
+    return render_user_content_with_timestamp(text, timestamp, tz=get_timezone())
+
+
+
+@pytest.mark.parametrize("timestamps", [False, True])
+@pytest.mark.parametrize("embedded", [False, True])
+@pytest.mark.parametrize("real_text", ["", "please check the result"])
+def test_recovery_cleanup_never_restores_a_sidecar(timestamps, embedded, real_text):
+    original = NOTE + (" " + real_text if real_text else "")
+    if embedded:
+        original = "[2026-08-20T12:00:00+00:00] " + original
+    replay, _ = _build_gateway_agent_history(
+        [{"role": "user", "content": original, "api_content": original + "\n\n" + POLICY, "timestamp": STAMP + 100}],
+        inject_timestamps=timestamps,
+    )
+    if not real_text:
+        assert replay == []
+    else:
+        assert "api_content" not in replay[0]
+        assert "System note:" not in replay[0]["content"]
+        expected_timestamp = STAMP if embedded else STAMP + 100
+        assert replay[0]["content"] == (_render(real_text, expected_timestamp) if timestamps else real_text)
+
+
+@pytest.fixture
+def responses_agent(tmp_path, monkeypatch):
+    """Use the real agent/Responses converter; replace only the network call."""
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    captured = []
+    responses = []
+    sid = "sanitized-timestamp-replay"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook, **kw: [{"context": POLICY}] if hook == "pre_llm_call" else [],
+    )
+
+    def respond(kwargs, **unused):
+        captured.append(deepcopy(kwargs))
+        output = responses.pop(0) if responses else [
+            {"type": "message", "id": "msg_done", "role": "assistant", "status": "completed", "phase": "final_answer", "content": [{"type": "output_text", "text": "done", "annotations": []}]}
+        ]
+        from openai.types.responses import Response
+
+        return Response.model_validate({
+            "id": "resp_test", "object": "response", "created_at": STAMP,
+            "model": "test-model", "status": "completed", "output": output,
+            "usage": None, "error": None, "incomplete_details": None,
+            "instructions": None, "metadata": {}, "parallel_tool_calls": True,
+            "temperature": None, "tool_choice": "auto", "tools": [], "top_p": None,
+        })
+
+    def make_agent():
+        agent = AIAgent(
+            api_key="test-key", base_url="http://127.0.0.1:1/v1", provider="openai-compat",
+            model="test-model", api_mode="codex_responses", max_iterations=4,
+            enabled_toolsets=[], quiet_mode=True, skip_context_files=True,
+            skip_memory=True, save_trajectories=False, session_db=db, session_id=sid,
+        )
+        agent._cached_system_prompt = "Stable synthetic system prompt."
+        agent.valid_tool_names = {"read_file"}
+        monkeypatch.setattr(agent, "_interruptible_streaming_api_call", respond)
+        monkeypatch.setattr(agent, "_interruptible_api_call", respond)
+        return agent
+
+    yield make_agent, captured, responses, db, sid
+    db.close()
+
+
+@pytest.mark.parametrize("timestamps", [False, True])
+@pytest.mark.parametrize("resume", ["cached", "db"])
+def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_path, timestamps, resume):
+    make_agent, captured, responses, db, sid = responses_agent
+    agent = make_agent()
+    tool_file = tmp_path / "sanitized-tool.txt"
+    tool_file.write_text("fixture result", encoding="utf-8")
+    responses.extend([
+        [
+            {"type": "reasoning", "id": "rs_test", "summary": [], "encrypted_content": "synthetic-reasoning"},
+            {"type": "function_call", "id": "fc_test", "call_id": "call_test", "name": "read_file", "arguments": json.dumps({"path": str(tool_file)})},
+        ],
+        [{"type": "message", "id": "msg_done", "role": "assistant", "status": "completed", "phase": "final_answer", "content": [{"type": "output_text", "text": "done", "annotations": []}]}],
+    ])
+    current = _render("first question") if timestamps else "first question"
+    result = agent.run_conversation(current, conversation_history=[], task_id="first", persist_user_message="first question", persist_user_timestamp=STAMP)
+    assert result["completed"]
+    assert len(captured) == 2
+    first_input = captured[0]["input"]
+    continuation = captured[1]["input"]
+    assert continuation[:len(first_input)] == first_input
+    assert any(item.get("call_id") == "call_test" and item.get("type") == "function_call_output" for item in continuation)
+
+    history = db.get_messages_as_conversation(sid)
+    if resume == "db":
+        from hermes_state import SessionDB
+
+        reopened = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            history = reopened.get_messages_as_conversation(sid)
+        finally:
+            reopened.close()
+    replay, observed = _build_gateway_agent_history(history, inject_timestamps=timestamps)
+    assert observed is None
+    if resume == "cached":
+        replay = _select_cached_agent_history(replay, agent._session_messages)
+    else:
+        agent = make_agent()
+    next_user = _render("second question", STAMP + 30) if timestamps else "second question"
+    result = agent.run_conversation(next_user, conversation_history=replay, task_id="second", persist_user_message="second question", persist_user_timestamp=STAMP + 30)
+    assert result["completed"]
+    assert len(captured) == 3
+    next_input = captured[2]["input"]
+    assert next_input[:len(continuation)] == continuation
+    assert not any("api_content" in item or "timestamp" in item for item in next_input)
+    assert any(item.get("encrypted_content") == "synthetic-reasoning" for item in next_input)
+    assert any(item.get("phase") == "final_answer" for item in next_input)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_tini_shim.py ===
+"""Unit tests for docker/tini-shim.sh argument stripping (#66679).
+
+These run without Docker: the shim's HERMES_TINI_SHIM_TARGET /
+HERMES_TINI_SHIM_WRAPPER hooks let us record the argv that would be
+handed to /init.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SHIM = REPO_ROOT / "docker" / "tini-shim.sh"
+
+
+@pytest.fixture
+def recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """Fake /init + wrapper that print argv, one token per line."""
+    init = tmp_path / "fake-init"
+    wrapper = tmp_path / "fake-wrapper"
+    init.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    wrapper.write_text("#!/bin/sh\nprintf 'wrapper\\n'\n")
+    init.chmod(0o755)
+    wrapper.chmod(0o755)
+    return init, wrapper
+
+
+def _run_shim(
+    recorder: tuple[Path, Path],
+    args: list[str],
+) -> subprocess.CompletedProcess[str]:
+    init, wrapper = recorder
+    env = os.environ.copy()
+    env["HERMES_TINI_SHIM_TARGET"] = str(init)
+    env["HERMES_TINI_SHIM_WRAPPER"] = str(wrapper)
+    return subprocess.run(
+        ["sh", str(SHIM), *args],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
+    )
+
+
+def test_shim_script_is_executable_bit_friendly() -> None:
+    assert SHIM.is_file()
+    text = SHIM.read_text()
+    assert text.startswith("#!/bin/sh")
+    assert "HERMES_TINI_SHIM_TARGET" in text
+
+
+def test_strips_g_and_double_dash(recorder: tuple[Path, Path]) -> None:
+    """Legacy `tini -g -- gateway run` must not forward `-g` to /init."""
+    r = _run_shim(recorder, ["-g", "--", "gateway", "run"])
+    assert r.returncode == 0, r.stderr
+    lines = [ln for ln in r.stdout.splitlines() if ln]
+    init, wrapper = recorder
+    assert lines[0] == str(wrapper)
+    assert lines[1:] == ["gateway", "run"]
+    assert "-g" not in lines
+    assert "--" not in lines
+
+
+
+
+
+
+def test_does_not_double_wrap_existing_wrapper(
+    recorder: tuple[Path, Path],
+) -> None:
+    _, wrapper = recorder
+    r = _run_shim(recorder, ["-g", "--", str(wrapper), "gateway", "run"])
+    assert r.returncode == 0, r.stderr
+    lines = [ln for ln in r.stdout.splitlines() if ln]
+    assert lines == [str(wrapper), "gateway", "run"]
+
+
+def test_strips_p_and_e_with_arguments(recorder: tuple[Path, Path]) -> None:
+    r = _run_shim(
+        recorder,
+        ["-p", "SIGKILL", "-e", "143", "-v", "-v", "--", "sleep", "infinity"],
+    )
+    assert r.returncode == 0, r.stderr
+    lines = [ln for ln in r.stdout.splitlines() if ln]
+    _, wrapper = recorder
+    assert lines == [str(wrapper), "sleep", "infinity"]
+    assert "SIGKILL" not in lines
+    assert "143" not in lines
+

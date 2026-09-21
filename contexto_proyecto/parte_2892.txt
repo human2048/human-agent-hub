@@ -1,0 +1,316 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_stale_base_url_api_mode.py ===
+"""Regression tests for #25107: gateway /model switch left a stale
+``base_url``/never persisted ``api_mode`` in config.yaml when switching to a
+custom provider whose resolver returned an empty ``base_url``.
+
+Root cause: both the picker-tap path (``_on_model_selected`` in
+``gateway/slash_commands.py``) and the typed ``/model X --global`` path
+(``_finish_switch``) guarded the persist block with two *independent*
+``if``s:
+
+    if result.base_url:
+        model_cfg["base_url"] = result.base_url
+    if target_provider != "custom":
+        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+
+For a NAMED provider the second ``if`` always clears any stale value, so the
+bug was invisible there. But for a ``custom`` provider with an empty
+resolved ``base_url``, NEITHER branch fires: the old base_url survives
+untouched, and ``api_mode`` was never written to ``model_cfg`` at all in
+either branch (only present in the in-memory session override).
+
+Fix: an explicit set-or-clear for both fields when the target provider is
+custom, so a genuine switch always leaves config.yaml coherent with the
+resolved result.
+"""
+
+import types
+
+import yaml
+import pytest
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+
+
+class _FakePickerAdapter:
+    def __init__(self):
+        self.captured_callback = None
+
+    async def send_model_picker(self, *, on_model_selected, **kwargs):
+        self.captured_callback = on_model_selected
+        return types.SimpleNamespace(success=True)
+
+
+def _make_runner(adapter=None):
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter} if adapter else {}
+    runner._voice_mode = {}
+    runner._session_model_overrides = {}
+    runner._running_agents = {}
+    return runner
+
+
+def _make_event(text):
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+    )
+
+
+def _fake_switch_result(*, base_url="", api_mode=""):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    return ModelSwitchResult(
+        success=True,
+        new_model="local-llama",
+        target_provider="custom",
+        provider_changed=True,
+        api_key="sk-local",
+        base_url=base_url,
+        api_mode=api_mode,
+        provider_label="Custom",
+        is_global=True,
+    )
+
+
+def _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value, *, base_url="", api_mode=""):
+    import gateway.run as gateway_run
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump({"model": model_yaml_value, "providers": {}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.model_switch_providers.list_picker_providers",
+        lambda **kw: [{"slug": "custom", "name": "Custom", "models": ["local-llama"]}],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kw: _fake_switch_result(base_url=base_url, api_mode=api_mode),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *a, **k: 8192,
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: hermes_home)
+    return cfg_path
+
+
+_STALE_MODEL_CFG = {
+    "default": "old-custom-model",
+    "provider": "custom",
+    "base_url": "https://old-stale-endpoint.example/v1",
+    "api_key": "sk-stale",
+    "api_mode": "anthropic_messages",
+}
+
+
+# ---------------------------------------------------------------------------
+# Typed `/model X --global` path (_finish_switch)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_typed_switch_to_custom_clears_stale_base_url_and_api_mode(tmp_path, monkeypatch):
+    """Switching to a custom provider whose resolver returns no base_url/
+    api_mode must clear the previous custom endpoint's leftovers, not keep
+    routing at the old host/protocol (#25107)."""
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, dict(_STALE_MODEL_CFG))
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model local-llama --provider custom --global")
+    )
+
+    assert result is not None
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "local-llama"
+    assert "base_url" not in written["model"], (
+        "stale base_url from the old custom endpoint must be cleared"
+    )
+    assert "api_mode" not in written["model"], (
+        "stale api_mode from the old custom endpoint must be cleared"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Picker-tap path (_on_model_selected)
+# ---------------------------------------------------------------------------
+
+
+async def _drive_picker(runner, event):
+    sent = await runner._handle_model_command(event)
+    assert sent is None
+    adapter = runner.adapters[Platform.TELEGRAM]
+    assert adapter.captured_callback is not None, "picker callback was not wired"
+    return await adapter.captured_callback("12345", "local-llama", "custom")
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_to_custom_clears_stale_base_url_and_api_mode(tmp_path, monkeypatch):
+    """Same bug, picker-tap path: tapping a custom-provider model with an
+    empty resolved base_url must clear the previous custom endpoint (#25107).
+    """
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, dict(_STALE_MODEL_CFG))
+
+    confirmation = await _drive_picker(_make_runner(adapter), _make_event("/model --global"))
+
+    assert confirmation is not None
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert "base_url" not in written["model"]
+    assert "api_mode" not in written["model"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_stale_confirmation_expiry.py ===
+"""Tests for stale confirmation text expiry in gateway history.
+
+Reproduces the failure mode in #59607: when a host-restart-causing tool
+runs, the user confirmation text remains in conversation history. On
+resume, the LLM sees the confirmation at the tail and may re-execute the
+destructive action if the user sends any follow-up.
+
+The fix: high-risk confirmation messages (user messages containing a
+known dangerous confirmation pattern) are tagged with a creation
+timestamp when they enter conversation history. On history replay, if
+the confirmation is older than EXPIRY (60s by default), the confirmation
+text is stripped from agent history before the model sees it.
+
+This complements 75ed07ace (which handles dangling assistant tool_calls
+tail) by handling the user-side confirmation tail.
+"""
+
+import time
+import pytest
+from typing import Dict, List
+
+from agent.replay_cleanup import (
+    is_dangerous_confirmation as _is_dangerous_confirmation,
+    strip_stale_dangerous_confirmations as _strip_stale_dangerous_confirmations,
+)
+from gateway.run import _build_gateway_agent_history
+
+
+# High-risk confirmation patterns. A user message matching one of these
+# (case-insensitive) is considered a "confirmation text" and is subject
+# to the expiry rule. Add new patterns here as new high-risk side effects
+# are introduced.
+
+
+def _make_history_with_confirmation(
+    *,
+    user_message_at: float,
+    assistant_warning_at: float,
+    confirmation_message: str,
+    confirmation_at: float,
+    assistant_action_at: float,
+) -> List[Dict]:
+    """Build a synthetic conversation history with a confirmation text.
+
+    Uses the real gateway's "timestamp" field (epoch seconds, as set in
+    gateway/run.py:11616, 11650, 11692, etc).
+    """
+    return [
+        {"role": "user", "content": "can you force a restart?", "timestamp": user_message_at},
+        {"role": "assistant", "content": "Rebooting the host is dangerous. To confirm, please type: 'confirm forced restart'", "timestamp": assistant_warning_at},
+        {"role": "user", "content": confirmation_message, "timestamp": confirmation_at},
+        {"role": "assistant", "content": "OK, restarting now.", "timestamp": assistant_action_at},
+    ]
+
+
+def test_stale_confirmation_text_is_stripped_on_resume():
+    """A confirmation text older than EXPIRY (60s by default) is stripped.
+
+    This is the core fix for #59607.
+    """
+    current_time = time.time()
+    # User confirmation was 5 minutes ago — well past the 60s expiry
+    user_message_at = current_time - 1000
+    assistant_warning_at = current_time - 999
+    confirmation_at = current_time - 300  # 5 minutes ago
+    assistant_action_at = current_time - 299
+
+    history = _make_history_with_confirmation(
+        user_message_at=user_message_at,
+        assistant_warning_at=assistant_warning_at,
+        confirmation_message="confirm forced restart",
+        confirmation_at=confirmation_at,
+        assistant_action_at=assistant_action_at,
+    )
+
+    agent_history, _ = _build_gateway_agent_history(history)
+
+    # The stale confirmation text should be gone
+    confirmation_present = any(
+        m.get("role") == "user" and "confirm forced restart" in (m.get("content") or "")
+        for m in agent_history
+    )
+    assert not confirmation_present, (
+        f"Stale confirmation text should be stripped on resume. "
+        f"Got agent_history: {agent_history}"
+    )
+
+
+def test_non_confirmation_text_is_preserved():
+    """A regular user message is never treated as a confirmation."""
+    current_time = time.time()
+    user_message_at = current_time - 1000  # 17 min ago
+    confirmation_at = current_time - 300   # 5 min ago
+
+    history = [
+        {"role": "user", "content": "can you help me with the docs?", "timestamp": user_message_at},
+        {"role": "assistant", "content": "Sure, what do you need?", "timestamp": confirmation_at},
+    ]
+
+    agent_history, _ = _build_gateway_agent_history(history)
+
+    # Both messages should still be there
+    user_msgs = [m for m in agent_history if m.get("role") == "user"]
+    assert len(user_msgs) == 1
+    assert "help me with the docs" in user_msgs[0].get("content", "")
+
+
+def test_redaction_preserves_role_alternation():
+    """Expiry must redact in place, never delete the user message.
+
+    The incident tail is ``user(confirm) → assistant("OK, restarting")``.
+    Deleting the user row would leave two consecutive assistant messages,
+    violating the strict role-alternation invariant providers enforce.
+    """
+    current_time = time.time()
+    history = _make_history_with_confirmation(
+        user_message_at=current_time - 1000,
+        assistant_warning_at=current_time - 999,
+        confirmation_message="confirm forced restart",
+        confirmation_at=current_time - 300,
+        assistant_action_at=current_time - 299,
+    )
+
+    cleaned = _strip_stale_dangerous_confirmations(history, now=current_time)
+
+    # Same message count — nothing deleted.
+    assert len(cleaned) == len(history)
+    # The user slot survives with an expiry sentinel instead of the phrase.
+    redacted = cleaned[2]
+    assert redacted["role"] == "user"
+    assert "confirm forced restart" not in redacted["content"]
+    assert "EXPIRED" in redacted["content"]
+    # No two consecutive same-role messages anywhere.
+    roles = [m["role"] for m in cleaned]
+    assert all(a != b for a, b in zip(roles, roles[1:])), roles
+    # Original history object is not mutated.
+    assert history[2]["content"] == "confirm forced restart"
+

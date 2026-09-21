@@ -1,0 +1,226 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\auteur\templates\STORYBOARD.md ===
+# STORYBOARD — <project>
+
+## Film meta
+- **Product:**
+- **Audience:**
+- **The one feeling:** <!-- awe / calm / hunger / trust / momentum … -->
+- **Peak scene:** <!-- exactly one, intensity ≥8 -->
+- **Assets available up front:** <!-- footage / photos / 3D / none -->
+- **Sourced-asset findings:** <!-- what a sourced asset turned out to make possible that you did not plan for. Inspect before you write: a glTF's node names, an HDRI's actual light direction, a texture's tiling. "the mesh has 8 named nodes" is the kind of fact that changes the film, and it must not live only in one session's reasoning. -->
+- **Assumptions made:** <!-- if intake was autonomous, every answer you derived instead of asking goes HERE (direct.md §0a) -->
+- **References taken:** <!-- 2–3 from design/refs/REFERENCES.md: "site — the ONE mechanic — how it changes here". Only sites you looked at. -->
+- **Moodboard read:** <!-- one line: palette relationship + light character taken from design/moodboard, and the one thing on that sheet to avoid -->
+- **Style gate verdict:** <!-- approved / approved with carried notes / rejected+redone. Carried notes = known problems you are deliberately building on; list them so they get resolved, not forgotten. -->
+
+## Arc
+<!-- hook → rising → PEAK → proof → door. 5–7 scenes. Adjacent scenes must differ in layout family AND motion family — the columns below are what makes Gate 0 checkable instead of a vibe. -->
+
+| # | Scene | Beat | Intensity (1–10) | layout family | motion family |
+|---|-------|------|------------------|---------------|---------------|
+| 1 |       | hook |                  |               |               |
+| 2 |       |      |                  |               |               |
+| … |       |      |                  |               |               |
+
+<!-- layout family: full-bleed-media / split-asymmetric / centred-type / stacked-cards / editorial-columns / pinned-canvas / marginal-notes …
+     motion family: scroll-scrub / pinned-stage / entrance-reveal / parallax-depth / kinetic-type / ambient-loop / none
+     Motion families used across the whole page must be ≤3 (commit-sheet field 5); the same family may
+     repeat, just never in two adjacent scenes. -->
+
+---
+
+### Scene 1 — <name>   | beat: hook | intensity: N
+- **purpose:** feel: … / learn: …
+- **subject:**
+- **layout_family / motion_family:** <!-- must match the Arc table -->
+- **camera:** <!-- eye-level / low-angle / high-angle / macro / orbital / static -->
+- **lighting:** <!-- hard contrast / golden / dusk / studio / neon / paper-flat -->
+- **motion:** <!-- what moves, driven by scroll-scrub | entrance | loop | hover -->
+- **transition_in / out:** <!-- cut / wipe-mask / curtain / letterbox / shutter / depth-parallax / displacement / view-transition -->
+- **scroll_len:** <!-- 100vh–400vh. Literal for pinned and peak scenes; for content-height scenes write "content" rather than a number you will not honour. -->
+- **copy:** H: "…" / sub: "…"  <!-- real words, not lorem -->
+- **media:** <!-- the director's shot spec — route via assets.md §0.5 (source) and §0 (generate) -->
+  - type: <!-- still | A→B morph | video | sequence | element/texture | 3D model | HDRI | none (type-led) -->
+  - route: <!-- SOURCE (source.mjs hdri|model|texture|icon|image|video) or GENERATE (image_generate; image→video backend for clips) — assets.md §0.5 decides -->
+  - frame prompt: <!-- the literal keyframe prompt = subject + camera + lighting + palette anchor. Write it NOW, not in phase 1. -->
+  - motion prompt: <!-- video/morph only. A controlled A→B state change is the WebGL displacement morph, NOT a video model. -->
+  - score: <!-- peak/ambient scenes only: mood/tempo for MiniMax music, or "none" -->
+- **fallback:** <!-- the scene when WebGL/video/motion is unavailable -->
+
+<!-- repeat per scene -->
+
+## Gate 0 checklist
+- [ ] exactly one scene with intensity ≥8
+- [ ] no two adjacent scenes share layout family or motion family (check the Arc table)
+- [ ] ≤3 distinct motion families across the whole page
+- [ ] every scene has real copy and a fallback
+- [ ] every `media:` block is filled: type, route, and — for a GENERATED scene — a literal frame prompt; for a SOURCED or live-3D scene, the equivalent direction to the renderer (subject + camera + lighting + palette), which is what you tune the light rig against; for a type-led scene, `none`. A one-line "generate something" is not a producible ask
+- [ ] storyboard approved (user) / self-reviewed against the one feeling (autonomous)
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\auteur\templates\SYSTEM-SHEET.md ===
+# SYSTEM-SHEET — <product>
+
+> Filled BEFORE any markup. The route map says what exists; the inventory says what it is built from
+> and — critically — **how many variants of each thing are allowed**. That number is the budget
+> `systemscan` enforces after the build. Declaring four button variants and shipping nine is the
+> disease this file exists to prevent.
+
+## Product
+- **What it does:**
+- **Who uses it, how often:** <!-- daily tools want less personality than monthly ones -->
+- **Stack / where the markup lands:** <!-- static, React, Vue, Rails views… and who plugs it in -->
+- **The moment of care:** <!-- the ONE place this product is more than correct. Not a wow moment — an empty state that genuinely helps, a table that does something smart, a keyboard flow that feels designed. There is no peak in this register. -->
+
+## Route map
+
+<!-- Every screen. A route nobody can describe in one line is a route nobody designed. -->
+
+| route | job (one line) | layout family | in the shell? | traffic |
+|---|---|---|---|---|
+| `/` |  |  | yes | high |
+| `/…` |  |  |  |  |
+
+**The shell** <!-- what persists across routes: nav, sidebar, header, page frame. Its mistakes are on every screen, so it is built first, right after tokens. -->
+- structure:
+- collapses to (mobile):
+- current-route indicator:
+
+**Build order** <!-- by traffic, not by interest. The boring high-traffic screen sets the patterns. -->
+1.
+2.
+
+## Component inventory
+
+<!-- Every control the product needs, with its variant count DECLARED. Add a row only when a screen
+     genuinely needs it — a component nobody has a route for is speculative work. -->
+
+<!-- `systemscan` counts a variant as a PAINTED SIGNATURE: background | colour | border-colour |
+     border-width | radius | font-size/weight | padding | shadow. A disabled button and a small
+     button are separate variants whether or not you name them. `<a class="btn">` counts as a
+     button, not a link. Pass these numbers per kind:
+       --max-variants button=3,link=4,input=2,select=1 -->
+
+| component | variants (name them all) | budget | where used |
+|---|---|---|---|
+| button | primary / ghost / danger | 3 | everywhere |
+| input |  |  |  |
+| select |  |  |  |
+| table |  |  |  |
+| … |  |  |  |
+
+**Non-control components** — pills, badges, banners, skeletons, avatars, tags. `systemscan` does not
+count these (no focus, no interaction), which makes them exactly where drift breeds unseen. Declare
+them here anyway and police them by eye against `components.png`:
+
+| component | variants | where used |
+|---|---|---|
+| status pill |  |  |
+
+**Rule:** a variant not on this list does not get built. If a screen needs one, that is a design
+decision — edit this file first, then build it.
+
+## State matrix
+
+<!-- One row per component. Mark n/a where the state genuinely cannot occur, and say why.
+     focus-visible is never n/a on anything interactive: systemscan presses Tab and looks. -->
+
+| component | default | hover | focus-visible | active | disabled | loading | empty | error | selected |
+|---|---|---|---|---|---|---|---|---|---|
+| button | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | n/a | n/a |
+|  |  |  |  |  |  |  |  |  |  |
+
+**Contrast survives every state.** A degraded, stale or disabled view usually dims something, and
+dimming is how a designed state quietly becomes unreadable — text at `opacity: .5` on a coloured
+surface can fall from 6.9:1 to under 3:1 while every linter stays silent, because they all read the
+undimmed computed colour. State the consequence for each state that changes opacity or colour:
+
+| state | what it dims | measured contrast after dimming |
+|---|---|---|
+| error / stale |  |  |
+| disabled |  |  |
+
+**How each state is reachable.** Five beautiful empty states nobody can open are five states nobody
+reviewed. Name the mechanism — a `:target` fragment, a query param, a fixture flag — preferring one
+that survives with JS off, and list the URLs:
+
+- mechanism:
+- URLs:
+
+**Empty / loading / error are not edge cases.** They are the first thing a new user sees. For each
+screen that can be empty, write the actual words:
+
+| screen | empty state says | the one action that fills it |
+|---|---|---|
+|  |  |  |
+
+## Density
+
+- **Tables:** rows per screen · sticky header? · sort affordance · `tabular-nums` on numerals
+- **Charts:** route to the `dataviz` skill — do not improvise a series palette here
+- **What gets truncated, and how the full value is reachable:**
+
+## Gate checklist
+- [ ] every route has a one-line job and a layout family
+- [ ] the shell is described, including its mobile collapse and its current-route indicator
+- [ ] every component has a named, justified variant count — not "a few"
+- [ ] every interactive component's `focus-visible` is designed, not defaulted
+- [ ] empty / loading / error are written as real copy for every screen that can hit them
+- [ ] build order is by traffic
+- [ ] no peak. If a screen has a wow moment, justify it or cut it.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\PORT_NOTES.md ===
+# Port Notes — baoyu-article-illustrator
+
+Ported from [JimLiu/baoyu-skills](https://github.com/JimLiu/baoyu-skills) v1.57.0.
+
+## Changes from upstream
+
+`SKILL.md`, `references/workflow.md`, `references/usage.md`, `references/style-presets.md`, `references/styles.md`, `references/prompt-construction.md`, and `prompts/system.md` were adapted. The 23 style files and 4 palette files are verbatim copies. The `references/config/` directory was removed entirely.
+
+### Adaptations
+
+| Change | Upstream | Hermes |
+|--------|----------|--------|
+| Metadata namespace | `openclaw` | `hermes` |
+| Trigger | `/baoyu-article-illustrator` slash command + CLI flags | Natural language skill matching |
+| User config | EXTEND.md (project/user/XDG paths) + first-time-setup | Removed — not part of Hermes infra |
+| User prompts | `AskUserQuestion` (batched, multi-question) | `clarify` tool (one question at a time) |
+| Image generation | `baoyu-imagine` (Bun/TypeScript, multi-provider, accepts `--ref`, writes to local path) | `image_generate` (returns URL only; agent downloads via `terminal`/`curl`) |
+| Backend selection | User picks provider via CLI flags | Not agent-selectable — `image_generate` uses the user-configured FAL model. Removed hardcoded "nano banana pro" line from `prompts/system.md`. |
+| Reference images | Passed to backend via `--ref`, copied via shell | `vision_analyze` extracts a textual description (binary never touched by `write_file`/`read_file`); description is embedded in prompts. Optional `terminal cp` for a local record. |
+| Platform support | Linux/macOS/Windows/WSL/PowerShell | Linux/macOS only |
+| File operations | Bash commands | Hermes file tools: `write_file`/`read_file` for text, `terminal` for binaries and URL downloads, `vision_analyze` for reading images |
+| Watermark | Driven by EXTEND.md `watermark.enabled` | Optional — user asks for it per-article |
+| Output directory | EXTEND.md `default_output_dir` (imgs-subdir / same-dir / illustrations-subdir / independent) | Defaults based on input type; user overrides in request |
+
+### What was preserved
+
+- Type × Style × Palette three-dimension framework
+- All style definitions (23 files, verbatim)
+- All palette definitions (4 files, verbatim)
+- Core reference files (workflow, prompt-construction, styles, style-presets) — adapted for Hermes tooling
+- Core principles and workflow structure (analyze → confirm → outline → prompts → generate)
+- Prompt-file-as-reproducibility-record discipline
+- Author, version, homepage attribution
+
+## Syncing with upstream
+
+To pull upstream updates:
+
+```bash
+# Compare versions
+curl -sL https://raw.githubusercontent.com/JimLiu/baoyu-skills/main/skills/baoyu-article-illustrator/SKILL.md | head -5
+# Look for version: line
+
+# Diff style/palette files (safe to overwrite — unchanged from upstream)
+diff <(curl -sL https://raw.githubusercontent.com/JimLiu/baoyu-skills/main/skills/baoyu-article-illustrator/references/styles/blueprint.md) references/styles/blueprint.md
+```
+
+`references/styles/*` and `references/palettes/*` can be overwritten directly. `SKILL.md`, `references/workflow.md`, `references/usage.md`, `references/style-presets.md`, `references/styles.md`, `references/prompt-construction.md`, and `prompts/system.md` must be manually merged since they contain Hermes-specific adaptations (tool wiring, backend neutrality, removed EXTEND.md references).
+

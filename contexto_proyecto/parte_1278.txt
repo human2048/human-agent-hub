@@ -1,0 +1,291 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\references\sources\senate-ld.md ===
+# Senate LD — Lobbying Disclosure (LD-1 / LD-2)
+
+## 1. Summary
+
+The Senate Office of Public Records publishes lobbying disclosures under the
+Lobbying Disclosure Act of 1995 (LDA, as amended by HLOGA 2007). LD-1 is
+registration of a new client-lobbyist relationship; LD-2 is the quarterly
+activity report.
+
+## 2. Access Methods
+
+- **API:** `https://lda.senate.gov/api/v1/` (no auth required for read-only)
+- **Bulk download:** `https://lda.senate.gov/api/v1/filings/?format=csv` (paginated)
+- **Auth:** Token required for >120 req/hour — register at https://lda.senate.gov/api/auth/register/
+- **Rate limit:** 120 req/hour unauthenticated, 1,200 req/hour authenticated
+
+## 3. Data Schema
+
+Key fields emitted by `fetch_senate_ld.py`:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `filing_uuid` | str | Unique filing ID |
+| `filing_type` | str | LD-1, LD-2, LD-203, etc. |
+| `filing_year` | int | Year |
+| `filing_period` | str | Q1/Q2/Q3/Q4 or annual |
+| `registrant_name` | str | Lobbying firm or organization |
+| `registrant_id` | str | Senate-assigned registrant ID |
+| `client_name` | str | Client being represented |
+| `client_id` | str | Senate-assigned client ID |
+| `client_general_description` | str | Client industry / business |
+| `income` | float | LD-2 income from client this quarter (USD) |
+| `expenses` | float | LD-2 expenses (in-house lobbying) |
+| `lobbyists` | str | Semicolon-separated lobbyist names |
+| `issues` | str | Semicolon-separated issue areas |
+| `government_entities` | str | Agencies/chambers contacted |
+| `filing_date` | str | YYYY-MM-DD |
+
+## 4. Coverage
+
+- US federal lobbying only (state lobbying handled by individual state ethics offices)
+- 1999 → present (full electronic coverage from 2008)
+- Quarterly reporting cycle (LD-2)
+- ~1M+ filings cumulative
+
+## 5. Cross-Reference Potential
+
+- **USAspending** ↔ `client_name` (clients lobbying for contracts)
+- **SEC EDGAR** ↔ `client_name` (public companies as lobbying clients)
+- **OFAC SDN** ↔ `client_name` (sanctions screening of lobbying clients)
+
+Join key: normalized client_name. registrant_id and client_id are canonical
+when joining Senate-internal records.
+
+## 6. Data Quality
+
+- Many lobbyist names appear in multiple registrants over time (job changes)
+- `issues` and `government_entities` are free-text — Inconsistent capitalization
+- Foreign agents register under FARA (Department of Justice), NOT here
+- Income/expenses are reported in $10,000 brackets in some older filings
+
+## 7. Acquisition Script
+
+Path: `scripts/fetch_senate_ld.py`
+
+```bash
+# By client
+python3 SKILL_DIR/scripts/fetch_senate_ld.py --client "EXAMPLE CORP" \
+    --year 2024 --out data/lobbying.csv
+
+# By registrant (lobbying firm)
+python3 SKILL_DIR/scripts/fetch_senate_ld.py --registrant "BIG K STREET LLP" \
+    --year 2024 --out data/lobbying.csv
+```
+
+Set `SENATE_LDA_TOKEN` env var if you have one (or pass `--token`).
+Defaults to anonymous (120 req/hour).
+
+## 8. Legal & Licensing
+
+- Public record under 2 U.S.C. § 1604 (LDA)
+- No commercial use restrictions
+- Reuse is unconditional — see Senate Public Records Office disclaimer
+
+## 9. References
+
+- API docs: https://lda.senate.gov/api/redoc/v1/
+- LDA guidance: https://lobbyingdisclosure.house.gov/ld_guidance.pdf
+- Senate Public Records: https://lda.senate.gov/
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\references\sources\usaspending.md ===
+# USAspending — Federal Government Contracts and Grants
+
+## 1. Summary
+
+USAspending.gov is the official source of federal spending data. Coverage:
+contracts, grants, loans, direct payments, sub-awards. Required by the DATA Act
+of 2014 — all federal agencies must report to a single schema.
+
+## 2. Access Methods
+
+- **API v2:** `https://api.usaspending.gov/api/v2/` (no auth, no key)
+- **Bulk:** `https://files.usaspending.gov/` (CSV / Parquet by award type)
+- **Auth:** None
+- **Rate limit:** Not strictly enforced, but be polite — keep to <10 req/s
+
+## 3. Data Schema
+
+Key fields emitted by `fetch_usaspending.py` (prime awards):
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `award_id` | str | Federal award ID (PIID for contracts, FAIN for grants) |
+| `recipient_name` | str | Awardee legal name |
+| `recipient_uei` | str | Unique Entity Identifier (replaced DUNS in 2022) |
+| `recipient_duns` | str | Legacy DUNS number (historical only) |
+| `recipient_parent_name` | str | Ultimate parent organization |
+| `recipient_state` | str | Recipient state |
+| `awarding_agency` | str | Department / agency name |
+| `awarding_sub_agency` | str | Sub-tier (e.g. DoD → Army) |
+| `award_type` | str | Contract / Grant / Loan / Direct Payment |
+| `award_amount` | float | Current total obligation in USD |
+| `award_date` | str | Action / signed date YYYY-MM-DD |
+| `period_of_performance_start` | str | YYYY-MM-DD |
+| `period_of_performance_end` | str | YYYY-MM-DD |
+| `naics_code` | str | Industry classification |
+| `psc_code` | str | Product / Service Code |
+| `competition_extent` | str | Full / limited / sole-source |
+| `description` | str | Award description (free-text) |
+
+## 4. Coverage
+
+- US federal awards only (state/local not included)
+- FY 2008 → present (full coverage from FY 2017)
+- Updated bi-weekly from agency reporting
+- ~100M+ transaction records cumulative
+
+## 5. Cross-Reference Potential
+
+- **SEC EDGAR** ↔ `recipient_name` (public companies as contractors)
+- **Senate LD** ↔ `recipient_name` (lobbying clients winning contracts)
+- **OFAC SDN** ↔ `recipient_name` (sanctions screening of contractors — must be
+  filtered out by SAM.gov but verify)
+- **ICIJ Offshore** ↔ `recipient_name` (offshore-linked contractors)
+
+Join key: normalized recipient name. UEI is canonical when present.
+
+## 6. Data Quality
+
+- DUNS → UEI transition (April 2022) — old records have DUNS, new records have UEI
+- Some sub-awards aren't reported (FFATA threshold is $30k)
+- Award amount changes over time (mod actions) — fetch script reports current total
+- `competition_extent` field is free-text in older records — `fetch_usaspending.py`
+  normalizes to canonical values
+- Recipient name variations are extensive — "ACME LLC", "Acme L.L.C.", "ACME, INC"
+  all appear. Use `entity_resolution.py`.
+
+## 7. Acquisition Script
+
+Path: `scripts/fetch_usaspending.py`
+
+```bash
+# By recipient name
+python3 SKILL_DIR/scripts/fetch_usaspending.py --recipient "EXAMPLE CORP" \
+    --fy 2024 --out data/contracts.csv
+
+# By awarding agency
+python3 SKILL_DIR/scripts/fetch_usaspending.py --agency "Department of Defense" \
+    --fy 2024 --out data/contracts.csv
+
+# Filter to sole-source only
+python3 SKILL_DIR/scripts/fetch_usaspending.py --recipient "EXAMPLE CORP" \
+    --fy 2024 --sole-source-only --out data/contracts.csv
+```
+
+## 8. Legal & Licensing
+
+- Public record under the Federal Funding Accountability and Transparency Act
+  (FFATA, 2006) and DATA Act (2014)
+- No commercial use restrictions on the data
+- Personal information of award recipients (e.g. small business owners' addresses
+  in some grants) should be handled per the source agency's privacy notice
+
+## 9. References
+
+- API docs: https://api.usaspending.gov/
+- Data dictionary: https://www.usaspending.gov/data-dictionary
+- Award schema: https://files.usaspending.gov/docs/Data_Dictionary_Crosswalk.xlsx
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\research\osint-investigation\references\sources\wayback.md ===
+# Wayback Machine — Internet Archive CDX
+
+## 1. Summary
+
+The Internet Archive's Wayback Machine has captured ~900B+ web pages since
+1996. The CDX server API indexes those captures by URL, timestamp, and
+content hash. Free, anonymous, no auth.
+
+## 2. Access Methods
+
+- **CDX server:** `https://web.archive.org/cdx/search/cdx`
+- **Wayback URL:** `https://web.archive.org/web/<timestamp>/<url>`
+- **Save Page Now (write):** `https://web.archive.org/save/<url>` (different API)
+- **Auth:** None
+- **Rate limit:** Generous; be polite (~1 req/s)
+
+## 3. Data Schema
+
+Key fields emitted by `fetch_wayback.py`:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `url` | str | Original URL captured |
+| `timestamp` | str | YYYYMMDDHHMMSS (CDX format) |
+| `wayback_url` | str | Direct replay URL |
+| `mimetype` | str | Content-type at capture |
+| `status` | str | HTTP status (typically 200) |
+| `digest` | str | SHA1 of capture content (collapse-friendly) |
+| `length` | str | Byte length of capture |
+
+## 4. Coverage
+
+- 1996 → present
+- ~900B+ captures across ~700M domains
+- Updated continuously by automated crawls + manual saves
+- Some domains have aggressive coverage (news), others sparse (private)
+
+## 5. Cross-Reference Potential
+
+- **Wikipedia** ↔ Reverse-lookup pages cited as references that have since
+  disappeared
+- **News URLs** ↔ Original article content when present-day URLs 404
+- **Corporate websites** ↔ Historical "About" pages, executive bios that
+  have been scrubbed
+
+The Wayback CDX is most useful as a **content-recovery** layer when other
+sources point to URLs that no longer exist.
+
+## 6. Data Quality
+
+- robots.txt-blocked domains may have spotty or no coverage
+- Captures vary in completeness (HTML may be saved without CSS/JS)
+- Some content is excluded by domain owner request (DMCA, etc.)
+- Coverage of "deep links" (URLs with query strings) is uneven
+- Time resolution is per-capture, not continuous — gaps are common
+
+## 7. Acquisition Script
+
+Path: `scripts/fetch_wayback.py`
+
+```bash
+# All captures of a specific URL
+python3 SKILL_DIR/scripts/fetch_wayback.py --url "https://example.com/page" \
+    --out data/wb.csv
+
+# All captures of a host
+python3 SKILL_DIR/scripts/fetch_wayback.py --url "example.com" \
+    --match host --out data/wb.csv
+
+# All captures of a domain + subdomains
+python3 SKILL_DIR/scripts/fetch_wayback.py --url "example.com" \
+    --match domain --out data/wb.csv
+
+# Only unique-content captures within a date window
+python3 SKILL_DIR/scripts/fetch_wayback.py --url "example.com" \
+    --match host --collapse digest \
+    --from-date 2020-01-01 --to-date 2023-12-31 \
+    --out data/wb.csv
+```
+
+## 8. Legal & Licensing
+
+- Internet Archive captures are made under fair-use research provisions
+- Replay URLs are stable references — citing them is encouraged
+- Internet Archive non-profit terms of use govern content
+- Some content is rights-restricted; replay may be blocked even if the
+  CDX entry shows it as captured
+
+## 9. References
+
+- CDX server docs: https://github.com/internetarchive/wayback/blob/master/wayback-cdx-server/README.md
+- Wayback API: https://archive.org/help/wayback_api.php
+- Internet Archive: https://archive.org/
+

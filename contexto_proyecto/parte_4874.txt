@@ -1,0 +1,286 @@
+
+
+=== ARCHIVO: .\hermes-agent\ui-tui\tsconfig.build.json ===
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@hermes/ink": ["src/types/hermes-ink.d.ts"]
+    }
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\ui-tui\tsconfig.json ===
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "jsx": "react-jsx",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": false,
+    "sourceMap": false,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.d.ts", "src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["src/__tests__", "node_modules", "dist"]
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\ui-tui\packages\hermes-ink\index.js ===
+export * from './dist/entry-exports.js'
+
+
+
+=== ARCHIVO: .\hermes-agent\ui-tui\packages\hermes-ink\package.json ===
+{
+  "name": "@hermes/ink",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/entry-exports.ts --bundle --platform=node --format=esm --packages=external --outdir=dist",
+    "check": "npm run typecheck",
+    "typecheck": "tsc -b . --noEmit",
+    "lint": "echo 'ok!'",
+    "fix": "echo 'nothing to fix'"
+  },
+  "sideEffects": true,
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    },
+    "./text-input": {
+      "types": "./text-input.d.ts",
+      "import": "./text-input.js",
+      "default": "./text-input.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "ink-text-input": "6.0.0",
+    "react": "19.2.7"
+  },
+  "dependencies": {
+    "@alcalzone/ansi-tokenize": "0.1.3",
+    "auto-bind": "5.0.1",
+    "bidi-js": "1.0.3",
+    "chalk": "5.6.2",
+    "cli-boxes": "3.0.0",
+    "code-excerpt": "4.0.0",
+    "emoji-regex": "10.6.0",
+    "get-east-asian-width": "1.6.0",
+    "indent-string": "5.0.0",
+    "lodash-es": "4.18.1",
+    "react": "19.2.7",
+    "react-reconciler": "0.33.0",
+    "semver": "7.8.5",
+    "signal-exit": "4.1.0",
+    "stack-utils": "2.0.6",
+    "strip-ansi": "7.2.0",
+    "supports-hyperlinks": "3.2.0",
+    "type-fest": "4.41.0",
+    "usehooks-ts": "3.1.1",
+    "wrap-ansi": "9.0.2"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "typescript": "6.0.3"
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\ui-tui\packages\hermes-ink\text-input.js ===
+export { default, UncontrolledTextInput } from 'ink-text-input'
+
+
+
+=== ARCHIVO: .\hermes-agent\ui-tui\packages\hermes-ink\tsconfig.json ===
+{
+    "extends": "../../tsconfig.json"
+}
+
+
+=== ARCHIVO: .\hermes-agent\web\AGENTS.md ===
+# web/ + hermes_cli/web_routers/ — the dashboard (`hermes dashboard` → `/chat`)
+
+Applies on top of the root `AGENTS.md`. Backend routers: `hermes_cli/web_routers/*.py`, one file per
+dashboard surface, mounted by `hermes_cli/web_server.py` (+ `web_server_*.py` siblings). Frontend:
+`web/src/`. Shared JSON-RPC/WS client: `apps/shared` (`@hermes/shared`), also used by the desktop.
+
+## The dashboard embeds the REAL `hermes --tui` — not a rewrite
+
+`hermes_cli/pty_bridge.py` + the `@app.websocket("/api/pty")` endpoint in `web_server.py`:
+
+- `web/src/pages/ChatPage.tsx` mounts xterm.js `Terminal` with the WebGL renderer, `@xterm/addon-fit`
+  (container-driven resize) and `@xterm/addon-unicode11` (wide-character widths).
+- `/api/pty?token=…` upgrades to a WebSocket; auth uses the same ephemeral `_SESSION_TOKEN` as REST,
+  passed as a query param because browsers cannot set `Authorization` on a WS upgrade.
+- The server spawns exactly what `hermes --tui` would spawn, through `ptyprocess` (POSIX PTY — WSL
+  works, native Windows does not).
+- Frames are raw PTY bytes each way; resize travels as `\x1b[RESIZE:<cols>;<rows>]`, intercepted
+  on the server and applied with `TIOCSWINSZ`.
+
+**Do not re-implement the primary chat experience in React.** Transcript, composer/input flow
+(including slash-command behaviour), and the PTY-backed terminal belong to the embedded TUI; anything
+added to Ink shows up here automatically. If you are rebuilding the transcript or composer for the
+dashboard, stop and extend Ink (`tui_gateway/AGENTS.md`).
+
+**Structured React UI around the TUI is fine when it is not a second chat surface.** Sidebar
+widgets, inspectors, summaries, status panels (`ChatSidebar`, `ModelPickerDialog`, `ToolCall`)
+complement the embedded TUI. Keep their state independent of the PTY child's session and surface
+their failures non-destructively so the terminal pane keeps working.
+
+## `dashboard` vs `serve`
+
+`dashboard` and `serve` share `cmd_dashboard` / `start_server` but are independent surfaces — neither
+launches the other. `serve` is the headless backend the desktop app spawns (`headless_backend=True`:
+`cmd_dashboard` skips `_build_web_ui` and exports `HERMES_SERVE_HEADLESS=1` so `mount_spa()`
+disables the SPA even if a stray `web_dist/` exists — only JSON-RPC/WS/API is reachable). The
+desktop has no build/runtime dependency on this frontend. Details: `apps/desktop/src/AGENTS.md`.
+
+## Rules
+
+- Auth: every new REST route and WS endpoint uses the same session token; never a second scheme.
+- Routers are one-file-per-surface; a new surface is a new `web_routers/<surface>.py`, not a growing
+  `web_server.py`.
+- Tests: Python in `tests/hermes_cli/` (routers, pty bridge); JS in the `web/` vitest suite. Python
+  tests must not assert about `package.json` / `.tsx` sources (root testing rules). Root TypeScript
+  style rules apply.
+
+
+
+=== ARCHIVO: .\hermes-agent\web\eslint.config.js ===
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import tseslint from 'typescript-eslint'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+    rules: {
+      // Context providers and hook files commonly export both a component
+      // (the Provider) and a hook (useContext). Allow constant exports so
+      // these don't need to be split into separate files.
+      'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+      // TODO: upgrade these react-hooks v7 rules from 'warn' to 'error' after
+      // refactoring set-state-in-effect, ref-as-instance-var, and manual
+      // memoization patterns in the web codebase.
+      'react-hooks/set-state-in-effect': 'warn',
+      'react-hooks/refs': 'warn',
+      'react-hooks/preserve-manual-memoization': 'warn',
+      'react-hooks/static-components': 'warn',
+    },
+  },
+])
+
+
+
+=== ARCHIVO: .\hermes-agent\web\index.html ===
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <title>Hermes Agent - Dashboard</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+
+
+=== ARCHIVO: .\hermes-agent\web\package.json ===
+{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "fix": "npm run lint:fix",
+    "preview": "vite preview",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run lint"
+  },
+  "dependencies": {
+    "@hermes/shared": "file:../apps/shared",
+    "@nous-research/ui": "0.18.2",
+    "@observablehq/plot": "0.6.17",
+    "@react-three/fiber": "9.6.1",
+    "@tailwindcss/vite": "4.3.3",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-unicode11": "0.9.0",
+    "@xterm/addon-web-links": "0.12.0",
+    "@xterm/addon-webgl": "0.19.0",
+    "@xterm/xterm": "6.0.0",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "gsap": "3.15.0",
+    "leva": "0.10.1",
+    "lucide-react": "0.577.0",
+    "motion": "12.42.2",
+    "qrcode": "1.5.4",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-router": "8.3.0",
+    "tailwind-merge": "3.6.0",
+    "tailwindcss": "4.3.3",
+    "unicode-animations": "1.0.3"
+  },
+  "devDependencies": {
+    "@babel/core": "8.0.1",
+    "@rolldown/plugin-babel": "0.2.3",
+    "@types/babel__core": "7.20.5",
+    "@types/node": "22.20.1",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "babel-plugin-react-compiler": "1.0.0",
+    "eslint-plugin-react-refresh": "0.5.3",
+    "three": "0.180.0",
+    "typescript": "6.0.3",
+    "vite": "8.2.0",
+    "vitest": "4.1.10"
+  }
+}
+

@@ -1,0 +1,270 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\toolperf_abeval\README.md ===
+# Core-Toolset A/B Eval Harness
+
+The hard A/B evaluation used for the August 2026 core-toolset performance
+batch (tracker: [#77056](https://github.com/NousResearch/hermes-agent/issues/77056)).
+It measures whether a set of tool-layer changes actually reduces model waste —
+LLM turns, tool calls, tool errors, retries, result bytes, wall clock — on a
+battery of **error-inducing tasks**, each derived from a waste class measured
+in real production traffic.
+
+## Design
+
+- **Two arms, one variable.** `baseline` and `fixes` runs differ ONLY by
+  `PYTHONPATH` (a checkout of `origin/main` vs your integration branch). Same
+  Hermes home, same model, same tasks, same reps.
+- **Tasks are traps.** Each of the 9 tasks is constructed so a specific
+  failure class fires: `python` vs `python3`/venv confusion, an
+  already-applied patch, an ambiguous multi-match edit, wrong-casing search,
+  hidden-dir search, giant truncated output, cd-heavy multi-dir work, a
+  blocklist-tripping inline script, and a paginated big-file read. A change
+  that claims to fix a waste class must move the needle on its trap.
+- **Scoring is from traces, not self-report.** Metrics come from NeMo Relay
+  ATOF traces emitted by the run itself (`llm`/`tool` scope events), plus wall
+  clock and a per-task programmatic success check (marker strings + on-disk
+  verification).
+- **Resume-safe.** Completed `run_id`s in `meta.jsonl` are skipped, so a
+  killed battery continues where it left off. Startup crashes (nonzero exit
+  with empty output) are NOT recorded — they retry on resume instead of
+  polluting cells (this bit the first pass of the Aug 2026 run).
+
+## Setup
+
+1. Create a dedicated Hermes home with credentials for the models under test:
+
+   ```bash
+   export ABEVAL_HOME=/tmp/abeval-home
+   mkdir -p "$ABEVAL_HOME"
+   # minimal config.yaml + provider key, e.g. OpenRouter:
+   cat > "$ABEVAL_HOME/config.yaml" <<'YAML'
+   model:
+     provider: openrouter
+   YAML
+   printf 'OPENROUTER_API_KEY=%s\n' "$KEY" > "$ABEVAL_HOME/.env"
+   ```
+
+   The runner writes a per-run Relay `plugins.toml` and points the native SDK
+   integration at it; no Hermes observability plugin needs to be enabled.
+
+2. Prepare the two trees:
+
+   ```bash
+   git worktree add /tmp/abeval-baseline origin/main
+   # fixes tree = your integration branch checkout
+   ```
+
+## Run
+
+```bash
+cd evals/toolperf_abeval
+export ABEVAL_ROOT=/tmp/abeval-workspace   # results + sandboxes land here
+export ABEVAL_HOME=/tmp/abeval-home
+./run_all.sh /tmp/abeval-baseline /path/to/fixes-tree 3 \
+  "anthropic/claude-sonnet-4.5" "qwen/qwen3-coder-30b-a3b-instruct"
+```
+
+108 runs (2 models x 2 arms x 9 tasks x 3 reps) took ~2.5h on the original
+battery. Re-print tables any time:
+
+```bash
+python3 ab_eval.py report --models "anthropic/claude-sonnet-4.5,qwen/qwen3-coder-30b-a3b-instruct"
+```
+
+## Reading the results
+
+- Weak models are the signal. Strong models recover from most induced errors
+  in one turn, so expect parity there; the fixes' win shows up as fewer
+  turns/tool calls/errors on the weak model. The Aug 2026 batch measured
+  −21% turns, −29% tool calls, errors→0, −23% wall on
+  qwen3-coder-30b, with sonnet-4.5 at parity.
+- Success-rate deltas at n=3 are noise. Audit any sub-100% cell run-by-run
+  (read `meta.jsonl` `tail`) before calling it a regression.
+- The eval can catch product gaps on BOTH arms — e.g. the original run found
+  the hidden-file search probe only fired on total-zero-match searches
+  (fixed on main since).
+
+## Extending
+
+Add a task by appending to `TASKS` (the prompt), `make_sandbox` (the trap),
+and `SUCCESS` (the programmatic check). Keep checks strict and mechanical —
+marker strings and on-disk state, never judge-by-vibes.
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\tool_search\analyze_livetest.py ===
+#!/usr/bin/env python3
+"""Compare enabled vs disabled runs and produce a readable report.
+
+Reads scripts/out/_summary.json and the per-scenario JSONs, prints a side-by-
+side comparison of what happened, and flags anomalies.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE / "out"
+
+
+def load_record(scenario_id: str, mode: str):
+    path = OUT / f"{scenario_id}__{mode}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def fmt_tool_seq(calls):
+    if not calls:
+        return "(none)"
+    return " → ".join(c["name"] for c in calls)
+
+
+def fmt_bridge_seq(calls):
+    if not calls:
+        return "(none)"
+    parts = []
+    for c in calls:
+        if c["name"] == "tool_call":
+            inner = (c.get("args") or {}).get("name", "?")
+            parts.append(f"tool_call→{inner}")
+        elif c["name"] == "tool_search":
+            args = c.get("args") or {}
+            qs = args.get("queries")
+            if isinstance(qs, list):
+                q = "; ".join(str(x) for x in qs)
+            else:  # legacy single-query transcripts
+                q = str(args["query"] if "query" in args else "?")
+            parts.append(f"search('{q[:30]}')")
+        elif c["name"] == "tool_describe":
+            args = c.get("args") or {}
+            ns = args.get("names")
+            if isinstance(ns, list):
+                n = ", ".join(str(x) for x in ns)
+            else:  # legacy single-name transcripts
+                n = str(args.get("name", "?"))
+            parts.append(f"describe({n})")
+    return " → ".join(parts)
+
+
+def main():
+    if not OUT.exists():
+        print("No output directory at", OUT)
+        sys.exit(1)
+    summary_path = OUT / "_summary.json"
+    if not summary_path.exists():
+        print("No _summary.json yet")
+        sys.exit(1)
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    scenarios = sorted({row["scenario"] for row in summary})
+
+    print(f"{'='*78}")
+    print("  Live test results: tool_search ENABLED vs DISABLED")
+    print(f"{'='*78}\n")
+
+    fails = 0
+    for sid in scenarios:
+        en = load_record(sid, "enabled")
+        di = load_record(sid, "disabled")
+        if not en or not di:
+            continue
+        expected = set(en["expected_underlying_tools"])
+
+        print(f"┌─ {sid}  ({en['scenario_description']})")
+        print(f"│  Prompt: {en['prompt'][:120]}")
+        print(f"│  Expected underlying tools: {sorted(expected) or '(none)'}")
+        print("│")
+
+        for label, rec in [("ENABLED ", en), ("DISABLED", di)]:
+            called_under = [c["name"] for c in rec["underlying_tool_calls"]]
+            called_set = set(called_under)
+            missing = expected - called_set
+            extra = called_set - expected - {"read_file", "search_files", "terminal", "todo", "memory"}
+
+            mark = "✓" if (expected.issubset(called_set) and not rec["error"]) else "✗"
+            if mark == "✗":
+                fails += 1
+
+            print(f"│  {label} {mark}  bridges={len(rec['bridge_calls']):2}  underlying={len(rec['underlying_tool_calls']):2}  "
+                  f"iters={rec['n_iterations']:2}  elapsed={rec['elapsed_seconds']:5.1f}s  err={bool(rec['error'])}")
+            print(f"│    underlying: {fmt_tool_seq(rec['underlying_tool_calls'])}")
+            if rec["bridge_calls"]:
+                print(f"│    bridges:    {fmt_bridge_seq(rec['bridge_calls'])}")
+            if missing:
+                print(f"│    ⚠ MISSING expected tools: {sorted(missing)}")
+            if extra:
+                print(f"│    ⓘ extra tools called: {sorted(extra)}")
+            if rec["error"]:
+                print(f"│    💥 error: {rec['error'][:200]}")
+        # Bridge-trip count vs direct (interesting comparator)
+        en_bridges = len(en["bridge_calls"])
+        di_underlying = len(di["underlying_tool_calls"])
+        en_underlying = len(en["underlying_tool_calls"])
+        overhead = en_bridges + en_underlying - di_underlying
+        print(f"│  Δ round-trip cost: enabled used {en_bridges + en_underlying} calls vs disabled {di_underlying}  →  +{overhead}")
+        print(f"│  Final (enabled):  {(en.get('final_response') or '')[:140]}")
+        print(f"│  Final (disabled): {(di.get('final_response') or '')[:140]}")
+        print("└──")
+        print()
+
+    print(f"\nFails: {fails}/{2*len(scenarios)}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\tool_search\README.md ===
+# Tool Search live test harness
+
+Runs five scenarios against a real model (Claude Haiku 4.5 via OpenRouter) to
+verify that the bridge tools work end-to-end. Records transcripts in
+`evals/tool_search/out/`.
+
+## Running
+
+```bash
+cd <repo root>
+python3 evals/tool_search/tool_search_livetest.py        # runs all 5 scenarios x 2 modes
+python3 evals/tool_search/analyze_livetest.py            # side-by-side report
+```
+
+Requires `OPENROUTER_API_KEY` set or present in `~/.hermes/.env`.
+
+## What it verifies
+
+| Scenario | Tests |
+|----------|-------|
+| A obvious_single | BM25 retrieval on an obvious tool name (github_create_issue) |
+| B vague_paraphrased | Retrieval when the model has to paraphrase ("schedule meeting" → evt_create) |
+| C multi_tool_chain | Multi-step task chaining two deferred tools (GitHub + Slack) |
+| D core_plus_deferred | Mixed: core tool (read_file) called directly, deferred tool (Slack) via bridge |
+| E no_tool_needed | Pure-knowledge prompt; verify no spurious tool_search invocations |
+
+Each scenario runs with `tool_search.enabled = on` and again with `off` for an
+A/B baseline. The harness records:
+
+- bridge_calls (the tool_search / tool_describe / tool_call sequence the model emitted)
+- underlying_tool_calls (what actually ran through the registry dispatcher)
+- final_response, iteration count, elapsed time, any errors
+
+## Output structure
+
+```
+evals/tool_search/out/
+  <scenario>__enabled.json    # tool_search ON
+  <scenario>__disabled.json   # tool_search OFF
+  _summary.json               # one-line summary across all runs
+```
+
+The 2026-05 baseline run is checked in for reference. Re-running may produce
+slightly different transcripts (the model is non-deterministic) but the
+expected_underlying_tools assertions should remain satisfied.
+

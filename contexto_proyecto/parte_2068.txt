@@ -1,0 +1,387 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_gateway_turn_sidecar.py ===
+"""Gateway must-deliver notes on the current user message.
+
+The gateway relocates per-turn volatile facts OUT of the ephemeral system
+prompt — auto-reset notes, the first-contact intro, voice-channel changes —
+and stages them on ``agent._gateway_turn_context_notes``.
+``build_turn_context`` consumes them once and delivers them through the same
+api_content sidecar channel as plugin context (string content), or as an
+appended text part on multimodal (list) content, where the string sidecar
+cannot apply and the fact would otherwise silently drop.
+"""
+
+from __future__ import annotations
+
+import types
+from unittest.mock import patch
+
+import pytest
+
+from agent.turn_context import (
+    append_notes_to_multimodal_content,
+    build_turn_context,
+    compose_user_api_content,
+    consume_gateway_turn_context_notes,
+)
+
+
+class _FakeTodoStore:
+    def has_items(self):
+        return True
+
+
+class _FakeGuardrails:
+    def reset_for_turn(self):
+        pass
+
+
+class _FakeAgent:
+    """Minimal stand-in covering only what the prologue touches
+    (mirrors tests/agent/test_api_content_sidecar.py)."""
+
+    def __init__(self):
+        self.session_id = "sess-1"
+        self.model = "test/model"
+        self.provider = "openrouter"
+        self.base_url = "https://openrouter.ai/api/v1"
+        self.api_key = "sk-x"
+        self.api_mode = "chat_completions"
+        self.platform = "discord"
+        self.quiet_mode = True
+        self.max_iterations = 90
+        self.tools = []
+        self.valid_tool_names = set()
+        self._skip_mcp_refresh = True
+        self.compression_enabled = False
+        self.context_compressor = types.SimpleNamespace(
+            protect_first_n=2, protect_last_n=2
+        )
+        self._cached_system_prompt = "SYSTEM"
+        self._memory_store = None
+        self._memory_manager = None
+        self._memory_nudge_interval = 0
+        self._turns_since_memory = 0
+        self._user_turn_count = 0
+        self._todo_store = _FakeTodoStore()
+        self._tool_guardrails = _FakeGuardrails()
+        self._compression_warning = None
+        self._interrupt_requested = False
+        self._memory_write_origin = "assistant_tool"
+        self._stream_context_scrubber = None
+        self._stream_think_scrubber = None
+
+    def _ensure_db_session(self):
+        pass
+
+    def _restore_primary_runtime(self):
+        pass
+
+    def _cleanup_dead_connections(self):
+        return False
+
+    def _emit_status(self, _msg):
+        pass
+
+    def _replay_compression_warning(self):
+        pass
+
+    def _hydrate_todo_store(self, *_a, **_k):
+        pass
+
+    def _safe_print(self, *_a, **_k):
+        pass
+
+    def _persist_session(self, messages, _history=None):
+        pass
+
+
+def _build(agent, **overrides):
+    kwargs = dict(
+        agent=agent,
+        user_message="hello",
+        system_message=None,
+        conversation_history=None,
+        task_id=None,
+        stream_callback=None,
+        persist_user_message=None,
+        restore_or_build_system_prompt=lambda *a, **k: None,
+        install_safe_stdio=lambda: None,
+        sanitize_surrogates=lambda s: s,
+        summarize_user_message_for_log=lambda s: str(s),
+        set_session_context=lambda _sid: None,
+        set_current_write_origin=lambda _o: None,
+        ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
+    )
+    kwargs.update(overrides)
+    return build_turn_context(**kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _stub_runtime_main():
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+        yield
+
+
+RESET_NOTE = (
+    "[System note: The user's previous session expired due to inactivity. "
+    "This is a fresh conversation with no prior context.]"
+)
+VC_NOTE = "[Voice channel now: dev-vc (2 members)]"
+
+
+class TestConsumeIsOneShot:
+    def test_consume_clears_the_attribute(self):
+        agent = _FakeAgent()
+        agent._gateway_turn_context_notes = RESET_NOTE
+        assert consume_gateway_turn_context_notes(agent) == RESET_NOTE
+        assert consume_gateway_turn_context_notes(agent) == ""
+
+    def test_absent_attribute_is_empty(self):
+        assert consume_gateway_turn_context_notes(_FakeAgent()) == ""
+
+    def test_non_string_value_is_empty(self):
+        agent = _FakeAgent()
+        agent._gateway_turn_context_notes = ["not-a-string"]
+        assert consume_gateway_turn_context_notes(agent) == ""
+
+
+class TestStringContentSidecarDelivery:
+    def test_notes_ride_the_api_content_sidecar(self):
+        """String user message: the note lands in the API copy only — the
+        stored content stays clean and the sidecar persists the exact sent
+        bytes (replay keeps them byte-stable in history)."""
+        agent = _FakeAgent()
+        agent._gateway_turn_context_notes = RESET_NOTE
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"
+        assert msg["api_content"] == "hello\n\n" + RESET_NOTE
+        # The composed bytes match what conversation_loop would send.
+        assert msg["api_content"] == compose_user_api_content(
+            "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
+        )
+        # Consumed: a later turn on the same cached agent replays nothing.
+        assert agent._gateway_turn_context_notes == ""
+
+    def test_notes_append_after_plugin_context(self):
+        agent = _FakeAgent()
+        agent._gateway_turn_context_notes = VC_NOTE
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX\n\n" + VC_NOTE
+
+    def test_no_notes_means_no_stamp(self):
+        agent = _FakeAgent()
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+
+class TestMultimodalFallback:
+    def test_notes_appended_as_text_part_on_list_content(self):
+        """Multimodal turns can't take the string sidecar
+        (compose_user_api_content returns None for lists) — the must-deliver
+        fact is appended as a durable text part instead of dropping."""
+        agent = _FakeAgent()
+        agent._gateway_turn_context_notes = RESET_NOTE
+        content = [
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": "https://x/img.png"}},
+        ]
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent, user_message=content)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"][-1] == {"type": "text", "text": RESET_NOTE}
+        # No string sidecar for list content.
+        assert "api_content" not in msg
+
+    def test_helper_appends_only_to_lists(self):
+        content = [{"type": "text", "text": "hi"}]
+        assert append_notes_to_multimodal_content(content, "NOTE") is True
+        assert content[-1] == {"type": "text", "text": "NOTE"}
+        assert append_notes_to_multimodal_content("string", "NOTE") is False
+        assert append_notes_to_multimodal_content(content, "") is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_gemini_alias_native_route.py ===
+"""Provider aliases preserve the native-vs-compatible client boundary."""
+from types import SimpleNamespace
+
+from openai import OpenAI
+
+from agent.agent_runtime_helpers import create_openai_client
+from agent.gemini_native_adapter import GeminiNativeClient
+from providers import get_provider_profile
+
+
+def test_gemini_aliases_preserve_native_endpoint_selection():
+    profile = get_provider_profile("gemini")
+    for provider in (profile.name, *profile.aliases):
+        for base_url, expected in (
+            ("https://generativelanguage.googleapis.com/v1beta", GeminiNativeClient),
+            ("https://example.invalid/v1", OpenAI),
+        ):
+            agent = SimpleNamespace(
+                provider=provider, model="gemini-flash-latest",
+                _client_log_context=lambda: "test",
+                _build_keepalive_http_client=lambda *a, **k: None,
+            )
+            client = create_openai_client(
+                agent, {"api_key": "test-key", "base_url": base_url},
+                reason="fallback", shared=False,
+            )
+            try:
+                assert isinstance(client, expected), (provider, base_url, type(client))
+            finally:
+                client.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_gemini_fast_fallback.py ===
+"""Regression tests for #11314 — credential-pool rotation vs. fallback.
+
+_pool_may_recover_from_rate_limit() is the hinge between credential-pool
+rotation and fallback-provider activation.  Rotation is only worth waiting on
+when the pool exists, has an available entry, and has more than one entry to
+rotate to; otherwise we should fall back to the configured fallback provider
+immediately.
+"""
+import inspect
+from unittest.mock import MagicMock
+
+from agent import conversation_loop
+from run_agent import _pool_may_recover_from_rate_limit
+
+
+def _pool(entries: int = 2):
+    p = MagicMock()
+    p.has_available.return_value = True
+    p.entries.return_value = list(range(entries))
+    return p
+
+
+def test_multi_entry_pool_recovers():
+    assert _pool_may_recover_from_rate_limit(_pool(entries=3)) is True
+
+
+
+
+def test_exhausted_pool_skips_rotation():
+    p = MagicMock()
+    p.has_available.return_value = False
+    assert _pool_may_recover_from_rate_limit(p) is False
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_gemini_free_tier_gate.py ===
+"""Tests for Gemini free-tier detection and blocking."""
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+
+from agent.gemini_native_adapter import (
+    gemini_http_error,
+    is_free_tier_quota_error,
+    probe_gemini_tier,
+)
+
+
+def _mock_response(status: int, headers: dict | None = None, text: str = "") -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status
+    resp.headers = headers or {}
+    resp.text = text
+    return resp
+
+
+def _run_probe(resp: MagicMock) -> str:
+    with patch("agent.gemini_native_adapter.httpx.Client") as MC:
+        inst = MagicMock()
+        inst.post.return_value = resp
+        MC.return_value.__enter__.return_value = inst
+        return probe_gemini_tier("fake-key")
+
+
+class TestProbeGeminiTier:
+    """Verify the tier probe classifies keys correctly."""
+
+
+
+
+
+    def test_free_tier_via_429_body(self):
+        body = (
+            '{"error":{"code":429,"message":"Quota exceeded for metric: '
+            'generativelanguage.googleapis.com/generate_content_free_tier_requests, '
+            'limit: 20"}}'
+        )
+        resp = _mock_response(429, {}, body)
+        assert _run_probe(resp) == "free"
+
+
+    def test_successful_200_without_rpd_header_is_paid(self):
+        resp = _mock_response(200, {}, '{"candidates":[]}')
+        assert _run_probe(resp) == "paid"
+
+
+
+
+
+
+
+
+class TestIsFreeTierQuotaError:
+    def test_detects_free_tier_marker(self):
+        assert is_free_tier_quota_error(
+            "Quota exceeded for metric: generate_content_free_tier_requests"
+        )
+
+
+    def test_no_free_tier_marker(self):
+        assert not is_free_tier_quota_error("rate limited")
+
+
+    def test_none(self):
+        assert not is_free_tier_quota_error(None)  # type: ignore[arg-type]
+
+
+class TestGeminiHttpErrorFreeTierGuidance:
+    """gemini_http_error should append free-tier guidance for free-tier 429s."""
+
+    class _FakeResp:
+        def __init__(self, status: int, text: str):
+            self.status_code = status
+            self.headers: dict = {}
+            self.text = text
+
+    def test_free_tier_429_appends_guidance(self):
+        body = (
+            '{"error":{"code":429,"message":"Quota exceeded for metric: '
+            "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+            'limit: 20","status":"RESOURCE_EXHAUSTED"}}'
+        )
+        err = gemini_http_error(self._FakeResp(429, body))
+        msg = str(err)
+        assert "free tier" in msg.lower()
+        assert "aistudio.google.com/apikey" in msg
+
+    def test_paid_429_has_no_billing_url(self):
+        body = '{"error":{"code":429,"message":"Rate limited","status":"RESOURCE_EXHAUSTED"}}'
+        err = gemini_http_error(self._FakeResp(429, body))
+        assert "aistudio.google.com/apikey" not in str(err)
+
+
+

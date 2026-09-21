@@ -1,0 +1,312 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_priority_path_compression_demotion.py ===
+"""Regression test: the ``_handle_message`` PRIORITY busy-path must also
+demote ``busy_input_mode='interrupt'`` to queue semantics when context
+compression is in flight (#56391), the same as
+``_handle_active_session_busy_message`` already does.
+
+Both code paths handle a message arriving while an agent is already running
+for the session. ``_handle_active_session_busy_message`` (the
+``busy_session_handler`` callback most platform adapters register via
+``gateway/platforms/base.py``) demotes ``interrupt`` -> ``queue`` for two
+independent reasons:
+
+  * active subagents (#30170)
+  * context compression in flight (#56391)
+
+``_handle_message`` has its own, independent inline "PRIORITY" busy-handling
+block (see the ``if _quick_key in self._running_agents:`` guard) that a
+plain-text follow-up reaches directly — mirrors_test_running_agent_session_
+toggles.py already proves ``_handle_message`` is invoked directly with an
+active running agent, not only through the adapter dispatch layer. That
+PRIORITY block's own comment says it mirrors
+``_handle_active_session_busy_message``'s subagent-demotion rationale
+verbatim, and it does demote for active subagents — but it never checks
+``_session_has_compression_in_flight``, so a plain-text follow-up landing on
+this path while compression is mid-flight still interrupts, racing a new
+turn against the pre-rotation parent session exactly as #56391 describes.
+"""
+
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionEntry, SessionSource, build_session_key
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_event(text: str) -> MessageEvent:
+    return MessageEvent(text=text, source=_make_source(), message_id="m1")
+
+
+def _make_runner(*, compression_in_flight: bool):
+    """Minimal GatewayRunner with an active running agent for this session.
+
+    Mirrors tests/gateway/test_running_agent_session_toggles.py's harness
+    (proven to drive _handle_message end-to-end with a live running agent),
+    extended with the compression-lock plumbing
+    _session_has_compression_in_flight reads.
+    """
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    adapter._pending_messages = {}
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+
+    source = _make_source()
+    sk = build_session_key(source)
+    session_entry = SessionEntry(
+        session_key=sk,
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    session_store = MagicMock()
+    session_store.get_or_create_session.return_value = session_entry
+    session_store.load_transcript.return_value = []
+    session_store.has_any_sessions.return_value = True
+    session_store.append_to_transcript = MagicMock()
+    session_store.rewrite_transcript = MagicMock()
+    session_store.update_session = MagicMock()
+    runner.session_store = session_store
+
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._show_reasoning = False
+    runner._service_tier = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    runner._draining = False
+    runner._busy_input_mode = "interrupt"
+
+    # No subagents active — isolates the compression-demotion behavior from
+    # the (already-correct) subagent-demotion branch.
+    runner._agent_has_active_subagents = lambda _agent: False
+    runner._session_has_compression_in_flight = AsyncMock(
+        return_value=compression_in_flight
+    )
+
+    import time
+    agent_mock = MagicMock()
+    agent_mock.get_activity_summary.return_value = {
+        "seconds_since_activity": 0.0,
+        "last_activity_desc": "api_call",
+        "api_call_count": 1,
+        "max_iterations": 60,
+    }
+    runner._running_agents[sk] = agent_mock
+    # Past the Telegram follow-up grace window (HERMES_TELEGRAM_FOLLOWUP_
+    # GRACE_SECONDS, default 3.0s) so the message reaches the PRIORITY
+    # interrupt/steer/subagent-demotion block instead of the earlier
+    # "just started, queue without interrupt" grace-period branch.
+    runner._running_agents_ts[sk] = time.time() - 120
+    return runner, agent_mock, sk
+
+
+@pytest.mark.asyncio
+async def test_priority_path_does_not_interrupt_when_compression_in_flight():
+    """A plain-text follow-up must NOT interrupt the running agent while
+    context compression is in flight — it must queue instead, mirroring
+    _handle_active_session_busy_message's #56391 demotion."""
+    runner, agent_mock, sk = _make_runner(compression_in_flight=True)
+
+    await runner._handle_message(_make_event("still there?"))
+
+    agent_mock.interrupt.assert_not_called()
+    queued = runner.adapters[Platform.TELEGRAM]._pending_messages.get(sk)
+    assert queued is not None and queued.text == "still there?"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_process_hermes_home_expansion.py ===
+"""Gateway identity-file readers expand a literal ``~`` in HERMES_HOME.
+
+``python -m gateway.run`` never passes through the CLI's ``normalize_hermes_home_env()``, so the
+process-level home readers (PID/lock/status, lifecycle ledger, heartbeat) must expand on their own
+or a fish-style ``HERMES_HOME='~/.hermes'`` lands the identity files under ``<cwd>/~/.hermes``.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from gateway import lifecycle_ledger, shutdown_watchdog, status
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [status._get_process_hermes_home, lifecycle_ledger._process_hermes_home,
+     shutdown_watchdog._process_hermes_home],
+    ids=["status", "lifecycle_ledger", "shutdown_watchdog"],
+)
+def test_process_home_readers_expand_literal_tilde(reader, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", "~/.x")
+    assert reader() == tmp_path / ".x"
+    assert reader().is_absolute()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".abs"))
+    assert reader() == Path(tmp_path / ".abs")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_profile_identity_purge.py ===
+"""Profile identity purge for `hermes profile delete`: the delete-only path, and what an unserve
+must leave alone.
+
+`_unserve_profile()` runs for every name that leaves the served set — a rename's old name leaves it
+exactly like a deleted one (its directory is gone either way) and the rename's rekey still needs that
+identity — so the purge lives behind the delete-only ``purge-profile-identity`` control verb and
+never in the unserve path (#111926, delete side).
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+def _make_store(tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(exist_ok=True)
+    store = SessionStore(
+        sessions_dir,
+        GatewayConfig(sessions_dir=sessions_dir, write_sessions_json=False,
+                      multiplex_profiles=True),
+    )
+    store._ensure_loaded()
+    return store
+
+
+def _entry(session_key, chat_id, profile):
+    from gateway.session import SessionEntry, SessionSource, Platform
+    from gateway.session_lifecycle import _now
+    now = _now()
+    return SessionEntry(
+        session_key=session_key, session_id=f"sid-{chat_id}",
+        platform=Platform.FEISHU, chat_type="dm", created_at=now, updated_at=now,
+        origin=SessionSource(platform=Platform.FEISHU, chat_id=chat_id, profile=profile),
+    )
+
+
+def _state_db():
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+    return SessionDB(Path(get_hermes_home()) / "state.db")
+
+
+def _runner_stub(store):
+    return SimpleNamespace(
+        session_store=store,
+        _profile_failed_platforms={},
+        _profile_adapters={},
+        pairing_stores={},
+        _busy_text_modes_by_profile={},
+        _busy_input_modes_by_profile={},
+        _served_profile_homes={},
+        _served_profile_signatures={},
+        _agent_cache={},
+        _evict_cached_agent=lambda key: None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unserve_profile_keeps_identity_for_a_rename_to_rekey(tmp_path):
+    """Unserving is not deleting: the purge must not run here.
+
+    A rename's old name leaves the served set exactly like a deleted one, and
+    ``migrate-profile-identity`` still has to find that identity to rekey it. A purge inside
+    ``_unserve_profile()`` would delete it first and break the rename it runs beside.
+    """
+    from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
+    store = _make_store(tmp_path)
+    with store._lock:
+        store._entries["agent:oldname:feishu:dm:chatA"] = _entry(
+            "agent:oldname:feishu:dm:chatA", "chatA", "oldname")
+    db = _state_db()
+    db.register_backend_heartbeat(
+        backend_id="be1", pid=1, started_at=time.time(), profile="oldname", host="h")
+    db.close()
+
+    home = tmp_path / "home"
+    home.mkdir()
+    await GatewayProfileReconcileMixin._unserve_profile(_runner_stub(store), "oldname", home)
+
+    assert "agent:oldname:feishu:dm:chatA" in store._entries
+    db = _state_db()
+    try:
+        assert db._read_one(
+            "SELECT COUNT(*) AS n FROM gateway_heartbeats WHERE profile = ?",
+            ("oldname",))["n"] == 1
+    finally:
+        db.close()
+
+
+def test_purge_verb_drops_routing_identity_and_reports_ok(tmp_path):
+    """The delete-only verb settles identity in the process that owns the routing index."""
+    from gateway.run_profile_reconcile import purge_profile_identity_verb
+    store = _make_store(tmp_path)
+    with store._lock:
+        store._entries["agent:gone:feishu:dm:chatA"] = _entry(
+            "agent:gone:feishu:dm:chatA", "chatA", "gone")
+        store._entries["agent:keepme:feishu:dm:chatB"] = _entry(
+            "agent:keepme:feishu:dm:chatB", "chatB", "keepme")
+    db = _state_db()
+    db.register_backend_heartbeat(
+        backend_id="be1", pid=1, started_at=time.time(), profile="gone", host="h")
+    db.close()
+
+    answer = purge_profile_identity_verb(_runner_stub(store))({"name": "gone"})
+
+    assert answer["ok"] is True
+    assert answer["dropped"] == 1
+    assert "agent:gone:feishu:dm:chatA" not in store._entries
+    assert "agent:keepme:feishu:dm:chatB" in store._entries
+    db = _state_db()
+    try:
+        assert db._read_one(
+            "SELECT COUNT(*) AS n FROM gateway_heartbeats WHERE profile = ?", ("gone",))["n"] == 0
+    finally:
+        db.close()
+

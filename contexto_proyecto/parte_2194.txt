@@ -1,0 +1,395 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_provider_attribution_headers.py ===
+"""Attribution default_headers applied per provider via base-URL detection.
+
+Mirrors the OpenRouter pattern for the Vercel AI Gateway so that
+referrerUrl / appName / User-Agent flow into gateway analytics.
+"""
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from run_agent import AIAgent
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_openrouter_base_url_applies_or_headers(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://openrouter.ai/api/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-Title"] == "Hermes Agent"
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_ai_gateway_base_url_applies_attribution_headers(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://ai-gateway.vercel.sh/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-Title"] == "Hermes Agent"
+    assert headers["User-Agent"].startswith("HermesAgent/")
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_routermint_base_url_applies_user_agent_header(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://api.routermint.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://api.routermint.com/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["User-Agent"].startswith("HermesAgent/")
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_nvidia_cloud_base_url_applies_billing_origin_header(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://integrate.api.nvidia.com/v1",
+        model="nvidia/test-model",
+        provider="nvidia",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert agent._client_kwargs["default_headers"]["X-BILLING-INVOKE-ORIGIN"] == "HermesAgent"
+
+    agent._apply_client_headers_for_base_url("https://integrate.api.nvidia.com/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["X-BILLING-INVOKE-ORIGIN"] == "HermesAgent"
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_fireworks_applies_attribution_via_profile_fallback(mock_openai):
+    """Fireworks has no host-specific branch — its attribution headers come
+    from the profile.default_headers fallback, the path a model switch
+    re-runs."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://api.fireworks.ai/inference/v1",
+        model="accounts/fireworks/models/kimi-k2p6",
+        provider="fireworks",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://api.fireworks.ai/inference/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-Title"] == "Hermes Agent"
+    assert headers["User-Agent"].startswith("HermesAgent/")
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_opencode_go_applies_attribution_via_profile_fallback(mock_openai):
+    """OpenCode (Zen/Go) attributes traffic by header like OpenRouter does.
+    Without profile.default_headers the relay only sees the OpenAI SDK's
+    generic User-Agent and Hermes Agent traffic shows up unattributed."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://opencode.ai/zen/go/v1",
+        model="glm-5",
+        provider="opencode-go",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://opencode.ai/zen/go/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-Title"] == "Hermes Agent"
+    assert headers["User-Agent"].startswith("HermesAgent/")
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_opencode_zen_applies_attribution_via_profile_fallback(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://opencode.ai/zen/v1",
+        model="claude-sonnet-4-5",
+        provider="opencode-zen",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://opencode.ai/zen/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-Title"] == "Hermes Agent"
+    assert headers["User-Agent"].startswith("HermesAgent/")
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_routed_client_preserves_openai_sdk_custom_headers(mock_openai):
+    mock_openai.return_value = MagicMock()
+    routed_client = SimpleNamespace(
+        api_key="test-key",
+        base_url="https://integrate.api.nvidia.com/v1",
+        _custom_headers={"X-BILLING-INVOKE-ORIGIN": "HermesAgent"},
+    )
+
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(
+        routed_client,
+        "nvidia/test-model",
+    )):
+        agent = AIAgent(
+            provider="nvidia",
+            model="nvidia/test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["X-BILLING-INVOKE-ORIGIN"] == "HermesAgent"
+
+
+
+
+
+
+
+
+
+
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_openrouter_headers_include_response_cache_when_enabled(mock_openai):
+    """When openrouter.response_cache is True, the cache header is injected."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    with patch("hermes_cli.config.load_config", return_value={
+        "openrouter": {"response_cache": True, "response_cache_ttl": 600},
+    }), patch("hermes_cli.config.load_config_readonly", return_value={
+        "openrouter": {"response_cache": True, "response_cache_ttl": 600},
+    }):
+        agent._apply_client_headers_for_base_url("https://openrouter.ai/api/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-OpenRouter-Cache"] == "true"
+    assert headers["X-OpenRouter-Cache-TTL"] == "600"
+
+
+# ---------------------------------------------------------------------------
+# model.default_headers — user-configured overrides (#40033)
+# ---------------------------------------------------------------------------
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_user_default_headers_override_sdk_user_agent(mock_openai):
+    """``model.default_headers`` lets a custom endpoint swap the OpenAI SDK
+    User-Agent that some gateways/WAFs reject (the #40033 reproduction)."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="http://localhost:8080/v1",
+        model="my-custom-model",
+        provider="custom",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    with patch("hermes_cli.config.load_config", return_value={
+        "model": {"default_headers": {"User-Agent": "curl/8.7.1", "X-Extra": "1"}},
+    }), patch("hermes_cli.config.load_config_readonly", return_value={
+        "model": {"default_headers": {"User-Agent": "curl/8.7.1", "X-Extra": "1"}},
+    }):
+        agent._apply_client_headers_for_base_url("http://localhost:8080/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["User-Agent"] == "curl/8.7.1"
+    assert headers["X-Extra"] == "1"
+
+
+
+
+
+
+
+
+@patch("agent.process_bootstrap.OpenAI")
+def test_openrouter_headers_no_cache_when_disabled(mock_openai):
+    """When openrouter.response_cache is False, no cache headers are sent."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    with patch("hermes_cli.config.load_config", return_value={
+        "openrouter": {"response_cache": False},
+    }), patch("hermes_cli.config.load_config_readonly", return_value={
+        "openrouter": {"response_cache": False},
+    }):
+        agent._apply_client_headers_for_base_url("https://openrouter.ai/api/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert "X-OpenRouter-Cache" not in headers
+    assert "X-OpenRouter-Cache-TTL" not in headers
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_provider_client_seam.py ===
+"""A provider profile can supply its own client — the registration seam.
+
+A provider whose wire protocol is not OpenAI-over-HTTP (the ACP subprocess
+shims) supplies its client via ``ProviderProfile.create_client()``, from inside
+or outside the tree. These tests pin the hook through the real entry point
+(``create_openai_client``), its failure isolation, and the capability flags
+that let such a client opt out of the auxiliary transport/async wrappers.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+import providers as _providers
+from providers.base import ProviderProfile
+
+
+class _FakeClient:
+    HERMES_SKIP_TRANSPORT_WRAP = True
+    HERMES_SKIP_ASYNC_WRAP = True
+    api_key = "k"
+    base_url = "acp://seam-test"
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _SeamProfile(ProviderProfile):
+    def create_client(self, **kwargs):
+        return _FakeClient(**kwargs)
+
+
+class _ExplodingProfile(ProviderProfile):
+    def create_client(self, **kwargs):
+        raise RuntimeError("plugin is broken")
+
+
+@pytest.fixture
+def registered():
+    """Register profiles for one test and restore the registry afterwards."""
+    _providers._discover_providers()
+    snapshot = (dict(_providers._REGISTRY), dict(_providers._ALIASES), _providers._PROVIDER_LIST_CACHE)
+    yield _providers.register_provider
+    _providers._REGISTRY.clear()
+    _providers._REGISTRY.update(snapshot[0])
+    _providers._ALIASES.clear()
+    _providers._ALIASES.update(snapshot[1])
+    _providers._PROVIDER_LIST_CACHE = snapshot[2]
+
+
+def _agent(provider: str = ""):
+    return SimpleNamespace(
+        provider=provider,
+        _client_log_context=lambda: "",
+        _build_keepalive_http_client=lambda *a, **k: None,
+    )
+
+
+def _build(provider, base_url):
+    from agent.agent_runtime_helpers import create_openai_client
+
+    return create_openai_client(_agent(provider), {"api_key": "k", "base_url": base_url}, reason="t", shared=False)
+
+
+def test_an_out_of_tree_profile_supplies_the_client_through_create_openai_client(registered):
+    from openai import OpenAI
+
+    registered(_SeamProfile(name="seam-test", aliases=("seam",), base_url="acp://seam-test"))
+    # By name, by alias, and by base_url prefix when no provider name is set.
+    assert isinstance(_build("seam-test", "acp://seam-test"), _FakeClient)
+    assert isinstance(_build("seam", "acp://seam-test"), _FakeClient)
+    assert isinstance(_build("", "acp://seam-test/x"), _FakeClient)
+    # No hook → the standard client, untouched by the seam.
+    assert isinstance(_build("openai-api", "https://api.example/v1"), OpenAI)
+
+
+def test_a_broken_plugin_falls_through_instead_of_taking_the_turn_down(registered):
+    from agent.agent_runtime_helpers import _provider_supplied_client
+
+    registered(_ExplodingProfile(name="seam-boom", base_url="acp://seam-boom"))
+    assert _provider_supplied_client(_agent("seam-boom"), {"api_key": "k"}) is None
+
+
+def test_copilot_acp_still_gets_its_acp_client_via_its_profile():
+    from agent.copilot_acp_client import CopilotACPClient
+
+    assert isinstance(_build("copilot-acp", "acp://copilot"), CopilotACPClient)
+    assert isinstance(_build("", "acp://copilot"), CopilotACPClient)
+
+
+def test_skip_flags_replace_the_isinstance_checks_for_in_and_out_of_tree_clients():
+    from agent.auxiliary_client import _maybe_wrap_anthropic, _to_async_client
+    from agent.copilot_acp_client import CopilotACPClient
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    assert CopilotACPClient.HERMES_SKIP_TRANSPORT_WRAP and CopilotACPClient.HERMES_SKIP_ASYNC_WRAP
+    assert GeminiNativeClient.HERMES_SKIP_TRANSPORT_WRAP
+    assert not getattr(GeminiNativeClient, "HERMES_SKIP_ASYNC_WRAP", False)
+
+    client = _FakeClient()  # never imported by auxiliary_client
+    assert _maybe_wrap_anthropic(client, "m", "k", "acp://seam-test") is client
+    assert _to_async_client(client, "m")[0] is client
+

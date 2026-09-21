@@ -1,0 +1,329 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_control_socket_pause.py ===
+"""pause-for-update control-socket verb (#92091 step 2, campaign #91277).
+
+The updater asks a running gateway to drain and exit cleanly (releasing its
+venv file handles) instead of tree-killing it mid-turn. Fallback contract:
+older gateways without the verb answer nothing, and callers keep the legacy
+marker/force-kill path.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.control_socket import (
+    GatewayControlServer,
+    pause_gateway_for_update,
+    query_gateway_control,
+)
+
+
+def _make_server(tmp_path, handler):
+    server = GatewayControlServer(
+        home=tmp_path, verb_handlers={"pause-for-update": handler}
+    )
+    return server
+
+
+def test_pause_verb_dispatches_and_returns_ack(tmp_path):
+    calls = []
+
+    def handler():
+        calls.append(1)
+        return {"pausing": True, "already_stopping": False, "pid": 111,
+                "drain_timeout": 30.0}
+
+    server = _make_server(tmp_path, handler)
+    raw = json.dumps({"verb": "pause-for-update", "id": 7}).encode()
+    response = json.loads(server.handle_request_line(raw).decode())
+    assert response["ok"] is True
+    assert response["result"]["pausing"] is True
+    assert response["result"]["drain_timeout"] == 30.0
+    assert response["id"] == 7
+    assert calls == [1]
+
+
+def test_unknown_verb_still_lists_pause(tmp_path):
+    server = _make_server(tmp_path, lambda: {})
+    raw = json.dumps({"verb": "nope"}).encode()
+    response = json.loads(server.handle_request_line(raw).decode())
+    assert response["ok"] is False
+    assert "pause-for-update" in response["supported_verbs"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="unix socket transport")
+def test_pause_client_roundtrip_over_real_socket(tmp_path):
+    """Full client→socket→handler→ACK path over a REAL unix socket."""
+
+    async def scenario():
+        acks = []
+
+        def handler():
+            acks.append(1)
+            return {"pausing": True, "already_stopping": False,
+                    "pid": 4242, "drain_timeout": 12.5}
+
+        server = _make_server(tmp_path, handler)
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, lambda: pause_gateway_for_update(tmp_path, timeout=5.0)
+            )
+        finally:
+            await server.stop()
+        return result, acks
+
+    result, acks = asyncio.run(scenario())
+    assert acks == [1]
+    assert result is not None
+    assert result["pausing"] is True and result["drain_timeout"] == 12.5
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="unix socket transport")
+def test_pause_client_none_when_gateway_lacks_verb(tmp_path):
+    """Back-compat: a step-1 gateway (identify/status only) answers ok:false
+    for the unknown verb → the client returns None → caller keeps the legacy
+    kill path."""
+
+    async def scenario():
+        server = GatewayControlServer(home=tmp_path)  # no pause handler
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: pause_gateway_for_update(tmp_path, timeout=5.0)
+            )
+        finally:
+            await server.stop()
+
+    assert asyncio.run(scenario()) is None
+
+
+def test_pause_client_none_when_no_socket(tmp_path):
+    assert pause_gateway_for_update(tmp_path, timeout=0.5) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_control_socket_windows_live.py ===
+"""LIVE Windows E2E for the gateway control socket named-pipe transport.
+
+Runs ONLY on a real Windows host (the on-demand ``windows-venv-e2e.yml``
+lane). Spawns a REAL child process that binds the REAL named pipe via the
+proactor event loop with the DEFAULT verb handlers, then drives the real
+sync client and the real fleet consumers against it — no mocks anywhere.
+
+Proves, on windows-latest:
+  1. `GatewayControlServer` binds ``\\\\.\\pipe\\hermes-gateway-<hash>`` via
+     ``loop.start_serving_pipe`` and answers ``identify``/``status``.
+  2. The sync client's pipe transport (open/write/read/busy-retry) works
+     against a live server and returns the child's true pid + code identity.
+  3. ``collect_fleet_versions()`` prefers the socket (``source: socket``).
+  4. After the server process is force-killed, the client returns None
+     (FileNotFoundError on the pipe — no stale-file hazard on Windows) and
+     consumers fall back to the state-file/scan layer.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32", reason="live Windows named-pipe E2E"
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+_CHILD_CODE = r"""
+import asyncio, os, sys
+sys.path.insert(0, sys.argv[1])
+os.environ["HERMES_HOME"] = sys.argv[2]
+from gateway.control_socket import GatewayControlServer
+
+async def main():
+    server = GatewayControlServer()
+    ok = await server.start()
+    # Print our REAL pid: on Windows uv venvs, python.exe is a trampoline
+    # that spawns the actual interpreter as a child, so Popen.pid is the
+    # shim, not the server process. (That spawner-view-vs-reality gap is
+    # the exact bug class the control socket exists to eliminate.)
+    print(f"SERVER_STARTED {os.getpid()}" if ok else "SERVER_FAILED", flush=True)
+    if not ok:
+        return
+    await asyncio.sleep(120)
+
+asyncio.run(main())
+"""
+
+
+@pytest.fixture()
+def live_server(tmp_path: Path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _CHILD_CODE, str(PROJECT_ROOT), str(home)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(PROJECT_ROOT),
+    )
+    line = proc.stdout.readline().strip()
+    if not line.startswith("SERVER_STARTED"):
+        err = proc.stderr.read() if proc.poll() is not None else ""
+        proc.kill()
+        pytest.fail(f"pipe server child failed to start: {line!r} {err}")
+    server_pid = int(line.split()[1])
+    yield proc, home, server_pid
+    _kill_tree(proc)
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the spawned child AND its descendants (uv trampoline shims)."""
+    if proc.poll() is None:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+        )
+        proc.wait()
+
+
+def test_named_pipe_identify_status_and_fleet_consumer(live_server, monkeypatch):
+    proc, home, server_pid = live_server
+    from gateway.control_socket import identify_gateway, query_gateway_control
+
+    ident = identify_gateway(home, timeout=5.0)
+    assert ident is not None, "identify returned None against a live pipe server"
+    # Compare against the server's SELF-reported pid, not Popen.pid — uv's
+    # Windows trampoline makes the spawner's view wrong (see _CHILD_CODE).
+    assert ident["pid"] == server_pid
+    assert ident["protocol"] == 1
+    assert ident["kind"] == "hermes-gateway"
+    assert ident["supervisor"] in {"systemd", "launchd", "desktop", "external", "manual"}
+
+    status = query_gateway_control(home, "status", timeout=5.0)
+    assert status is not None
+    assert status["answering_pid"] == server_pid
+
+    # Real fleet consumer prefers the pipe
+    import hermes_cli.update_receipt as ur
+
+    monkeypatch.setattr(
+        "hermes_cli.build_info.get_code_identity",
+        lambda refresh=False: {"sha": ident.get("code_sha") or "X", "version": "t"},
+    )
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_profiles_root", lambda: home / "no-profiles"
+    )
+    fleet = ur.collect_fleet_versions()
+    assert len(fleet) == 1, fleet
+    assert fleet[0]["source"] == "socket"
+    assert fleet[0]["pid"] == server_pid
+
+
+def test_pipe_gone_after_kill_falls_back(live_server, monkeypatch):
+    proc, home, server_pid = live_server
+    from gateway.control_socket import identify_gateway
+
+    assert identify_gateway(home, timeout=5.0) is not None
+    _kill_tree(proc)
+    time.sleep(0.5)
+
+    assert identify_gateway(home, timeout=2.0) is None
+
+    # Consumer falls back to the state file (live pid = this test process)
+    import hermes_cli.update_receipt as ur
+
+    (home / "gateway_state.json").write_text(
+        json.dumps(
+            {"pid": os.getpid(), "code_sha": "OLD", "kind": "hermes-gateway"}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.build_info.get_code_identity",
+        lambda refresh=False: {"sha": "NEW", "version": "t"},
+    )
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_profiles_root", lambda: home / "no-profiles"
+    )
+    fleet = ur.collect_fleet_versions()
+    assert len(fleet) == 1, fleet
+    assert "source" not in fleet[0]
+    assert fleet[0]["state"] == "stale"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_conversation_scope_funnel.py ===
+"""Behavior tests for _clear_conversation_scope — the single conversation-
+boundary funnel (#64934 follow-up).
+
+Boundaries (/new, /resume, auto-reset, expiry finalization,
+compression-exhausted reset) used to each carry a hand-copied pop-list of the
+per-session dicts, and the lists drifted whenever a new dict was added
+(#48031, #58403, #10702, #35809 were all "boundary X forgot dict Y" bugs).
+The funnel clears every dict registered in _CONVERSATION_SCOPED_STATE plus
+the boundary security state, in one call.
+"""
+
+from gateway.run import _CONVERSATION_SCOPED_STATE, GatewayRunner
+
+KEY = "agent:main:telegram:dm:777"
+OTHER = "agent:main:discord:dm:888"
+
+
+def _bare_runner() -> GatewayRunner:
+    runner = object.__new__(GatewayRunner)
+    for attr in _CONVERSATION_SCOPED_STATE:
+        setattr(runner, attr, {KEY: object(), OTHER: object()})
+    # Turn-scoped state that the funnel must NOT touch.
+    runner._running_agents = {KEY: object()}
+    runner._running_agents_ts = {KEY: 1.0}
+    runner._session_run_generation = {KEY: 7}
+    return runner
+
+
+def test_funnel_leaves_turn_scoped_and_generation_state_alone():
+    runner = _bare_runner()
+    runner._clear_conversation_scope(KEY, reason="test")
+    # Turn-scoped: owned by _release_running_agent_state / dispatch finally.
+    assert KEY in runner._running_agents
+    assert KEY in runner._running_agents_ts
+    # Generation counter is monotonic by design (#28686) — never reset.
+    assert runner._session_run_generation[KEY] == 7
+
+
+def test_funnel_is_bare_runner_safe_and_empty_key_noop():
+    runner = object.__new__(GatewayRunner)
+    # No dicts initialized at all — must not raise (pitfall #17).
+    runner._clear_conversation_scope(KEY, reason="test")
+    runner._clear_conversation_scope("", reason="test")
+
+
+def test_funnel_also_clears_boundary_security_state():
+    runner = _bare_runner()
+    runner._pending_approvals = {KEY: {"cmd": "rm -rf"}, OTHER: {}}
+    runner._update_prompt_pending = {KEY: True}
+    runner._pending_skills_reload_notes = {KEY: "note"}
+    runner._clear_conversation_scope(KEY, reason="test")
+    assert KEY not in runner._pending_approvals
+    assert OTHER in runner._pending_approvals
+    assert KEY not in runner._update_prompt_pending
+    assert KEY not in runner._pending_skills_reload_notes
+

@@ -1,0 +1,292 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_startup_failed_platform_reports_degraded.py ===
+"""A configured platform that fails to start must not let the gateway report a normal run.
+
+api_server lost the bind race against the gateway it was replacing (Errno 48 / 10048), logged
+``✗ api_server failed to connect`` at WARNING, and carried on serving its messaging platforms. The
+startup summary said ``Gateway running with 1 platform(s)`` and the runtime state said ``running``:
+status looked healthy, every API client was gone, nothing retried. The startup summary is the SHARED
+gate — every platform, not just api_server — so the same failure on any other platform is reported
+the same way.
+"""
+import logging
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.run import GatewayRunner
+from gateway.status import read_runtime_status
+
+
+class _PortTakenAdapter(BasePlatformAdapter):
+    """Loses the bind race exactly like api_server: fatal AND non-retryable, so it is parked."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, extra={"port": 8642}), Platform.API_SERVER)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error(
+            "api_server_port_in_use",
+            "Port 8642 already in use. Set platforms.api_server.port in config.yaml to a different "
+            "value, then `/platform resume api_server`.",
+            retryable=False,
+        )
+        return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+class _HealthyAdapter(BasePlatformAdapter):
+    """The messaging platform that keeps the gateway useful — and used to hide the failure."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+def _runner_with_one_parked_platform(monkeypatch, tmp_path) -> GatewayRunner:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={
+            Platform.API_SERVER: PlatformConfig(enabled=True, extra={"port": 8642}),
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***"),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    monkeypatch.setattr(
+        runner,
+        "_create_adapter",
+        lambda platform, platform_config: (
+            _PortTakenAdapter() if platform is Platform.API_SERVER else _HealthyAdapter()
+        ),
+    )
+    async def _no_secondary_profiles():
+        return 0
+
+    monkeypatch.setattr(runner, "_start_secondary_profile_adapters", _no_secondary_profiles)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_parked_platform_is_logged_at_error_and_the_run_is_degraded(monkeypatch, tmp_path, caplog):
+    """A configured platform that never came up is reported at ERROR (not the WARNING that hid it)
+    and the runtime state says ``degraded`` while the surviving platform keeps the gateway alive."""
+    runner = _runner_with_one_parked_platform(monkeypatch, tmp_path)
+
+    with caplog.at_level(logging.ERROR):
+        ok = await runner.start()
+    try:
+        assert ok is True, "the working platform keeps the gateway alive; only reporting changes"
+        assert runner.should_exit_cleanly is False
+        assert any(
+            record.levelno >= logging.ERROR and "api_server" in record.getMessage()
+            for record in caplog.records
+        )
+        state = read_runtime_status()
+        assert state["gateway_state"] == "degraded"
+        assert state["platforms"]["api_server"]["state"] == "fatal"
+        assert state["platforms"]["api_server"]["error_code"] == "api_server_port_in_use"
+        assert state["platforms"]["telegram"]["state"] == "connected"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_every_platform_connected_still_reports_a_normal_run(monkeypatch, tmp_path, caplog):
+    """Protection: a clean startup keeps the normal ``running`` state and logs no ERROR."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config: _HealthyAdapter())
+
+    async def _no_secondary_profiles():
+        return 0
+
+    monkeypatch.setattr(runner, "_start_secondary_profile_adapters", _no_secondary_profiles)
+
+    with caplog.at_level(logging.ERROR):
+        ok = await runner.start()
+    try:
+        assert ok is True
+        state = read_runtime_status()
+        assert state["gateway_state"] == "running"
+        assert state["platforms"]["telegram"]["state"] == "connected"
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            "a healthy startup must not log ERROR"
+        )
+    finally:
+        await runner.stop()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_startup_launch_profile_hooks_scope.py ===
+"""Multiplex invariant: the launch profile's ``hooks:`` block registers at gateway startup.
+
+Startup runs before any turn scope exists. With ``multiplex_profiles`` on, ``get_secret`` fails
+closed outside a scope, so the unscoped launch-profile registration raised on the first
+``hooks.outbound[].secret_env`` target and ``_register_config_hooks`` swallowed it at DEBUG level —
+every launch-profile outbound webhook was silently dropped. Regression for the #108319 follow-up.
+"""
+from __future__ import annotations
+
+import logging
+
+from agent import secret_scope
+from gateway.run_startup import GatewayStartupMixin
+
+
+def _capture_registration(monkeypatch, hooks_cfg):
+    seen: dict = {}
+    import agent.outbound_webhooks as ow
+    import agent.shell_hooks as sh
+    import hermes_cli.config as cfgmod
+
+    def fake_register_outbound(cfg):
+        seen["targets"] = ow.iter_configured_targets(cfg)
+        seen["scope"] = secret_scope.current_secret_scope()
+
+    monkeypatch.setattr(cfgmod, "load_config", lambda: hooks_cfg)
+    monkeypatch.setattr(sh, "register_from_config", lambda cfg, accept_hooks=False: None)
+    monkeypatch.setattr(ow, "register_from_config", fake_register_outbound)
+    return seen
+
+
+def test_launch_profile_webhooks_register_signed_under_multiplex(tmp_path, monkeypatch, caplog):
+    launch_home = tmp_path / ".hermes"
+    launch_home.mkdir()
+    (launch_home / ".env").write_text("MY_HOOK_SECRET=s3cret-of-launch\n")
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    monkeypatch.delenv("MY_HOOK_SECRET", raising=False)
+    cfg = {"hooks": {"outbound": [
+        {"url": "https://hooks.example/signed", "events": ["on_session_end"], "secret_env": "MY_HOOK_SECRET"},
+        {"url": "https://hooks.example/plain", "events": ["on_session_end"]},
+    ]}}
+    seen = _capture_registration(monkeypatch, cfg)
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        assert secret_scope.current_secret_scope() is None  # startup: no turn scope yet
+        with caplog.at_level(logging.WARNING, logger="gateway.run_startup"):
+            GatewayStartupMixin._register_launch_profile_config_hooks()
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert seen.get("scope") is not None, "registration must run inside the launch profile's scope"
+    assert [t.url for t in seen["targets"]] == ["https://hooks.example/signed", "https://hooks.example/plain"]
+    assert seen["targets"][0].secret == "s3cret-of-launch"
+    assert "registration failed" not in caplog.text
+
+
+def test_registration_failure_is_a_warning_not_debug(monkeypatch, caplog):
+    """A dropped hook block must be visible: the swallow used to log at DEBUG."""
+    import hermes_cli.config as cfgmod
+
+    def boom():
+        raise RuntimeError("config exploded")
+
+    monkeypatch.setattr(cfgmod, "load_config", boom)
+    with caplog.at_level(logging.WARNING, logger="gateway.run_startup"):
+        GatewayStartupMixin._register_launch_profile_config_hooks()
+    assert any(r.levelno == logging.WARNING and "registration failed" in r.getMessage() for r in caplog.records)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_startup_no_eager_platform_install.py ===
+"""Regression tests: ``_apply_env_overrides`` must not lazy-install platform
+SDKs for platforms the user has not configured.
+
+Historically ``PlatformEntry.check_fn`` doubled as the lazy-installer
+(it pip-installed the platform SDK as a side effect).  The enablement sweep
+in ``_apply_env_overrides`` used to call ``check_fn`` for *every* registered
+plugin platform unconditionally, so a single ``load_gateway_config()`` —
+which the desktop/dashboard readiness probe (``GET /api/status``) awaits
+synchronously — pip-installed Discord, Telegram, Slack, Feishu and Dingtalk
+even with ``platforms: none``.  That blocked startup until every install
+finished and made the desktop app time out and boot-loop (stuck at 94%).
+
+Two layers of protection now exist:
+1. The sweep consults the cheap ``is_connected`` credential check FIRST and
+   only reaches the dependency check for platforms that are already enabled
+   or actually configured (this file pins that contract).
+2. ``check_fn`` is now defined as a PASSIVE probe; the ACTIVE installer
+   lives on ``ensure_deps_fn`` and only runs from
+   ``platform_registry.create_adapter()`` (#79812).
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
+from gateway.platform_registry import PlatformEntry, platform_registry
+
+
+@pytest.fixture
+def isolated_registry():
+    """Run with a registry containing only the entries the test registers."""
+    original = dict(platform_registry._entries)
+    platform_registry._entries.clear()
+    try:
+        # ``_apply_env_overrides`` calls ``discover_plugins()`` (idempotent),
+        # which would re-register the real bundled platforms and clobber the
+        # fakes below.  Neutralize it so the test controls the registry.
+        with patch("hermes_cli.plugins.discover_plugins", lambda *a, **k: None):
+            yield platform_registry
+    finally:
+        platform_registry._entries.clear()
+        platform_registry._entries.update(original)
+
+
+def _register_fake_platform(name, *, check_fn, is_connected):
+    platform_registry.register(
+        PlatformEntry(
+            name=name,
+            label=name.title(),
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=check_fn,
+            is_connected=is_connected,
+            source="plugin",
+        )
+    )
+
+
+def test_unconfigured_platform_is_not_probed_for_install(isolated_registry):
+    # is_connected reports "no credentials" → the platform must be skipped
+    # without ever calling check_fn (which would lazy-install the SDK).
+    check_fn = MagicMock(return_value=True)
+    _register_fake_platform(
+        "discord", check_fn=check_fn, is_connected=lambda cfg: False
+    )
+
+    config = GatewayConfig()
+    _apply_env_overrides(config)
+
+    check_fn.assert_not_called()
+    assert not config.platforms.get(Platform.DISCORD, PlatformConfig()).enabled
+
+
+

@@ -1,0 +1,403 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_status_free_tier_line.py ===
+"""The in-chat /status line identifies an active Nous free-tier route."""
+
+import base64
+import json
+import time
+from datetime import datetime
+
+import pytest
+
+from agent.i18n import t
+from gateway.config import Platform
+from gateway.session import SessionEntry, build_session_key
+from hermes_cli import anon_auth
+from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+from tests.gateway.test_status_command import _make_event, _make_runner, _make_source
+
+
+def _runner():
+    source = _make_source()
+    entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-free-tier-status",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    return _make_runner(entry)
+
+
+def _jwt(**claims) -> str:
+    def segment(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    payload = {
+        "sub": "nas_user:status",
+        "client_id": "nas-anonymous",
+        "account_tier": "anonymous",
+        "scope": "inference:invoke tool:invoke",
+        "exp": int(time.time()) + 900,
+        **claims,
+    }
+    return f"{segment({'alg': 'RS256'})}.{segment(payload)}.sig"
+
+
+def _seed_nous(state: dict) -> None:
+    with _auth_store_lock():
+        store = _load_auth_store()
+        store.setdefault("providers", {})["nous"] = state
+        store["active_provider"] = "nous"
+        _save_auth_store(store)
+
+
+def _free_tier_state() -> dict:
+    return {
+        "auth_method": anon_auth.ANON_AUTH_METHOD,
+        "account_tier": "anonymous",
+        "anon_token": "anon_status",
+        "access_token": _jwt(),
+        "expires_at": "2999-01-01T00:00:00+00:00",
+        "inference_base_url": "https://welcome-api.nousresearch.com/v1",
+    }
+
+
+def _account_state() -> dict:
+    return {
+        "auth_method": "oauth_device_code",
+        "access_token": _jwt(client_id="hermes-cli", account_tier="standard"),
+        "refresh_token": "refresh-status",
+        "expires_at": "2999-01-01T00:00:00+00:00",
+    }
+
+
+@pytest.fixture(autouse=True)
+def isolated_auth_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared-store"))
+    monkeypatch.setenv("HERMES_GUEST_ONBOARDING", "1")
+
+
+@pytest.mark.asyncio
+async def test_status_names_the_free_tier_and_the_slash_command_when_the_free_tier_carries_inference(
+):
+    runner = _runner()
+    _seed_nous(_free_tier_state())
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert anon_auth.FREE_TIER_STATUS_LINE in result
+
+
+@pytest.mark.asyncio
+async def test_status_omits_the_line_for_a_real_account():
+    runner = _runner()
+    _seed_nous(_account_state())
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert anon_auth.FREE_TIER_STATUS_LINE not in result
+
+
+@pytest.mark.asyncio
+async def test_a_status_gate_failure_never_breaks_status(monkeypatch):
+    runner = _runner()
+    _seed_nous(_free_tier_state())
+    monkeypatch.setattr(anon_auth, "guest_carries_inference", lambda: False)
+    expected = await runner._handle_message(_make_event("/status"))
+
+    def broken_store():
+        raise RuntimeError("broken store")
+
+    monkeypatch.setattr(anon_auth, "guest_carries_inference", broken_store)
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert result == expected
+
+
+def test_the_line_comes_from_the_catalog_in_every_language():
+    assert t("gateway.status.free_tier") == anon_auth.FREE_TIER_STATUS_LINE
+    # Every catalog carries its own translation; the product name, the route and the verb stay verbatim.
+    for lang in ("ja", "de"):
+        line = t("gateway.status.free_tier", lang=lang)
+        assert line != anon_auth.FREE_TIER_STATUS_LINE
+        assert line.startswith("Nous · ") and " · nous/welcome · " in line and "/login" in line
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_status_phrases.py ===
+import random
+
+from gateway.status_phrases import (
+    classify_status_context,
+    choose_status_phrase,
+    resolve_status_phrase_catalog,
+)
+
+
+def test_long_running_context_uses_status_bucket():
+    assert classify_status_context("status") == "status"
+    assert classify_status_context("heartbeat") == "status"
+    assert classify_status_context("long_running") == "status"
+
+
+def test_status_phrase_does_not_leak_raw_preview_or_args():
+    msg = choose_status_phrase(
+        "status",
+        preview="actual private scratch text should not be sent",
+        args={"secret": "SECRET-123"},
+        rng=random.Random(4),
+    )
+
+    assert "actual private scratch" not in msg
+    assert "SECRET-123" not in msg
+    assert msg
+
+
+def test_status_phrase_path_can_load_relative_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    phrase_dir = tmp_path / "phrase-catalog"
+    phrase_dir.mkdir()
+    (phrase_dir / "01-status.yaml").write_text("status:\n  - relative dir status text\n", encoding="utf-8")
+
+    catalog = resolve_status_phrase_catalog(
+        {"display": {"status_phrases": {"path": "phrase-catalog"}}},
+        "whatsapp",
+    )
+
+    assert "relative dir status text" in catalog["status"]
+
+
+def test_choose_status_phrase_uses_custom_catalog_without_leaking_args():
+    catalog = resolve_status_phrase_catalog(
+        {"display": {"status_phrases": {"mode": "replace", "status": ["custom safe status text"]}}},
+        "whatsapp",
+    )
+
+    msg = choose_status_phrase(
+        "status",
+        args={"query": "SECRET SEARCH"},
+        catalog=catalog,
+    )
+
+    assert msg == "custom safe status text"
+    assert "SECRET" not in msg
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_stderr_formatting.py ===
+"""Regression tests for operator-visible gateway stderr formatting."""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from gateway.run import _gateway_stderr_formatter
+
+
+def test_gateway_stderr_formatter_includes_timestamp() -> None:
+    record = logging.LogRecord(
+        name="gateway.run",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="delivery failed",
+        args=(),
+        exc_info=None,
+    )
+
+    rendered = _gateway_stderr_formatter().format(record)
+
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} "
+        r"ERROR gateway\.run: delivery failed",
+        rendered,
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_steer_command.py ===
+"""Tests for the gateway /steer command handler.
+
+/steer injects a user message into the agent's next tool result without
+interrupting. The gateway runner must:
+
+  1. When an agent IS running → call ``agent.steer(text)``, do NOT set
+     ``_interrupt_requested``, do NOT touch ``_pending_messages``.
+  2. When the agent is the PENDING sentinel → fall back to /queue
+     semantics (store in ``adapter._pending_messages``).
+  3. When no agent is active → strip the slash prefix and let the normal
+     prompt pipeline handle it as a regular user message.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionEntry, SessionSource, build_session_key
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_event(text: str, channel_context: str | None = None) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=_make_source(),
+        message_id="m1",
+        channel_context=channel_context,
+    )
+
+
+def _make_runner(session_entry: SessionEntry):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    adapter._pending_messages = {}
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = MagicMock()
+    runner._session_db.get_session_title.return_value = None
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._show_reasoning = False
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    return runner, adapter
+
+
+def _session_entry() -> SessionEntry:
+    return SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_steer_calls_agent_steer_and_does_not_interrupt():
+    """When an agent is running, /steer must call agent.steer(text) and
+    leave interrupt state untouched."""
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+
+    running_agent = MagicMock()
+    running_agent.steer.return_value = True
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer also check auth.log"))
+
+    # The handler replied with a confirmation
+    assert result is not None
+    assert "steer" in result.lower() or "queued" in result.lower()
+    # The agent's steer() was called with the payload (prefix stripped)
+    running_agent.steer.assert_called_once()
+    injected = running_agent.steer.call_args.args[0]
+    assert injected.endswith("\n\nalso check auth.log")
+    assert '"chat_id": "c1"' in injected
+    # Critically: interrupt was NOT called
+    running_agent.interrupt.assert_not_called()
+    # And no user-text queueing happened — the steer doesn't go into
+    # _pending_messages (that would be turn-boundary /queue semantics).
+    assert runner._pending_messages == {}
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed", [float("nan"), True, "not-a-number"])
+async def test_steer_reaches_ancient_turn_via_fresh_timestamp_fallback(
+    monkeypatch, elapsed
+):
+    runner, _adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    running_agent = MagicMock()
+    running_agent.steer.return_value = True
+    running_agent.get_activity_summary.return_value = {
+        "seconds_since_activity": elapsed,
+        "last_activity_at": time.time() - 3,
+        "last_activity_desc": "receiving stream response",
+    }
+    runner._running_agents[sk] = running_agent
+    runner._running_agents_ts[sk] = time.time() - 31_471
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "1800")
+
+    result = await runner._handle_message(_make_event("/steer pause safely"))
+
+    running_agent.steer.assert_called_once()
+    injected = running_agent.steer.call_args.args[0]
+    assert injected.endswith("\n\npause safely")
+    assert '"chat_id": "c1"' in injected
+    assert runner._running_agents[sk] is running_agent
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_steer_agent_without_steer_method_falls_back():
+    """If the running agent somehow lacks the steer() method (older build,
+    test stub), the handler must not explode — fall back to /queue."""
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+
+    # A bare object that does NOT have steer() — use a spec'd Mock so
+    # hasattr(agent, "steer") returns False.
+    running_agent = MagicMock(spec=[])
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(
+        _make_event("/steer fallback", channel_context="[Thread context]\nAlice: earlier request")
+    )
+
+    assert result is not None
+    # Must mention queueing since steer wasn't available
+    assert "queued" in result.lower()
+    assert sk in adapter._pending_messages
+    assert adapter._pending_messages[sk].text == "fallback"
+    assert (
+        adapter._pending_messages[sk].channel_context
+        == "[Thread context]\nAlice: earlier request"
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    pytest.main([__file__, "-v"])
+

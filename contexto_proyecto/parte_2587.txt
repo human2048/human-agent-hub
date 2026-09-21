@@ -1,0 +1,342 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_allowed_channels.py ===
+"""Regression guard for #14920: wildcard "*" in Discord channel config lists.
+
+Setting ``allowed_channels: "*"``, ``free_response_channels: "*"``, or
+``ignored_channels: "*"`` in config (or their ``DISCORD_*_CHANNELS`` env var
+equivalents) must behave as a wildcard — i.e. the bot responds in every
+channel (or is silenced in every channel, for the ignored list). Previously
+the literal string "*" was placed into a set and compared against numeric
+channel IDs via set-intersection, which always produced an empty set and
+caused every message to be silently dropped (for ``allowed_channels``) or
+every ``free_response`` / ``ignored`` check to fail open.
+"""
+
+import unittest
+
+
+def _channel_is_allowed(channel_id: str, allowed_channels_raw: str) -> bool:
+    """Replicate the channel-allow-list check from discord.py on_message."""
+    if not allowed_channels_raw:
+        return True
+    allowed_channels = {ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()}
+    if "*" in allowed_channels:
+        return True
+    return bool({channel_id} & allowed_channels)
+
+
+def _channel_is_ignored(channel_id: str, ignored_channels_raw: str) -> bool:
+    """Replicate the ignored-channel check from discord.py on_message."""
+    ignored_channels = {
+        ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()
+    }
+    return "*" in ignored_channels or bool({channel_id} & ignored_channels)
+
+
+def _channel_is_free_response(channel_id: str, free_channels_raw: str) -> bool:
+    """Replicate the free-response-channel check from discord.py on_message."""
+    free_channels = {
+        ch.strip() for ch in free_channels_raw.split(",") if ch.strip()
+    }
+    return "*" in free_channels or bool({channel_id} & free_channels)
+
+
+class TestDiscordAllowedChannelsWildcard(unittest.TestCase):
+    """Wildcard and channel-list behaviour for DISCORD_ALLOWED_CHANNELS."""
+
+    def test_wildcard_allows_any_channel(self):
+        """'*' should allow messages from any channel ID."""
+        self.assertTrue(_channel_is_allowed("1234567890", "*"))
+
+
+    def test_exact_match_allowed(self):
+        """Channel ID present in the explicit list is allowed."""
+        self.assertTrue(_channel_is_allowed("1234567890", "1234567890,9876543210"))
+
+
+class TestDiscordIgnoredChannelsWildcard(unittest.TestCase):
+    """Wildcard and channel-list behaviour for DISCORD_IGNORED_CHANNELS."""
+
+    def test_wildcard_silences_every_channel(self):
+        """'*' in ignored_channels silences the bot everywhere."""
+        self.assertTrue(_channel_is_ignored("1234567890", "*"))
+
+
+class TestDiscordFreeResponseChannelsWildcard(unittest.TestCase):
+    """Wildcard and channel-list behaviour for DISCORD_FREE_RESPONSE_CHANNELS."""
+
+    def test_wildcard_makes_every_channel_free_response(self):
+        """'*' in free_response_channels exempts every channel from mention-required."""
+        self.assertTrue(_channel_is_free_response("1234567890", "*"))
+
+
+    def test_exact_match_is_free_response(self):
+        self.assertTrue(_channel_is_free_response("111", "111,222"))
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_allowed_mentions.py ===
+"""Tests for the Discord ``allowed_mentions`` safe-default helper.
+
+Ensures the bot defaults to blocking ``@everyone`` / ``@here`` / role pings
+so an LLM response (or echoed user content) can't spam a whole server —
+and that the four ``DISCORD_ALLOW_MENTION_*`` env vars correctly opt back
+in when an operator explicitly wants a different policy.
+"""
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+
+class _FakeAllowedMentions:
+    """Stand-in for ``discord.AllowedMentions`` that exposes the same four
+    boolean flags as real attributes so the test can assert on them.
+    """
+
+    def __init__(self, *, everyone=True, roles=True, users=True, replied_user=True):
+        self.everyone = everyone
+        self.roles = roles
+        self.users = users
+        self.replied_user = replied_user
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return (
+            f"AllowedMentions(everyone={self.everyone}, roles={self.roles}, "
+            f"users={self.users}, replied_user={self.replied_user})"
+        )
+
+
+def _ensure_discord_mock():
+    """Install (or augment) a mock ``discord`` module.
+
+    Other test modules in this directory stub ``discord`` via
+    ``sys.modules.setdefault`` — whichever test file imports first wins and
+    our full module is then silently dropped. We therefore ALWAYS force
+    ``AllowedMentions`` onto whatever is currently in ``sys.modules["discord"]``;
+    that's the only attribute this test file actually needs real behavior from.
+    """
+    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+        sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+        return
+
+    if sys.modules.get("discord") is None:
+        discord_mod = MagicMock()
+        discord_mod.Intents.default.return_value = MagicMock()
+        discord_mod.Client = MagicMock
+        discord_mod.File = MagicMock
+        discord_mod.DMChannel = type("DMChannel", (), {})
+        discord_mod.Thread = type("Thread", (), {})
+        discord_mod.ForumChannel = type("ForumChannel", (), {})
+        discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
+        discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, danger=3, green=1, blurple=2, red=3, grey=4, secondary=5)
+        discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4)
+        discord_mod.Interaction = object
+        discord_mod.Embed = MagicMock
+        discord_mod.app_commands = SimpleNamespace(
+            describe=lambda **kwargs: (lambda fn: fn),
+            choices=lambda **kwargs: (lambda fn: fn),
+            Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+        )
+        discord_mod.opus = SimpleNamespace(is_loaded=lambda: True)
+
+        ext_mod = MagicMock()
+        commands_mod = MagicMock()
+        commands_mod.Bot = MagicMock
+        ext_mod.commands = commands_mod
+
+        sys.modules["discord"] = discord_mod
+        sys.modules.setdefault("discord.ext", ext_mod)
+        sys.modules.setdefault("discord.ext.commands", commands_mod)
+
+    # Whether we just installed the mock OR the mock was already installed
+    # by another test's _ensure_discord_mock, force the AllowedMentions
+    # stand-in onto it — _build_allowed_mentions() reads this attribute.
+    sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+
+
+_ensure_discord_mock()
+
+from plugins.platforms.discord.adapter import _build_allowed_mentions  # noqa: E402
+
+
+# The four DISCORD_ALLOW_MENTION_* env vars that _build_allowed_mentions reads.
+# Cleared before each test so env leakage from other tests never masks a regression.
+_ENV_VARS = (
+    "DISCORD_ALLOW_MENTION_EVERYONE",
+    "DISCORD_ALLOW_MENTION_ROLES",
+    "DISCORD_ALLOW_MENTION_USERS",
+    "DISCORD_ALLOW_MENTION_REPLIED_USER",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_allowed_mention_env(monkeypatch):
+    for name in _ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_safe_defaults_block_everyone_and_roles():
+    am = _build_allowed_mentions()
+    assert am.everyone is False, "default must NOT allow @everyone/@here pings"
+    assert am.roles is False, "default must NOT allow role pings"
+    assert am.users is True, "default must allow user pings so replies work"
+    assert am.replied_user is True, "default must allow reply-reference pings"
+
+
+def test_env_var_opts_back_into_everyone(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_EVERYONE", "true")
+    am = _build_allowed_mentions()
+    assert am.everyone is True
+    # other defaults unaffected
+    assert am.roles is False
+    assert am.users is True
+    assert am.replied_user is True
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_allow_bots_yaml_config.py ===
+"""config.yaml `discord.allow_bots` must reach the adapter's bot gate.
+
+Invariant: every Discord allowlist gate configurable in `config.yaml` resolves through
+`PlatformConfig.extra` even when no `DISCORD_*` env var is set. `allow_bots` regressed
+because `_get_allow_bots()` read env only, so a YAML-configured value was silently
+ignored and bot-to-bot handoffs stayed blocked.
+"""
+
+import importlib
+import sys
+import types
+
+import pytest
+
+
+@pytest.fixture
+def adapter_mod():
+    sys.modules.pop("plugins.platforms.discord.adapter", None)
+    return importlib.import_module("plugins.platforms.discord.adapter")
+
+
+def _seed(adapter_mod, yaml_cfg, discord_cfg):
+    return adapter_mod._apply_yaml_config(yaml_cfg, discord_cfg)
+
+
+def test_yaml_allow_bots_is_seeded_into_extra(adapter_mod, monkeypatch):
+    monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+    seeded = _seed(adapter_mod, {}, {"allow_bots": "mentions"})
+    assert seeded is not None
+    assert seeded.get("allow_bots") == "mentions"
+
+
+def _fake_adapter(adapter_mod, extra, env_overrides=None):
+    """A DiscordAdapter shell with only the gate-resolution state populated."""
+    adapter = object.__new__(adapter_mod.DiscordAdapter)
+    adapter.config = types.SimpleNamespace(extra=extra)
+    snapshot = {key: "" for key in adapter_mod._GATE_ENV_KEYS}
+    snapshot.update(env_overrides or {})
+    adapter._gate_env_snapshot = snapshot
+    return adapter
+
+
+def test_adapter_reads_allow_bots_from_extra_without_env(adapter_mod, monkeypatch):
+    monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+    monkeypatch.setattr(adapter_mod, "_scoped_gate_env", lambda name, default="": default)
+
+    adapter = _fake_adapter(adapter_mod, {"allow_bots": "mentions"})
+
+    assert adapter._get_allow_bots() == "mentions"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_approval_mentions.py ===
+"""Discord approval prompts can opt into owner mentions."""
+
+import os
+from types import SimpleNamespace
+
+import pytest
+
+from plugins.platforms.discord.adapter import (
+    DiscordAdapter,
+    _apply_yaml_config,
+)
+
+
+class _FakeChannel:
+    def __init__(self):
+        self.sent_kwargs = None
+
+    async def send(self, **kwargs):
+        self.sent_kwargs = kwargs
+        return SimpleNamespace(id=12345)
+
+
+class _FakeClient:
+    def __init__(self, channel):
+        self.channel = channel
+
+    def get_channel(self, channel_id):
+        return self.channel
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_mentions_allowed_users_when_enabled(monkeypatch):
+    monkeypatch.setenv("DISCORD_APPROVAL_MENTIONS", "true")
+    channel = _FakeChannel()
+    adapter = object.__new__(DiscordAdapter)
+    adapter._client = _FakeClient(channel)
+    adapter._allowed_user_ids = {"222", "111", "alice"}
+    adapter._allowed_role_ids = set()
+    adapter.config = SimpleNamespace(extra=None)
+
+    result = await adapter.send_exec_approval(
+        chat_id="99",
+        command="make check",
+        session_key="session-1",
+        description="dangerous command",
+    )
+
+    assert result.success is True
+    # Mentions are prepended to the (always present) content mirror.
+    assert channel.sent_kwargs["content"].startswith("<@111> <@222>\n")
+    assert "make check" in channel.sent_kwargs["content"]
+    assert "allowed_mentions" in channel.sent_kwargs
+    assert channel.sent_kwargs["embed"].title.endswith("Hermes wants to run a command that needs your OK")
+
+
+def test_yaml_config_seeds_websocket_health_with_primary_precedence(monkeypatch):
+    for key in (
+        "HERMES_DISCORD_LIVENESS_INTERVAL_SECONDS",
+        "HERMES_DISCORD_LIVENESS_FAILURE_THRESHOLD",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    seeded = _apply_yaml_config(
+        {},
+        {
+            "websocket_liveness_interval_seconds": 11,
+            "liveness_interval_seconds": 99,
+            "websocket_liveness_failure_threshold": 2,
+            "websocket_heartbeat_ack_max_age_seconds": 75,
+            "websocket_max_latency_seconds": 30,
+        },
+    )
+
+    assert os.environ["HERMES_DISCORD_LIVENESS_INTERVAL_SECONDS"] == "11"
+    assert os.environ["HERMES_DISCORD_LIVENESS_FAILURE_THRESHOLD"] == "2"
+    assert seeded == {
+        "websocket_liveness_interval_seconds": 11,
+        "websocket_liveness_failure_threshold": 2,
+        "websocket_heartbeat_ack_max_age_seconds": 75,
+        "websocket_max_latency_seconds": 30,
+    }
+
+
+

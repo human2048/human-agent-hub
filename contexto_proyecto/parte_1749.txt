@@ -1,0 +1,183 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\xlsx\references\restructuring.md ===
+# Reference-aware restructuring (xlsx_restructure.py)
+
+`scripts/xlsx_restructure.py` performs one row/column insert or delete
+and rewrites everything that references the moved cells. This document
+gives the exact rewrite rules and honest limits.
+
+## What gets rewritten
+
+| Artifact | Scope | Behavior |
+|---|---|---|
+| Formula references | ALL sheets | A1 refs into the edited sheet are shifted; refs into a fully deleted region become `#REF!` |
+| Merged-cell ranges | edited sheet | shifted; expanded when they span the insertion point; dropped (reported `to: null`) when fully deleted |
+| Autofilter ref | edited sheet | shifted/expanded like a range |
+| Freeze panes | edited sheet | anchor cell shifted (never below row/col of the pane's own minimum) |
+| Data validations | edited sheet | each range in the sqref shifted; deleted ranges removed |
+| Conditional formats | edited sheet | applied range (sqref) shifted |
+| Native tables | edited sheet | table `ref` shifted/expanded |
+| Defined names | workbook scope | `attr_text` refs into the edited sheet rewritten |
+| Row heights / column widths | edited sheet | dimension keys re-indexed |
+
+## Reference grammar handled
+
+- Relative and absolute coordinates in any mix: `B2`, `$B2`, `B$2`,
+  `$B$2` — the `$` flags are preserved through the shift.
+- Ranges `B2:D9`, including partial-absolute endpoints.
+- Cross-sheet refs: `Data!B2`, `'My Sheet'!$A$1:$C$9` (quoted names may
+  contain doubled quotes `''`). Only refs whose sheet qualifier matches
+  the edited sheet are touched; unqualified refs are interpreted
+  relative to the formula's own sheet.
+- String literals inside formulas (`"See B2"`) are never rewritten.
+- Function names that look like cells (`LOG10(...)`) are not touched
+  (a reference is never followed by `(`).
+- Whole-row/column refs (`B:B`, `2:2`) pass through unchanged — Excel
+  semantics keep them valid across inserts within the span.
+
+## Shift semantics
+
+Insert of N at index i: every coordinate >= i moves +N; range endpoints
+move independently, so a range spanning i grows by N.
+
+Delete of N at index i: coordinates before i are unchanged; coordinates
+past the deleted block move -N; a single cell inside the block becomes
+`#REF!`; a RANGE partially covering the block is clamped (Excel does the
+same); a range entirely inside the block becomes `#REF!` (formulas) or
+is removed (merges/validations).
+
+## What it CANNOT shift (honest limits)
+
+- **Chart anchors and plotted ranges** — openpyxl chart objects are not
+  reliably round-tripped; anchors stay where they were. Re-create
+  charts after restructuring if their data moved.
+- **Images / drawings** — same reason.
+- **Conditional-format RULE formulas** — the applied range (sqref) is
+  shifted, but formulas inside `cell_is`/`expression` rules (e.g.
+  `$B1>100`) are left as-is. Review them if they reference moved cells.
+- **Sheet-local defined names** and names using R1C1 or union/
+  intersection operators are rewritten only if they parse as plain A1
+  refs; anything else passes through untouched.
+- **Structured table references** in formulas (`Table1[Sales]`) don't
+  need shifting (they follow the table), and are left alone.
+
+Every run prints a JSON report listing exactly which formulas, merges,
+tables, names, and ranges were changed, plus a fixed `not_shifted` list
+of the above limits — inspect it after any structural edit.
+
+## One op per invocation
+
+The CLI takes exactly one of `--insert-rows/--delete-rows/
+--insert-cols/--delete-cols` (as `IDX[:N]`; columns accept letters).
+For multiple operations run it repeatedly — ordering compound shifts in
+one pass is where spreadsheet tools historically corrupt references.
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\productivity\xlsx\scripts\csv_to_xlsx.py ===
+#!/usr/bin/env python3
+"""Convert a CSV file to a styled .xlsx workbook with type inference.
+
+Type inference per cell (disable with --no-infer):
+  int, float, bool ("true"/"false", case-insensitive), ISO date
+  (YYYY-MM-DD) and ISO datetime; everything else stays a string.
+
+Styling applied by default (disable with --plain):
+  bold header row with a light fill, frozen top row, autofilter over the
+  data range, and column widths sized to the longest cell (capped at 60).
+
+Usage:
+  csv_to_xlsx.py data.csv out.xlsx
+  csv_to_xlsx.py data.csv out.xlsx --sheet-name Import --encoding cp1252
+  csv_to_xlsx.py data.csv out.xlsx --delimiter ';' --no-infer
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from datetime import date, datetime
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+MAX_COL_WIDTH = 60
+COL_PADDING = 2
+DEFAULT_COL_WIDTH = 8
+
+
+def infer(text):
+    if text == "":
+        return None
+    low = text.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    for caster in (int, float):
+        try:
+            return caster(text)
+        except ValueError:
+            pass
+    for parser in (date.fromisoformat, datetime.fromisoformat):
+        try:
+            return parser(text)
+        except ValueError:
+            pass
+    return text
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="CSV -> styled .xlsx converter.")
+    ap.add_argument("csv_file", help="input CSV path")
+    ap.add_argument("output", help="output .xlsx path")
+    ap.add_argument("--sheet-name", default="Sheet1")
+    ap.add_argument("--encoding", default="utf-8",
+                    help="CSV file encoding (default utf-8)")
+    ap.add_argument("--delimiter", default=",")
+    ap.add_argument("--no-infer", action="store_true",
+                    help="keep every cell as a string")
+    ap.add_argument("--plain", action="store_true",
+                    help="skip header styling / freeze / autofilter")
+    args = ap.parse_args(argv)
+
+    with open(args.csv_file, newline="", encoding=args.encoding) as fh:
+        rows = list(csv.reader(fh, delimiter=args.delimiter))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = args.sheet_name
+    for i, row in enumerate(rows):
+        if args.no_infer or i == 0:
+            ws.append(row)
+        else:
+            ws.append([infer(cell) for cell in row])
+
+    if rows and not args.plain:
+        header_font = Font(bold=True)
+        header_fill = PatternFill("solid", fgColor="DDEBF7")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for col_idx in range(1, ws.max_column + 1):
+            longest = max((len(str(r[col_idx - 1])) for r in rows
+                           if len(r) >= col_idx), default=DEFAULT_COL_WIDTH)
+            ws.column_dimensions[get_column_letter(col_idx)].width = \
+                min(longest + COL_PADDING, MAX_COL_WIDTH)
+
+    wb.save(args.output)
+    print(json.dumps({"ok": True, "output": args.output,
+                      "rows": len(rows)}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+        sys.exit(1)
+

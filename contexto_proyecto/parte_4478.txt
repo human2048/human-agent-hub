@@ -1,0 +1,317 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_profiles_list_worker_session.py ===
+"""Tests: profiles.list ``worker_session`` (freshest kanban/tool worker).
+
+Why: kanban/tool worker sessions are deny-listed out of every conversation
+list, so the desktop Bots roster showed a profile as idle ("3 hr ago")
+while its kanban worker had been running for 12+ minutes
+(NousResearch/hermes-agent#90268). profiles.list now reports the newest
+DENIED row per profile as ``worker_session`` so roster UIs can light
+ACTIVE NOW off the worker's ``last_activity_at`` heartbeat.
+
+Contract under test:
+- ``worker_session`` is the newest kanban/tool row: id, source, title,
+  last_active.
+- ``None`` when the profile has no worker sessions.
+- ``last_session`` still never includes worker rows (existing deny intact).
+- ``include_sessions: false`` skips the field entirely.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import tui_gateway.server as srv
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    h = tmp_path / ".hermes"
+    h.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(h))
+    return h
+
+
+def _db(profile_dir):
+    from hermes_state import SessionDB
+
+    return SessionDB(db_path=profile_dir / "state.db")
+
+
+def _add_session(db, sid, *, source="cli", title="", ts, text):
+    db.create_session(sid, source)
+    db.append_message(sid, "user", text, timestamp=ts)
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, sid))
+
+
+def _profiles(params):
+    envelope = srv._methods["profiles.list"](1, params)
+    return envelope["result"]["profiles"]
+
+
+def _row(profiles, name):
+    return next(p for p in profiles if p["name"] == name)
+
+
+def test_worker_session_reports_newest_worker_and_keeps_last_session_clean(home):
+    db = _db(home)
+    _add_session(db, "chat1", source="cli", title="Chat", ts=1000, text="hello")
+    _add_session(db, "work-old", source="kanban", title="Task 4", ts=2000, text="work kanban task 4")
+    _add_session(db, "work-new", source="kanban", title="Task 9", ts=3000, text="work kanban task 9")
+    db.close()
+
+    row = _row(_profiles({}), "default")
+
+    worker = row["worker_session"]
+    assert worker is not None
+    assert worker["id"] == "work-new"
+    assert worker["source"] == "kanban"
+    assert worker["last_active"] >= 3000
+    # The conversation preview still never surfaces worker rows.
+    assert row["last_session"]["id"] == "chat1"
+
+
+def test_worker_session_none_without_workers(home):
+    db = _db(home)
+    _add_session(db, "chat1", source="cli", title="Chat", ts=1000, text="hello")
+    db.close()
+
+    row = _row(_profiles({}), "default")
+    assert row["worker_session"] is None
+    assert row["last_session"]["id"] == "chat1"
+
+
+def test_worker_session_tool_source_counts(home):
+    db = _db(home)
+    _add_session(db, "sub1", source="tool", title="Subagent", ts=5000, text="delegated run")
+    db.close()
+
+    row = _row(_profiles({}), "default")
+    assert row["worker_session"]["id"] == "sub1"
+    assert row["worker_session"]["source"] == "tool"
+    # No human-facing session at all: last_session stays None.
+    assert row["last_session"] is None
+
+
+def test_include_sessions_false_omits_worker_session(home):
+    db = _db(home)
+    _add_session(db, "work1", source="kanban", title="Task", ts=1000, text="task body")
+    db.close()
+
+    row = _row(_profiles({"include_sessions": False}), "default")
+    assert "worker_session" not in row
+    assert "last_session" not in row
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_profiles_ui_meta_cas.py ===
+"""Gateway-owned revisions for concurrent profile UI metadata updates.
+
+Clients use ``profiles.list`` to read a shared key and its revision, merge a
+local mutation, then pass that revision back to ``profiles.configure``.  The
+gateway must let exactly one concurrent writer advance the key and make every
+stale writer retry instead of silently replacing somebody else's state.
+"""
+
+from __future__ import annotations
+
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+import tui_gateway.server as srv
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    return hermes_home
+
+
+def _configure(ui_meta, expected=None):
+    params = {"name": "default", "ui_meta": ui_meta}
+    if expected is not None:
+        params["ui_meta_expected_revisions"] = expected
+    return srv._methods["profiles.configure"]("configure", params)["result"]["applied"]
+
+
+def _default_profile():
+    rows = srv._methods["profiles.list"](
+        "list", {"include_sessions": False}
+    )["result"]["profiles"]
+    return next(row for row in rows if row["name"] == "default")
+
+
+def test_ui_meta_revision_advances_and_stale_compare_and_swap_is_rejected(home):
+    first = _configure({"shared-room": {"messages": ["one"]}})
+    assert first["ui_meta"] is True
+    assert first["ui_meta_revisions"] == {"shared-room": 1}
+
+    second = _configure(
+        {"shared-room": {"messages": ["one", "two"]}},
+        {"shared-room": 1},
+    )
+    assert second["ui_meta"] is True
+    assert second["ui_meta_revisions"] == {"shared-room": 2}
+
+    stale = _configure(
+        {"shared-room": {"messages": ["stale replacement"]}},
+        {"shared-room": 1},
+    )
+    assert stale["ui_meta"] is False
+    assert stale["ui_meta_conflicts"] == {
+        "shared-room": {"expected": 1, "actual": 2}
+    }
+
+    row = _default_profile()
+    assert row["ui_meta"]["shared-room"] == {"messages": ["one", "two"]}
+    assert row["ui_meta_revisions"]["shared-room"] == 2
+
+
+def test_ui_meta_revision_survives_key_deletion(home):
+    _configure({"shared-room": {"messages": ["one"]}})
+    deleted = _configure({"shared-room": None}, {"shared-room": 1})
+
+    assert deleted["ui_meta"] is True
+    assert deleted["ui_meta_revisions"] == {"shared-room": 2}
+    row = _default_profile()
+    assert "shared-room" not in row.get("ui_meta", {})
+    assert row["ui_meta_revisions"]["shared-room"] == 2
+
+    stale_recreate = _configure(
+        {"shared-room": {"messages": ["resurrected"]}},
+        {"shared-room": 1},
+    )
+    assert stale_recreate["ui_meta"] is False
+    assert stale_recreate["ui_meta_conflicts"]["shared-room"]["actual"] == 2
+
+
+def test_profiles_list_normalizes_yaml_timestamps_in_ui_meta(home):
+    """#92506: an unquoted ISO timestamp under ui_meta is parsed by YAML as datetime; the
+    profiles.list row must still be JSON-serializable (the value becomes its ISO string)."""
+    (home / "profile.yaml").write_text(
+        "ui_meta:\n  hermes-bots:\n    created: 2026-08-22T00:00:00Z\n",
+        encoding="utf-8",
+    )
+
+    row = _default_profile()
+
+    assert row["ui_meta"]["hermes-bots"]["created"] == "2026-08-22T00:00:00+00:00"
+    json.dumps(row)
+
+
+def test_two_concurrent_writers_cannot_both_replace_the_same_revision(home):
+    def write(label):
+        return _configure(
+            {"shared-room": {"messages": [label]}},
+            {"shared-room": 0},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ("alpha", "beta")))
+
+    assert sum(result["ui_meta"] is True for result in results) == 1
+    assert sum(result["ui_meta"] is False for result in results) == 1
+    loser = next(result for result in results if result["ui_meta"] is False)
+    assert loser["ui_meta_conflicts"]["shared-room"]["actual"] == 1
+    assert _default_profile()["ui_meta_revisions"]["shared-room"] == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_profile_db_readonly.py ===
+"""Foreign-profile _profile_db handles must not write-lock another profile's live store.
+
+A named-profile backend serving RPCs about a different profile (desktop app-global remote
+mode, profile switcher) used to acquire() a WRITER on that profile's state.db per RPC and
+close it in the handler's finally. Reads never need that lock, and the writer's close
+participated in the deleted-WAL incident class. Read paths now open read-only, mirroring
+hermes_cli.web_routers.profiles._read_profile_db; the few RPCs that genuinely write
+(move-cwd, delete, set_hidden, foreign import) opt in with writer=True, and the two
+opportunistic writes reachable from read RPCs (repo-root backfill, Bot Chat unarchive)
+either skip or escalate to a short-lived writer instead of writing on the reader.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import tui_gateway.server as server
+from hermes_state import SessionDB
+
+
+def _seed_store(home: Path) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session(session_id="seed", source="cli", model="m")
+    db.close()
+    return home
+
+
+def _bind_foreign(monkeypatch, tmp_path: Path) -> None:
+    foreign = _seed_store(tmp_path / "profiles" / "code")
+    monkeypatch.setattr(server, "_profile_home", lambda name: foreign if (name or "").strip() == "code" else None)
+
+
+def test_foreign_profile_db_is_read_only(monkeypatch, tmp_path):
+    _bind_foreign(monkeypatch, tmp_path)
+    with server._profile_db({"profile": "code"}) as db:
+        assert db is not None
+        assert db.read_only is True
+        assert db.get_session("seed") is not None
+
+
+def test_foreign_profile_db_writer_opt_in(monkeypatch, tmp_path):
+    _bind_foreign(monkeypatch, tmp_path)
+    with server._profile_db({"profile": "code"}, writer=True) as db:
+        assert db is not None
+        assert db.read_only is False
+        assert db.set_session_title("seed", "renamed") is True
+
+
+def test_discover_repos_payload_skips_backfill_on_read_only(monkeypatch, tmp_path):
+    """The repo-root backfill UPDATE must not be attempted (and swallowed) on a reader."""
+    _bind_foreign(monkeypatch, tmp_path)
+    with server._profile_db({"profile": "code"}) as db:
+        calls = []
+        monkeypatch.setattr(type(db), "backfill_repo_roots", lambda self, m: calls.append(m), raising=False)
+        server._discover_repos_payload(db, backfill=True, include_cached=False)
+        assert calls == []
+    # Same call on a writable handle still backfills.
+    with server._profile_db({"profile": "code"}, writer=True) as db:
+        calls = []
+        monkeypatch.setattr(type(db), "backfill_repo_roots", lambda self, m: calls.append(m), raising=False)
+        server._discover_repos_payload(db, backfill=True, include_cached=False)
+        assert len(calls) == 1
+
+
+def test_bot_chat_unarchive_escalates_to_writer(monkeypatch, tmp_path):
+    """An archived-by-accident Bot Chat found via an exact-title lookup on a READ-ONLY foreign
+    handle is still resurrected: the write goes through a short-lived registry writer."""
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+    foreign = tmp_path / "profiles" / "code"
+    foreign.mkdir(parents=True, exist_ok=True)
+    db = SessionDB(db_path=foreign / "state.db")
+    db.create_session(session_id="bot", source="cli", model="m")
+    db.set_session_title("bot", BOT_CHAT_TITLE)
+    db.end_session("bot", "ws_orphan_reap")
+    db.set_session_archived("bot", True)
+    db.close()
+    monkeypatch.setattr(server, "_profile_home", lambda name: foreign if (name or "").strip() == "code" else None)
+
+    with server._profile_db({"profile": "code"}) as ro_db:
+        assert ro_db.read_only is True
+        resp = server._session_list_by_title("rid", ro_db, BOT_CHAT_TITLE)
+    assert resp["result"]["sessions"], "archived Bot Chat was not resurrected through the writer escalation"
+
+    check = SessionDB(db_path=foreign / "state.db", read_only=True)
+    try:
+        assert not check.get_session("bot").get("archived")
+    finally:
+        check.close()
+

@@ -1,0 +1,320 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\ai-presenter-video\assets\job.template.json ===
+{
+  "schema_version": 1,
+  "job_id": "replace-me",
+  "state": "intake",
+  "mode": "automation",
+  "input": {
+    "topic": "",
+    "script_path": "",
+    "presenter_image": "",
+    "voice_sample": "",
+    "supporting_media": [],
+    "rights_confirmed": false,
+    "adult_presenter_confirmed": false,
+    "remote_upload_approved": false,
+    "voice_clone_approved": false
+  },
+  "creative": {
+    "language": "auto",
+    "audience": "general",
+    "goal": "explain clearly",
+    "duration_target_s": 60,
+    "aspect": "9:16",
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "style": "credible contemporary presenter",
+    "watermark": "",
+    "cta": ""
+  },
+  "voice": {
+    "strategy": "auto",
+    "voice_id": "",
+    "rate": 1.06,
+    "segment_lufs": -17,
+    "program_lufs": -16
+  },
+  "plan": {
+    "status": "draft",
+    "opening_target_s": 4,
+    "closing_target_s": 5,
+    "chapters": [],
+    "requested_generation_seconds": 0,
+    "estimated_cost": null,
+    "price_evidence_date": "",
+    "pilot_approved": false,
+    "paid_generation_approved": false,
+    "retry_ceiling": 3
+  },
+  "capabilities": {
+    "voice_generation": {},
+    "main_presenter": {},
+    "short_motion": {},
+    "lipsync_repair": {},
+    "word_timestamp_asr": {},
+    "timeline_compositor": {},
+    "encoder_qa": {}
+  },
+  "manual_input_review": {
+    "image_viewed": false,
+    "single_clear_face": false,
+    "image_has_no_unwanted_text": false,
+    "voice_sample_listened": false,
+    "single_clear_speaker": false
+  },
+  "artifacts": {
+    "script": "",
+    "beat_sheet": "",
+    "timeline": "",
+    "storyboard": "",
+    "final_audio": "",
+    "caption_json": "",
+    "rendered": "",
+    "master": "",
+    "share": ""
+  },
+  "qa": {
+    "preflight_report": "",
+    "asr_report": "",
+    "composition_report": "",
+    "delivery_report": "",
+    "manual_visual_review": ""
+  }
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\ai-presenter-video\references\editing.md ===
+# Editing
+
+Read this file for the visual plan, deterministic timeline, openings, closes, screen demos, captions, keyword callouts, covers, previews, and exports.
+
+## Visual routes
+
+- **Presenter-led:** the presenter carries the explanation; add one concise visual idea per beat.
+- **Screen-demo:** preserve real UI readability; introduce the presenter large at chapter starts, then shrink the same continuous video into a verified safe region.
+- **Mixed explainer:** assign supporting media only where it proves or clarifies narration.
+
+Do not fabricate product evidence. Label conceptual visuals clearly.
+
+## Timeline contract
+
+The locked narration defines duration and semantic boundaries. Every clip keeps three independent values:
+
+- authored start in the final video;
+- authored duration;
+- source-media start.
+
+When an opening changes length, shift authored starts while preserving presenter source offsets. Keep video sources muted and use approved external narration as the program clock. Prefer one continuous presenter source and source-time slices over regenerated chapter clips.
+
+Use hard cuts at settled semantic pauses. Add transitions only when they clarify structure. Preserve a quiet tail so the last word, gesture, and mouth position finish naturally.
+
+## Opening, body, and close
+
+- Establish the topic and payoff within the first few seconds.
+- Design the time-zero frame as a deliberate cover frame.
+- Keep opening copy away from eyes, mouth, and the hand-motion path.
+- Use the same visual system across the cover, chapters, captions, keywords, progress, and close.
+- End with a conclusion or one requested next step. Do not add promotional copy without a brief requirement.
+
+## Captions
+
+Generate word timestamps from the final audio. Split into short semantic phrases, normally one readable line. A practical baseline is about `40ms` visual lead and `120ms` tail hold when neighboring phrases allow it.
+
+Keep captions clear of the face, UI, watermark, progress line, and platform controls. Highlight one meaningful term per phrase. Make entrances and exits quick enough to preserve reading stability.
+
+## Presenter-side keyword presets
+
+Use keyword callouts to amplify selected spoken beats. Avoid repeating one identical card throughout the video.
+
+Rotate a small family of presets such as:
+
+- radial burst;
+- tilted ribbon or sticker;
+- hand-drawn circle or marker stroke;
+- large/small type contrast;
+- staggered word-chip cluster;
+- double-layer outline lockup.
+
+Bind each callout to a real spoken stress or ASR word anchor. Separate the entry timing of the kicker, main word, secondary word, marker, rays, and outline by a few frames. Let the callout settle briefly, then collapse before the next idea. Keep it inside a consistent presenter-side safe region and verify the complete motion path does not cover the face or hands.
+
+## Composition and preview
+
+Use a deterministic compositor available in the environment. For HyperFrames:
+
+1. load the current HyperFrames workflow and domain instructions;
+2. give all timed media explicit start, duration, track, and source offset;
+3. run the required composition check with representative emphasis and transition samples;
+4. inspect time zero, chapter cuts, layout changes, keyword beats, captions, close, and final frame;
+5. open the final Studio preview and obtain approval before rendering;
+6. render at delivery quality only after approval.
+
+Measure the assembled stereo program after rendering. Mono narration duplicated into stereo can measure about 3 LU louder, so perform final program normalization from the rendered file.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\ai-presenter-video\references\generation.md ===
+# Generation
+
+Read this file for intake, content, narration, capability selection, paid generation, presenter prompts, or provider changes.
+
+## Inputs and authorization
+
+Required:
+
+- a topic or script;
+- one local presenter image with one clear adult face;
+- confirmed image rights before remote upload;
+- confirmed adult status from the user.
+
+Optional:
+
+- authorized voice sample;
+- screen recordings, B-roll, images, charts, brand assets, or source links;
+- audience, duration, language, aspect, style, watermark, music, CTA, provider preference, or previous episode.
+
+Inspect the real image. Record visible anchors only: framing, hair, glasses, clothing, accessories, hands, furniture, background geometry, camera height, crop, light, exposure, white balance, embedded text, logos, occlusion, multiple faces, and resolution. Do not infer sensitive traits.
+
+When a voice sample exists, listen for one speaker, audible speech duration, language, noise, echo, clipping, music, silence, and codec damage. Record whether cloning is authorized. Keep the original unchanged.
+
+## Content and narration
+
+For a topic, use one clear spine:
+
+```text
+hook → promise → 2–4 useful beats → synthesis → close
+```
+
+For a supplied script, preserve factual meaning while improving breath, pronunciation, sentence length, and transitions. Flag material factual edits for approval.
+
+Generate the complete approved narration before visual work. Keep one voice identity and one synthesis configuration. Split only for operational limits or clean semantic sections. Preserve raw and normalized copies.
+
+Run ASR against final audio. Review names, numbers, English tokens, omitted words, repeated words, and tail speech. Use actual audio durations for every later cut.
+
+## Capability routing
+
+Resolve capabilities at execution time:
+
+| Capability | Acceptance priority |
+|---|---|
+| Voice generation | authorization, identity, pronunciation, rate control, clean audio |
+| Main presenter | exact audio support, semantic lip sync, identity stability, required duration |
+| Short motion | stable face, one controllable gesture, fixed camera, economical retry |
+| Lip-sync repair | preserves accepted motion while replacing mouth timing with exact audio |
+| Word-timestamp ASR | accurate word start/end times and reviewable output |
+| Timeline compositor | explicit source offsets, frame-accurate seek, deterministic render |
+| Encoder and QA | local probe, loudness, decode, black-frame and contact-sheet support |
+
+Inspect current installed tools and official documentation when availability, duration, pricing, or request fields may have changed. Prefer a user-selected provider when it passes the gates. Otherwise choose the simplest available capability that does.
+
+Record the actual provider, model, version, region, parameters, price evidence date, task ID, and sanitized request body in `job.json`. Ask before a provider change that affects cost, privacy, voice, appearance, or quality.
+
+## Billing and pilot gate
+
+Before the first remote or paid call, state:
+
+- files or data being uploaded;
+- capability and selected tool;
+- requested seconds or units;
+- known price or that the cost is unknown;
+- pilot duration and retry ceiling;
+- expected output and main risks.
+
+Generate the smallest useful pilot. Continue to a full run only after technical checks and visual review pass. Do not generate a long clip when the edit uses only a short range.
+
+## Presenter prompt structure
+
+Write prompts in this order:
+
+1. Bind the user image as the sole presenter and scene reference.
+2. List only visible identity, clothing, accessory, camera, framing, background, light, exposure, and white-balance anchors.
+3. Request realistic skin, hair, eye moisture, fabric, breathing, bilateral blinking, and restrained head motion.
+4. Supply exact dialogue through the tool's supported audio or dialogue field.
+5. Tie one physically plausible gesture to one phrase and approximate time.
+6. Reserve a settled, closed-mouth tail.
+7. Exclude identity, face, glasses, hair, wardrobe, skin tone, background, camera, lighting, finger, hand, dialogue, text, logo, watermark, and extra-person drift.
+
+For the main presenter, prioritize mouth timing and identity. Keep hands low or outside frame. For an opening or close, one small gesture may carry the hook or CTA. Keep hands below the collarbone, away from the face and lens, and end the movement before the tail hold.
+
+If the body performance is accepted but mouth timing is visibly late, preserve the motion plate and apply lip-sync repair with the exact locked audio and no duration extension.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\ai-presenter-video\references\qa-recovery.md ===
+# QA and recovery
+
+Read this file before accepting generated media or delivery, and whenever a production fault appears.
+
+## Acceptance gates
+
+### Inputs
+
+- Topic or script exists.
+- Presenter image decodes and contains one reviewed adult face.
+- Image rights, adult confirmation, and remote-upload permission are recorded.
+- Any voice sample contains one authorized speaker.
+- Supporting media is probed and its provenance is recorded.
+
+### Audio
+
+- Final ASR matches the intended script once, without material omissions or additions.
+- Sections have consistent loudness, commonly near `-17 LUFS`.
+- Assembled program loudness is commonly `-16 ± 0.5 LUFS` unless the destination specifies another target.
+- No clipped words, doubled tracks, echo, clicks, unexpected silence, or truncated tail.
+- Measure the final stereo file; section measurements alone are insufficient.
+
+### Presenter
+
+- Expected resolution, frame rate, duration, and decodable streams.
+- No black frames, long exact-frame freezes, progressive darkening, or duration extension.
+- Identity, face geometry, hair, glasses, clothing, accessories, background, crop, exposure, and white balance remain coherent.
+- Mouth follows names, numbers, English tokens, plosives, and phrase endings.
+- Blinks are sparse and bilateral; gestures occur once and settle; hands remain plausible and away from the face.
+- Tail ends with a settled face and resting mouth.
+
+### Composition and delivery
+
+- No flash, duplicate presenter, source-time reset, missing overlay, overflow, face obstruction, caption collision, or unreadable UI.
+- Opening, callouts, captions, watermark, progress, and platform safe zones remain compatible.
+- Master and share files have the expected duration, dimensions, frame rate, codec, pixel format, and audio rate.
+- Both files fully decode.
+- Contact sheet covers opening, chapters, emphasis graphics, close, and final frame.
+- Watch the complete video at normal speed before delivery.
+
+## Recovery rules
+
+### Interrupted remote task
+
+Poll the saved task ID and download a succeeded result. Resubmit only after a confirmed failure or cancellation.
+
+### Voice identity or loudness changes
+
+Confirm one synthesis identity and configuration. Regenerate the mismatching section, normalize again, and rerun ASR. If the final render is louder than the source, confirm video is muted and apply whole-program two-pass loudness correction.
+
+### Presenter changes between chapters
+
+Use one continuous audio-driven source with source-time slices. When splitting is unavoidable, lock identity, framing, parameters, light, and quiet edge holds.
+
+### Body motion works but mouth is late
+
+Keep the accepted motion plate. Apply lip-sync repair with the exact locked audio and no duration extension. Check speech anchors at numbers, plosives, English tokens, and final syllables.
+
+### Face, glasses, hands, or light drift
+
+Retry from the original image with reduced motion and explicit camera, exposure, and white-balance locks. Simplify the gesture and keep hands low. Structural face or finger faults require regeneration; grading cannot correct them.
+
+### Frozen picture-in-picture
+
+Confirm the layout uses moving video, source offsets advance continuously, and no poster frame or identical-frame padding replaced the presenter.
+
+### Captions or keyword graphics feel wrong
+
+Regenerate timings from the final audio. Split by meaning, shorten visible phrases, and adjust small lead/hold margins. Bind keyword motion to actual spoken anchors and verify its complete path against the face, hands, UI, and captions.
+
+### Three rejected paid candidates
+
+Stop. Preserve candidates, prompts, task IDs, cost, and rejection notes. Summarize the recurring failure, remaining options, expected additional cost, and the single variable proposed for the next attempt.
+

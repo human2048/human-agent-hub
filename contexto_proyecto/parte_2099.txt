@@ -1,0 +1,408 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_kanban_stop.py ===
+"""Tests for the kanban worker turn-end stop guard."""
+
+from __future__ import annotations
+
+import pytest
+
+from agent.kanban_stop import (
+    build_kanban_stop_nudge,
+    kanban_stop_nudge_enabled,
+    session_called_kanban_terminal,
+)
+
+
+@pytest.fixture
+def clear_kanban_env(monkeypatch):
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+
+
+
+
+def test_env_can_disable(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
+    assert kanban_stop_nudge_enabled() is False
+    assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_nudge_disabled_inside_delegated_child(clear_kanban_env):
+    from agent.delegation_context import delegated_child_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent")
+
+    assert kanban_stop_nudge_enabled() is True
+    with delegated_child_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+    assert kanban_stop_nudge_enabled() is True
+
+
+def test_nudge_disabled_inside_non_dispatcher_context(clear_kanban_env):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent")
+
+    assert kanban_stop_nudge_enabled() is True
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+    assert kanban_stop_nudge_enabled() is True
+
+
+def test_nudge_when_no_terminal_tool(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
+    messages = [
+        {"role": "user", "content": "work kanban task"},
+        {
+            "role": "assistant",
+            "content": "Let me write the comprehensive recipe.",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_heartbeat", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": "kanban_heartbeat", "tool_call_id": "1", "content": "ok"},
+    ]
+    nudge = build_kanban_stop_nudge(messages=messages, attempts=0)
+    assert nudge is not None
+    assert "kanban_complete" in nudge
+    assert "kanban_block" in nudge
+    assert "t_46be8aa5" in nudge
+    assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
+
+
+def test_no_nudge_after_kanban_complete(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_complete", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+
+
+
+
+# ── Integration: agent nudge + dispatcher bounded retry ──────────────
+# These tests verify the two layers compose correctly: the agent-side
+# nudge fires first (up to 2 attempts), and if the worker still exits
+# without a terminal call, the dispatcher's bounded retry (streak of 3)
+# handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
+# for the dispatcher-side streak tests.
+
+
+
+
+
+
+@pytest.mark.parametrize(
+    "tool_name,who",
+    [
+        ("kanban_request_review", "build worker handing off for same-card review"),
+        ("kanban_request_changes", "review agent sending the card back"),
+    ],
+)
+def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
+    """Handoff tools end the worker's turn just like complete/block.
+
+    Both move the card out of ``running``, and the worker is told to call
+    them — goals.py's continuation/finalize prompts name
+    ``kanban_request_review``; the force-loaded sdlc-review skill names
+    ``kanban_request_changes``. Nudging afterwards asks a worker that did
+    the right thing to close a card it must not close.
+    """
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_handoff")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": tool_name, "tool_call_id": "1", "content": "ok"},
+    ]
+    assert session_called_kanban_terminal(messages) is True, who
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
+    """Widening the set must not swallow the case the guard exists for."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Let me open the review next.",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_comment", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": "kanban_comment", "tool_call_id": "1", "content": "ok"},
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    nudge = build_kanban_stop_nudge(messages=messages)
+    assert nudge is not None
+    # The nudge offers every worker exit, not just close-out; a card that must go
+    # through review must never be steered to ``kanban_complete`` alone.
+    assert "kanban_request_review" in nudge and "kanban_block" in nudge
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_kimi_coding_anthropic_thinking.py ===
+"""Kimi / Moonshot thinking behavior on the Anthropic-Messages wire.
+
+Contract (changed from the original #13848 mitigation):
+
+- Kimi-family endpoints receive ``thinking`` in **adaptive** form
+  (``thinking.type="adaptive"`` + ``output_config.effort``) — never manual
+  ``budget_tokens``.  Their Anthropic-compatible endpoints
+  (``api.moonshot.cn/anthropic``, ``api.kimi.com/coding``) accept the
+  field set, and the replay-validation 400s that originally motivated
+  dropping the parameter (#13848) no longer occur.
+
+- ``convert_messages_to_anthropic`` still preserves unsigned
+  reasoning_content-derived thinking blocks on replay for this family, so
+  multi-turn tool-call history round-trips.
+
+Kimi on the chat_completions route handles ``thinking`` via ``extra_body``
+in ``ChatCompletionsTransport`` (#13503).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+class TestKimiCodingAnthropicThinking:
+    """Kimi-family thinking on the Anthropic wire (incl. /coding)."""
+
+    def test_kimi_coding_with_explicit_disabled_omits_thinking(self) -> None:
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        kwargs = build_anthropic_kwargs(
+            model="kimi-k2.5",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": False},
+            base_url="https://api.kimi.com/coding",
+        )
+        assert "thinking" not in kwargs
+
+    def test_non_kimi_third_party_still_gets_thinking(self) -> None:
+        """MiniMax and other third-party Anthropic endpoints must retain thinking."""
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        kwargs = build_anthropic_kwargs(
+            model="MiniMax-M2.7",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            base_url="https://api.minimax.io/anthropic",
+        )
+        assert "thinking" in kwargs
+        assert kwargs["thinking"]["type"] == "enabled"
+
+    def test_native_anthropic_still_gets_thinking(self) -> None:
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            base_url=None,
+        )
+        assert "thinking" in kwargs
+
+
+class TestKimiFamilyGetsAdaptiveThinking:
+    """Kimi-family endpoints get adaptive thinking + output_config.effort."""
+
+    @pytest.mark.parametrize(
+        "base_url,model",
+        [
+            # Official Kimi / Moonshot hosts (all URL shapes)
+            ("https://api.kimi.com/coding", "kimi-k2.5"),
+            ("https://api.kimi.com/coding/v1", "kimi-k2.5"),
+            ("https://api.kimi.com/coding/anthropic", "kimi-k2.5"),
+            ("https://api.kimi.com/v1", "kimi-k2.5"),
+            ("https://api.moonshot.ai/anthropic", "moonshot-v1-32k"),
+            ("https://api.moonshot.cn/anthropic", "moonshot-v1-32k"),
+            ("https://api.moonshot.cn/anthropic/v1", "kimi-0714-preview"),
+            # Custom / proxied hosts with a Kimi-family model (#17057)
+            ("http://my-kimi-proxy.internal", "kimi-2.6"),
+            ("https://llm.example.com/anthropic", "moonshotai/kimi-k2.5"),
+        ],
+    )
+    def test_kimi_family_endpoint_gets_adaptive_thinking(
+        self, base_url: str, model: str
+    ) -> None:
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        kwargs = build_anthropic_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "high"},
+            base_url=base_url,
+        )
+        assert kwargs.get("thinking", {}).get("type") == "adaptive", (
+            f"Kimi-family endpoint ({base_url}, {model}) must receive "
+            f"adaptive thinking, got {kwargs.get('thinking')!r}"
+        )
+        assert "budget_tokens" not in kwargs["thinking"]
+        assert kwargs["output_config"] == {"effort": "high"}
+        # Adaptive mode must not force temperature or inflate max_tokens
+        # (those are manual-budget-mode side effects).
+        assert "temperature" not in kwargs
+        assert kwargs["max_tokens"] == 4096
+
+
+
+
+    def test_kimi_family_replay_preserves_unsigned_thinking(self) -> None:
+        """On a custom Kimi endpoint, unsigned reasoning_content thinking
+        blocks must survive the third-party signature-stripping pass so
+        the upstream's message-history validation passes.
+        """
+        from agent.anthropic_message_convert import convert_messages_to_anthropic
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "reasoning_content": "planning the tool call",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "skill_view", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        _, converted = convert_messages_to_anthropic(
+            messages,
+            base_url="http://my-kimi-proxy.internal",
+            model="kimi-2.6",
+        )
+        # The assistant message still carries the unsigned thinking block
+        # synthesised from reasoning_content (required by Kimi's history
+        # validation).  A plain third-party endpoint would have stripped it.
+        assistant_msg = next(m for m in converted if m["role"] == "assistant")
+        assistant_blocks = assistant_msg["content"]
+        thinking_blocks = [
+            b for b in assistant_blocks
+            if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0]["thinking"] == "planning the tool call"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_last_reasoning_per_turn.py ===
+"""Tests for per-turn reasoning extraction in AIAgent.run_conversation.
+
+Verifies the reasoning field returned to display layers (CLI reasoning box,
+gateway reasoning footer, TUI reasoning event) only reflects the CURRENT
+turn's reasoning — never leaks from a prior turn — and is picked up
+correctly when reasoning is attached to a tool-calling assistant step
+rather than the final-answer assistant step.
+"""
+from __future__ import annotations
+
+
+def _extract_last_reasoning(messages):
+    """Replica of the extraction loop in run_agent.py (~line 13867).
+
+    Tests pin the loop's behaviour so that refactors can't silently
+    regress the per-turn semantic.
+    """
+    last_reasoning = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            break
+        if msg.get("role") == "assistant" and msg.get("reasoning"):
+            last_reasoning = msg["reasoning"]
+            break
+    return last_reasoning
+
+
+def test_simple_turn_reasoning_present():
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi", "reasoning": "greeting the user"},
+    ]
+    assert _extract_last_reasoning(messages) == "greeting the user"
+
+
+
+
+
+
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_last_total_tokens.py ===
+"""Test that last_total_tokens is correctly set by ContextCompressor."""
+
+from agent.context_compressor import ContextCompressor
+
+
+def test_update_from_response_sets_total_tokens():
+    """ABC contract: last_total_tokens must be set from API response."""
+    c = ContextCompressor(model="test", quiet_mode=True, config_context_length=200000)
+
+    c.update_from_response({"prompt_tokens": 100, "completion_tokens": 30, "total_tokens": 130})
+    assert c.last_total_tokens == 130
+
+    c.update_from_response({"prompt_tokens": 100, "completion_tokens": 30})
+    assert c.last_total_tokens == 130
+
+
+def test_session_reset_clears_total_tokens():
+    """on_session_reset must zero total_tokens."""
+    c = ContextCompressor(model="test", quiet_mode=True, config_context_length=200000)
+    c.update_from_response({"prompt_tokens": 100, "completion_tokens": 30, "total_tokens": 130})
+    c.on_session_reset()
+    assert c.last_total_tokens == 0
+

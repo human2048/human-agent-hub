@@ -1,0 +1,311 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\logs.py ===
+"""``hermes logs`` subcommand parser."""
+
+from __future__ import annotations
+
+import argparse
+from typing import Callable
+
+
+def build_logs_parser(subparsers, *, cmd_logs: Callable) -> None:
+    """Attach the ``logs`` subcommand to ``subparsers``."""
+    logs_parser = subparsers.add_parser(
+        "logs", help="View and filter Hermes log files",
+        description="View, tail, and filter agent.log / errors.log / gateway.log / gui.log / desktop.log",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+    hermes logs                    Show last 50 lines of agent.log
+    hermes logs -f                 Follow agent.log in real time
+    hermes logs errors             Show last 50 lines of errors.log
+    hermes logs gateway -n 100     Show last 100 lines of gateway.log
+    hermes logs gui -f             Follow gui.log in real time
+    hermes logs desktop -f         Follow desktop.log (Electron app boot/backend)
+    hermes logs --level WARNING    Only show WARNING and above
+    hermes logs --session abc123   Filter by session ID
+    hermes logs --component tools  Only show tool-related lines
+    hermes logs --since 1h         Lines from the last hour
+    hermes logs --since 30m -f     Follow, starting from 30 min ago
+    hermes logs list               List available log files with sizes
+""")
+    logs_parser.add_argument(
+        "log_name", nargs="?", default="agent",
+        help="Log to view: agent (default), errors, gateway, gui, or 'list' to show available files",
+    )
+    logs_parser.add_argument(
+        "-n", "--lines", type=int, default=50, help="Number of lines to show (default: 50)")
+    logs_parser.add_argument(
+        "-f", "--follow", action="store_true", help="Follow the log in real time (like tail -f)")
+    logs_parser.add_argument(
+        "--level", metavar="LEVEL", help="Minimum log level to show (DEBUG, INFO, WARNING, ERROR)")
+    logs_parser.add_argument(
+        "--session", metavar="ID", help="Filter lines containing this session ID substring")
+    logs_parser.add_argument(
+        "--since", metavar="TIME", help="Show lines since TIME ago (e.g. 1h, 30m, 2d)")
+    logs_parser.add_argument(
+        "--component", metavar="NAME",
+        help="Filter by component: gateway, agent, tools, cli, cron, gui")
+    logs_parser.set_defaults(func=cmd_logs)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\mcp.py ===
+"""``hermes mcp`` subcommand parser."""
+
+from __future__ import annotations
+
+import argparse
+from typing import Callable
+
+from hermes_cli.subcommands._shared import add_accept_hooks_flag
+
+
+def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
+    """Attach the ``mcp`` subcommand to ``subparsers``."""
+    mcp_parser = subparsers.add_parser(
+        "mcp", help="Manage MCP servers and run Hermes as an MCP server",
+        description="Manage MCP server connections and run Hermes as an MCP server.\n\n"
+            "MCP servers provide additional tools via the Model Context Protocol.\n"
+            "Use 'hermes mcp add' to connect to a new server, or\n"
+            "'hermes mcp serve' to expose Hermes conversations over MCP.")
+    mcp_sub = mcp_parser.add_subparsers(dest="mcp_action")
+
+    mcp_serve_p = mcp_sub.add_parser(
+        "serve", help="Run Hermes as an MCP server (expose conversations to other agents)")
+    mcp_serve_p.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose logging on stderr")
+    add_accept_hooks_flag(mcp_serve_p)
+
+    mcp_add_p = mcp_sub.add_parser("add", help="Add an MCP server (discovery-first install)")
+    mcp_add_p.add_argument("name", help="Server name (used as config key)")
+    mcp_add_p.add_argument("--url", help="HTTP/SSE endpoint URL")
+    # dest="mcp_command": the default dest="command" would clobber the top-level
+    # subcommand name the dispatcher routes on (None when omitted → falls into chat).
+    mcp_add_p.add_argument("--command", dest="mcp_command", help="Stdio command (e.g. npx)")
+    mcp_add_p.add_argument(
+        "--args", nargs=argparse.REMAINDER, default=[],
+        help="Arguments for stdio command; must be the last option")
+    mcp_add_p.add_argument("--auth", choices=["oauth", "header"], help="Auth method")
+    mcp_add_p.add_argument("--preset", help="Known MCP preset name")
+    mcp_add_p.add_argument(
+        "--connect-timeout", type=float,
+        help="Timeout in seconds for initial connection and tool discovery")
+    mcp_add_p.add_argument(
+        "--env", nargs="*", default=[], help="Environment variables for stdio servers (KEY=VALUE)")
+
+    mcp_rm_p = mcp_sub.add_parser("remove", aliases=["rm"], help="Remove an MCP server")
+    mcp_rm_p.add_argument("name", help="Server name to remove")
+
+    mcp_sub.add_parser("list", aliases=["ls"], help="List configured MCP servers")
+
+    mcp_test_p = mcp_sub.add_parser("test", help="Test MCP server connection")
+    mcp_test_p.add_argument("name", help="Server name to test")
+
+    mcp_cfg_p = mcp_sub.add_parser("configure", aliases=["config"], help="Toggle tool selection")
+    mcp_cfg_p.add_argument("name", help="Server name to configure")
+
+    mcp_login_p = mcp_sub.add_parser(
+        "login", help="Force re-authentication for an OAuth-based MCP server")
+    mcp_login_p.add_argument("name", help="Server name to re-authenticate")
+    mcp_login_p.add_argument(
+        "--flow", choices=["browser", "device"], default=None,
+        help="OAuth flow (overrides oauth.flow): browser PKCE or RFC 8628 device code")
+
+    mcp_reauth_p = mcp_sub.add_parser(
+        "reauth", help="Re-authenticate one OAuth MCP server, or all of them (--all)")
+    mcp_reauth_p.add_argument(
+        "name", nargs="?", help="Server name to re-authenticate (omit with --all)")
+    mcp_reauth_p.add_argument(
+        "--all", action="store_true",
+        help="Re-authenticate every OAuth server in config, one at a time")
+
+    # Catalog (Nous-approved MCPs shipped with the repo)
+    mcp_sub.add_parser(
+        "picker", help="Interactive catalog picker (also the default for `hermes mcp`)")
+    mcp_sub.add_parser("catalog", help="List Nous-approved MCPs available for one-click install")
+    mcp_install_p = mcp_sub.add_parser(
+        "install", help="Install a catalog MCP by name (e.g. `hermes mcp install n8n`)")
+    mcp_install_p.add_argument("identifier", help="Catalog entry name (or `official/<name>`)")
+
+    add_accept_hooks_flag(mcp_parser)
+    mcp_parser.set_defaults(func=cmd_mcp)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\memory.py ===
+"""``hermes memory`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from hermes_cli.subcommands._shared import add_yes_flag
+
+
+def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
+    """Attach the ``memory`` subcommand to ``subparsers``."""
+    memory_parser = subparsers.add_parser(
+        "memory", help="Configure external memory provider",
+        description="Set up and manage external memory provider plugins.\n\n"
+            "Available providers: honcho, openviking, mem0, hindsight,\n"
+            "holographic, retaindb, byterover.\n\n"
+            "Only one external provider can be active at a time.\n"
+            "Built-in memory (MEMORY.md/USER.md) is always active.")
+    memory_sub = memory_parser.add_subparsers(dest="memory_command")
+    _setup_parser = memory_sub.add_parser(
+        "setup", help="Interactive provider selection and configuration")
+    _setup_parser.add_argument(
+        "provider", nargs="?", default=None,
+        help="Provider to configure directly (e.g. honcho), skipping the picker")
+    memory_sub.add_parser("status", help="Show current memory provider config")
+    memory_sub.add_parser("off", help="Disable external provider (built-in only)")
+    _reset_parser = memory_sub.add_parser(
+        "reset", help="Erase all built-in memory (MEMORY.md and USER.md)")
+    add_yes_flag(_reset_parser)
+    _reset_parser.add_argument(
+        "--target", choices=["all", "memory", "user"], default="all",
+        help="Which store to reset: 'all' (default), 'memory', or 'user'")
+    memory_parser.set_defaults(func=cmd_memory)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\migrate.py ===
+"""``hermes migrate`` subcommand parser."""
+
+from __future__ import annotations
+
+
+def build_migrate_parser(subparsers) -> None:
+    """Attach the ``migrate`` subcommand to ``subparsers``."""
+    from hermes_cli.migrate import cmd_migrate, cmd_migrate_xai
+
+    migrate_parser = subparsers.add_parser(
+        "migrate", help="Migrate configuration for retired models or deprecated settings",
+        description="Diagnose and (optionally) rewrite the active config.yaml to "
+            "replace references to retired models or deprecated settings.")
+    migrate_subparsers = migrate_parser.add_subparsers(dest="migrate_type")
+
+    migrate_xai = migrate_subparsers.add_parser(
+        "xai", help="Migrate xAI models scheduled for retirement on May 15, 2026",
+        description="Scan config.yaml for references to xAI models retiring on "
+            "May 15, 2026 and, with --apply, rewrite them in-place to the "
+            "official replacements per the xAI migration guide. The original "
+            "config.yaml is backed up before any rewrite.")
+    migrate_xai.add_argument(
+        "--apply", action="store_true",
+        help="Rewrite config.yaml in-place (default: dry-run, no writes)")
+    migrate_xai.add_argument(
+        "--no-backup", action="store_true",
+        help="Skip the timestamped backup of config.yaml when applying")
+    migrate_xai.set_defaults(func=cmd_migrate_xai)
+
+    migrate_relay = migrate_subparsers.add_parser(
+        "relay", help="Convert legacy HERMES_NEMO_RELAY_ATIF_*/ATOF_* exporter vars into relay-plugins.toml",
+        description="The NeMo Relay cutover stopped reading the legacy exporter variables; a .env that still "
+            "carries them (and no HERMES_NEMO_RELAY_PLUGINS_TOML) exports nothing. Generate "
+            "<hermes home>/relay-plugins.toml from them, point HERMES_NEMO_RELAY_PLUGINS_TOML at it, "
+            "and comment the legacy lines out. `hermes update` runs this for every profile automatically.")
+    migrate_relay.add_argument(
+        "--all-profiles", action="store_true",
+        help="Migrate the default home and every named profile (what `hermes update` does)")
+    migrate_relay.add_argument(
+        "--no-validate", action="store_true",
+        help="Skip activating the generated file through Relay's validator before writing it")
+    migrate_relay.set_defaults(func=_cmd_migrate_relay)
+    migrate_parser.set_defaults(func=cmd_migrate)
+
+
+def _cmd_migrate_relay(args) -> None:
+    from hermes_cli.relay_plugin_migrate import cmd_migrate_relay
+    cmd_migrate_relay(args)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\moa.py ===
+"""``hermes moa`` subcommand parser."""
+
+from __future__ import annotations
+
+
+def build_moa_parser(subparsers) -> None:
+    """Attach the ``moa`` subcommand to ``subparsers``."""
+    from hermes_cli.moa_cmd import cmd_moa
+
+    moa_parser = subparsers.add_parser(
+        "moa", help="Configure Mixture of Agents provider/model slots",
+        description="Configure the provider/model set used by /moa <prompt>.")
+    moa_subparsers = moa_parser.add_subparsers(dest="moa_command")
+    moa_subparsers.add_parser("list", aliases=["ls"], help="Show current MoA model slots")
+    moa_configure = moa_subparsers.add_parser("configure", aliases=["config"], help="Interactively pick MoA models")
+    moa_configure.add_argument("name", nargs="?", help="Preset name to create or update")
+    moa_delete = moa_subparsers.add_parser("delete", aliases=["rm"], help="Delete a MoA preset")
+    moa_delete.add_argument("name", help="Preset name to delete")
+    moa_parser.set_defaults(func=cmd_moa)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\model.py ===
+"""``hermes model`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_model_parser(subparsers, *, cmd_model: Callable) -> None:
+    """Attach the ``model`` subcommand to ``subparsers``."""
+    model_parser = subparsers.add_parser(
+        "model", help="Select default model and provider",
+        description="Interactively select your inference provider and default model")
+    model_parser.add_argument(
+        "--refresh", action="store_true",
+        help="Wipe the model picker disk cache and re-fetch every provider's live /v1/models list.")
+    model_parser.add_argument(
+        "--portal-url", help="Portal base URL for Nous login (default: production portal)")
+    model_parser.add_argument(
+        "--inference-url",
+        help="Inference API base URL for Nous login (default: production inference API)")
+    model_parser.add_argument(
+        "--client-id", default=None,
+        help="OAuth client id to use for Nous login (default: hermes-cli)")
+    model_parser.add_argument("--scope", default=None, help="OAuth scope to request for Nous login")
+    model_parser.add_argument(
+        "--no-browser", action="store_true",
+        help="Do not attempt to open the browser automatically during Nous login")
+    model_parser.add_argument(
+        "--timeout", type=float, default=15.0,
+        help="HTTP request timeout in seconds for Nous login (default: 15)")
+    model_parser.add_argument(
+        "--ca-bundle", help="Path to CA bundle PEM file for Nous TLS verification")
+    model_parser.add_argument(
+        "--insecure", action="store_true",
+        help="Disable TLS verification for Nous login (testing only)")
+    model_parser.set_defaults(func=cmd_model)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\monitoring.py ===
+"""``hermes monitoring`` subcommand parser (gateway health/diagnostics export control)."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_monitoring_parser(subparsers, *, cmd_monitoring: Callable) -> None:
+    """Attach the ``monitoring`` subcommand (with actions) to ``subparsers``."""
+    p = subparsers.add_parser(
+        "monitoring", help="Inspect gateway monitoring (health & diagnostics export)",
+        description="Gateway monitoring: service health metrics plus redacted "
+            "diagnostics, exported over OTLP to an operator-configured "
+            "endpoint. Content-free by construction — no prompts, messages, "
+            "tool args/results, or usage analytics. Configure under "
+            "monitoring.* in config.yaml.")
+    sub = p.add_subparsers(dest="monitoring_action")
+
+    sub.add_parser("status", help="Show monitoring settings, export state, and redaction posture")
+
+    p.set_defaults(func=cmd_monitoring)
+

@@ -1,0 +1,393 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\test_vector_generator.py ===
+"""Conformance vector generator tests (Phase 5 oracle workstream).
+
+Behavior contracts, not change-detectors: determinism, corpus invariants,
+oracle-import health (the generator calls format_message UNBOUND — these
+tests fail loudly if a refactor gives those renderers instance state), and
+vector-file shape. Native outputs themselves are NOT snapshotted here — the
+connector's conformance runner is the consumer that asserts them.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from generate_conformance_vectors import (  # noqa: E402
+    ADVERSARIAL,
+    GRID,
+    SCAR,
+    _oracles,
+    corpus,
+    generate,
+)
+
+PLATFORMS = ("discord", "slack", "telegram", "whatsapp")
+
+
+def test_corpus_ids_unique_and_categorized():
+    rows = corpus()
+    ids = [r["id"] for r in rows]
+    assert len(ids) == len(set(ids)), "vector ids must be unique (runner keys on them)"
+    assert {r["category"] for r in rows} == {"grid", "scar", "adversarial"}
+    assert len(GRID) >= 20 and len(SCAR) >= 10 and len(ADVERSARIAL) >= 8
+
+
+def test_oracles_importable_and_self_free():
+    """The generator invokes format_message unbound (self=None) — verify every
+    oracle actually renders under that calling convention. A refactor that
+    adds instance state to a renderer must update the generator too."""
+    oracles = _oracles()
+    assert set(oracles) == set(PLATFORMS)
+    for platform, render in oracles.items():
+        out = render("**bold** and `code`")
+        assert isinstance(out, str) and out, platform
+
+
+
+
+def test_vector_files_shape(tmp_path):
+    generate(tmp_path)
+    for platform in PLATFORMS:
+        doc = json.loads((tmp_path / f"{platform}.json").read_text(encoding="utf-8"))
+        assert doc["platform"] == platform
+        assert doc["oracle"]["repo"] == "NousResearch/hermes-agent"
+        assert re.match(r"^[0-9a-f]{40}$|^unknown$", doc["oracle"]["commit"])
+        assert doc["oracle"]["generator_version"] >= 1
+        ids = set()
+        for v in doc["vectors"]:
+            assert v["expect"] in ("parity", "semantic", "divergent"), v["id"]
+            assert isinstance(v["native_output"], str)
+            if v["expect"] == "divergent":
+                assert v.get("note"), f"{platform}/{v['id']}: divergent needs a note"
+            ids.add(v["id"])
+        assert len(ids) == len(doc["vectors"])
+
+
+
+
+
+
+def test_committed_vectors_match_regeneration(tmp_path):
+    """The committed tests/conformance/vectors/ must reproduce from the
+    current oracle — the same lockstep discipline as openapi.json (drift
+    means someone changed a renderer without regenerating)."""
+    committed_dir = REPO_ROOT / "tests" / "conformance" / "vectors"
+    if not committed_dir.exists():
+        pytest.skip("no committed vectors in this checkout")
+    generate(tmp_path)
+    for platform in PLATFORMS:
+        fresh = json.loads((tmp_path / f"{platform}.json").read_text(encoding="utf-8"))
+        committed = json.loads((committed_dir / f"{platform}.json").read_text(encoding="utf-8"))
+        # Compare everything except the commit stamp (committed file may be
+        # one commit behind HEAD in a dirty working tree).
+        fresh["oracle"].pop("commit")
+        committed["oracle"].pop("commit")
+        assert fresh == committed, (
+            f"{platform} vectors drifted — run "
+            "`python scripts/generate_conformance_vectors.py` and commit"
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\__init__.py ===
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\persistence\README.md ===
+# Crash/resume persistence conformance cells
+
+Phase 1 of the machine-checked conformance suite proposed in #80921, following
+the contract framing of "Resume Means Resume" (arXiv:2608.03836): each cell is
+a deterministic, LLM-free probe of one persistence contract clause, run against
+the **real `SessionDB`** with a real `SIGKILL` delivered to a separate OS
+process mid-write.
+
+## Cells
+
+| cell | contract clause | origin |
+|---|---|---|
+| 1 — `test_cell1_prefix_durability` | acknowledged appends survive a hard crash; contiguous prefix; deterministic recovery | adapted from the tracking issue's spot-probe (29.5K-message original, scaled to a ≥200-append kill window with identical assertions) |
+| 2 — `test_cell2_consume_once` | a parked handoff is claimed by exactly one of N racing processes | adapted from the tracking issue's spot-probe (8-process file-barrier race) |
+| 3 — `test_cell3_rotation_atomicity` | a compression rotation is visible entirely or not at all — never a compression-ended parent without a continuation (the #80337 orphan shape; recovery for the legacy population merged in #80487) | new in this suite |
+| 4 — fork determinism on edit/rewind | recovery yields exactly the chosen prefix after a fork | **stub** — interlocked with the rewind/archive redesign (#82956–#82959) |
+| 5 — delivery-outbox effect exactly-once | crash between provider send and durable record must not double-deliver on catch-up | **stub** — needs a fake-transport seam; cron delivery scope in flight (#83197/#83557) |
+
+## Method
+
+- Real `SessionDB(db_path=...)` in an isolated `tmp_path`; no mocks on the
+  persistence layer.
+- Crashes are real `SIGKILL`s to a separate interpreter, asserted to be
+  **alive at kill time** (a clean early exit cannot masquerade as a crash
+  test); acknowledgement journals tolerate a torn final line (the kill can
+  interrupt the journal write itself).
+- Every wait is deadline-bounded; coordination uses file barriers, never
+  sleeps-for-correctness.
+- Journal-mode matrix (cells 1 and 3): the resolver's default, explicit
+  `DELETE`, and explicit `WAL` — each leg steers the child's own resolver
+  via an isolated `HERMES_HOME` config, then **audits the on-disk mode after
+  the run** and skips when the environment didn't honor the request (e.g.
+  the resolver's WAL-reset downgrade gate, the tracking issue's 3.50.4
+  caveat). A leg that ran in a different mode never counts as evidence for
+  the advertised one. Cell 2 runs on the resolver's default only (the
+  consume-once property is journal-mode-independent: it rests on a single
+  predicated UPDATE).
+
+## Semantics
+
+These are **conformance** cells: they are expected GREEN on main (cells 1–2
+reproduce the tracking issue's passing probes; cell 3 pins the atomicity the
+#80337 forensics established). A failing cell is a **fire**: report it on
+#80921 with the cell's evidence — do not silence it, and do not attach a fix
+to this suite.
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\persistence\test_cell1_prefix_durability.py ===
+"""Cell 1 — prefix continuation + recovery determinism under real SIGKILL.
+
+Contract clause (arXiv:2608.03836): every append the store *acknowledged*
+survives a hard crash; recovery yields a contiguous prefix (no holes, no
+duplicates); two independent recovery passes see the identical transcript.
+
+Adapted from the spot-probe in the tracking issue (#80921), which ran ~29.5K
+messages to a SIGKILL with zero lost-after-return. Scaled down for CI: the
+parent kills the writer once >= 200 acknowledged appends are journaled — the
+property assertions are identical, only the exposure window is shorter.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from tests.conformance.persistence._harness import (
+    effective_mode_or_skip,
+    integrity_ok,
+    kill9_and_reap,
+    make_hermes_home,
+    spawn_child,
+    wait_for,
+)
+
+WRITER = r"""
+import json, sys
+from pathlib import Path
+from hermes_state import SessionDB
+
+db_path = Path({db_path!r})
+journal = Path({journal!r})
+db = SessionDB(db_path=db_path)
+db.create_session("cell1", source="conformance")
+i = 0
+with journal.open("a", buffering=1) as j:
+    while True:
+        rowid = db.append_message("cell1", "user", content=f"m{{i}}")
+        # fsync-journal the acknowledged index AFTER append returns —
+        # exactly the probe's definition of "claimed durable".
+        j.write(json.dumps({{"i": i, "rowid": rowid}}) + "\n")
+        j.flush()
+        i += 1
+"""
+
+
+def _acknowledged(journal: Path) -> list[dict]:
+    if not journal.exists():
+        return []
+    out = []
+    for line in journal.read_text().splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A torn final line is expected under SIGKILL: the write to the
+            # journal itself was interrupted. That index was never fully
+            # acknowledged to the harness, so it is out of scope.
+            continue
+    return out
+
+
+def _recover(db_path: Path) -> list[tuple]:
+    """One independent recovery pass in a fresh connection/process context."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT id, content FROM messages WHERE session_id='cell1' ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("requested_mode", [None, "DELETE", "WAL"])
+def test_acknowledged_appends_survive_sigkill(tmp_path, requested_mode):
+    db_path = tmp_path / "state.db"
+    journal = tmp_path / "acked.jsonl"
+
+    child_env = {}
+    if requested_mode is not None:
+        # Steer the CHILD's own resolver via an isolated HERMES_HOME config:
+        # pre-seeding the file alone is not enough — SessionDB.__init__ runs
+        # apply_wal_with_fallback(), which upgrades a non-WAL file to WAL
+        # whenever the configured mode says so (the resolver's downgrade
+        # gates may still refuse; effective_mode_or_skip audits post-run).
+        child_env["HERMES_HOME"] = str(
+            make_hermes_home(tmp_path, requested_mode.lower())
+        )
+
+    child = spawn_child(
+        WRITER.format(db_path=str(db_path), journal=str(journal)), env=child_env
+    )
+    try:
+        wait_for(
+            lambda: len(_acknowledged(journal)) >= 200,
+            what=">=200 acknowledged appends",
+            child=child,
+        )
+        # The kill must interrupt a LIVE writer — a child that already
+        # exited would turn this into a clean-shutdown test.
+        assert child.poll() is None, (
+            f"writer exited early (rc={child.returncode}): "
+            f"{(child.stderr.read() if child.stderr else b'').decode(errors='replace')[-1500:]}"
+        )
+    finally:
+        kill9_and_reap(child)
+
+    # A leg that ran in a different mode than requested is no evidence for
+    # the requested mode — skip it rather than silently double-counting WAL.
+    mode = effective_mode_or_skip(db_path, requested_mode)
+    acked = _acknowledged(journal)
+    assert len(acked) >= 200, (
+        f"[journal_mode={mode}] only {len(acked)} acknowledged appends "
+        "journaled before the kill — harness window too small"
+    )
+
+    pass1 = _recover(db_path)
+    pass2 = _recover(db_path)
+
+    # Zero lost-after-return: every acknowledged index is present.
+    recovered_contents = {row[1] for row in pass1}
+    lost = [a for a in acked if f"m{a['i']}" not in recovered_contents]
+    assert not lost, (
+        f"[journal_mode={mode}] {len(lost)} acknowledged appends lost after "
+        f"SIGKILL (first: {lost[:3]})"
+    )
+
+    # Contiguous prefix: indices 0..N-1 with no holes and no duplicates.
+    indices = sorted(int(row[1][1:]) for row in pass1)
+    assert indices == list(range(len(indices))), (
+        f"[journal_mode={mode}] recovered transcript is not a contiguous "
+        "prefix (holes or duplicates present)"
+    )
+
+    # Recovery determinism: two independent passes identical.
+    assert pass1 == pass2, f"[journal_mode={mode}] recovery passes diverge"
+
+    assert integrity_ok(db_path), f"[journal_mode={mode}] integrity_check failed"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\conformance\persistence\test_cell2_consume_once.py ===
+"""Cell 2 — consume-once under cross-process concurrent delivery.
+
+Contract clause (arXiv:2608.03836): a parked handoff is claimed by exactly
+one consumer, no matter how many independent processes race for it. This is
+the cell the paper found failing at saturation 1.0 in 36/40 cells across
+deployed frameworks; Hermes' ``claim_handoff`` ships the paper's own repair
+shape (single UPDATE with a state predicate, rowcount-checked), which the
+tracking-issue probe confirmed. This cell pins it permanently.
+
+8 independent OS processes are released from a file barrier simultaneously;
+each calls ``SessionDB.claim_handoff()`` on the same pending session.
+"""
+
+from __future__ import annotations
+
+from tests.conformance.persistence._harness import (
+    on_disk_journal_mode,
+    reap,
+    spawn_child,
+    wait_for,
+)
+
+CLAIMANT = r"""
+import sys, time
+from pathlib import Path
+from hermes_state import SessionDB
+
+db_path = Path({db_path!r})
+barrier = Path({barrier!r})
+ready = Path({ready!r})
+
+ready.touch()
+deadline = time.monotonic() + 55
+while not barrier.exists():
+    if time.monotonic() > deadline:
+        sys.exit(3)
+    time.sleep(0.005)
+
+db = SessionDB(db_path=db_path)
+won = db.claim_handoff("cell2")
+# Disjoint codes: 0=won, 10=lost. An unhandled exception exits 1, which must
+# NEVER be confusable with a clean "lost the claim" — a run where one
+# claimant wins and seven CRASH is not a consume-once proof.
+sys.exit(0 if won else 10)
+"""
+
+N_CLAIMANTS = 8
+
+
+def test_exactly_one_claimant_wins(tmp_path):
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+    barrier = tmp_path / "go"
+
+    db = SessionDB(db_path=db_path)
+    db.create_session("cell2", source="conformance")
+    assert db.request_handoff("cell2", "telegram") is not False
+
+    children = []
+    ready_files = []
+    for i in range(N_CLAIMANTS):
+        ready = tmp_path / f"ready-{i}"
+        ready_files.append(ready)
+        children.append(
+            spawn_child(
+                CLAIMANT.format(
+                    db_path=str(db_path), barrier=str(barrier), ready=str(ready)
+                )
+            )
+        )
+
+    # Barrier: release only when every process is up and polling.
+    wait_for(
+        lambda: all(r.exists() for r in ready_files),
+        what="all claimants at the barrier",
+    )
+    barrier.touch()
+
+    results = [reap(c) for c in children]
+    mode = on_disk_journal_mode(db_path)
+
+    codes = [rc for rc, _, _ in results]
+    assert all(rc in (0, 10) for rc in codes), (
+        f"[journal_mode={mode}] claimant crashed/timed out: {codes}; "
+        f"stderr: {[e[-300:] for _, _, e in results if e]}"
+    )
+    winners = codes.count(0)
+    assert winners == 1, (
+        f"[journal_mode={mode}] consume-once violated: {winners} of "
+        f"{N_CLAIMANTS} concurrent claimants won"
+    )
+

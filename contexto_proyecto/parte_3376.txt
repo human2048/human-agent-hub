@@ -1,0 +1,375 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_memory_status_env_hint.py ===
+"""`hermes memory status` should explain *why* a provider is unavailable.
+
+Regression coverage for NousResearch/hermes-agent#2765: when the selected
+provider reports unavailable, status lists the missing env vars and surfaces
+the systemd/gateway ``.env``-inheritance gotcha that most often causes it.
+"""
+
+import hermes_cli.memory_setup as memory_setup
+
+
+class _UnavailableProvider:
+    def is_available(self):
+        return False
+
+    def get_config_schema(self):
+        return [
+            {
+                "key": "api_key",
+                "env_var": "HINDSIGHT_API_KEY",
+                "secret": True,
+                "url": "https://ui.hindsight.vectorize.io",
+            }
+        ]
+
+
+def test_status_surfaces_env_inheritance_hint_when_unavailable(monkeypatch, capsys):
+    monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
+    monkeypatch.setattr(
+        memory_setup,
+        "_get_available_providers",
+        lambda: [("hindsight", "cloud", _UnavailableProvider())],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": {"provider": "hindsight", "hindsight": {}}},
+    )
+
+    memory_setup.cmd_status(object())
+    out = capsys.readouterr().out
+
+    assert "not available" in out
+    assert "HINDSIGHT_API_KEY" in out  # names the missing var
+    assert ".env" in out               # systemd/gateway root-cause hint
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_mem_trim.py ===
+"""Tests for the long-lived gateway heap-trim helper."""
+
+from unittest.mock import Mock
+
+import pytest
+
+import hermes_cli.mem_trim as mem_trim
+
+
+@pytest.fixture(autouse=True)
+def _reset_trim_state(monkeypatch):
+    monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 0.0)
+    monkeypatch.setattr(mem_trim, "_probe_done", True)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", None)
+    monkeypatch.setattr(mem_trim, "_trim_call_count", 0)
+
+
+def test_unsupported_allocator_is_noop_without_gc(monkeypatch):
+    collect = Mock()
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+
+    assert mem_trim.trim_memory(force=True, reason="test") is False
+    collect.assert_not_called()
+
+
+def test_config_kill_switch_overrides_force_from_config_file(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "context:\n  memory_trim:\n    enabled: false\n",
+        encoding="utf-8",
+    )
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    token = set_hermes_home_override(hermes_home)
+
+    try:
+        assert mem_trim.trim_memory(force=True) is False
+        trim.assert_not_called()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_default_config_declares_memory_trim_controls():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    context = DEFAULT_CONFIG["context"]
+    assert isinstance(context, dict)
+    settings = context["memory_trim"]
+    assert isinstance(settings, dict)
+    assert isinstance(settings["enabled"], bool)
+    assert isinstance(settings["cooldown_seconds"], float)
+
+
+def test_collect_memory_snapshot_parses_linux_proc_status(monkeypatch):
+    # No ``sys.platform`` pin: the only platform check lives inside
+    # ``_read_proc_status``, which is replaced below — the subject here is
+    # the /proc/self/status parser, which is host-independent.
+    monkeypatch.setattr(
+        mem_trim,
+        "_read_proc_status",
+        lambda: "Name:\tpython\nVmRSS:\t1234 kB\nRssAnon:\t567 kB\n",
+    )
+    monkeypatch.setattr(mem_trim.threading, "active_count", lambda: 9)
+
+    assert mem_trim.collect_memory_snapshot(history_bytes=42) == {
+        "rss_kib": 1234,
+        "rss_anon_kib": 567,
+        "thread_count": 9,
+        "history_bytes": 42,
+    }
+
+
+def test_success_collects_then_trims(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mem_trim.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setattr(
+        mem_trim, "_malloc_trim", lambda pad: calls.append(("trim", pad)) or 1
+    )
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+
+    assert mem_trim.trim_memory(reason="turn", cooldown_seconds=60) is True
+    assert calls == ["gc", ("trim", 0)]
+    assert mem_trim._last_trim_monotonic == 100.0
+
+
+def test_success_logs_memory_snapshot_and_trim_result(monkeypatch, caplog):
+    monkeypatch.setattr(mem_trim.gc, "collect", lambda: None)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", lambda _pad: 1)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    snapshots = iter(
+        (
+            {"rss_kib": 4096, "rss_anon_kib": 3072, "thread_count": 3},
+            {"rss_kib": 2048, "rss_anon_kib": 1024, "thread_count": 3},
+        )
+    )
+    monkeypatch.setattr(mem_trim, "collect_memory_snapshot", lambda: next(snapshots))
+
+    with caplog.at_level("INFO", logger="hermes_cli.mem_trim"):
+        assert mem_trim.trim_memory(reason="test turn") is True
+
+    assert "reason=test turn" in caplog.text
+    assert "malloc_trim=1" in caplog.text
+    assert "rss_kib=4096->2048" in caplog.text
+
+
+def test_force_logs_even_when_periodic_log_sampling_skips(monkeypatch, caplog):
+    monkeypatch.setattr(mem_trim.gc, "collect", lambda: None)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", lambda _pad: 1)
+    monkeypatch.setattr(mem_trim, "_config_settings", lambda: (True, 0.0, 99, 1.0))
+    # Two ticks: the forced call comes after the 5s force floor so it runs
+    # (the floor exists to coalesce burst closes, not to mute logging).
+    _ticks = iter([100.0, 110.0])
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: next(_ticks, 110.0))
+    monkeypatch.setattr(
+        mem_trim,
+        "collect_memory_snapshot",
+        lambda: {"rss_kib": 4096, "rss_anon_kib": 3072, "thread_count": 3},
+    )
+
+    with caplog.at_level("INFO", logger="hermes_cli.mem_trim"):
+        assert mem_trim.trim_memory(reason="periodic") is True
+        assert mem_trim.trim_memory(force=True, reason="close") is True
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("reason=periodic" in message for message in messages)
+    assert any("reason=close" in message for message in messages)
+
+
+def test_cooldown_suppresses_repeated_collection(monkeypatch):
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 95.0)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+
+    assert mem_trim.trim_memory(cooldown_seconds=60) is False
+    collect.assert_not_called()
+    trim.assert_not_called()
+    assert mem_trim.trim_memory(force=True, cooldown_seconds=60) is True
+
+
+def test_config_cooldown_controls_rate_limit(monkeypatch):
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 1.0)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "context": {
+                "memory_trim": {"enabled": True, "cooldown_seconds": 120.0}
+            }
+        },
+    )
+
+    assert mem_trim.trim_memory() is False
+    trim.assert_not_called()
+
+
+def test_legacy_environment_switch_does_not_control_behavior(monkeypatch):
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setenv("HERMES_DISABLE_MEMORY_TRIM", "1")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"context": {"memory_trim": {"enabled": True}}},
+    )
+
+    assert mem_trim.trim_memory(force=True) is True
+    trim.assert_called_once_with(0)
+
+
+def test_libc_failure_is_fail_open_and_rate_limited(monkeypatch):
+    trim = Mock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+
+    assert mem_trim.trim_memory(reason="test", cooldown_seconds=60) is False
+    assert mem_trim._last_trim_monotonic == 100.0
+    assert mem_trim.trim_memory(cooldown_seconds=60) is False
+    assert trim.call_count == 1
+
+
+def test_force_floor_coalesces_burst_closes(monkeypatch):
+    """A delegate batch closes N child agents back-to-back, each forcing a
+    trim — the short force floor must coalesce the burst instead of stacking
+    N uncooled full gc.collect() passes in the same process."""
+    collect = Mock()
+    trim = Mock(return_value=1)
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_malloc_trim", trim)
+    monkeypatch.setattr(mem_trim, "_config_settings", lambda: (True, 0.0, 1, 0.0))
+    monkeypatch.setattr(
+        mem_trim,
+        "collect_memory_snapshot",
+        lambda: {"rss_kib": 4096, "rss_anon_kib": 3072, "thread_count": 3},
+    )
+    monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 0.0)
+
+    # t=100: first forced close runs.
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    assert mem_trim.trim_memory(force=True, reason="agent close") is True
+    assert trim.call_count == 1
+
+    # t=101..103: three more child closes inside the floor — all coalesced.
+    for t in (101.0, 102.0, 103.0):
+        monkeypatch.setattr(mem_trim.time, "monotonic", lambda t=t: t)
+        assert mem_trim.trim_memory(force=True, reason="agent close") is False
+    assert trim.call_count == 1, "burst closes must not stack forced trims"
+
+    # t=106: past the floor — the parent's final close-trim still fires.
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 106.0)
+    assert mem_trim.trim_memory(force=True, reason="agent close") is True
+    assert trim.call_count == 2
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_meta_prompt_cache.py ===
+"""Behavior contracts for Meta Muse prompt-caching host mandate."""
+
+import pytest
+
+from hermes_cli.providers import determine_api_mode, host_mandated_api_mode
+from hermes_cli import runtime_provider as rp
+
+
+class TestHostMandatedMetaResponses:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.meta.ai/v1",
+            "https://api.meta.ai/v1/",
+            "https://api.meta.ai/v1/chat/completions",
+            "https://API.META.AI/v1",
+            "https://api.meta.ai",
+            "https://api.meta.ai:443/v1",
+            "https://api.meta.ai./v1",
+            "https://attacker.test@api.meta.ai/v1",
+        ],
+    )
+    def test_host_mandated_meta_returns_codex_responses(self, url):
+        assert host_mandated_api_mode(url) == "codex_responses"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.meta.ai.attacker.test/v1",
+            "https://proxy.test/api.meta.ai/v1",
+            "https://api.meta.ai.evil/v1",
+            "https://meta.ai/v1",
+            "https://www.meta.ai/v1",
+            "https://api.meta.com/v1",
+            "https://[::1]/v1",
+            "https://generic.example.com/v1",
+            "",
+        ],
+    )
+    def test_host_mandated_meta_rejects_spoofs(self, url):
+        assert host_mandated_api_mode(url) != "codex_responses"
+        # Must be None for generic/unrelated hosts (contract: no clobber)
+        if url in (
+            "https://generic.example.com/v1",
+            "https://[::1]/v1",
+            "",
+            "https://meta.ai/v1",
+            "https://api.meta.ai.attacker.test/v1",
+            "https://proxy.test/api.meta.ai/v1",
+        ):
+            assert host_mandated_api_mode(url) is None
+
+    def test_determine_api_mode_meta_via_named_custom(self):
+        assert determine_api_mode("meta", "https://api.meta.ai/v1") == "codex_responses"
+        assert determine_api_mode("custom", "https://api.meta.ai/v1") == "codex_responses"
+        assert determine_api_mode("generic", "https://generic.example.com/v1") == "chat_completions"
+
+    def test_determine_api_mode_meta_with_trailing_slash(self):
+        assert determine_api_mode("meta", "https://api.meta.ai/v1/") == "codex_responses"
+
+    def test_runtime_detect_meta(self):
+        assert rp._detect_api_mode_for_url("https://api.meta.ai/v1") == "codex_responses"
+        assert rp._detect_api_mode_for_url("https://api.meta.ai/v1/chat/completions") == "codex_responses"
+        assert rp._detect_api_mode_for_url("https://API.META.AI/v1") == "codex_responses"
+
+    def test_runtime_detect_meta_rejects_spoofs(self):
+        assert rp._detect_api_mode_for_url("https://api.meta.ai.attacker.test/v1") is None
+        assert rp._detect_api_mode_for_url("https://proxy.test/api.meta.ai/v1") is None
+        assert rp._detect_api_mode_for_url("https://meta.ai/v1") is None
+        assert rp._detect_api_mode_for_url("https://generic.example.com/v1") is None
+
+    def test_fallback_api_mode_meta(self):
+        assert rp._fallback_api_mode("meta", "https://api.meta.ai/v1", "muse-spark-1.2") == "codex_responses"
+        assert rp._fallback_api_mode("custom", "https://api.meta.ai/v1", "muse-spark-1.2") == "codex_responses"
+        # generic still chat
+        assert rp._fallback_api_mode("custom", "https://generic.example.com/v1", "muse-spark-1.2") == "chat_completions"
+
+
+class TestMetaConfigRoundtrip:
+    def test_providers_meta_api_mode_roundtrip(self):
+        from hermes_cli.config import _normalize_custom_provider_entry
+
+        entry = {"name": "Meta", "base_url": "https://api.meta.ai/v1", "api_mode": "codex_responses"}
+        normalized = _normalize_custom_provider_entry(entry)
+        assert normalized.get("api_mode") == "codex_responses"
+
+        entry2 = {"name": "Meta", "base_url": "https://api.meta.ai/v1", "transport": "codex_responses"}
+        normalized2 = _normalize_custom_provider_entry(entry2)
+        # transport is lifted to api_mode via _normalize path or at least preserved
+        assert normalized2.get("api_mode") == "codex_responses" or normalized2.get("transport") == "codex_responses"
+
+    def test_providers_dict_to_custom_providers_preserves_meta_without_explicit_mode(self):
+        # Without explicit api_mode, host mandate resolves via providers.determine_api_mode
+        # This test ensures the providers entry survives normalization and the host still mandates
+        from hermes_cli.providers import host_mandated_api_mode
+
+        assert host_mandated_api_mode("https://api.meta.ai/v1") == "codex_responses"
+        # Simulate providers dict path: providers.meta.base_url stored, no api_mode field
+        # The resolution layer (determine_api_mode / runtime_provider) must mandate.
+        from hermes_cli.providers import determine_api_mode
+
+        assert determine_api_mode("meta", "https://api.meta.ai/v1", "muse-spark-1.2") == "codex_responses"
+

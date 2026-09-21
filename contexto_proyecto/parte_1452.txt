@@ -1,0 +1,316 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\commandcode\__init__.py ===
+"""CommandCode provider profiles: ``commandcode`` (chat_completions) and
+``commandcode-anthropic`` (anthropic_messages, Bearer auth — see
+``agent/anthropic_adapter.py``). Same key and base URL for both."""
+
+import json
+import logging
+import urllib.request
+
+from hermes_cli.urllib_security import open_credentialed_url
+from providers import get_provider_profile, register_provider
+from providers.base import ProviderProfile, _profile_user_agent
+
+logger = logging.getLogger(__name__)
+
+_COMMANDCODE_BASE = "https://api.commandcode.ai/provider/v1"
+_COMMANDCODE_MODELS_URL = f"{_COMMANDCODE_BASE}/models"
+
+
+class CommandCodeProfile(ProviderProfile):
+    """CommandCode — OpenAI-compatible chat completions endpoint."""
+
+    def fetch_models(
+        self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
+    ) -> list[str] | None:
+        """Public (unauthenticated) /models endpoint. The picker passes base_url
+        unconditionally, so only a value differing from the default is a custom endpoint."""
+        caller_base = (base_url or "").strip().rstrip("/")
+        custom = caller_base and caller_base != _COMMANDCODE_BASE
+        models_url = caller_base + "/models" if custom else _COMMANDCODE_MODELS_URL
+        try:
+            req = urllib.request.Request(models_url)
+            req.add_header("Accept", "application/json")
+            req.add_header("User-Agent", _profile_user_agent())
+            with open_credentialed_url(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+            return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and "id" in m]
+        except Exception as exc:
+            logger.debug("fetch_models(commandcode): %s", exc)
+            return None
+
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+    ) -> tuple[dict, dict]:
+        """DeepSeek ids (``deepseek/deepseek-v4-flash``) get the native DeepSeek wire
+        controls: DeepSeek V4+ defaults to thinking when ``thinking`` is omitted, so
+        without them ``/reasoning`` never reaches the request (#95232). Other model
+        families stay a no-op — CommandCode declares no reasoning vocabulary for them."""
+        m = (model or "").strip()
+        if not m.lower().startswith("deepseek/"):
+            return {}, {}
+        # Registry lookup, not a module import: the deepseek shim is only a loader-injected
+        # sys.modules entry, and the registry honours a user override of the profile.
+        native = get_provider_profile("deepseek")
+        if native is None:
+            return {}, {}
+        return native.build_api_kwargs_extras(
+            reasoning_config=reasoning_config, model=m.split("/", 1)[1], **context,
+        )
+
+
+class CommandCodeAnthropicProfile(CommandCodeProfile):
+    """CommandCode — Anthropic Messages API-compatible endpoint."""
+
+    def fetch_models(
+        self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
+    ) -> list[str] | None:
+        """Public /models endpoint, filtered to Anthropic-family models."""
+        all_models = super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
+        return None if all_models is None else [m for m in all_models if m.startswith("claude-")]
+
+
+commandcode = CommandCodeProfile(
+    name="commandcode", aliases=("commandcode-chat",), api_mode="chat_completions",
+    # Same key as the anthropic profile; distinct base-URL override vars so each
+    # profile renders its own card on the desktop Keys tab (rows keyed by env var).
+    env_vars=("COMMANDCODE_API_KEY", "COMMANDCODE_BASE_URL"),
+    display_name="CommandCode", description="CommandCode — 20+ models via OpenAI-compatible API",
+    signup_url="https://commandcode.ai/", base_url=_COMMANDCODE_BASE, models_url=_COMMANDCODE_MODELS_URL,
+    fallback_models=(
+        "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "Qwen/Qwen3.7-Max", "Qwen/Qwen3.6-Plus",
+        "moonshotai/Kimi-K2.6", "zai-org/GLM-5.1", "MiniMaxAI/MiniMax-M2.7", "stepfun/Step-3.5-Flash",
+        "xiaomi/mimo-v2.5-pro", "google/gemini-3.5-flash", "gpt-5.5",
+    ),
+    default_aux_model="deepseek/deepseek-v4-flash",
+)
+
+commandcode_anthropic = CommandCodeAnthropicProfile(
+    name="commandcode-anthropic", aliases=("commandcode-claude",), api_mode="anthropic_messages",
+    env_vars=("COMMANDCODE_API_KEY", "COMMANDCODE_ANTHROPIC_BASE_URL"),
+    display_name="CommandCode (Anthropic)",
+    description="CommandCode — Claude models via Anthropic Messages API",
+    signup_url="https://commandcode.ai/", base_url=_COMMANDCODE_BASE, models_url=_COMMANDCODE_MODELS_URL,
+    fallback_models=("claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"),
+    default_aux_model="claude-haiku-4-5-20251001",
+)
+
+register_provider(commandcode)
+register_provider(commandcode_anthropic)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\copilot\__init__.py ===
+"""Copilot / GitHub Models provider profile.
+
+Core routes GPT-5+/Codex -> codex_responses and Claude -> anthropic_messages;
+this profile covers the chat_completions remainder: editor attribution headers
+(copilot_default_headers()) and catalog-gated GitHub Models reasoning.
+"""
+
+from typing import Any
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class CopilotProfile(ProviderProfile):
+    """GitHub Copilot / GitHub Models — editor headers + reasoning."""
+
+    def build_api_kwargs_extras(
+        self, *, model: str | None = None, reasoning_config: dict | None = None,
+        supports_reasoning: bool = False, **ctx,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not (supports_reasoning and model):
+            return {}, {}
+        try:
+            from hermes_cli.models import clamp_reasoning_effort_to_supported, github_model_reasoning_efforts
+
+            supported = github_model_reasoning_efforts(model)
+            if not supported:
+                return {}, {}
+            if not reasoning_config:
+                return {"reasoning": {"effort": "medium"}}, {}
+            effort = reasoning_config.get("effort", "medium")
+            # Honor a level the live catalog lists; otherwise clamp to the nearest WEAKER
+            # supported level (never drop straight to medium, which inverted the ladder:
+            # ultra < high). Bespoke levels the ladder can't place fall to medium (or [0]).
+            # See #74295.
+            if effort not in supported:
+                effort = clamp_reasoning_effort_to_supported(effort, list(supported))
+                if effort not in supported:
+                    effort = "medium" if "medium" in supported else supported[0]
+            return {"reasoning": {"effort": effort}}, {}
+        except Exception:
+            return {}, {}
+
+
+copilot = CopilotProfile(
+    name="copilot", aliases=("github-copilot", "github-models", "github-model", "github"),
+    env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"), base_url="https://api.githubcopilot.com",
+    auth_type="copilot",
+)
+
+register_provider(copilot)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\copilot-acp\__init__.py ===
+"""GitHub Copilot ACP provider profile.
+
+copilot-acp does not speak OpenAI-over-HTTP: it drives an external ACP subprocess over
+stdio, so the profile supplies its own client via :meth:`ProviderProfile.create_client`.
+An out-of-tree ACP provider (``~/.hermes/plugins/model-providers/`` or a pip entry point)
+uses the same three lines without touching core.
+"""
+
+from typing import Any
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class CopilotACPProfile(ProviderProfile):
+    """GitHub Copilot ACP — external process, no REST models endpoint."""
+
+    def create_client(self, **client_kwargs: Any) -> Any:
+        """Build the ACP stdio shim rather than an HTTP client."""
+        from agent.copilot_acp_client import CopilotACPClient
+
+        return CopilotACPClient(**client_kwargs)
+
+    def fetch_models(
+        self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 15.0
+    ) -> list[str] | None:
+        """Enabled models advertised by a short-lived signed-in ACP session (``session/new``).
+
+        The CLI may keep its login in an OS credential store with no token Hermes can reuse, so
+        the session is the only source that reflects the account's enablement. ``api_key`` /
+        ``base_url`` are ignored: the subprocess owns auth. None when the CLI is missing, refuses
+        ``--acp``, or the probe fails/times out — callers fall back to their next source.
+        """
+        from hermes_cli.auth import resolve_external_process_provider_credentials
+
+        try:
+            creds = resolve_external_process_provider_credentials(self.name)
+            if not str(creds.get("base_url") or "").startswith("acp://"):
+                return None
+            client = self.create_client(
+                api_key=creds.get("api_key"), base_url=creds.get("base_url"),
+                command=creds.get("command"), args=creds.get("args"))
+            return client.list_models(timeout_seconds=timeout) or None
+        except Exception:
+            # Missing CLI (AuthError), refused --acp / failed spawn (RuntimeError), probe
+            # timeout — the base fetch_models contract is "None if the fetch failed".
+            return None
+
+
+copilot_acp = CopilotACPProfile(
+    name="copilot-acp", aliases=("github-copilot-acp", "copilot-acp-agent"),
+    api_mode="chat_completions",  # ACP subprocess uses chat_completions routing
+    env_vars=(),  # Managed by ACP subprocess
+    base_url="acp://copilot",  # ACP internal scheme
+    auth_type="external_process",
+    # How to launch the CLI; env var names predate this profile (formerly hardcoded in
+    # hermes_cli/auth.py), so existing setups keep working.
+    process_command="copilot",
+    process_args=("--acp", "--stdio"),
+    process_command_env_vars=("HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH"),
+    process_args_env_var="HERMES_COPILOT_ACP_ARGS",
+)
+
+register_provider(copilot_acp)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\custom\__init__.py ===
+"""Custom / Ollama (local) provider profile: any endpoint registered as
+provider="custom" (Ollama, vLLM, llama.cpp, GLM-5.2 on ARK, …)."""
+
+from typing import Any
+from urllib.parse import urlparse
+
+from agent.reasoning_effort import OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
+    """True only for explicit Ollama signatures (port 11434 or an ``ollama`` host label).
+    ``think`` is Ollama-native; strict hosts (Mistral, Groq) 422 on it, and
+    arbitrary localhost may be llama.cpp / vLLM / LM Studio."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    try:  # urlparse raises ValueError on malformed ports ("host:99999"); treat as not-Ollama.
+        if parsed.port == 11434:
+            return True
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return bool(host) and (host == "ollama.com" or host.endswith(".ollama.com") or "ollama" in host.split("."))
+
+
+class CustomProfile(ProviderProfile):
+    """Custom/Ollama local provider — think=false and num_ctx support."""
+
+    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...]:
+        """The OpenAI-compat wire set, mirroring this profile's own chat-completions clamp.
+
+        Without this declaration the Responses transport clamps onto the OpenAI
+        per-model ladder (``codex_supported_efforts``), where ``max`` is gpt-5.6-only —
+        so a custom relay's model had a configured ``max`` silently demoted to
+        ``xhigh`` while the same provider over chat-completions forwarded ``max``
+        unchanged (#114249). A custom endpoint's vocabulary is undiscoverable, so
+        the widest OpenAI-compat set is the honest ceiling; ``ultra`` still clamps
+        to ``max`` via the shared ``clamp_effort`` policy.
+        """
+        return OPENAI_COMPAT_WIRE_EFFORTS
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, ollama_num_ctx: int | None = None, **ctx: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        extra_body: dict[str, Any] = {}
+        top_level: dict[str, Any] = {}
+        if ollama_num_ctx:
+            extra_body["options"] = {"num_ctx": ollama_num_ctx}
+        # disabled -> top-level reasoning_effort="none" (Ollama's /v1 ignores
+        # extra_body.think) plus think=False only on Ollama URLs; enabled+effort ->
+        # top-level reasoning_effort clamped to the OpenAI-compat wire (GLM/ARK,
+        # vLLM and SGLang all top out at "max"; "ultra" verbatim 400s); enabled
+        # without effort -> omit so the server default applies. Never emit
+        # think=True (Ollama-only flag).
+        if reasoning_config and isinstance(reasoning_config, dict):
+            effort = (reasoning_config.get("effort") or "").strip().lower()
+            if effort == "none" or reasoning_config.get("enabled", True) is False:
+                # See #14820.
+                top_level["reasoning_effort"] = "none"
+                if _looks_like_ollama_endpoint(ctx.get("base_url")):
+                    extra_body["think"] = False
+            elif effort:
+                top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
+        return extra_body, top_level
+
+    def fetch_models(
+        self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
+    ) -> list[str] | None:
+        """base_url is user-configured; fetch only if set."""
+        if not (base_url or self.base_url):
+            return None
+        return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
+
+
+custom = CustomProfile(
+    name="custom", aliases=("ollama", "local", "vllm", "llamacpp", "llama.cpp", "llama-cpp"),
+    env_vars=(),  # No fixed key — custom endpoint
+    base_url="",  # User-configured
+    # An arbitrary client ceiling can exceed a local server's actual output limit.
+    # The endpoint owns its generation default.
+)
+
+register_provider(custom)
+

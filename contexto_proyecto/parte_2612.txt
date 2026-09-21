@@ -1,0 +1,381 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_split_cap.py ===
+"""Regression tests for the Discord split-delivery cap (issue #86581).
+
+A degenerate turn can produce tens of thousands of characters.  Without a
+ceiling, the adapter posts every 2000-char chunk back-to-back and floods the
+channel — the #86581 incident delivered 60,698 chars as 31 messages.  The
+cap keeps the first ``MAX_SPLIT_MESSAGES`` chunks and replaces the remainder
+with a short notice.
+"""
+
+from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+
+
+def _ensure_discord_mock():
+    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+        return
+    discord_mod = MagicMock()
+    discord_mod.Intents.default.return_value = MagicMock()
+    discord_mod.Client = MagicMock
+    discord_mod.File = MagicMock
+    discord_mod.DMChannel = type("DMChannel", (), {})
+    discord_mod.Thread = type("Thread", (), {})
+    discord_mod.ForumChannel = type("ForumChannel", (), {})
+    ext_mod = MagicMock()
+    commands_mod = MagicMock()
+    commands_mod.Bot = MagicMock
+    ext_mod.commands = commands_mod
+    sys.modules.setdefault("discord", discord_mod)
+    sys.modules.setdefault("discord.ext", ext_mod)
+    sys.modules.setdefault("discord.ext.commands", commands_mod)
+
+
+_ensure_discord_mock()
+
+from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+
+
+MAX = DiscordAdapter.MAX_MESSAGE_LENGTH
+CAP = DiscordAdapter.MAX_SPLIT_MESSAGES
+
+
+def _make_adapter():
+    return DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+
+def _huge_content(chars: int = 60_000) -> str:
+    # Distinct filler — this test is about SIZE, not repetition.
+    return " ".join(f"word-{i}-" + "x" * 12 for i in range(chars // 20))
+
+
+class TestCapSplitChunks:
+    def test_below_cap_unchanged(self):
+        adapter = _make_adapter()
+        chunks = ["a", "b", "c"]
+        assert adapter._cap_split_chunks(chunks) == chunks
+
+    def test_over_cap_keeps_n_minus_1_plus_notice(self):
+        adapter = _make_adapter()
+        chunks = [f"chunk-{i}-" + "z" * 100 for i in range(40)]
+        capped = adapter._cap_split_chunks(chunks)
+        assert len(capped) == CAP
+        assert capped[0] == chunks[0]
+        assert "Response truncated" in capped[-1]
+        assert "delivery limit" in capped[-1]
+        # The notice itself must stay under Discord's per-message cap.
+        assert len(capped[-1]) <= MAX
+
+
+class TestSendCap:
+    @pytest.mark.asyncio
+    async def test_send_caps_split_flood(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = []
+
+        async def fake_send(*, content, reference=None):
+            sends.append(content)
+            return SimpleNamespace(id=9000 + len(sends))
+
+        channel = SimpleNamespace(id=555, send=AsyncMock(side_effect=fake_send))
+        adapter._client = SimpleNamespace(
+            get_channel=lambda _cid: channel,
+            fetch_channel=AsyncMock(),
+        )
+
+        result = await adapter.send("555", _huge_content())
+
+        assert result.success is True
+        assert len(sends) == CAP
+        assert "Response truncated" in sends[-1]
+
+
+class TestForumCap:
+    @pytest.mark.asyncio
+    async def test_send_to_forum_caps_followup_chunks(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        thread_sends = []
+
+        async def fake_thread_send(*, content):
+            thread_sends.append(content)
+            return SimpleNamespace(id=8000 + len(thread_sends))
+
+        thread_channel = SimpleNamespace(
+            id=777, send=AsyncMock(side_effect=fake_thread_send)
+        )
+        forum_channel = SimpleNamespace(
+            id=666,
+            type=SimpleNamespace(value=15),
+            create_thread=AsyncMock(return_value=SimpleNamespace(
+                id=777,
+                thread=thread_channel,
+                message=SimpleNamespace(id=8000),
+            )),
+        )
+
+        result = await adapter._send_to_forum(forum_channel, _huge_content())
+
+        assert result.success is True
+        # 1 starter message + at most (CAP - 1) follow-up chunks.
+        assert len(thread_sends) <= CAP - 1
+        assert "Response truncated" in thread_sends[-1]
+
+
+class TestEditOverflowCap:
+    @pytest.mark.asyncio
+    async def test_edit_overflow_split_capped(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        edits = []
+        sends = []
+
+        async def fake_edit(*, content):
+            edits.append(content)
+
+        async def fake_send(*, content, reference=None):
+            sends.append(content)
+            return SimpleNamespace(id=9000 + len(sends))
+
+        msg = SimpleNamespace(id=42, edit=AsyncMock(side_effect=fake_edit))
+        channel = SimpleNamespace(id=555, send=AsyncMock(side_effect=fake_send))
+
+        result = await adapter._edit_overflow_split(channel, msg, "42", _huge_content())
+
+        assert result.success is True
+        # 1 in-place edit + at most (CAP - 1) continuation sends.
+        assert len(edits) == 1
+        assert len(sends) <= CAP - 1
+        assert "Response truncated" in (sends[-1] if sends else edits[-1])
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_sync_limit.py ===
+"""Test Discord slash command sync respects the 100-command hard limit."""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+import sys
+
+import pytest
+
+from gateway.config import PlatformConfig
+
+
+def _ensure_discord_mock():
+    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+        return
+    if sys.modules.get("discord") is None:
+        discord_mod = MagicMock()
+        discord_mod.Intents.default.return_value = MagicMock()
+        sys.modules["discord"] = discord_mod
+        sys.modules["discord.ext"] = MagicMock()
+        sys.modules["discord.ext.commands"] = MagicMock()
+
+
+_ensure_discord_mock()
+
+from plugins.platforms.discord.adapter import DiscordAdapter
+
+
+class _FakeTreeCommand:
+    """Minimal command stub matching discord.py tree command API."""
+
+    def __init__(self, name: str, command_type: int = 1):
+        self.name = name
+        self.type = command_type
+
+    def to_dict(self, _tree):
+        return {"name": self.name, "type": self.type}
+
+
+@pytest.fixture
+def adapter():
+    """Create a Discord adapter with mocked Discord client."""
+    _ensure_discord_mock()
+    config = PlatformConfig(enabled=True, token="fake-token")
+    adapter = DiscordAdapter(config)
+
+    # Mock the Discord client and tree
+    adapter._client = MagicMock()
+    adapter._client.tree = MagicMock()
+    adapter._client.http = AsyncMock()
+    adapter._client.application_id = "test_app_id"
+
+    adapter._sleep_between_command_sync_mutations = AsyncMock()
+    adapter._existing_command_to_payload = MagicMock(side_effect=lambda cmd: {"name": cmd.name})
+    adapter._canonicalize_app_command_payload = MagicMock(side_effect=lambda p: p)
+    adapter._patchable_app_command_payload = MagicMock(side_effect=lambda p: p)
+
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_safe_sync_deletes_before_creating():
+    """Sync must delete obsolete commands BEFORE creating new ones.
+
+    Discord's 100-command limit is enforced when trying to upsert. If we
+    have 100 commands on Discord, try to add 1 new one, and haven't deleted
+    any yet, Discord rejects with error 30032.
+
+    The fix: identify and delete obsolete commands first, then create/update.
+    This ensures we never temporarily exceed 100 during the sync operation.
+
+    This is a regression guard for the samuraiheart bug where sync would fail
+    with error 30032 even though the registration code properly capped at 100.
+    """
+    _ensure_discord_mock()
+    config = PlatformConfig(enabled=True, token="fake-token")
+    adapter = DiscordAdapter(config)
+
+    adapter._client = MagicMock()
+    adapter._client.tree = MagicMock()
+    adapter._client.http = AsyncMock()
+    adapter._client.application_id = "test_app_id"
+    adapter._sleep_between_command_sync_mutations = AsyncMock()
+    adapter._existing_command_to_payload = MagicMock(side_effect=lambda cmd: {"name": cmd.name})
+    adapter._canonicalize_app_command_payload = MagicMock(side_effect=lambda p: p)
+    adapter._patchable_app_command_payload = MagicMock(side_effect=lambda p: p)
+
+    # Simulate having 100 commands on Discord, with 1 that's no longer desired
+    # and 1 new command that should be created.
+    # Existing on Discord: cmd_0, cmd_1, ..., cmd_99 (100 total)
+    # Desired locally: cmd_1, cmd_2, ..., cmd_99, cmd_new (100 total)
+    # So: delete cmd_0 (1 deletion), create cmd_new (1 creation)
+
+    existing_commands = [
+        SimpleNamespace(id=f"id_{i}", name=f"cmd_{i}", type=1)
+        for i in range(100)
+    ]
+    adapter._client.tree.fetch_commands = AsyncMock(return_value=existing_commands)
+
+    adapter._client.tree.get_commands = MagicMock(
+        return_value=[
+            _FakeTreeCommand(name=f"cmd_{i}", command_type=1)
+            for i in range(1, 100)
+        ] + [_FakeTreeCommand(name="cmd_new", command_type=1)]
+    )
+
+    # Track the order of mutations
+    mutation_log = []
+
+    async def mock_delete(*args):
+        mutation_log.append(("delete", args[-1]))
+
+    async def mock_upsert(*args):
+        mutation_log.append(("create", args[-1].get("name")))
+
+    adapter._client.http.delete_global_command = mock_delete
+    adapter._client.http.upsert_global_command = mock_upsert
+    adapter._client.http.edit_global_command = AsyncMock()
+
+    # Call sync
+    await adapter._safe_sync_slash_commands()
+
+    # Verify that:
+    # 1. A deletion happened (cmd_0)
+    # 2. It happened BEFORE any creation
+    # 3. The creation of cmd_new happened AFTER deletion
+    deletes = [m for m in mutation_log if m[0] == "delete"]
+    creates = [m for m in mutation_log if m[0] == "create"]
+
+    assert len(deletes) >= 1, "At least one command should be deleted"
+    assert len(creates) >= 1, "At least one command should be created"
+
+    # The key assertion: all deletions should come before all creations.
+    # Find the index of the last delete and the first create.
+    last_delete_idx = max(i for i, m in enumerate(mutation_log) if m[0] == "delete")
+    first_create_idx = min(i for i, m in enumerate(mutation_log) if m[0] == "create")
+
+    assert last_delete_idx < first_create_idx, (
+        f"Deletions must happen before creations to avoid exceeding 100-command limit. "
+        f"Last delete at index {last_delete_idx}, first create at index {first_create_idx}"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_system_messages.py ===
+"""Tests for Discord system message filtering (thread renames, pins, etc.)."""
+
+import pytest
+import unittest
+from unittest.mock import MagicMock
+
+discord = pytest.importorskip("discord")
+
+
+def _make_author(*, bot: bool = False, is_self: bool = False):
+    """Create a mock Discord author."""
+    author = MagicMock()
+    author.bot = bot
+    author.id = 99999 if is_self else 12345
+    author.name = "TestBot" if bot else "TestUser"
+    author.display_name = author.name
+    return author
+
+
+def _make_message(*, author=None, content="hello", msg_type=None):
+    """Create a mock Discord message with a specific type."""
+    msg = MagicMock()
+    msg.author = author or _make_author()
+    msg.content = content
+    msg.attachments = []
+    msg.mentions = []
+    msg.type = msg_type if msg_type is not None else discord.MessageType.default
+    msg.channel = MagicMock()
+    msg.channel.id = 222
+    msg.channel.name = "test-channel"
+    msg.channel.guild = MagicMock()
+    msg.channel.guild.name = "TestServer"
+    return msg
+
+
+class TestDiscordSystemMessageFilter(unittest.TestCase):
+    """Test that Discord system messages (thread renames, pins, etc.) are ignored."""
+
+    def _run_filter(self, message, client_user=None):
+        """Simulate the on_message filter logic and return whether message was accepted.
+
+        Replicates the guard added to discord.py:
+            if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+                return  # ignored
+        """
+        # Own messages always ignored
+        if message.author == client_user:
+            return False
+
+        # System message filter (the fix being tested)
+        if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+            return False
+
+        return True  # message accepted
+
+    def test_default_messages_accepted(self):
+        """Regular user messages (type=default) should be accepted."""
+        msg = _make_message(msg_type=discord.MessageType.default)
+        self.assertTrue(self._run_filter(msg))
+
+    def test_reply_messages_accepted(self):
+        """Reply messages (type=reply) should be accepted — users reply to bot messages."""
+        msg = _make_message(msg_type=discord.MessageType.reply)
+        self.assertTrue(self._run_filter(msg))
+
+    def test_thread_rename_ignored(self):
+        """Thread rename system messages should be ignored."""
+        msg = _make_message(msg_type=discord.MessageType.channel_name_change)
+        self.assertFalse(self._run_filter(msg))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

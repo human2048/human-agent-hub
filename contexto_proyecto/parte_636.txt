@@ -1,0 +1,260 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\default_soul.py ===
+"""Default SOUL.md template seeded into HERMES_HOME on first run."""
+
+# Kept identical to agent/prompt_builder.py's DEFAULT_AGENT_IDENTITY: _ensure_default_soul_md()
+# seeds this into SOUL.md on first run, so it is the text virtually every real user gets. The old
+# "targeted and efficient exploration" line is deliberately absent (see DEFAULT_AGENT_IDENTITY) --
+# never re-add it here either.
+# DEFAULT_AGENT_IDENTITY only serves sessions with no SOUL.md at all (e.g. skip_context_files), which is not
+# the common case. See #95681.
+DEFAULT_SOUL_MD = (
+    "You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of "
+    "the ask — a one-line question gets a one-line answer, and finished work gets a short report of what "
+    "changed, what's verified, and what's left, never a replay of the process. No filler (\"Great question,\" "
+    "\"I'd be happy to\"), no restating the request back, no re-summarizing what you already said, no narrating "
+    "tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's "
+    "right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or "
+    "the stakes demand it, not by default."
+)
+
+_SCAFFOLD_HEAD = (
+    "# Hermes Agent Persona\n\n<!--\nThis file defines the agent's personality and tone.\n"
+    "The agent will embody whatever you write here.\nEdit this to customize how Hermes communicates with you.\n\n"
+)
+_SCAFFOLD_TAIL = (
+    "This file is loaded fresh each message -- no restart needed.\n"
+    "Delete the contents (or this file) to use the default personality.\n-->"
+)
+
+# Auto-seeded SOUL.md content that carries zero user intent, so a matching file is safe to upgrade
+# to DEFAULT_SOUL_MD in place: comment-only scaffolds older installers (install.sh / install.ps1 /
+# docker/SOUL.md) wrote, plus earlier generations of the auto-seeded default text. Compared on
+# normalized content (stripped, line endings unified). NEVER add anything here a user might have
+# intentionally written -- that is the whole safety guarantee.
+_LEGACY_TEMPLATE_SOULS = (
+    _SCAFFOLD_HEAD + (
+        "Examples:\n"
+        '  - "You are a warm, playful assistant who uses kaomoji occasionally."\n'
+        '  - "You are a concise technical expert. No fluff, just facts."\n'
+        '  - "You speak like a friendly coworker who happens to know everything."\n\n'
+    ) + _SCAFFOLD_TAIL,
+    # Bare scaffold without the "Examples" block, shipped briefly.
+    _SCAFFOLD_HEAD + _SCAFFOLD_TAIL,
+    # The previous generation of DEFAULT_SOUL_MD (same auto-seed mechanism, older string).
+    (
+        "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, "
+        "knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, "
+        "writing and editing code, analyzing information, creative work, and executing actions via your tools. "
+        "You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over "
+        "being verbose unless otherwise directed below. Be targeted and efficient in your exploration and "
+        "investigations."
+    ),
+    # ASCII-dashed variant seeded by scripts/install.ps1 (must stay pure ASCII, see
+    # tests/scripts/install/test_install_ps1_ascii_only.py); upgrading converges Windows installs on the em-dash text.
+    DEFAULT_SOUL_MD.replace("\u2014", "--"),
+)
+
+
+def _normalize_soul(text: str) -> str:
+    """Unify line endings, strip a leading UTF-8 BOM, trim whitespace."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff").strip()
+
+
+def is_legacy_template_soul(text: str) -> bool:
+    """True if ``text`` is a non-customized, auto-seeded SOUL.md (see ``_LEGACY_TEMPLATE_SOULS``).
+
+    Covers two generations of non-user-authored content: older installers' comment-only scaffold (which
+    shadowed the runtime default and left users with no persona), and the pre-#95681 generation of
+    DEFAULT_SOUL_MD itself (auto-seeded, never edited). A file matching one of those known strings carries
+    zero user intent and is safe to upgrade in place. Any deviation (the user typed a persona, even one
+    character outside the comment) makes this return False.
+    """
+    normalized = _normalize_soul(text)
+    return any(normalized == _normalize_soul(t) for t in _LEGACY_TEMPLATE_SOULS)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\dep_ensure.py ===
+"""Lazy dependency bootstrapper for non-Python runtime deps. Detection and prompting live here (cross-platform,
+instant, Python-controlled UX); install.sh / install.ps1 remain the *installation* backend."""
+from __future__ import annotations
+
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from hermes_constants import agent_browser_runnable, find_node_executable
+from tools.environments.local import hermes_subprocess_env
+
+_IS_WINDOWS = platform.system() == "Windows"
+
+_DEP_CHECKS = {
+    # find_node_executable() rather than a bare which(): $HERMES_HOME/node is not on PATH, so
+    # which() would report Node missing on a managed install and trigger a redundant re-install.
+    "node": lambda: find_node_executable("node") is not None,
+    "browser": lambda: (agent_browser_runnable(shutil.which("agent-browser")) or _has_system_browser()
+                        or _has_hermes_agent_browser() or _has_npx_agent_browser()),
+    "ripgrep": lambda: shutil.which("rg") is not None,
+    "ffmpeg": lambda: shutil.which("ffmpeg") is not None,
+}
+
+_DEP_DESCRIPTIONS = {"node": "Node.js (required for browser tools and TUI)",
+                     "browser": "Browser engine (Chromium, for web browsing tools)",
+                     "ripgrep": "ripgrep (fast file search)", "ffmpeg": "ffmpeg (TTS voice messages)"}
+
+
+def _has_system_browser() -> bool:
+    names = ("chrome", "msedge", "chromium") if _IS_WINDOWS else (
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome")
+    return any(shutil.which(name) for name in names)
+
+
+def _has_npx_agent_browser() -> bool:
+    """agent-browser resolves lazily via npx on the default install, invisible to the PATH/managed-dir
+    probes above. Mirror tools.browser_tool_install.check_browser_requirements's Termux carve-out so this
+    check can't diverge from what browser tools actually find.
+
+    See #43564.
+    """
+    try:
+        from tools.browser_tool_install import _find_agent_browser, _is_npx_agent_browser_sentinel, _requires_real_termux_browser_install
+        browser_cmd = _find_agent_browser(validate=False)
+    except Exception:
+        return False
+    return _is_npx_agent_browser_sentinel(browser_cmd) and not _requires_real_termux_browser_install(browser_cmd)
+
+
+def _has_hermes_agent_browser() -> bool:
+    from hermes_constants import get_hermes_home  # late import: tests patch hermes_constants.get_hermes_home
+    home = get_hermes_home()
+    if _IS_WINDOWS:  # npm -g --prefix puts .cmd shims directly in the prefix dir
+        return (home / "node" / "agent-browser.cmd").is_file()
+    # install.sh installs into $HERMES_HOME/node/bin/ via npm -g --prefix; legacy git clones used node_modules/.bin/.
+    return ((home / "node" / "bin" / "agent-browser").is_file()
+            or (home / "node_modules" / ".bin" / "agent-browser").is_file())
+
+
+def _find_install_script(package_dir: Path | None = None, repo_root: Path | None = None) -> tuple[Path | None, str | None]:
+    """Locate the install script — bundled in wheel or in git checkout."""
+    package_dir = package_dir or Path(__file__).parent
+    repo_root = repo_root or package_dir.parent
+    candidates = [("install.sh", "bash"), ("install.ps1", "powershell")]
+    if _IS_WINDOWS:
+        candidates.reverse()
+    for script_name, shell in candidates:
+        for base in (package_dir, repo_root):
+            if (script := base / "scripts" / script_name).is_file():
+                return script, shell
+    return None, None
+
+
+def ensure_dependency(dep: str, interactive: bool = True) -> bool:
+    """Ensure a non-Python dependency is available. Returns True if available."""
+    check = _DEP_CHECKS.get(dep)
+    if check is None or check():  # unknown dep — don't silently forward to install script
+        return check is not None
+    script, shell = _find_install_script()
+    desc = _DEP_DESCRIPTIONS.get(dep, dep)
+    if script is None:
+        if interactive:
+            print(f"  {desc} is not installed and no install script was found.")
+            print(f"  Install {dep} manually and try again.")
+        return False
+    if interactive and sys.stdin.isatty():
+        try:
+            reply = input(f"{desc} is not installed. Install now? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if reply not in ("", "y", "yes"):
+            return False
+    if shell == "powershell":
+        from hermes_constants import get_hermes_home
+        ps_bin = shutil.which("powershell") or shutil.which("pwsh")
+        if not ps_bin:
+            if interactive:
+                print("  PowerShell not found. Install PowerShell or run install.ps1 manually.")
+            return False
+        cmd = [ps_bin, "-ExecutionPolicy", "Bypass", "-File", str(script), "-Ensure", dep, "-HermesHome", str(get_hermes_home())]
+    else:
+        cmd = ["bash", str(script), "--ensure", dep]
+    run_env = {**hermes_subprocess_env(inherit_credentials=False), "IS_INTERACTIVE": "false"}
+    return subprocess.run(cmd, env=run_env).returncode == 0 and check()
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\desktop_console.py ===
+"""Keep Windows console backpressure off the packaged desktop startup path."""
+
+import logging
+import os
+import sys
+import threading
+import time
+from contextlib import contextmanager
+
+logger = logging.getLogger("hermes_cli.desktop")
+
+
+def desktop_launch_notice(message: str, *, source_mode: bool = False) -> None:
+    if sys.platform == "win32" and not source_mode:
+        # setup_logging() uses an async queue and rotating, redacted files.
+        logger.info(message)
+    else:
+        print(message)
+
+
+@contextmanager
+def desktop_console_output(*, source_mode: bool):
+    """Drain packaged Windows stdout/stderr into the existing rotating logs.
+
+    Inheriting the console lets an unresponsive console host/profiler block
+    Electron's synchronous startup messages before it can create a window.
+    Keep source launches interactive and preserve subprocess.run's lifecycle
+    and exit-code handling. Read bounded lines so output cannot grow a buffer
+    without limit, and never wait indefinitely on a descendant's open pipe.
+    """
+    if sys.platform != "win32" or source_mode:
+        yield {}
+        return
+
+    def drain(read_fd, level):
+        with os.fdopen(read_fd, "rb") as stream:
+            # Decode/redact complete records, not arbitrary pipe-read fragments.
+            # Discard an oversized line in full: even its prefix may be a secret.
+            limit = 128 * 1024
+            while data := stream.readline(limit + 1):
+                if len(data) > limit:
+                    while data and not data.endswith(b"\n"):
+                        data = stream.readline(8192)
+                    logger.log(level, "[desktop] [oversized line omitted]")
+                else:
+                    logger.log(level, "[desktop] %s", data.decode("utf-8", errors="replace").rstrip())
+
+    streams = {}
+    readers = []
+    try:
+        # Keep diagnostics visible even when ordinary INFO output is disabled.
+        for name, level in (("stdout", logging.INFO), ("stderr", logging.ERROR)):
+            read_fd, write_fd = os.pipe()
+            streams[name] = write_fd
+            reader = threading.Thread(
+                target=drain, args=(read_fd, level), name=f"desktop-console-{name}", daemon=True,
+            )
+            try:
+                reader.start()
+            except BaseException:
+                os.close(read_fd)
+                raise
+            readers.append(reader)
+        yield streams
+    finally:
+        for write_fd in streams.values():
+            os.close(write_fd)
+        deadline = time.monotonic() + 1
+        for reader in readers:
+            reader.join(timeout=max(0, deadline - time.monotonic()))
+

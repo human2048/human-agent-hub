@@ -1,0 +1,363 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_blueprints.py ===
+"""Tests for the blueprints layer (skill frontmatter <-> cron automation bridge).
+
+A blueprint is a skill with a metadata.hermes.blueprint block. These verify parsing,
+the create-job bridge, and the export round-trip without touching the real
+cron store.
+"""
+
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from tools.blueprints import (
+    BlueprintError,
+    BlueprintSpec,
+    create_blueprint_job,
+    export_blueprint,
+    parse_blueprint,
+    blueprint_spec_for_installed,
+)
+
+
+BLUEPRINT_SKILL = """---
+name: morning-brief
+description: Summarize unread email and calendar every morning.
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [blueprint, email]
+    blueprint:
+      schedule: "0 8 * * *"
+      deliver: telegram
+      prompt: "Summarize my unread email and today's calendar."
+---
+
+# Morning Brief
+
+Every morning, gather unread email and the day's calendar and send a digest.
+"""
+
+PLAIN_SKILL = """---
+name: not-a-blueprint
+description: Just a regular skill.
+metadata:
+  hermes:
+    tags: [misc]
+---
+
+# Not a blueprint
+"""
+
+MALFORMED_BLUEPRINT = """---
+name: broken
+description: Blueprint with no schedule.
+metadata:
+  hermes:
+    blueprint:
+      deliver: origin
+---
+
+# Broken
+"""
+
+
+class TestParseBlueprint:
+    def test_parses_full_blueprint(self):
+        spec = parse_blueprint(BLUEPRINT_SKILL)
+        assert spec is not None
+        assert spec.skill_name == "morning-brief"
+        assert spec.schedule == "0 8 * * *"
+        assert spec.deliver == "telegram"
+        assert spec.prompt is not None and spec.prompt.startswith("Summarize")
+
+
+    def test_deliver_defaults_to_origin(self):
+        skill = (
+            "---\nname: r\ndescription: d\nmetadata:\n  hermes:\n"
+            '    blueprint:\n      schedule: "every 1h"\n---\n\nbody'
+        )
+        spec = parse_blueprint(skill)
+        assert spec is not None
+        assert spec.deliver == "origin"
+
+
+class TestBlueprintSpecForInstalled:
+    def test_finds_and_parses_installed_blueprint(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        rec_dir = skills_dir / "productivity" / "morning-brief"
+        rec_dir.mkdir(parents=True)
+        (rec_dir / "SKILL.md").write_text(BLUEPRINT_SKILL, encoding="utf-8")
+
+        with patch("tools.skills_hub.SKILLS_DIR", skills_dir):
+            spec = blueprint_spec_for_installed("morning-brief")
+        assert spec is not None
+        assert spec.schedule == "0 8 * * *"
+
+
+    def test_plain_skill_returns_none(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        d = skills_dir / "misc" / "not-a-blueprint"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(PLAIN_SKILL, encoding="utf-8")
+        with patch("tools.skills_hub.SKILLS_DIR", skills_dir):
+            assert blueprint_spec_for_installed("not-a-blueprint") is None
+
+
+class TestCreateBlueprintJob:
+    def test_bridges_to_create_job(self):
+        spec = parse_blueprint(BLUEPRINT_SKILL)
+        assert spec is not None
+        captured = {}
+
+        def fake_create_job(**kwargs):
+            captured.update(kwargs)
+            return {"id": "abc123", **kwargs}
+
+        with patch("cron.jobs.create_job", fake_create_job):
+            job = create_blueprint_job(spec, origin={"platform": "telegram"})
+
+        assert captured["schedule"] == "0 8 * * *"
+        assert captured["skills"] == ["morning-brief"]
+        assert captured["deliver"] == "telegram"
+        assert captured["prompt"].startswith("Summarize")
+        assert job["id"] == "abc123"
+
+
+class TestExportBlueprint:
+    def test_round_trips_job_to_skill_md(self):
+        job = {
+            "name": "My Morning Brief",
+            "schedule_display": "0 8 * * *",
+            "skills": ["morning-brief"],
+            "deliver": "telegram",
+            "prompt": "Summarize my unread email.",
+        }
+        md = export_blueprint(job, "# Morning Brief\n\nDoes the morning digest.")
+        # The exported SKILL.md must itself parse back as a blueprint.
+        spec = parse_blueprint(md)
+        assert spec is not None
+        assert spec.schedule == "0 8 * * *"
+        assert spec.deliver == "telegram"
+        # Name is sanitized to a valid skill identifier.
+        assert spec.skill_name == "my-morning-brief"
+
+
+    def test_export_interval_job_without_display(self):
+        # Regression: parse_schedule stores interval periods as "minutes" —
+        # exporting a job with only the parsed schedule dict must round-trip
+        # the real interval, not fall back to the daily default.
+        job = {
+            "name": "poller",
+            "schedule": {"kind": "interval", "minutes": 30},
+            "skills": ["poller"],
+        }
+        md = export_blueprint(job, "body")
+        spec = parse_blueprint(md)
+        assert spec is not None
+        assert spec.schedule == "every 30m"
+
+        job["schedule"] = {"kind": "interval", "minutes": 120}
+        spec = parse_blueprint(export_blueprint(job, "body"))
+        assert spec is not None
+        assert spec.schedule == "every 2h"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_bot_dm_payload_cache.py ===
+"""DM payload files must be reaped by gateway housekeeping, not only in-band.
+
+`message_agent` writes the message body to a file and hands the path to a
+*background* delivery, so it cannot be removed at the call site. The runner
+owns per-delivery cleanup, and `_write_dm_file` sweeps opportunistically —
+but a gateway that never sends another DM would still keep orphans forever.
+`cleanup_bot_dm_cache` follows the same contract as the other
+``cleanup_*_cache`` helpers (returns the number of files removed) so the
+gateway housekeeping loop in ``gateway/run.py`` prunes this cache on the
+same hourly cadence as the media caches.
+"""
+
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from tools import bot_mode_dm
+
+
+@pytest.fixture()
+def temp_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
+    return tmp_path
+
+
+def _age(path: Path, seconds: float) -> None:
+    past = time.time() - seconds
+    os.utime(path, (past, past))
+
+
+class TestCleanupContract:
+    def test_expired_payloads_are_removed_and_counted(self, temp_root):
+        old = Path(bot_mode_dm._write_dm_file("stale"))
+        fresh = Path(bot_mode_dm._write_dm_file("recent"))
+        _age(old, bot_mode_dm._DM_STALE_SECONDS + 1)
+
+        removed = bot_mode_dm.cleanup_bot_dm_cache()
+
+        assert removed == 1
+        assert not old.exists()
+        assert fresh.exists(), "a payload still in flight was reaped"
+
+    def test_cleanup_reports_how_many_it_removed(self, temp_root):
+        # write all files first: _write_dm_file itself sweeps opportunistically
+        paths = [Path(bot_mode_dm._write_dm_file("x")) for _ in range(3)]
+        for p in paths:
+            _age(p, bot_mode_dm._DM_STALE_SECONDS + 1)
+        assert bot_mode_dm.cleanup_bot_dm_cache() == 3
+
+    def test_a_missing_dm_dir_is_not_an_error(self, temp_root):
+        assert bot_mode_dm.cleanup_bot_dm_cache() == 0
+
+    def test_legacy_and_relay_prefixed_orphans_are_swept(self, temp_root):
+        legacy = temp_root / "hermes-dm-legacy.txt"
+        relay = temp_root / "hermes-relay-dm-orphan.txt"
+        unrelated = temp_root / "other.txt"
+        for f in (legacy, relay, unrelated):
+            f.write_text("secret", encoding="utf-8")
+            _age(f, bot_mode_dm._DM_STALE_SECONDS + 1)
+
+        removed = bot_mode_dm.cleanup_bot_dm_cache()
+
+        assert removed == 2
+        assert not legacy.exists()
+        assert not relay.exists()
+        assert unrelated.exists()
+
+    def test_shorter_max_age_hours_is_honored(self, temp_root):
+        recent = Path(bot_mode_dm._write_dm_file("an hour old"))
+        _age(recent, 2 * 3600)
+        assert bot_mode_dm.cleanup_bot_dm_cache(max_age_hours=1) == 1
+        assert not recent.exists()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_bot_failure_reasons.py ===
+"""Tests: typed failure-reason codes (tools/bot_failure_reasons.py, #93091).
+
+Pins the closed reason vocabulary, the ordered classifier (incl. the
+auth-beats-quota precedence seen in real Anthropic 401 bodies), the three
+real-world fixtures from live bot runs, and the auto-retryable set.
+"""
+
+import pytest
+
+from tools import bot_failure_reasons as fr
+
+# Real error text captured from live bot turns.
+FIXTURE_ANTHROPIC_401 = (
+    "Error code: 401 - {'type': 'error', 'error': {'type': 'authentication_error', "
+    "'message': 'Your API key is invalid, blocked or out of funds...'}}"
+)
+FIXTURE_NO_PROVIDER = (
+    "agent init failed: No LLM provider configured. Run `hermes model` to select "
+    "a provider, or run `hermes setup` for first-time configuration."
+)
+FIXTURE_NO_TOKEN = "agent init failed: No access token found for Nous Portal login."
+
+
+def test_closed_vocabulary_contains_every_code():
+    assert fr.ALL_REASONS == {
+        "runtime_offline",
+        "queued_expired",
+        "delivery_timeout",
+        "agent_blocked",
+        "cancelled",
+        "provider_auth_or_access",
+        "provider_quota_limit",
+        "provider_rate_limit",
+        "provider_server_error",
+        "context_overflow",
+        "missing_config",
+        "model_unavailable",
+        "unknown",
+    }
+    # constants match their string values
+    assert fr.RUNTIME_OFFLINE == "runtime_offline"
+    assert fr.PROVIDER_AUTH_OR_ACCESS == "provider_auth_or_access"
+    assert fr.UNKNOWN == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("text", "code"),
+    [
+        ("Error code: 403 - forbidden", fr.PROVIDER_AUTH_OR_ACCESS),
+        ("Invalid API key provided", fr.PROVIDER_AUTH_OR_ACCESS),
+        ("Error code: 402 - payment required", fr.PROVIDER_QUOTA_LIMIT),
+        ("insufficient balance, top up your account", fr.PROVIDER_QUOTA_LIMIT),
+        ("You exceeded your current quota", fr.PROVIDER_QUOTA_LIMIT),
+        ("Error code: 429 - Too Many Requests", fr.PROVIDER_RATE_LIMIT),
+        ("Rate limit reached for gpt-4o", fr.PROVIDER_RATE_LIMIT),
+        ("Error code: 500 - internal server error", fr.PROVIDER_SERVER_ERROR),
+        ("Error code: 529 - overloaded_error: Overloaded", fr.PROVIDER_SERVER_ERROR),
+        ("This model's maximum context length is 128000 tokens", fr.CONTEXT_OVERFLOW),
+        ("context_overflow: prompt too large", fr.CONTEXT_OVERFLOW),
+        ("missing config: no provider block in config.yaml", fr.MISSING_CONFIG),
+        ("model 'gpt-9' not found", fr.MODEL_UNAVAILABLE),
+        ("The model `foo-bar` does not exist", fr.MODEL_UNAVAILABLE),
+        ("model_not_found", fr.MODEL_UNAVAILABLE),
+        ("status: 401 unauthorized", fr.PROVIDER_AUTH_OR_ACCESS),
+        ("upstream server error", fr.PROVIDER_SERVER_ERROR),
+        # bare numbers WITHOUT a status-code context must not classify —
+        # they feed AUTO_RETRYABLE and a misfire could auto-retry a
+        # permanent local failure (review finding on #93101).
+        ("gate check failed: error at line 502 of module", fr.UNKNOWN),
+        ("took 429 ms to fail", fr.UNKNOWN),
+        ("something inexplicable happened", fr.UNKNOWN),
+        ("", fr.UNKNOWN),
+        (None, fr.UNKNOWN),
+    ],
+)
+def test_classify_agent_error_rules(text, code):
+    assert fr.classify_agent_error(text) == code
+
+
+def test_fixture_anthropic_401_auth_beats_quota():
+    # The live 401 body ALSO says "out of funds" — auth wins by precedence.
+    assert "out of funds" in FIXTURE_ANTHROPIC_401
+    assert fr.classify_agent_error(FIXTURE_ANTHROPIC_401) == fr.PROVIDER_AUTH_OR_ACCESS
+
+
+def test_precedence_authentication_error_type_alone_beats_quota_words():
+    text = "authentication_error: account is out of funds"
+    assert fr.classify_agent_error(text) == fr.PROVIDER_AUTH_OR_ACCESS
+    # but plain quota text without any auth marker classifies as quota
+    assert fr.classify_agent_error("account is out of funds") == fr.PROVIDER_QUOTA_LIMIT
+
+
+def test_fixture_no_provider_configured_is_missing_config():
+    assert fr.classify_agent_error(FIXTURE_NO_PROVIDER) == fr.MISSING_CONFIG
+
+
+def test_fixture_no_access_token_is_missing_config():
+    assert fr.classify_agent_error(FIXTURE_NO_TOKEN) == fr.MISSING_CONFIG
+
+
+def test_auto_retryable_set_and_predicate():
+    assert fr.AUTO_RETRYABLE == {
+        fr.RUNTIME_OFFLINE,
+        fr.DELIVERY_TIMEOUT,
+        fr.PROVIDER_RATE_LIMIT,
+        fr.PROVIDER_SERVER_ERROR,
+    }
+    for code in fr.AUTO_RETRYABLE:
+        assert fr.is_auto_retryable(code)
+    for code in fr.ALL_REASONS - fr.AUTO_RETRYABLE:
+        assert not fr.is_auto_retryable(code)
+    assert not fr.is_auto_retryable("")
+    assert not fr.is_auto_retryable("nonsense")
+

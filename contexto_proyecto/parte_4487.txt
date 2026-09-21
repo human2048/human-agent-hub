@@ -1,0 +1,358 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_retirement_continuations.py ===
+"""Retirement cannot splice between a turn's completion and its automatic successors."""
+
+import threading
+import types
+
+
+def test_crash_continuation_reserves_before_build_and_refuses_prepared_backend(tmp_path, monkeypatch):
+    from hermes_cli import backend_retirement
+    from tui_gateway import server
+    from tui_gateway.turn_marker import record_turn_start
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 3600, 3))
+    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
+    record_turn_start(tmp_path, "recovery", "unfinished")
+    building, release = threading.Event(), threading.Event()
+
+    def build(*args):
+        building.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr(server, "_start_agent_build", build)
+    monkeypatch.setattr(server, "_wait_agent", lambda *args, **kw: {"error": "no model in test"})
+    token = fence.prepare()["token"]
+    try:
+        assert server._maybe_schedule_auto_continue("s", session, "recovery") is None
+        assert not building.is_set()
+        assert fence.cancel(token) == {"ok": True}
+        assert server._maybe_schedule_auto_continue("s", session, "recovery") is not None
+        assert building.wait(10)
+        assert not session["running"]
+        assert fence.prepare() == {"ok": False, "idle": False}
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "auto-continue-s":
+                thread.join(10)
+    assert fence.prepare()["ok"] is True
+
+
+def test_prompt_worker_stays_busy_after_running_flag_until_finalizers_finish(tmp_path, monkeypatch):
+    from hermes_cli import backend_retirement
+    from tui_gateway import server
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    agent = types.SimpleNamespace(session_id="retirement-turn", clear_interrupt=lambda: None,
+                                  run_conversation=lambda *args, **kwargs: {"final_response": "done"})
+    session = {"agent": agent, "session_key": "retirement-turn", "history": [], "profile_home": str(tmp_path),
+               "history_lock": threading.RLock(), "history_version": 0, "running": True, "attached_images": [],
+               "image_counter": 0, "cols": 80, "slash_worker": None, "show_reasoning": False,
+               "tool_progress_mode": "all", "inflight_turn": None}
+    for name in ("_wire_callbacks", "_sync_agent_model_with_config", "_register_session_cwd", "_sync_session_key_after_compress"):
+        monkeypatch.setattr(server, name, lambda *args, **kw: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kw: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    finishing, release = threading.Event(), threading.Event()
+
+    def finish(*args):
+        finishing.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr(server, "_emit_settled_session_info", finish)
+    monkeypatch.setitem(server._sessions, "s", session)
+    try:
+        assert server._run_prompt_submit("r", "s", session, "hello") is True
+        assert finishing.wait(10)
+        assert session["running"] is False
+        assert fence.prepare() == {"ok": False, "idle": False}
+    finally:
+        release.set()
+        if thread := session.get("_run_thread"):
+            thread.join(10)
+    assert fence.prepare()["ok"] is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_retirement_workers.py ===
+"""Detached work must retain process admission, including scoped side-agent cleanup."""
+
+import contextvars
+from pathlib import Path
+import queue
+import threading
+
+
+def test_side_workers_hold_admission_through_cleanup_and_preserve_profile_scope(tmp_path, monkeypatch):
+    from hermes_cli import backend_retirement
+    from hermes_constants import get_hermes_home
+    from agent.secret_scope import get_secret, set_multiplex_active
+    from tui_gateway import server
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+        (home / "config.yaml").write_text("terminal:\n  backend: local\n")
+        (home / ".env").write_text(f"RETIREMENT_SCOPE={home.name}\n")
+    marker = contextvars.ContextVar("retirement_test_marker", default="missing")
+    marker.set("inherited")
+    emitted = queue.Queue()
+    monkeypatch.setattr(server, "_emit", lambda *a: emitted.put(a))
+    set_multiplex_active(True)
+    try:
+        for home in [homes[0], homes[1], homes[0]]:
+            entered, release, cleaning, release_cleanup = (threading.Event() for _ in range(4))
+            observed = []
+
+            def body():
+                observed.append((get_hermes_home(), get_secret("RETIREMENT_SCOPE"), marker.get()))
+                entered.set()
+                assert release.wait(10)
+                return "finished"
+
+            def cleanup():
+                cleaning.set()
+                assert release_cleanup.wait(10)
+
+            session = {"profile_home": str(home), "cwd": str(tmp_path)}
+            try:
+                result = server._spawn_side_agent("r", session, "side", "parent", "background.complete", body, cleanup=cleanup)
+                assert result["result"]["task_id"] == "side"
+                assert entered.wait(10)
+                assert fence.prepare() == {"ok": False, "idle": False}
+                assert observed == [(home, home.name, "inherited")]
+                release.set()
+                assert cleaning.wait(10)
+                assert fence.prepare() == {"ok": False, "idle": False}
+            finally:
+                release.set()
+                release_cleanup.set()
+                # The cleanup event happens before the admission finalizer: join the real worker.
+                for thread in threading.enumerate():
+                    if thread.name == "side-agent-side":
+                        thread.join(10)
+            emitted.get(timeout=10)
+            token = fence.prepare()["token"]
+            assert "error" in server._spawn_side_agent("r", session, "late", "parent", "background.complete", body)
+            assert fence.cancel(token) == {"ok": True}
+    finally:
+        set_multiplex_active(False)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_review_summary_callback.py ===
+"""Tests for tui_gateway background-review summary delivery.
+
+When the self-improvement background review fires and saves a skill or
+memory entry, it calls ``agent.background_review_callback(message)``. In
+the CLI that routes through a prompt_toolkit-safe ``_cprint``; in the TUI
+there is no print surface, so without a callback wired up the review
+writes the change silently. ``_init_session`` attaches a callback that
+emits a ``review.summary`` event which Ink renders as a persistent
+transcript line.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture()
+def server():
+    # Mocks are scoped to the initial import only (see
+    # tests/tui_gateway/test_protocol.py for the rationale).
+    with patch.dict(
+        "sys.modules",
+        {
+            "hermes_constants": MagicMock(
+                get_hermes_home=MagicMock(return_value="/tmp/hermes_test_review_summary")
+            ),
+            "hermes_cli.env_loader": MagicMock(),
+            "hermes_cli.banner": MagicMock(),
+            "hermes_state": MagicMock(),
+        },
+    ):
+        import importlib
+
+        mod = importlib.import_module("tui_gateway.server")
+
+    yield mod
+    # Reset module-level session state without re-importing. importlib.reload
+    # would re-register the module's atexit hooks (ThreadPoolExecutor
+    # shutdown, _shutdown_sessions); the duplicates race the stderr
+    # buffer at interpreter shutdown and surface as Fatal Python error:
+    # _enter_buffered_busy. Clearing the per-session dicts gives the
+    # next test a clean slate.
+    mod._sessions.clear()
+    __import__("tui_gateway.server_requests", fromlist=["x"]).reset_for_tests()
+
+
+def test_init_session_attaches_background_review_callback(server, monkeypatch):
+    """After _init_session, agent.background_review_callback is set to a
+    function that emits 'review.summary' for the session's sid."""
+    # Neutralize side-effect calls inside _init_session so we're testing
+    # just the callback wiring.
+    monkeypatch.setattr(server, "_SlashWorker", lambda *a, **kw: object())
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": "m"})
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+
+    captured_emits: list = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: captured_emits.append(
+            (event, sid, payload)
+        ),
+    )
+
+    class FakeAgent:
+        model = "fake/model"
+        # Presence of the attribute is all the Python side needs; the real
+        # AIAgent has it defaulted to None in __init__.
+        background_review_callback = None
+
+    agent = FakeAgent()
+    server._init_session("sid-abc", "session-key", agent, [], cols=80)
+
+    cb = getattr(agent, "background_review_callback", None)
+    assert callable(cb), (
+        "_init_session must attach a background_review_callback to the "
+        "agent so the self-improvement review is visible in the TUI."
+    )
+
+    # Clear the session.info emit captured during _init_session.
+    captured_emits.clear()
+
+    # Invoke the callback the way AIAgent._spawn_background_review would.
+    cb("💾 Self-improvement review: Skill 'hermes-release' patched")
+
+    # Exactly one review.summary event should have been emitted, bound to
+    # the session id we passed in, carrying the full message text.
+    matched = [e for e in captured_emits if e[0] == "review.summary"]
+    assert len(matched) == 1, captured_emits
+    event, sid, payload = matched[0]
+    assert sid == "sid-abc"
+    assert payload == {
+        "text": "💾 Self-improvement review: Skill 'hermes-release' patched"
+    }
+
+
+def test_review_summary_callback_survives_agent_without_attribute(server, monkeypatch):
+    """If the agent is a bare object that doesn't allow attribute
+    assignment (e.g. some stubbed test double), _init_session must not
+    raise — session startup stays robust."""
+    monkeypatch.setattr(server, "_SlashWorker", lambda *a, **kw: object())
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": "m"})
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+
+    class LockedAgent:
+        __slots__ = ("model",)
+
+        def __init__(self):
+            self.model = "fake/model"
+
+    # LockedAgent's __slots__ blocks background_review_callback assignment.
+    server._init_session("sid-x", "key-x", LockedAgent(), [], cols=80)
+    # If we got here, _init_session swallowed the AttributeError gracefully.
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, "on"),       # unset → default on
+        ("on", "on"),
+        ("off", "off"),
+        ("verbose", "verbose"),
+        ("VERBOSE", "verbose"),  # case-normalized
+        (True, "on"),       # bool back-compat
+        (False, "off"),
+    ],
+)
+def test_load_memory_notifications_normalization(server, monkeypatch, raw, expected):
+    """_load_memory_notifications mirrors the gateway's bool→str normalization
+    and defaults to 'on' when the key is absent."""
+    display = {} if raw is None else {"memory_notifications": raw}
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"display": display})
+    assert server._load_memory_notifications() == expected
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_rollback_container_refusal.py ===
+"""``rollback.diff`` refuses a container-backed session like every other ``/rollback diff`` surface.
+
+The host tree vs a host checkpoint is not the sandbox session's diff, so the RPC must not run
+``mgr.diff`` once the manager classifies the task's backend as a container."""
+import threading
+import types
+
+from tui_gateway import server
+
+
+def test_rollback_diff_refuses_container_backed_session():
+    seen = {}
+
+    class _Mgr:
+        enabled = True
+
+        def unsupported_backend_reason(self, task_id="default"):
+            seen["task_id"] = task_id
+            return "Checkpoints are not taken for terminal.backend=docker: file paths belong to the container."
+
+        def list_checkpoints(self, cwd):
+            return [{"hash": "abc123"}]
+
+        def diff(self, cwd, target):
+            raise AssertionError("mgr.diff must not run for a container-backed session")
+
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()), session_key="container-session"
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "rollback.diff", "params": {"session_id": "sid", "hash": "abc123"}}
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "result" not in resp
+    assert "terminal.backend=docker" in resp["error"]["message"]
+    assert seen["task_id"] == "container-session"
+
+
+def _session(agent, **extra):
+    return {
+        "agent": agent,
+        "session_key": "session-key",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "image_counter": 0,
+        "cols": 80,
+        "slash_worker": None,
+        "show_reasoning": False,
+        "tool_progress_mode": "all",
+        **extra,
+    }
+

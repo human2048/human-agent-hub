@@ -1,0 +1,313 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_pin.py ===
+"""CLI pin / unpin / pinned subcommands (issue #52955).
+
+Pin state is the durable "keep" flag in state.db that the Desktop sidebar
+writes; these tests pin the CLI's read/write access to the SAME store
+(SessionDB.set_session_pinned / list_sessions_rich(include_pinned=True)),
+not a client-local list.
+"""
+
+import json
+import sys
+
+
+class _FakeDB:
+    def __init__(self, rows=None, known=("20260315_092437_c9a6ff",)):
+        self.rows = rows or []
+        self.known = set(known)
+        self.pin_calls = []
+        self.list_kwargs = None
+        self.closed = False
+
+    def resolve_session_id(self, session_id):
+        for k in self.known:
+            if k.startswith(session_id):
+                return k
+        return None
+
+    def set_session_pinned(self, session_id, pinned):
+        self.pin_calls.append((session_id, pinned))
+        return session_id in self.known
+
+    def get_session_title(self, session_id):
+        return "Alpha Work" if session_id in self.known else None
+
+    def list_sessions_rich(self, **kwargs):
+        self.list_kwargs = kwargs
+        return self.rows
+
+    def close(self):
+        self.closed = True
+
+
+def _run(monkeypatch, capsys, argv_tail, db):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: db)
+    monkeypatch.setattr(sys, "argv", ["hermes", "sessions", *argv_tail])
+    try:
+        main_mod.main()
+        code = 0
+    except SystemExit as e:  # non-zero exits propagate through main()
+        code = e.code or 0
+    return code, capsys.readouterr().out
+
+
+def test_pin_accepts_unique_prefix(monkeypatch, capsys):
+    db = _FakeDB()
+    code, out = _run(monkeypatch, capsys, ["pin", "20260315_092437"], db)
+    assert db.pin_calls == [("20260315_092437_c9a6ff", True)]
+    assert "Pinned session '20260315_092437_c9a6ff'." in out
+    assert "(Alpha Work)" in out
+    assert code == 0
+
+
+def test_unpin_writes_false(monkeypatch, capsys):
+    db = _FakeDB()
+    _code, out = _run(monkeypatch, capsys, ["unpin", "20260315_092437_c9a6ff"], db)
+    assert db.pin_calls == [("20260315_092437_c9a6ff", False)]
+    assert "Unpinned session" in out
+
+
+def test_pin_multiple_ids_one_missing(monkeypatch, capsys):
+    db = _FakeDB(known=("aaa111", "bbb222"))
+    code, out = _run(monkeypatch, capsys, ["pin", "aaa", "nope", "bbb"], db)
+    assert ("aaa111", True) in db.pin_calls
+    assert ("bbb222", True) in db.pin_calls
+    assert "No session 'nope'" in out and "hermes sessions list" in out
+    assert code == 1
+
+
+def test_pinned_lists_only_pinned_rows(monkeypatch, capsys):
+    rows = [
+        {
+            "id": "pinned_one",
+            "title": "Keep Me",
+            "source": "cli",
+            "last_active": 1_700_000_000.0,
+            "message_count": 3,
+            "pinned": 1,
+        },
+        {
+            "id": "recent_unpinned",
+            "title": "Recent",
+            "source": "cli",
+            "last_active": 1_700_000_100.0,
+            "message_count": 5,
+            "pinned": 0,
+        },
+    ]
+    db = _FakeDB(rows=rows)
+    _code, out = _run(monkeypatch, capsys, ["pinned"], db)
+    # include_pinned back-fill is what guarantees old pins surface
+    assert db.list_kwargs["include_pinned"] is True
+    assert "pinned_one" in out
+    assert "Keep Me" in out
+    assert "recent_unpinned" not in out
+
+
+def test_pinned_json_output(monkeypatch, capsys):
+    rows = [
+        {
+            "id": "pinned_one",
+            "title": "Keep Me",
+            "source": "cli",
+            "last_active": 1_700_000_000.0,
+            "message_count": 3,
+            "pinned": 1,
+        },
+    ]
+    db = _FakeDB(rows=rows)
+    _code, out = _run(monkeypatch, capsys, ["pinned", "--json"], db)
+    payload = json.loads(out)
+    assert payload == [
+        {
+            "id": "pinned_one",
+            "title": "Keep Me",
+            "source": "cli",
+            "last_active": 1_700_000_000.0,
+            "message_count": 3,
+        }
+    ]
+
+
+def test_pinned_empty_hint(monkeypatch, capsys):
+    db = _FakeDB(rows=[])
+    _code, out = _run(monkeypatch, capsys, ["pinned"], db)
+    assert "No pinned sessions" in out
+    assert "hermes sessions pin" in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_repair_check_only_exit.py ===
+"""`hermes sessions repair --check-only` must fail (non-zero) when the store is unhealthy.
+
+Automation gates on the exit status; printing the reason and exiting 0 read as "healthy"
+(#63386, PR #103321).
+"""
+import argparse
+from pathlib import Path
+
+import hermes_state
+from hermes_cli import sessions_cmd
+from hermes_state import SessionDB
+
+
+def test_check_only_exit_status_tracks_probe_verdict(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    args = argparse.Namespace(check_only=True, no_backup=False)
+
+    assert not sessions_cmd._cmd_repair(args)
+    # Destroy the schema header so the probe fails on its first statement.
+    with open(db_path, "r+b") as f:
+        f.seek(100)
+        f.write(b"\xff" * (4096 - 100))
+    for side in ("-wal", "-shm"):
+        Path(str(db_path) + side).unlink(missing_ok=True)
+    assert sessions_cmd._cmd_repair(args) == 1
+    assert db_path.stat().st_size > 0, "check-only must not touch the file"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_sessions_size_delta_label.py ===
+"""Tests for the session-store size-delta label (`hermes sessions optimize*`).
+
+A negative before/after delta means the DB grew — printing
+"reclaimed -163.0 MB" for that reads as data loss (issue #70146).
+"""
+
+from hermes_cli.sessions_cmd import _size_delta_label
+
+
+def test_shrink_reports_reclaimed():
+    assert _size_delta_label(15094.1) == "reclaimed 15094.1 MB"
+
+
+def test_growth_reports_grew_by_not_negative_reclaimed():
+    label = _size_delta_label(-163.0)
+    assert label == "grew by 163.0 MB"
+    assert "reclaimed" not in label
+    assert "-" not in label
+
+
+def test_no_negative_number_ever_rendered():
+    """Whatever the sign, the rendered number is never negative."""
+    for value in (-9999.9, -0.1, 0.0, 0.1, 9999.9):
+        assert "-" not in _size_delta_label(value), value
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_boundary_hooks.py ===
+from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from hermes_cli.plugins import VALID_HOOKS, PluginManager
+from cli import HermesCLI
+
+
+def test_session_hooks_in_valid_hooks():
+    """Verify on_session_finalize and on_session_reset are registered as valid hooks."""
+    assert "on_session_finalize" in VALID_HOOKS
+    assert "on_session_reset" in VALID_HOOKS
+
+
+# These tests pin CLI ownership of the finalize request. The end-to-end
+# built-in/core/plugin dispatch order is exercised by
+# tests/hermes_cli/test_lifecycle.py::test_finalize_session_closes_core_before_plugin_export.
+@patch("hermes_cli.lifecycle.invoke_hook")
+@patch("hermes_cli.lifecycle.finalize_session")
+def test_session_finalize_on_reset(mock_finalize_session, mock_invoke_hook):
+    """Verify on_session_finalize fires when /new or /reset is used."""
+    cli = HermesCLI()
+    cli.agent = MagicMock()
+    cli.agent.session_id = "test-session-id"
+
+    # Simulate /new command which triggers on_session_finalize for the old session
+    cli.new_session(silent=True)
+
+    # Check if on_session_finalize was called for the old session
+    assert any(
+        not c.args
+        and c.kwargs["session_id"] == "test-session-id"
+        and c.kwargs["platform"] == "cli"
+        for c in mock_finalize_session.call_args_list
+    )
+    # Check if on_session_reset was called for the new session
+    assert any(
+        c.args == ("on_session_reset",)
+        and c.kwargs["session_id"] == cli.session_id
+        and c.kwargs["platform"] == "cli"
+        for c in mock_invoke_hook.call_args_list
+    )
+
+
+@patch("hermes_cli.lifecycle.finalize_session")
+def test_session_finalize_on_cleanup(mock_finalize_session):
+    """Verify on_session_finalize fires during CLI exit cleanup."""
+    import cli as cli_mod
+
+    mock_agent = MagicMock()
+    mock_agent.session_id = "cleanup-session-id"
+    cli_mod._active_agent_ref = mock_agent
+    cli_mod._cleanup_done = False
+
+    cli_mod._run_cleanup()
+
+    assert any(
+        not c.args
+        and c.kwargs["session_id"] == "cleanup-session-id"
+        and c.kwargs["platform"] == "cli"
+        and c.kwargs["reason"] == "shutdown"
+        for c in mock_finalize_session.call_args_list
+    )
+
+
+@patch("hermes_cli.lifecycle.invoke_hook")
+def test_interrupted_session_end_helper_emits_observer_shape(mock_invoke_hook):
+    """Verify quiet single-query interruption emits a correlated session end."""
+    import cli as cli_mod
+
+    mock_agent = MagicMock()
+    mock_agent.session_id = "agent-session-id"
+    mock_agent.model = "test-model"
+    mock_agent.platform = "cli"
+    mock_agent._current_task_id = "task-1"
+    mock_agent._current_turn_id = "turn-1"
+    mock_agent._current_api_request_id = "api-1"
+    cli = SimpleNamespace(agent=mock_agent, session_id="cli-session-id")
+
+    cli_mod._emit_interrupted_session_end(cli, reason="keyboard_interrupt")
+
+    mock_agent.interrupt.assert_called_once_with("keyboard interrupt")
+    assert cli.session_id == "agent-session-id"
+    mock_invoke_hook.assert_called_once()
+    call = mock_invoke_hook.call_args
+    assert call.args == ("on_session_end",)
+    assert call.kwargs["session_id"] == "agent-session-id"
+    assert call.kwargs["task_id"] == "task-1"
+    assert call.kwargs["turn_id"] == "turn-1"
+    assert call.kwargs["api_request_id"] == "api-1"
+    assert call.kwargs["completed"] is False
+    assert call.kwargs["interrupted"] is True
+    assert call.kwargs["reason"] == "keyboard_interrupt"
+
+
+@patch("hermes_cli.plugins.invoke_hook")
+def test_hook_errors_are_caught(mock_invoke_hook):
+    """Verify hook exceptions are caught and don't crash the agent."""
+    mgr = PluginManager()
+
+    # Register a hook that raises
+    def bad_callback(**kwargs):
+        raise Exception("Hook failed")
+
+    mgr._hooks["on_session_finalize"] = [bad_callback]
+
+    # This should not raise
+    results = mgr.invoke_hook("on_session_finalize", session_id="test", platform="cli")
+    assert results == []
+

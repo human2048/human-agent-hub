@@ -1,0 +1,290 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\auth.py ===
+"""``hermes auth`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
+    """Attach the ``auth`` subcommand to ``subparsers``."""
+    auth_parser = subparsers.add_parser("auth", help="Manage pooled provider credentials")
+    auth_subparsers = auth_parser.add_subparsers(dest="auth_action")
+    auth_add = auth_subparsers.add_parser("add", help="Add a pooled credential")
+    auth_add.add_argument(
+        "provider", help="Provider id (for example: anthropic, openai-codex, openrouter)")
+    auth_add.add_argument(
+        "--type", dest="auth_type", choices=["oauth", "api-key", "api_key"],
+        help="Credential type to add")
+    auth_add.add_argument("--label", help="Optional display label")
+    auth_add.add_argument(
+        "--priority", type=int,
+        help="Place the new credential at this priority (0 = tried first under fill_first); "
+             "appends last when omitted")
+    auth_add.add_argument("--api-key", help="API key value (otherwise prompted securely)")
+    auth_add.add_argument("--portal-url", help="Nous portal base URL")
+    auth_add.add_argument("--inference-url", help="Nous inference base URL")
+    auth_add.add_argument("--client-id", help="OAuth client id")
+    auth_add.add_argument("--scope", help="OAuth scope override")
+    auth_add.add_argument(
+        "--no-browser", action="store_true", help="Do not auto-open a browser for OAuth login")
+    auth_add.add_argument("--timeout", type=float, help="OAuth/network timeout in seconds")
+    auth_add.add_argument(
+        "--insecure", action="store_true", help="Disable TLS verification for OAuth login")
+    auth_add.add_argument("--ca-bundle", help="Custom CA bundle for OAuth login")
+    auth_list = auth_subparsers.add_parser("list", help="List pooled credentials")
+    auth_list.add_argument("provider", nargs="?", help="Optional provider filter")
+    auth_remove = auth_subparsers.add_parser(
+        "remove", help="Remove a pooled credential by index, id, or label")
+    auth_remove.add_argument("provider", help="Provider id")
+    auth_remove.add_argument("target", help="Credential index, entry id, or exact label")
+    auth_reset = auth_subparsers.add_parser(
+        "reset", help="Clear exhaustion status for a provider's credentials (all, or one target)")
+    auth_reset.add_argument("provider", help="Provider id")
+    auth_reset.add_argument(
+        "target", nargs="?",
+        help="Optional credential index, entry id, or exact label; clears every credential when omitted")
+    auth_priority = auth_subparsers.add_parser(
+        "priority", help="Move a pooled credential to a priority (0 = tried first under fill_first)")
+    auth_priority.add_argument("provider", help="Provider id")
+    auth_priority.add_argument("target", help="Credential index, entry id, or exact label")
+    auth_priority.add_argument("priority", type=int, help="New priority; others are renumbered")
+    auth_refresh = auth_subparsers.add_parser(
+        "refresh", help="Refresh a pooled OAuth credential's tokens and clear its cooldown")
+    auth_refresh.add_argument("provider", help="Provider id")
+    auth_refresh.add_argument(
+        "target", nargs="?",
+        help="Credential index, entry id, or exact label (required when the pool holds more than one)")
+    auth_status = auth_subparsers.add_parser("status", help="Show auth status for a provider")
+    auth_status.add_argument("provider", help="Provider id")
+    auth_logout = auth_subparsers.add_parser(
+        "logout", help="Log out a provider and clear stored auth state")
+    auth_logout.add_argument("provider", help="Provider id")
+    auth_upgrade = auth_subparsers.add_parser(
+        "upgrade", help="Sign in with a Nous account, keeping your connectors")
+    auth_upgrade.add_argument(
+        "--no-browser", action="store_true", help="Do not auto-open a browser for sign-in")
+    auth_upgrade.add_argument("--timeout", type=float, help="Network timeout in seconds")
+    auth_spotify = auth_subparsers.add_parser(
+        "spotify", help="Authenticate Hermes with Spotify via PKCE")
+    auth_spotify.add_argument(
+        "spotify_action", nargs="?", choices=["login", "status", "logout"], default="login")
+    auth_spotify.add_argument(
+        "--client-id", help="Spotify app client_id (or set HERMES_SPOTIFY_CLIENT_ID)")
+    auth_spotify.add_argument(
+        "--redirect-uri", help="Allow-listed localhost redirect URI for your Spotify app")
+    auth_spotify.add_argument("--scope", help="Override requested Spotify scopes")
+    auth_spotify.add_argument(
+        "--no-browser", action="store_true",
+        help="Do not attempt to open the browser automatically")
+    auth_spotify.add_argument(
+        "--timeout", type=float, help="Callback/token exchange timeout in seconds")
+    auth_parser.set_defaults(func=cmd_auth)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\backup.py ===
+"""``hermes backup`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_backup_parser(subparsers, *, cmd_backup: Callable) -> None:
+    """Attach the ``backup`` subcommand to ``subparsers``."""
+    backup_parser = subparsers.add_parser(
+        "backup", help="Back up Hermes home directory to a zip file",
+        description="Create a zip archive of your entire Hermes configuration, "
+        "skills, sessions, and data (excludes the hermes-agent codebase). "
+        "Use --quick for a fast snapshot of just critical state files.")
+    backup_parser.add_argument(
+        "-o",
+        "--output", help="Output path for the zip file (default: ~/hermes-backup-<timestamp>.zip)")
+    backup_parser.add_argument(
+        "-q", "--quick", action="store_true",
+        help="Quick snapshot: only critical state files (config, state.db, .env, auth, cron)")
+    backup_parser.add_argument(
+        "-l", "--label", help="Label for the snapshot (only used with --quick)")
+    backup_parser.add_argument(
+        "-k", "--keep", type=int, default=3, metavar="N",
+        help="After a full backup, delete older hermes-backup-*.zip files in the output "
+             "directory beyond the newest N (default 3; 0 keeps everything)")
+    backup_parser.set_defaults(func=cmd_backup)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\browser.py ===
+"""``hermes browser`` subcommand parser."""
+
+from __future__ import annotations
+
+import sys
+
+
+def build_browser_parser(subparsers) -> None:
+    """Attach the ``browser`` subcommand to ``subparsers``."""
+    browser_parser = subparsers.add_parser(
+        "browser", help="Real-profile browsing helpers (close a browser locking its profile)",
+        description="Helpers for real-profile browsing (browser.use_real_profile). "
+            "close-profile terminates the browser process tree holding your "
+            "default profile so Hermes can copy it — DESTRUCTIVE (unsaved tabs "
+            "in that browser are lost). The agent runs this only after you "
+            "approve closing the browser.")
+    browser_subparsers = browser_parser.add_subparsers(dest="browser_action")
+    browser_close = browser_subparsers.add_parser(
+        "close-profile",
+        help="Close the browser locking your real profile (asks nothing — "
+             "run only with the user's explicit OK; loses unsaved tabs)")
+    browser_close.add_argument(
+        "--browser",
+        help="Override detected default browser (chrome/edge/brave/brave-origin/chromium)")
+
+    def _dispatch_browser(_args):
+        from hermes_cli.browser_connect import (
+            UNSUPPORTED_CHANNEL, close_browser_holding_profile, detect_default_chromium,
+            real_profile_data_dir)
+
+        action = getattr(_args, "browser_action", None)
+        if action != "close-profile":
+            browser_parser.print_help()
+            return 2
+        browser = getattr(_args, "browser", None) or detect_default_chromium()
+        if not browser or browser == UNSUPPORTED_CHANNEL:
+            print("✗ No supported Chromium default browser detected.", file=sys.stderr)
+            return 1
+        src = real_profile_data_dir(browser)
+        if not src:
+            print(f"✗ Could not resolve the {browser} profile directory.", file=sys.stderr)
+            return 1
+        closed, msg = close_browser_holding_profile(src)
+        if closed:
+            print(f"✓ {msg}")
+            return 0
+        print(f"✗ {msg}", file=sys.stderr)
+        return 1
+
+    browser_parser.set_defaults(func=_dispatch_browser)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\bundles.py ===
+"""``hermes bundles`` subcommand parser."""
+
+from __future__ import annotations
+
+
+def build_bundles_parser(subparsers) -> None:
+    """Attach the ``bundles`` subcommand to ``subparsers``."""
+    bundles_parser = subparsers.add_parser(
+        "bundles", help="Create, list, and manage skill bundles (aliases for multiple skills)",
+        description="Skill bundles let you load several skills under one slash "
+            "command. `/<bundle>` from the CLI or gateway loads every "
+            "referenced skill at once.")
+    from hermes_cli.bundles import register_cli as _bundles_register, bundles_command
+    _bundles_register(bundles_parser)
+    bundles_parser.set_defaults(func=bundles_command)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\checkpoints.py ===
+"""``hermes checkpoints`` subcommand parser."""
+
+from __future__ import annotations
+
+
+def build_checkpoints_parser(subparsers) -> None:
+    """Attach the ``checkpoints`` subcommand to ``subparsers``."""
+    checkpoints_parser = subparsers.add_parser(
+        "checkpoints", help="Inspect / prune / clear ~/.hermes/checkpoints/",
+        description="Manage the filesystem checkpoint store — the shadow git "
+        "repo hermes uses to snapshot working directories before "
+        "write_file/patch/terminal calls. Lets you see how much "
+        "space checkpoints occupy, force a prune, or wipe the base.")
+    from hermes_cli.checkpoints import register_cli as _register_checkpoints_cli
+    _register_checkpoints_cli(checkpoints_parser)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\claw.py ===
+"""``hermes claw`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from hermes_cli.subcommands._shared import add_yes_flag
+
+
+def build_claw_parser(subparsers, *, cmd_claw: Callable) -> None:
+    """Attach the ``claw`` subcommand to ``subparsers``."""
+    claw_parser = subparsers.add_parser(
+        "claw", help="OpenClaw migration tools",
+        description="Migrate settings, memories, skills, and API keys from OpenClaw to Hermes")
+    claw_subparsers = claw_parser.add_subparsers(dest="claw_action")
+
+    # claw migrate
+    claw_migrate = claw_subparsers.add_parser(
+        "migrate", help="Migrate from OpenClaw to Hermes",
+        description="Import settings, memories, skills, and API keys from an OpenClaw installation. "
+        "Always shows a preview before making changes.")
+    claw_migrate.add_argument("--source", help="Path to OpenClaw directory (default: ~/.openclaw)")
+    claw_migrate.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview only — stop after showing what would be migrated")
+    claw_migrate.add_argument(
+        "--preset", choices=["user-data", "full"], default="full",
+        help="Migration preset (default: full). Neither preset imports secrets — "
+        "pass --migrate-secrets to include API keys.")
+    claw_migrate.add_argument(
+        "--overwrite", action="store_true",
+        help="Overwrite existing files (default: refuse to apply when the plan has conflicts)")
+    claw_migrate.add_argument(
+        "--migrate-secrets", action="store_true",
+        help="Include allowlisted secrets (TELEGRAM_BOT_TOKEN, API keys, etc.). "
+        "Required even under --preset full.")
+    claw_migrate.add_argument(
+        "--no-backup", action="store_true",
+        help="Skip the pre-migration zip snapshot of ~/.hermes/ (by default a "
+        "single restore-point archive is written to ~/.hermes/backups/ "
+        "before apply; restorable with 'hermes import').")
+    claw_migrate.add_argument(
+        "--workspace-target", help="Absolute path to copy workspace instructions into")
+    claw_migrate.add_argument(
+        "--skill-conflict", choices=["skip", "overwrite", "rename"], default="skip",
+        help="How to handle skill name conflicts (default: skip)")
+    add_yes_flag(claw_migrate, "Skip confirmation prompts")
+
+    # claw cleanup
+    claw_cleanup = claw_subparsers.add_parser(
+        "cleanup", aliases=["clean"], help="Archive leftover OpenClaw directories after migration",
+        description="Scan for and archive leftover OpenClaw directories to prevent state fragmentation",
+    )
+    claw_cleanup.add_argument("--source", help="Path to a specific OpenClaw directory to clean up")
+    claw_cleanup.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview what would be archived without making changes")
+    add_yes_flag(claw_cleanup, "Skip confirmation prompts")
+    claw_parser.set_defaults(func=cmd_claw)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\completion.py ===
+"""``hermes completion`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_completion_parser(subparsers, *, cmd_completion: Callable, parser) -> None:
+    """Attach the ``completion`` subcommand to ``subparsers``."""
+    completion_parser = subparsers.add_parser(
+        "completion", help="Print shell completion script (bash, zsh, or fish)")
+    completion_parser.add_argument(
+        "shell", nargs="?", default="bash", choices=["bash", "zsh", "fish"],
+        help="Shell type (default: bash)")
+    completion_parser.set_defaults(func=lambda args: cmd_completion(args, parser))
+

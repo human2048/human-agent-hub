@@ -1,0 +1,192 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_warning_notification_contracts.py ===
+"""Diagnostic suppression preserves real producer outcomes and control paths."""
+
+import asyncio
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from agent import empty_response_guard
+from agent.status_output import StatusOutputMixin
+from agent.turn_api_call import nous_rate_limit_guard
+from agent.turn_empty_response import _terminal_empty
+from gateway.config import Platform
+from gateway.run import GatewayRunner, _load_gateway_config
+from gateway.run_turn_runner import TurnRunner
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
+
+
+class Agent(StatusOutputMixin):
+    suppress_status_output = True
+    log_prefix = ""
+    provider = "nous"
+    model = "model"
+    base_url = "https://example.invalid/v1"
+    _fallback_chain = []
+    _empty_content_retries = 3
+
+    def _try_activate_fallback(self):
+        return False
+
+    def _persist_session(self, *args):
+        self.persisted = True
+
+    def _extract_reasoning(self, *args):
+        return ""
+
+    def _drop_trailing_empty_response_scaffolding(self, *args):
+        pass
+
+    def _build_assistant_message(self, *args):
+        return {"role": "assistant"}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_real_retry_producers_keep_final_failure_and_persistence(tmp_path, monkeypatch, caplog, enabled):
+    from gateway import run
+
+    (tmp_path / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(not enabled).lower()}}}")
+    monkeypatch.setattr(run, "_hermes_home", tmp_path)
+    sent = []
+    async def send(chat_id, text, **kwargs):
+        sent.append(text)
+        return SimpleNamespace(success=True)
+    adapter = SimpleNamespace(send=send)
+    source = SessionSource(platform=Platform.SLACK, chat_id="D1", user_id="U1")
+    gateway = object.__new__(GatewayRunner)
+    ctx = TurnContext(source=source, user_config=_load_gateway_config(), _run_still_current=lambda: True,
+                      _status_adapter=adapter, _status_chat_id="D1", _status_thread_metadata={})
+    agent = Agent()
+    agent.status_callback = TurnRunner(gateway, ctx)._status_callback_sync
+    monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))
+    setattr(agent, empty_response_guard._STREAK_COST_ATTR, Decimal("1.25"))
+    messages = []
+    final = _terminal_empty(agent, SimpleNamespace(), "stop", messages)
+    assert bool(sent) is enabled
+    assert messages[-1]["_empty_terminal_sentinel"] is True
+    assert "Empty response" in caplog.text
+    result = {"final_response": final, "messages": messages, "failed": True}
+    response, silent, _ = asyncio.run(gateway._hmwa_shape_agent_response(
+        result, source, [], SimpleNamespace(session_id="session"), None, None, None, "session", "slack", 0))
+    assert response and response != "(empty)" and not silent
+    sent.clear()
+    with patch("agent.nous_rate_guard.nous_rate_limit_remaining", return_value=60), \
+         patch("hermes_cli.anon_auth.apply_model_switch"), \
+         patch("hermes_cli.anon_auth.route_is_welcome_host", return_value=False):
+        verdict = nous_rate_limit_guard(agent, _retry=SimpleNamespace(), api_messages=[], messages=[],
+            conversation_history=[], active_system_prompt="", retry_count=0, compression_attempts=0, api_call_count=0)
+    assert bool(sent) is enabled
+    assert verdict.result["failed"] and agent.persisted
+    assert "/retry" in verdict.result["final_response"]
+    assert not agent._retry_status_buffer
+
+
+@pytest.mark.parametrize("yaml_text,expected", [
+    ("display: broken", True), ("display: [broken]", True),
+    ("display: {platforms: broken}", True),
+    ("display: {suppress_warning_notifications: true, platforms: broken}", False),
+])
+def test_bad_config_containers_do_not_abort_startup_warning(tmp_path, monkeypatch, yaml_text, expected):
+    from gateway import run
+
+    (tmp_path / "config.yaml").write_text(yaml_text)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(run, "_hermes_home", tmp_path)
+    gateway = object.__new__(GatewayRunner)
+    gateway._session_db_init_error = "database is locked"
+    gateway._session_db_handle_cache = None
+    gateway._home_channel_transports = lambda: [(Platform.SLACK, None, None, None)]
+    gateway._send_home_channel_message = AsyncMock()
+    asyncio.run(gateway._send_session_db_warning_notifications())
+    assert gateway._send_home_channel_message.await_count == int(expected)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_warning_render_boundary.py ===
+"""UI sink gating never suppresses the producer or interprets its return value."""
+import pytest
+from gateway import warning_notifications as policy
+
+
+@pytest.mark.parametrize("setting", [None, False, True])
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_render_notification_calls_renderer_only_when_visible(setting, diagnostic):
+    cfg = {} if setting is None else {"display": {"suppress_warning_notifications": setting}}
+    observed = ["producer ran"]
+    def renderer():
+        observed.append("rendered")
+        return False  # not a delivery receipt
+    presented = policy.render_notification(renderer, platform="cli", user_config=cfg, diagnostic=diagnostic)
+    expected = not (diagnostic and setting is True)
+    assert presented is expected
+    assert observed == (["producer ran", "rendered"] if expected else ["producer ran"])
+
+
+def test_render_failure_propagates_and_requested_result_does_not_read_policy(monkeypatch):
+    def fail():
+        raise RuntimeError("renderer failed")
+    monkeypatch.setattr(policy, "warning_notifications_enabled", lambda *a: pytest.fail("must not consult policy for result"))
+    with pytest.raises(RuntimeError, match="renderer failed"):
+        policy.render_notification(fail, platform="tui", diagnostic=False)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_warning_wiring_conservation.py ===
+"""Actual per-turn wiring must retain observers before presentation scope binds."""
+from types import SimpleNamespace as NS
+from unittest.mock import patch
+
+from agent.status_output import StatusOutputMixin
+from agent.notification_presentation import notification_turn
+from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
+from gateway.config import Platform
+from gateway.session import SessionSource
+
+
+def test_actual_wiring_retains_observers_and_controls_across_muted_turn():
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="offline", chat_type="dm")
+    for muted in (False, True, False):
+        observed = []
+        ctx = TurnContext(source=source, user_config={"display": {"suppress_warning_notifications": True}},
+            mute_notification_reply=muted, _hooks_ref=NS(loaded_hooks=[]),
+            _status_callback_sync=lambda *a: observed.append(("status", a)))
+        holder = NS(_ctx=ctx, _runner=NS(_service_tier=None, _consume_pending_turn_sidecar_notes=lambda _: []),
+            _make_bg_review_callbacks=lambda: (lambda _: None, lambda: None),
+            _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
+            _clarify_callback_sync=lambda *a: "yes",
+            _notice_callback_sync=lambda *a: observed.append(("notice", a)),
+            _attach_session_title_callback=lambda *a: None)
+        agent = StatusOutputMixin()
+        agent.suppress_status_output = True
+        TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)
+        with notification_turn(agent, muted=muted, session_id="offline"):
+            agent._emit_warning("real warning source")
+            agent._emit_notice(NS(level="warn", text="structured diagnostic"))
+            assert agent.clarify_callback("Continue?") == "yes"
+        assert len(observed) == 2
+        assert callable(agent.status_callback) and callable(agent.notice_callback)
+
+
+def test_concrete_gateway_sinks_hide_all_freeform_muted_turn_output():
+    for muted in (False, True, False):
+        scheduled = []
+        ctx = TurnContext(source=SessionSource(platform=Platform.TELEGRAM, chat_id="offline"),
+            user_config={}, mute_notification_reply=muted)
+        holder = NS(_ctx=ctx, _status_live=lambda: True,
+            _schedule=lambda coro, *args: scheduled.append(coro),
+            _runner=NS(_deliver_platform_notice=lambda *args: "notice-send"))
+        with patch("gateway.run._prepare_gateway_status_message", lambda *args: "prepared"), \
+             patch("gateway.run._send_or_update_status_coro", lambda *args: "status-send"), \
+             patch("gateway.run.render_notice_line", lambda notice: notice.text):
+            TurnRunner._status_callback_sync(holder, "lifecycle", "ordinary progress")
+            TurnRunner._status_callback_sync(holder, "warn", "warning")
+            TurnRunner._notice_callback_sync(holder, NS(level="info", text="info"))
+            TurnRunner._notice_callback_sync(holder, NS(level="warn", text="warning"))
+        assert len(scheduled) == (0 if muted else 4)
+

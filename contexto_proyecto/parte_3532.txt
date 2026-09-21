@@ -1,0 +1,413 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_export.py ===
+import json
+import sys
+
+from hermes_cli.session_export import export_record_count, render_sessions_export
+from hermes_cli.session_export_html import (
+    _generate_messages_html,
+    generate_multi_session_html_export,
+)
+
+
+def _sample_session():
+    return {
+        "id": "sess-123",
+        "source": "cli",
+        "model": "test/model",
+        "title": "Debug auth flow",
+        "started_at": 1700000000,
+        "message_count": 5,
+        "messages": [
+            {
+                "id": 1,
+                "role": "system",
+                "content": "hidden system context",
+                "timestamp": 1700000000,
+            },
+            {
+                "id": 2,
+                "role": "user",
+                "content": "Why is login broken?",
+                "timestamp": 1700000001,
+                "platform_message_id": "evt-2",
+            },
+            {
+                "id": 3,
+                "role": "assistant",
+                "content": "I will inspect the auth middleware.",
+                "timestamp": 1700000002,
+            },
+            {
+                "id": 4,
+                "role": "tool",
+                "tool_name": "read_file",
+                "content": "def redirect_after_login(): pass",
+                "timestamp": 1700000003,
+            },
+            {
+                "id": 5,
+                "role": "user",
+                "content": [{"type": "text", "text": "Only show me the prompts."}],
+                "timestamp": 1700000004,
+            },
+        ],
+    }
+
+
+
+
+
+
+
+
+
+
+def test_html_export_escapes_tool_call_names():
+    payload = '<img src=x onerror="alert(document.domain)">'
+
+    rendered = _generate_messages_html(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": payload, "arguments": "<b>x</b>"},
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert payload not in rendered
+    assert '&lt;img src=x onerror=&quot;alert(document.domain)&quot;&gt;' in rendered
+    assert "&lt;b&gt;x&lt;/b&gt;" in rendered
+
+
+
+
+def test_export_record_count_switches_unit_for_prompt_only_exports():
+    assert export_record_count([_sample_session()]) == (1, "session")
+    assert export_record_count([_sample_session()], only="user-prompts") == (
+        2,
+        "prompt",
+    )
+
+
+def test_sessions_export_cli_prompt_only_stdout(monkeypatch, capsys):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    captured = {}
+
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            captured["resolved_from"] = session_id
+            return "sess-123"
+
+        def export_session(self, session_id):
+            captured["exported"] = session_id
+            return _sample_session()
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "sessions", "export", "-", "--session-id", "sess", "--only", "user-prompts"],
+    )
+
+    main_mod.main()
+
+    output = capsys.readouterr().out
+    records = [json.loads(line) for line in output.splitlines()]
+    assert [record["text"] for record in records] == [
+        "Why is login broken?",
+        "Only show me the prompts.",
+    ]
+    assert captured == {
+        "resolved_from": "sess",
+        "exported": "sess-123",
+        "closed": True,
+    }
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_export_batch.py ===
+from hermes_state import SessionDB
+
+
+def test_export_all_batches_message_reads_without_changing_export_rows(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        for index, source in enumerate(("cli", "telegram", "cli", "cli")):
+            session_id = f"session-{index}"
+            db.create_session(session_id=session_id, source=source)
+            db.append_messages_batch(
+                session_id,
+                [
+                    {"role": "user", "content": f"question {index}"},
+                    {
+                        "role": "assistant",
+                        "content": f"answer {index}",
+                        "tool_calls": [{"id": f"call-{index}", "type": "function"}],
+                    },
+                ],
+            )
+
+        sessions = db.search_sessions(source="cli", limit=100000)
+        expected = [
+            {**session, "messages": db.get_messages(session["id"])}
+            for session in sessions
+        ]
+
+        original_read_all = db._read_all
+        read_calls = 0
+
+        def counted_read_all(*args, **kwargs):
+            nonlocal read_calls
+            read_calls += 1
+            return original_read_all(*args, **kwargs)
+
+        monkeypatch.setattr(db, "_read_all", counted_read_all)
+
+        exported = db.export_all(source="cli")
+        # Export rows carry a derived `timings` block on top of the session +
+        # messages; strip it so the batching contract compares like with like.
+        assert [{k: v for k, v in row.items() if k != "timings"} for row in exported] == expected
+        assert all("timings" in row for row in exported)
+        assert read_calls <= 2
+    finally:
+        db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_export_html.py ===
+"""Tests for the HTML session export renderer."""
+
+from hermes_cli.session_export_html import (
+    _generate_messages_html,
+    generate_html_export,
+    generate_multi_session_html_export,
+)
+
+
+def test_tool_call_name_is_escaped():
+    """A tool-call name is attacker-influenced (a prompt-injected model can emit
+    an arbitrary name), so it must be HTML-escaped like every sibling field."""
+    payload = '<img src=x onerror="alert(1)">'
+    html = _generate_messages_html([
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": payload, "arguments": "{}"},
+                }
+            ],
+        }
+    ])
+    assert payload not in html
+    assert "&lt;img src=x onerror=" in html
+
+
+def test_tool_call_arguments_stay_escaped():
+    html = _generate_messages_html([
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "<b>x</b>"},
+                }
+            ],
+        }
+    ])
+    assert "&lt;b&gt;x&lt;/b&gt;" in html
+    assert "<b>x</b>" not in html
+
+
+def test_multi_session_export_keeps_switcher_script():
+    """The multi-session export drives session switching with an inline script,
+    so the escaping fix must not remove or block that script."""
+    sessions = [
+        {"id": "aaaa1111", "title": "First", "started_at": 0,
+         "messages": [{"role": "user", "content": "one"}]},
+        {"id": "bbbb2222", "title": "Second", "started_at": 0,
+         "messages": [{"role": "user", "content": "two"}]},
+    ]
+    html = generate_multi_session_html_export(sessions)
+    assert "function showSession" in html
+    assert 'data-id="aaaa1111"' in html
+    assert 'id="view-bbbb2222"' in html
+
+
+def test_single_session_untitled_coalesces_none_title_and_model():
+    """An un-named session (title/model still ``None`` until async title
+    generation completes) is the default state, so the single-session export
+    must fall back to human-readable defaults for the browser-tab ``<title>``
+    and the ``Model:`` meta line — matching the on-page ``<h1>`` — instead of
+    leaking the literal string ``None``."""
+    session = {"id": "abc", "title": None, "model": None, "messages": []}
+    html = generate_html_export(session)
+
+    # Browser-tab title falls back to the same default as the <h1> header.
+    assert "<title>Hermes Session</title>" in html
+    assert "<title>None</title>" not in html
+    # Model meta falls back instead of rendering the literal "None".
+    assert "<strong>Model:</strong> Unknown" in html
+    assert "<strong>Model:</strong> None" not in html
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_export_html_escape.py ===
+import re
+
+from hermes_cli.session_export_html import _generate_messages_html
+
+
+def test_tool_call_name_is_escaped_in_html_export():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "timestamp": 1700000000,
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "<script>alert(1)</script>",
+                        "arguments": "{}",
+                    }
+                }
+            ],
+        }
+    ]
+
+    html = _generate_messages_html(messages)
+
+    # Raw, executable markup must never reach the standalone artifact.
+    assert "<script>alert(1)</script>" not in html
+    # The escaped form must be present instead.
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+
+
+def test_role_is_escaped_in_html_export():
+    messages = [
+        {
+            "role": "<img src=x onerror=alert(document.domain)>",
+            "content": "hello",
+            "timestamp": 1700000000,
+        }
+    ]
+
+    html = _generate_messages_html(messages)
+
+    assert "<img src=x onerror=alert(document.domain)>" not in html
+    assert "&lt;img src=x onerror=alert(document.domain)&gt;" in html
+    # The class attribute must remain a single, well-formed token: a crafted
+    # role must not break out of it nor split into several unintended classes.
+    class_value = re.search(r'class="(message message-[^"]*active)"', html)
+    assert class_value is not None
+    assert " message-" in class_value.group(1)  # exactly one message-<role> class
+    assert class_value.group(1).count("message-") == 1
+
+
+def test_known_role_keeps_its_css_class():
+    html = _generate_messages_html(
+        [{"role": "assistant", "content": "hi", "timestamp": 1700000000}]
+    )
+    assert 'class="message message-assistant active"' in html
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_session_export_md.py ===
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.session_export_md import (
+    append_manifest_entry,
+    render_session_markdown,
+    safe_session_filename,
+    verify_export_file,
+    write_session_markdown,
+)
+
+
+def _session(**overrides):
+    data = {
+        "id": "20260706_123456_abcd1234",
+        "title": "Export Test",
+        "source": "telegram",
+        "model": "gpt-5.5",
+        "billing_provider": "openai-codex",
+        "cwd": "/tmp/project",
+        "started_at": 1783331696.0,
+        "last_active": 1783331705.0,
+        "ended_at": 1783331710.0,
+        "message_count": 3,
+        "tool_call_count": 1,
+        "archived": 0,
+        "messages": [
+            {"role": "user", "content": "Hello", "created_at": 1783331697.0},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "terminal", "arguments": "{\"command\": \"pwd\"}"}}
+                ],
+                "created_at": 1783331698.0,
+            },
+            {"role": "tool", "name": "terminal", "content": "output", "created_at": 1783331699.0},
+        ],
+    }
+    data.update(overrides)
+    return data
+
+
+
+
+def test_safe_session_filename_is_deterministic_and_path_safe():
+    filename = safe_session_filename(
+        _session(id="20260706_123456_abcd1234", title="Bad / title: * ?"), fmt="qmd"
+    )
+
+    assert filename.startswith("20260706_123456_abcd1234-")
+    assert filename.endswith(".qmd")
+    assert "/" not in filename
+    assert ":" not in filename
+    assert "*" not in filename
+    assert "?" not in filename
+
+
+
+
+
+
+def test_verify_export_file_checks_count_and_sha(tmp_path):
+    session = _session()
+    path = write_session_markdown(session, tmp_path)
+
+    ok, reason = verify_export_file(path, session)
+    assert ok is True
+    assert reason == "ok"
+
+    path.write_text(path.read_text(encoding="utf-8").replace("Hello", "Tampered"), encoding="utf-8")
+    ok, reason = verify_export_file(path, session)
+    assert ok is False
+    assert "sha256" in reason
+
+
+

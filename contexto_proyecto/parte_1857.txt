@@ -1,0 +1,196 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_truncation_continuation.py ===
+"""Regression test for anthropic_messages truncation continuation.
+
+When an Anthropic response hits ``stop_reason: max_tokens`` (mapped to
+``finish_reason == 'length'`` in run_agent), the agent must retry with
+a continuation prompt — the same behavior it has always had for
+chat_completions and bedrock_converse.  Before this PR, the
+``if self.api_mode in ('chat_completions', 'bedrock_converse'):`` guard
+silently dropped Anthropic-wire truncations on the floor, returning a
+half-finished response with no retry.
+
+We don't exercise the full agent loop here (it's 3000 lines of inference,
+streaming, plugin hooks, etc.) — instead we verify the normalization
+adapter produces exactly the shape the continuation block now consumes.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+
+def _make_anthropic_text_block(text: str) -> SimpleNamespace:
+    return SimpleNamespace(type="text", text=text)
+
+
+def _make_anthropic_tool_use_block(name: str = "my_tool") -> SimpleNamespace:
+    return SimpleNamespace(
+        type="tool_use",
+        id="toolu_01",
+        name=name,
+        input={"foo": "bar"},
+    )
+
+
+def _make_anthropic_response(blocks, stop_reason: str = "max_tokens"):
+    return SimpleNamespace(
+        id="msg_01",
+        type="message",
+        role="assistant",
+        model="claude-sonnet-4-6",
+        content=blocks,
+        stop_reason=stop_reason,
+        stop_sequence=None,
+        usage=SimpleNamespace(input_tokens=100, output_tokens=200),
+    )
+
+
+class TestTruncatedAnthropicResponseNormalization:
+    """AnthropicTransport.normalize_response() gives us the shape _build_assistant_message expects."""
+
+    def test_text_only_truncation_produces_text_content_no_tool_calls(self):
+        """Pure-text Anthropic truncation → continuation path should fire."""
+        from agent.transports import get_transport
+
+        response = _make_anthropic_response(
+            [_make_anthropic_text_block("partial response that was cut off")]
+        )
+        nr = get_transport("anthropic_messages").normalize_response(response)
+
+        # The continuation block checks these two attributes:
+        #   assistant_message.content  → appended to truncated_response_parts
+        #   assistant_message.tool_calls → guards the text-retry branch
+        assert nr.content is not None
+        assert "partial response" in nr.content
+        assert not nr.tool_calls, (
+            "Pure-text truncation must have no tool_calls so the text-continuation "
+            "branch (not the tool-retry branch) fires"
+        )
+        assert nr.finish_reason == "length", "max_tokens stop_reason must map to OpenAI-style 'length'"
+
+
+    def test_empty_content_does_not_crash(self):
+        """Empty response.content — defensive: treat as a truncation with no text."""
+        from agent.transports import get_transport
+
+        response = _make_anthropic_response([])
+        nr = get_transport("anthropic_messages").normalize_response(response)
+        # Depending on the adapter, content may be "" or None — both are
+        # acceptable; what matters is no exception.
+        assert nr is not None
+        assert not nr.tool_calls
+
+
+class TestContinuationLogicBranching:
+    """Symbolic check that the api_mode gate now includes anthropic_messages."""
+
+    @pytest.mark.parametrize("api_mode", ["chat_completions", "bedrock_converse", "anthropic_messages"])
+    def test_all_three_api_modes_hit_continuation_branch(self, api_mode):
+        # The guard in run_agent.py is:
+        #   if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages"):
+        assert api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}
+
+    def test_codex_responses_still_excluded(self):
+        # codex_responses has its own truncation path (not continuation-based)
+        # and should NOT be routed through the shared block.
+        assert "codex_responses" not in {"chat_completions", "bedrock_converse", "anthropic_messages"}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_whitespace_text_blocks.py ===
+"""Regression: whitespace-only text blocks must be coerced, not sent verbatim.
+
+Reproduces HTTP 400 ``messages: text content blocks must contain non-whitespace
+text``. When context compression (or certain tool-call flows) produces an
+assistant message with an empty or whitespace-only text block, that block is
+stored in session history and replayed on every subsequent turn — permanently
+wedging the session behind the same 400.
+
+Fix (mirrors ``bedrock_adapter._safe_text``, ref #9486): coerce empty/whitespace
+text to a non-whitespace placeholder at two points on the Anthropic request path
+— ``_sanitize_replay_block`` (ordered-blocks replay) and the final content walk
+in ``_convert_assistant_message`` (main path). Ref #69512.
+"""
+import pytest
+from agent.anthropic_message_convert import _EMPTY_TEXT_PLACEHOLDER, _safe_text, _sanitize_replay_block, _convert_assistant_message
+
+
+def _text_blocks(msg):
+    return [b for b in msg["content"] if isinstance(b, dict) and b.get("type") == "text"]
+
+
+def _assert_no_blank_text(msg):
+    """No text content block in the converted message is empty/whitespace-only."""
+    assert isinstance(msg["content"], list)
+    for b in _text_blocks(msg):
+        assert b["text"].strip(), f"blank text block survived: {b!r}"
+
+
+class TestSafeText:
+    def test_none_becomes_placeholder(self):
+        assert _safe_text(None) == _EMPTY_TEXT_PLACEHOLDER
+
+
+    @pytest.mark.parametrize("blank", ["   ", "\n", "\t", " \n\t "])
+    def test_whitespace_only_becomes_placeholder(self, blank):
+        assert _safe_text(blank) == _EMPTY_TEXT_PLACEHOLDER
+
+
+
+
+class TestSanitizeReplayBlockWhitespace:
+    def test_whitespace_text_block_dropped(self):
+        # Blank text blocks are DROPPED at the block level (not coerced in
+        # place) — the caller relocates any cache_control the block carried
+        # and appends the non-whitespace placeholder only when nothing
+        # cacheable survives, so real thinking/tool_use blocks aren't
+        # cluttered with "(empty)" noise. See _convert_assistant_message.
+        assert _sanitize_replay_block({"type": "text", "text": "   \n"}) is None
+
+
+    def test_none_text_block_dropped_without_crash(self):
+        # text=None (invalid upstream payload) must not reach .strip().
+        assert _sanitize_replay_block({"type": "text", "text": None}) is None
+
+    def test_real_text_block_unchanged(self):
+        out = _sanitize_replay_block({"type": "text", "text": "hi"})
+        assert out == {"type": "text", "text": "hi"}
+
+
+class TestConvertAssistantMessageWhitespace:
+    def test_ordered_blocks_replay_coerces_blank_text(self):
+        # The interleaved-thinking fast path replays anthropic_content_blocks
+        # through _sanitize_replay_block; a stored whitespace text block here is
+        # exactly the compression-produced poison that wedges the session.
+        msg = {
+            "role": "assistant",
+            "anthropic_content_blocks": [
+                {"type": "thinking", "thinking": "reasoning", "signature": "sig-A"},
+                {"type": "text", "text": "  "},
+            ],
+        }
+        out = _convert_assistant_message(msg)
+        _assert_no_blank_text(out)
+        assert _text_blocks(out) == [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]
+
+
+
+
+    def test_thinking_block_not_treated_as_text(self):
+        # Only text blocks are coerced; thinking blocks are left untouched even
+        # if their payload is whitespace (they obey a different schema rule).
+        msg = {
+            "role": "assistant",
+            "anthropic_content_blocks": [
+                {"type": "thinking", "thinking": "  ", "signature": "sig-B"},
+                {"type": "text", "text": "real"},
+            ],
+        }
+        out = _convert_assistant_message(msg)
+        thinking = [b for b in out["content"] if b.get("type") == "thinking"]
+        assert thinking == [{"type": "thinking", "thinking": "  ", "signature": "sig-B"}]
+

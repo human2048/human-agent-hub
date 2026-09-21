@@ -1,0 +1,341 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_client_cache_eviction.py ===
+"""Regression coverage for provider-scoped auxiliary cache eviction (#113022)."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import agent.auxiliary_client as aux
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+
+def _cache_entry() -> tuple[MagicMock, str, None]:
+    return (MagicMock(), "test-model", None)
+
+
+def test_evict_cached_clients_matches_provider_after_profile_home_key(monkeypatch):
+    """OAuth rotation must evict both sync and async entries for its provider."""
+    anthropic_sync = _cache_entry()
+    anthropic_async = _cache_entry()
+    other_provider = _cache_entry()
+    sync_key = aux._client_cache_key("anthropic", async_mode=False)
+    async_key = aux._client_cache_key("anthropic", async_mode=True)
+    other_key = aux._client_cache_key("openai-codex", async_mode=False)
+    monkeypatch.setattr(aux, "_client_cache", {
+        sync_key: anthropic_sync,
+        async_key: anthropic_async,
+        other_key: other_provider,
+    })
+
+    aux._evict_cached_clients("anthropic")
+
+    assert sync_key not in aux._client_cache
+    assert async_key not in aux._client_cache
+    assert other_key in aux._client_cache
+    other_provider[0].close.assert_not_called()
+
+
+def test_evict_cached_clients_is_scoped_to_the_calling_profile(monkeypatch, tmp_path):
+    """A rotation in profile A must not drop profile B's client for the same provider."""
+    key_a = aux._client_cache_key("anthropic", async_mode=False)
+    token = set_hermes_home_override(tmp_path / "profiles" / "b")
+    try:
+        key_b = aux._client_cache_key("anthropic", async_mode=False)
+    finally:
+        reset_hermes_home_override(token)
+    assert key_a[0] != key_b[0]
+    monkeypatch.setattr(aux, "_client_cache", {key_a: _cache_entry(), key_b: _cache_entry()})
+
+    aux._evict_cached_clients("anthropic")
+
+    assert key_a not in aux._client_cache
+    assert key_b in aux._client_cache
+
+
+def test_evict_cached_clients_does_not_close_possibly_in_flight_client(monkeypatch):
+    """Eviction pops the entry; a concurrent caller mid-request must not get a closed client."""
+    entry = _cache_entry()
+    key = aux._client_cache_key("anthropic", async_mode=False)
+    monkeypatch.setattr(aux, "_client_cache", {key: entry})
+
+    aux._evict_cached_clients("anthropic")
+
+    assert key not in aux._client_cache
+    entry[0].close.assert_not_called()
+
+
+def test_pool_rotation_evicts_client_built_with_revoked_credential(monkeypatch):
+    """A 401 pool rotation drops the old provider client before retry/fallback."""
+    stale_entry = _cache_entry()
+    stale_key = aux._client_cache_key("anthropic", async_mode=False)
+    monkeypatch.setattr(aux, "_client_cache", {stale_key: stale_entry})
+
+    pool = MagicMock()
+    pool.has_credentials.return_value = True
+    pool.try_refresh_current.return_value = None
+    pool.mark_exhausted_and_rotate.return_value = SimpleNamespace(id="fresh-oauth-entry")
+    auth_error = Exception("revoked OAuth token")
+    auth_error.status_code = 401
+
+    with patch("agent.auxiliary_client.load_pool", return_value=pool):
+        assert aux._recover_provider_pool("anthropic", auth_error, failed_api_key="revoked-token") is True
+
+    assert stale_key not in aux._client_cache
+    pool.mark_exhausted_and_rotate.assert_called_once()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_client_cache_follows_credential.py ===
+"""Regression coverage: the auxiliary client cache key follows the pooled credential (#113022).
+
+Points 1/2/5 of the issue: a token rotated or refreshed by another process must yield a new
+client instead of a 401 round trip on the cached one, including while a per-model cooldown
+hides the entry from ``peek()``.
+"""
+
+import time
+
+import pytest
+
+import agent.anthropic_credentials as anth_cred
+import agent.auxiliary_client as aux
+from hermes_cli.auth import write_credential_pool
+
+MODEL = "claude-sonnet-4-5"
+
+
+def _seed(provider: str, token: str, *, model_cooldown: str | None = None) -> None:
+    row = {
+        "id": "entry-1", "label": "pooled", "auth_type": "oauth", "priority": 1, "source": "manual",
+        "access_token": token, "refresh_token": f"rt-{token}", "expires_at": time.time() + 3600,
+    }
+    if model_cooldown:
+        row["model_cooldowns"] = {model_cooldown: time.time() + 600}
+    write_credential_pool(provider, [row])
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(aux, "_client_cache", {})
+    # HERMES_HOME only redirects Hermes-owned state; the borrowed Claude Code
+    # reader still consults ~/.claude/.credentials.json and the macOS Keychain,
+    # so an ambient login on the host would seed a second un-cooled-down pool
+    # entry and break the cooldown assertions below (#114424).
+    monkeypatch.setattr(anth_cred, "read_claude_code_credentials", lambda: None)
+    return tmp_path / "hermes"
+
+
+def test_isolated_home_hides_ambient_borrowed_credentials(isolated_home):
+    """The suite stays hermetic on hosts with an ambient Claude Code login (#114424)."""
+    _seed("anthropic", "tok-old", model_cooldown=MODEL)
+    pool = aux._load_pool_with_credentials("anthropic")
+    assert [entry.source for entry in pool.entries()] == ["manual"]
+    assert aux._pool_cache_hint("anthropic").startswith("anthropic::")
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_pool_token_rotation_changes_cache_key_and_hides_the_secret(isolated_home, provider):
+    """Same entry id, new token -> different key; the token itself never enters the key."""
+    _seed(provider, "tok-old")
+    before = aux._client_cache_key(provider, async_mode=False, model=MODEL)
+    _seed(provider, "tok-new")
+    after = aux._client_cache_key(provider, async_mode=False, model=MODEL)
+
+    assert before != after
+    flat = repr(before) + repr(after)
+    assert "tok-old" not in flat and "tok-new" not in flat
+    # unchanged credentials still hit the same entry (control)
+    assert aux._client_cache_key(provider, async_mode=False, model=MODEL) == after
+
+
+def test_pool_cache_hint_follows_rotation_during_per_model_cooldown(isolated_home):
+    """A per-model cooldown hides the entry from peek(); the hint must still track the token."""
+    _seed("anthropic", "tok-old", model_cooldown=MODEL)
+    before = aux._pool_cache_hint("anthropic")
+    _seed("anthropic", "tok-new", model_cooldown=MODEL)
+    after = aux._pool_cache_hint("anthropic")
+
+    assert before.startswith("anthropic::") and after.startswith("anthropic::")
+    assert before != after
+    assert "tok-" not in before + after
+
+
+def _seed_two(provider: str, first_token: str, second_token: str) -> None:
+    rows = []
+    for idx, token in ((1, first_token), (2, second_token)):
+        rows.append({
+            "id": f"entry-{idx}", "label": f"pooled-{idx}", "auth_type": "oauth", "priority": idx,
+            "source": "manual", "access_token": token, "refresh_token": f"rt-{token}",
+            "expires_at": time.time() + 3600,
+        })
+    write_credential_pool(provider, rows)
+
+
+def test_sibling_entry_rotation_does_not_churn_selected_entry_key(isolated_home):
+    """Only the peeked entry's key is digested: rotating entry-2 keeps entry-1's client cached."""
+    _seed_two("anthropic", "tok-a1", "tok-b1")
+    before = aux._pool_cache_hint("anthropic")
+    assert before.startswith("anthropic:entry-1:")
+    _seed_two("anthropic", "tok-a1", "tok-b2")  # sibling rotated, selection unchanged
+    assert aux._pool_cache_hint("anthropic") == before
+    _seed_two("anthropic", "tok-a2", "tok-b2")  # the selected entry itself rotated
+    after = aux._pool_cache_hint("anthropic")
+    assert after.startswith("anthropic:entry-1:") and after != before
+    assert "tok-" not in before + after
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_client_nous_401_cache_key.py ===
+"""A Nous 401 refresh must replace the auxiliary client under the SAME cache key
+``call_llm`` acquired it with (model dimension #56889, task dimension #58894).
+Otherwise the expired client is never evicted and every auxiliary call 401s,
+refreshes, and retries forever (#91023).
+
+End-to-end through the REAL call_llm / async_call_llm and the REAL module
+cache; only the client factories are patched.
+"""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+import agent.auxiliary_client as ac
+
+
+NOUS_BASE_URL = "https://inference-api.nousresearch.com/v1"
+
+
+@pytest.fixture(autouse=True)
+def _clean_client_cache():
+    ac._client_cache.clear()
+    yield
+    ac._client_cache.clear()
+
+
+class _Auth401(Exception):
+    """A 401 the auth-error classifier recognizes (``status_code`` attribute)."""
+
+    status_code = 401
+
+
+def _nous_mock_client(*, async_mode, raises=None, returns=None):
+    """A stand-in OpenAI client whose ``chat.completions.create`` 401s or returns."""
+    client = MagicMock()
+    client.base_url = NOUS_BASE_URL
+    create = AsyncMock() if async_mode else MagicMock()
+    if raises is not None:
+        create.side_effect = raises
+    else:
+        create.return_value = returns
+    client.chat.completions.create = create
+    return client
+
+
+def test_call_llm_auto_provider_evicts_stale_client_end_to_end(monkeypatch):
+    """End-to-end: a default auto-provider 401 must evict the stale client.
+
+    The integration guard the unit refresh tests structurally cannot give: it
+    runs the REAL primary acquisition (``_get_cached_client`` at call_llm's
+    acquisition site) and the REAL 401 refresh against the REAL module cache,
+    patching only the client *factories* -- never ``_get_cached_client``, whose
+    wholesale patching in the pre-existing call_llm 401 tests is exactly why the
+    acquisition-vs-refresh key divergence went unseen. The stale client is
+    acquired under the auto+task cache key; the 401 refresh must land the fresh
+    client under that SAME key and evict the stale one. If the acquisition site
+    stops threading ``task`` (the #58894 regression) the refresh rebuilds a
+    divergent key, the stale expired-credential client survives, and the
+    stale-absence assertion fails.
+    """
+    task = "compression"
+    stale = _nous_mock_client(async_mode=False, raises=_Auth401("stale creds"))
+    fresh = _nous_mock_client(async_mode=False, returns={"ok": True})
+
+    # Force the default auto path and make the primary acquisition build `stale`.
+    monkeypatch.setattr(
+        ac, "_resolve_task_provider_model",
+        lambda *a, **k: ("auto", None, None, None, None),
+    )
+    monkeypatch.setattr(
+        ac, "resolve_provider_client",
+        lambda *a, **k: (stale, "nous-model"),
+    )
+    # The 401 refresh rebuilds a fresh client from refreshed runtime creds.
+    monkeypatch.setattr(
+        ac, "_resolve_nous_runtime_api",
+        lambda *, force_refresh=False, stale_access_token=None: ("fresh-key", NOUS_BASE_URL),
+    )
+    monkeypatch.setattr(
+        ac, "_create_openai_client",
+        lambda *, api_key, base_url, **kwargs: fresh,
+    )
+    monkeypatch.setattr(ac, "_validate_llm_response", lambda resp, _task: resp)
+
+    result = ac.call_llm(task=task, messages=[{"role": "user", "content": "hi"}])
+
+    assert result == {"ok": True}
+    assert stale.chat.completions.create.call_count == 1
+    assert fresh.chat.completions.create.call_count == 1
+    # The stale expired-credential client must be gone from the cache, not merely
+    # shadowed by the fresh client under a divergent (task-dropped) key.
+    assert not any(entry[0] is stale for entry in ac._client_cache.values()), (
+        "stale auto-provider client survived the 401 refresh: the acquisition "
+        "site dropped the task dimension so the refresh keyed the fresh client "
+        "under a different cache entry (#58894)"
+    )
+    assert any(entry[0] is fresh for entry in ac._client_cache.values())
+
+
+@pytest.mark.asyncio
+async def test_async_call_llm_auto_provider_evicts_stale_client_end_to_end(monkeypatch):
+    """Async twin of the end-to-end auto-provider eviction guard.
+
+    Passing a non-None ``main_runtime`` also pins the async acquisition site's
+    ``main_runtime`` threading: for ``provider == "auto"`` the runtime is part of
+    the key, so if the async acquisition rebuilds without it (while the refresh
+    passes it) the fresh client again lands under a divergent key -- the same bug
+    class one element over. Reverting either the ``task`` or the ``main_runtime``
+    kwarg at the async acquisition site fails this test.
+    """
+    task = "session_search"
+    main_runtime = {"provider": "nous", "model": "Hermes-4-405B"}
+    stale = _nous_mock_client(async_mode=True, raises=_Auth401("stale creds"))
+    fresh = _nous_mock_client(async_mode=True, returns={"ok": True})
+
+    monkeypatch.setattr(
+        ac, "_resolve_task_provider_model",
+        lambda *a, **k: ("auto", None, None, None, None),
+    )
+    monkeypatch.setattr(
+        ac, "resolve_provider_client",
+        lambda *a, **k: (stale, "nous-model"),
+    )
+    monkeypatch.setattr(
+        ac, "_resolve_nous_runtime_api",
+        lambda *, force_refresh=False, stale_access_token=None: ("fresh-key", NOUS_BASE_URL),
+    )
+    # Async refresh builds a sync client then wraps it; patch the wrap to `fresh`.
+    monkeypatch.setattr(
+        ac, "_create_openai_client",
+        lambda *, api_key, base_url, **kwargs: MagicMock(),
+    )
+    monkeypatch.setattr(ac, "_to_async_client", lambda *a, **k: (fresh, "nous-model"))
+    monkeypatch.setattr(ac, "_validate_llm_response", lambda resp, _task: resp)
+
+    result = await ac.async_call_llm(
+        task=task,
+        messages=[{"role": "user", "content": "hi"}],
+        main_runtime=main_runtime,
+    )
+
+    assert result == {"ok": True}
+    assert stale.chat.completions.create.await_count == 1
+    assert fresh.chat.completions.create.await_count == 1
+    assert not any(entry[0] is stale for entry in ac._client_cache.values()), (
+        "stale auto-provider async client survived the 401 refresh: the async "
+        "acquisition site dropped the task/main_runtime dimension so the refresh "
+        "keyed the fresh client under a different cache entry (#58894)"
+    )
+    assert any(entry[0] is fresh for entry in ac._client_cache.values())
+

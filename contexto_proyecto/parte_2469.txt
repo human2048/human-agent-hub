@@ -1,0 +1,419 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\docker\test_home_override_scripts.py ===
+"""Runtime smoke tests for Docker HOME overrides and script behavior.
+
+Build the real image and verify the actual runtime behavior:
+
+  1. main-wrapper preserves the Docker ``-w`` working directory
+  2. dashboard service resets HOME to /opt/data before privilege drop
+  3. dashboard does not auto-add ``--insecure`` from a non-loopback bind host
+  4. stage2 hook repairs profiles/ and cron/ ownership on every boot
+"""
+from __future__ import annotations
+
+import subprocess
+
+from tests.docker.conftest import docker_exec, docker_exec_sh, start_container, restart_container
+
+
+
+
+def test_dashboard_service_resets_home(
+    built_image: str, container_name: str,
+) -> None:
+    """The dashboard run script must export HOME=/opt/data before dropping
+    privileges, so HOME-anchored state (discord lockfile, XDG dirs) doesn't
+    try to write to /root (the /init context's HOME).
+
+    We check this by inspecting the environment of the dashboard service
+    process if it's running, or by verifying the run script sets HOME
+    before the exec. At runtime, the cleanest check is: start the
+    container with HERMES_DASHBOARD=1 and verify the dashboard process
+    (if it starts) has HOME=/opt/data.
+
+    Since the dashboard requires an auth provider on non-loopback binds,
+    we bind to 127.0.0.1 where the auth gate doesn't engage, and check
+    the process env.
+    """
+    start_container(built_image, container_name, "HERMES_DASHBOARD=1", "HERMES_DASHBOARD_HOST=127.0.0.1")
+
+    # Check if the dashboard process is running and inspect its HOME.
+    r = docker_exec_sh(
+        container_name,
+        # Find the dashboard process (hermes dashboard) and read its HOME
+        # from /proc/<pid>/environ. If not running, verify the run script
+        # itself exports HOME=/opt/data by grepping the script source.
+        'pid=$(pgrep -f "hermes dashboard" | head -1); '
+        'if [ -n "$pid" ]; then '
+        '  tr "\\0" "\\n" < /proc/$pid/environ | grep "^HOME="; '
+        'else '
+        '  grep -q "export HOME=/opt/data" '
+        '    /opt/hermes/docker/s6-rc.d/dashboard/run && '
+        '  echo "HOME=/opt/data"; '
+        'fi',
+        timeout=15,
+    )
+    assert "HOME=/opt/data" in r.stdout, (
+        f"dashboard process or run script does not set HOME=/opt/data: "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    )
+
+
+def test_dashboard_does_not_auto_insecure_from_host(
+    built_image: str, container_name: str,
+) -> None:
+    """The dashboard MUST NOT auto-add ``--insecure`` based on
+    HERMES_DASHBOARD_HOST. The auth gate is the authority now.
+
+    The auth gate is the authority on whether non-loopback binds are
+    safe; ``--insecure`` must never be auto-derived from the bind host.
+
+    We start the container with a non-loopback bind host and verify
+    the dashboard process does NOT receive ``--insecure`` in its
+    command line. If the dashboard fails to start (because the auth
+    gate correctly blocks an unauthenticated non-loopback bind), that's
+    also acceptable — the point is no auto-insecure.
+    """
+    start_container(built_image, container_name, "HERMES_DASHBOARD=1", "HERMES_DASHBOARD_HOST=0.0.0.0")
+
+    # Check the dashboard process command line for --insecure.
+    r = docker_exec_sh(
+        container_name,
+        'pid=$(pgrep -f "hermes dashboard" | head -1); '
+        'if [ -n "$pid" ]; then '
+        '  tr "\\0" " " < /proc/$pid/cmdline; '
+        'fi',
+        timeout=10,
+    )
+    cmdline = r.stdout.strip()
+    # If the process is running, it must NOT have --insecure.
+    if cmdline:
+        assert "--insecure" not in cmdline, (
+            f"dashboard process has --insecure in cmdline (auto-derived "
+            f"from host): {cmdline!r}"
+        )
+
+
+def test_stage2_repairs_profiles_and_cron_ownership(
+    built_image: str, container_name: str,
+) -> None:
+    """profiles/ and cron/ must both be reclaimed after root-context writes.
+
+    The stage2 hook chowns these dirs to hermes:hermes on every boot.
+    We simulate a root-owned file in each, then restart the container
+    and verify ownership is repaired.
+    """
+    start_container(built_image, container_name)
+
+    # Create root-owned files in profiles/ and cron/ to simulate
+    # docker exec (root) writes.
+    docker_exec(
+        container_name, "mkdir", "-p", "/opt/data/profiles/testprof",
+        user="root", timeout=5,
+    )
+    docker_exec(
+        container_name, "touch", "/opt/data/profiles/testprof/marker",
+        user="root", timeout=5,
+    )
+    docker_exec(
+        container_name, "touch", "/opt/data/cron/root_owned.json",
+        user="root", timeout=5,
+    )
+
+    # Verify they're root-owned before restart.
+    r = docker_exec_sh(
+        container_name,
+        'stat -c "%U" /opt/data/profiles/testprof/marker '
+        '/opt/data/cron/root_owned.json',
+        timeout=5,
+    )
+    assert "root" in r.stdout, (
+        f"expected root-owned files before restart, got: {r.stdout!r}"
+    )
+
+    # Restart — stage2 hook runs again and repairs ownership.
+    restart_container(container_name)
+
+    # Verify files are now owned by hermes.
+    r = docker_exec_sh(
+        container_name,
+        'stat -c "%U" /opt/data/profiles/testprof/marker '
+        '/opt/data/cron/root_owned.json',
+        timeout=5,
+    )
+    assert "hermes" in r.stdout, (
+        f"expected hermes-owned files after restart, got: {r.stdout!r} — "
+        f"stage2 hook did not repair profiles/ and cron/ ownership"
+    )
+
+
+=== ARCHIVO: .\hermes-agent\tests\docker\test_immutable_install.py ===
+"""Runtime smoke tests for Docker immutable install tree and install-method stamp.
+
+Build the real image and verify at runtime:
+
+  1. /opt/hermes is not writable by the hermes user (immutable install tree)
+  2. PYTHONDONTWRITEBYTECODE and HERMES_DISABLE_LAZY_INSTALLS are set
+  3. /opt/hermes/.install_method contains "docker" (code-scoped stamp)
+  4. $HERMES_HOME/.install_method is NOT stamped as "docker" by stage2
+  5. A stale "docker" stamp in $HERMES_HOME is healed (removed) on boot
+"""
+from __future__ import annotations
+
+from tests.docker.conftest import (
+    docker_exec,
+    docker_exec_sh,
+    restart_container,
+    start_container,
+)
+
+
+def test_install_tree_not_writable_by_hermes(
+    built_image: str, container_name: str,
+) -> None:
+    """The hermes user must not be able to modify /opt/hermes.
+
+    The install tree (source, venv, TUI bundle, node_modules) must remain
+    root-owned and non-writable so an agent session cannot self-modify
+    the installation and brick the gateway.
+    """
+    start_container(built_image, container_name)
+
+    r = docker_exec_sh(
+        container_name,
+        # Try to create a file under /opt/hermes as the hermes user
+        "touch /opt/hermes/test_write 2>&1 && "
+        "echo WRITE_SUCCEEDED || echo WRITE_FAILED",
+        timeout=10,
+    )
+    assert "WRITE_FAILED" in r.stdout, (
+        f"hermes user can write to /opt/hermes (install tree not immutable): "
+        f"{r.stdout}"
+    )
+
+    # Also check a key subdirectory
+    r = docker_exec_sh(
+        container_name,
+        "touch /opt/hermes/.venv/test_write 2>&1 && "
+        "echo WRITE_SUCCEEDED || echo WRITE_FAILED",
+        timeout=10,
+    )
+    assert "WRITE_FAILED" in r.stdout, (
+        f"hermes user can write to /opt/hermes/.venv: {r.stdout}"
+    )
+
+
+def test_hermes_disable_lazy_installs_and_dont_write_bytecode(
+    built_image: str, container_name: str,
+) -> None:
+    """The container must set PYTHONDONTWRITEBYTECODE and
+    HERMES_DISABLE_LAZY_INSTALLS=1 so no .pyc files are written to the
+    immutable install tree and no lazy installs attempt to modify it."""
+    start_container(built_image, container_name)
+
+    r = docker_exec_sh(
+        container_name,
+        'test "$PYTHONDONTWRITEBYTECODE" = "1" && '
+        'test "$HERMES_DISABLE_LAZY_INSTALLS" = "1" && '
+        'echo ENV_OK || echo ENV_MISSING',
+        timeout=10,
+    )
+    assert "ENV_OK" in r.stdout, (
+        f"expected PYTHONDONTWRITEBYTECODE=1 and "
+        f"HERMES_DISABLE_LAZY_INSTALLS=1, got: {r.stdout} stderr={r.stderr}"
+    )
+
+
+
+
+def test_stale_docker_stamp_in_home_is_healed_on_boot(
+    built_image: str, container_name: str,
+) -> None:
+    """A stale 'docker' stamp left in $HERMES_HOME by an older image
+    must be removed on boot so shared homes self-heal."""
+    # Start container, write a stale stamp
+    start_container(built_image, container_name)
+
+    # Write a stale 'docker' stamp as root
+    docker_exec(
+        container_name, "sh", "-c",
+        "printf 'docker\\n' > /opt/data/.install_method",
+        user="root", timeout=5,
+    )
+    # Verify it exists
+    r = docker_exec_sh(container_name, "cat /opt/data/.install_method", timeout=5)
+    assert r.stdout.strip() == "docker"
+
+    # Restart - stage2 should heal it
+    restart_container(container_name)
+
+    # The stale stamp must be gone
+    r = docker_exec_sh(
+        container_name,
+        "test -f /opt/data/.install_method && "
+        "cat /opt/data/.install_method || echo HEALED",
+        timeout=10,
+    )
+    assert "HEALED" in r.stdout or r.stdout.strip() != "docker", (
+        f"stale 'docker' stamp in $HERMES_HOME was not healed on boot: "
+        f"{r.stdout}"
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\docker\test_immutable_install_permissions.py ===
+"""Docker smoke tests for immutable install permissions."""
+from __future__ import annotations
+
+import subprocess
+import textwrap
+
+
+def test_container_sets_hosted_write_policy_env(built_image: str) -> None:
+    script = (
+        'test "$HERMES_HOME" = "/opt/data" && '
+        'test "$HERMES_WRITE_SAFE_ROOT" = "/opt/data" && '
+        'test "$HERMES_DISABLE_LAZY_INSTALLS" = "1" && '
+        'test "$PYTHONDONTWRITEBYTECODE" = "1"'
+    )
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh", built_image, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_hermes_user_cannot_modify_install_but_can_write_data(built_image: str) -> None:
+    script = textwrap.dedent(
+        r"""
+        set -eu
+        /opt/hermes/.venv/bin/python - <<'PY'
+        from pathlib import Path
+
+        install_file = Path("/opt/hermes/agent/message_sanitization.py")
+        try:
+            with install_file.open("a", encoding="utf-8") as handle:
+                handle.write("\n# unexpected hosted mutation\n")
+        except PermissionError:
+            pass
+        else:
+            raise SystemExit("install source write unexpectedly succeeded")
+
+        skill_dir = Path("/opt/data/skills/permission-smoke")
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text("# Permission smoke\n", encoding="utf-8")
+        if skill_file.read_text(encoding="utf-8") != "# Permission smoke\n":
+            raise SystemExit("data write verification failed")
+        PY
+        """
+    ).strip()
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "su",
+            built_image,
+            "hermes",
+            "-s",
+            "/bin/sh",
+            "-c",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\docker\test_license_file_present.py ===
+"""Runtime smoke test for Docker image license-file presence.
+
+Build the real image and verify the LICENSE file is present inside the
+container (PEP 639 license-files metadata must resolve inside the
+Docker image).
+"""
+from __future__ import annotations
+
+import subprocess
+
+
+def test_docker_image_contains_license_file(built_image: str) -> None:
+    """The LICENSE file must be present inside the built Docker image.
+
+    PEP 639 license-files metadata references LICENSE, and the Docker
+    build context must not exclude it.
+    """
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "test",
+         built_image, "-f", "/opt/hermes/LICENSE"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, (
+        f"LICENSE file not found at /opt/hermes/LICENSE inside the Docker "
+        f"image: {r.stderr[-500:]}"
+    )
+
+
+=== ARCHIVO: .\hermes-agent\tests\docker\test_log_dir_seed.py ===
+"""Runtime smoke test for Docker $HERMES_HOME/logs/gateways seeding.
+
+Build the real image and verify logs/ and logs/gateways/ exist and are
+owned by the hermes user after container boot.
+
+Regression guard for #45258: if the first gateway log service runs in
+root context, logs/gateways/ is created root-owned; every profile
+registered later runs its log service as the dropped hermes user and
+s6-log crash-loops on mkdir: Permission denied.
+"""
+from __future__ import annotations
+
+from tests.docker.conftest import (
+    docker_exec_sh,
+    restart_container,
+    start_container,
+)
+
+
+def test_logs_gateways_seeded_and_hermes_owned(
+    built_image: str, container_name: str,
+) -> None:
+    """logs/ and logs/gateways/ must exist and be owned by hermes after boot."""
+    start_container(built_image, container_name)
+
+    # Both directories must exist
+    r = docker_exec_sh(
+        container_name,
+        "test -d /opt/data/logs && "
+        "test -d /opt/data/logs/gateways && "
+        "echo DIRS_OK || echo DIRS_MISSING",
+        timeout=10,
+    )
+    assert "DIRS_OK" in r.stdout, (
+        f"logs/ or logs/gateways/ not seeded: {r.stdout}"
+    )
+
+    # Both must be owned by hermes
+    r = docker_exec_sh(
+        container_name,
+        'logs_owner=$(stat -c "%U" /opt/data/logs); '
+        'gateways_owner=$(stat -c "%U" /opt/data/logs/gateways); '
+        'echo "logs=$logs_owner gateways=$gateways_owner"',
+        timeout=10,
+    )
+    assert "logs=hermes" in r.stdout, (
+        f"logs/ not owned by hermes: {r.stdout}"
+    )
+    assert "gateways=hermes" in r.stdout, (
+        f"logs/gateways/ not owned by hermes: {r.stdout}"
+    )
+
+
+

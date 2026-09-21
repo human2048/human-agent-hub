@@ -1,0 +1,260 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\autonomous-ai-agents\hermes-agent\references\background-systems.md ===
+# Durable & Background Systems
+
+Four systems run alongside the main conversation loop. Quick reference
+here; full developer notes live in `AGENTS.md`, user-facing docs under
+`website/docs/user-guide/features/`.
+
+### Delegation (`delegate_task`)
+
+Spawn a subagent with an isolated context + terminal session.
+
+- **Single:** `delegate_task(goal, context)`.
+- **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
+  parallel, capped by `delegation.max_concurrent_children` (default 3).
+- **Background:** `delegate_task(background=true)` returns a handle
+  immediately and keeps the parent loop going; the child's result
+  re-enters the conversation as a new turn when it finishes.
+- **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
+  (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
+- **Not durable.** A backgrounded child is still process-local — if the
+  parent process exits, the child is lost. For work that must outlive
+  the process, use `cronjob` or
+  `terminal(background=True, notify_on_complete=True)`.
+
+Config: `delegation.*` in `config.yaml`.
+
+### Cron (scheduled jobs)
+
+Durable scheduler — `cron/jobs.py` + `cron/scheduler.py`. Drive it via
+the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
+`pause`, `resume`, `run`, `remove`), or the `/cron` slash command.
+
+- **Schedules:** duration (`"30m"`, `"2h"`), "every" phrase
+  (`"every monday 9am"`), 5-field cron (`"0 9 * * *"`), or ISO timestamp.
+- **Per-job knobs:** `skills`, `model`/`provider` override, `script`
+  (pre-run data collection; `no_agent=True` makes the script the whole
+  job), `context_from` (chain job A's output into job B), `workdir`
+  (run in a specific dir with its `AGENTS.md` / `CLAUDE.md` loaded),
+  multi-platform delivery.
+- **Invariants:** 3-minute hard interrupt per run, `.tick.lock` file
+  prevents duplicate ticks across processes, cron sessions pass
+  `skip_memory=True` by default, and cron deliveries are framed with a
+  header/footer instead of being mirrored into the target gateway
+  session (keeps role alternation intact).
+
+User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/cron
+
+### Curator (skill lifecycle)
+
+Background maintenance for agent-created skills. Tracks usage, marks
+idle skills stale, archives stale ones, keeps a pre-run tar.gz backup
+so nothing is lost.
+
+- **CLI:** `hermes curator <verb>` — `status`, `usage`, `run`, `pause`,
+  `resume`, `pin`, `unpin`, `archive`, `restore`, `list-archived`, `prune`,
+  `backup`, `rollback`.
+- **Slash:** `/curator <subcommand>` mirrors the CLI.
+- **Scope:** only touches skills with `created_by: "agent"` provenance.
+  Bundled + hub-installed skills are off-limits. **Never deletes** —
+  max destructive action is archive. Pinned skills are exempt from
+  every auto-transition and every LLM review pass.
+- **Cost:** the deterministic inactivity/prune sweep runs for free. The
+  aux-model "consolidate overlapping skills into umbrellas" pass is
+  **off by default** — opt in with `curator.consolidate: true` or
+  `hermes curator run --consolidate`. Routine background curation costs
+  zero tokens.
+- **Telemetry:** sidecar at `~/.hermes/skills/.usage.json` holds
+  per-skill `use_count`, `view_count`, `patch_count`,
+  `last_activity_at`, `state`, `pinned`.
+
+Config: `curator.*` (`enabled`, `interval_hours`, `min_idle_hours`,
+`stale_after_days`, `archive_after_days`, `backup.*`).
+User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/curator
+
+### Kanban (multi-agent work queue)
+
+Durable SQLite board for multi-profile / multi-worker collaboration.
+Users drive it via `hermes kanban <verb>`; dispatcher-spawned workers
+see a focused `kanban_*` toolset gated by `HERMES_KANBAN_TASK`, and
+orchestrator profiles can opt into the broader `kanban` toolset. Normal
+sessions still have zero `kanban_*` schema footprint unless configured.
+
+- **CLI verbs (common):** `init`, `create`, `list` (alias `ls`),
+  `show`, `assign`, `link`, `unlink`, `comment`, `complete`, `block`,
+  `unblock`, `archive`, `tail`. Less common: `watch`, `stats`, `runs`,
+  `log`, `dispatch`, `daemon`, `gc`.
+- **Worker/orchestrator toolset:** `kanban_show`, `kanban_complete`,
+  `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`,
+  `kanban_link`; profiles that explicitly enable the `kanban` toolset
+  outside a dispatcher-spawned task also get `kanban_list` and
+  `kanban_unblock` for board routing.
+- **Dispatcher** runs inside the gateway by default
+  (`kanban.dispatch_in_gateway: true`) — reclaims stale claims,
+  promotes ready tasks, atomically claims, spawns assigned profiles.
+  Auto-blocks a task after `failure_limit` consecutive spawn failures
+  (default 2; configurable via `kanban.failure_limit` or per-task
+  `max_retries`).
+- **Isolation:** board is the hard boundary (workers get
+  `HERMES_KANBAN_BOARD` pinned in env); tenant is a soft namespace
+  within a board for workspace-path + memory-key isolation.
+
+User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\autonomous-ai-agents\hermes-agent\references\cli-reference.md ===
+# Hermes CLI Reference
+
+Live sources when anything looks stale: `hermes --help`, `hermes <command> --help`,
+https://hermes-agent.nousresearch.com/docs/reference/cli-commands
+
+### Global Flags
+
+```
+hermes [flags] [command]        (no subcommand = interactive chat)
+
+  --version, -V             Show version
+  -z, --oneshot PROMPT      One-shot: print ONLY the final response (for scripts/pipes)
+  -m MODEL  --provider P    Model/provider override for this invocation
+  -t, --toolsets LIST       Comma-separated toolsets for this invocation
+  --resume, -r SESSION      Resume session by ID or title
+  --continue, -c [NAME]     Resume by name, or most recent session
+  --worktree, -w            Isolated git worktree mode (parallel agents)
+  --skills, -s SKILL        Preload skills (comma-separate or repeat)
+  --profile, -p NAME        Use a named profile
+  --yolo                    Skip dangerous command approval
+  --tui / --cli             Force the Ink TUI / classic REPL
+  --ignore-rules            Skip AGENTS.md/SOUL.md/memory/skill injection
+  --safe-mode               Disable ALL customizations (troubleshooting)
+  --pass-session-id         Include session ID in system prompt
+```
+
+### Chat
+
+```
+hermes chat [flags]
+  -q, --query TEXT          Single query, non-interactive
+  --image PATH              Attach a local image to a single query
+  -Q, --quiet               Suppress banner, spinner, tool previews
+  --checkpoints             Enable filesystem checkpoints (/rollback)
+  --max-turns N             Cap tool-calling iterations
+  --source TAG              Session source tag (default: cli)
+```
+(plus the global flags above)
+
+### Configuration
+
+```
+hermes setup [section]      Wizard (model|tts|terminal|gateway|tools|agent)
+hermes model                Interactive model/provider picker
+hermes fallback [add|remove|list]  Fallback provider chain
+hermes config [show|edit|get|set|unset|path|env-path|check|migrate]
+hermes login / logout       OAuth sign-in / clear stored auth
+hermes doctor [--fix]       Check dependencies and config
+hermes status [--all]       Component status
+```
+
+### Tools & Skills
+
+```
+hermes tools [list|enable NAME|disable NAME]   Per-platform toolsets (curses UI with no args)
+
+hermes skills list|browse|search QUERY|inspect ID
+hermes skills install ID    Hub identifier OR a direct https://…/SKILL.md URL
+hermes skills config        Enable/disable skills per platform
+hermes skills check|update|uninstall|publish PATH
+hermes skills tap add REPO  Add a GitHub repo as a skill source
+hermes bundles              Skill bundles (one /<name> alias loads several skills)
+```
+
+### MCP Servers
+
+```
+hermes mcp add NAME (--url or --command) | remove | list | test NAME
+hermes mcp catalog | install NAME     Curated catalog install
+hermes mcp configure NAME             Toggle tool selection
+hermes mcp serve                      Run Hermes as an MCP server
+```
+Details (transport, tool discovery, catalog): `references/native-mcp.md`.
+
+### Gateway (Messaging Platforms)
+
+```
+hermes gateway run|install|start|stop|restart|status|setup
+```
+
+20+ platforms: Telegram, Discord, Slack, WhatsApp (Baileys + Business Cloud API), iMessage (Photon — `hermes photon setup`), Signal, Email, SMS, Matrix, Mattermost, Teams, LINE, SimpleX, ntfy, Google Chat, Home Assistant, DingTalk, Feishu, WeCom, Weixin, API Server, Webhooks. Open WebUI connects via the API Server adapter. Most adapters ship under `plugins/platforms/`.
+Docs: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/
+
+### Sessions
+
+```
+hermes sessions list|browse|rename ID TITLE|delete ID|export OUT|prune|stats
+```
+
+### Cron / Webhooks
+
+```
+hermes cron list|create SCHED|edit ID|pause|resume|run ID|remove|status
+    Schedules: '30m', 'every 2h', '0 9 * * *', ISO timestamp
+hermes webhook subscribe NAME|list|remove NAME|test NAME
+```
+Webhook payloads/routes: `references/webhooks.md`.
+
+### Profiles
+
+```
+hermes profile list|create NAME (--clone|--clone-all|--clone-from)|use|show|delete
+hermes profile rename A B | alias NAME | export NAME | import FILE
+hermes profile migrate-identity A B   Retry a completed rename's session/routing identity migration
+```
+
+### Credentials & Pools
+
+```
+hermes auth                 Interactive credential manager
+hermes auth add [PROVIDER]  Add OAuth or API-key credential (nous, openai-codex, qwen-oauth, …)
+hermes auth list|remove P IDX|reset PROVIDER|status
+```
+Multiple credentials per provider form a pool that rotates automatically and skips exhausted keys.
+
+### Other
+
+```
+hermes desktop / gui        Native desktop app
+hermes dashboard            Web admin panel + embedded chat (--stop / --status)
+hermes proxy                OpenAI-compatible local proxy backed by an OAuth provider
+hermes portal               Quick setup / sign in via Nous Portal
+hermes kanban <verb>        Multi-agent work-queue board
+hermes project              Named multi-folder workspaces
+hermes skin list|use|set    Switch/tweak skins (see references/themes.md)
+hermes pets <verb>          Pet mascots (see references/petdex.md)
+hermes memory setup|status|off|reset   Memory provider
+hermes secrets bitwarden|onepassword   External secret stores
+hermes moa                  Mixture-of-Agents slots
+hermes hooks / security / backup / import / checkpoints / console
+hermes logs [-f] [errors]   View agent/error logs
+hermes send                 One-off message through a gateway platform
+hermes pairing / plugins / insights / journey / computer-use
+hermes acp                  ACP server (IDE integration)
+hermes completion bash|zsh|fish
+hermes update / uninstall / claw migrate
+```
+
+Plugin- and provider-supplied subcommands (e.g. `hermes photon setup`) only appear once their plugin is installed/active.
+
+### Where to Find Things
+
+| Looking for... | Location |
+|---|---|
+| Config options | `hermes config edit` · [Configuration docs](https://hermes-agent.nousresearch.com/docs/user-guide/configuration) |
+| Tools / toolsets | `hermes tools list` · [Tools reference](https://hermes-agent.nousresearch.com/docs/reference/tools-reference) |
+| Skills catalog | `hermes skills browse` · [Skills catalog](https://hermes-agent.nousresearch.com/docs/reference/skills-catalog) |
+| Provider setup | `hermes model` · [Providers guide](https://hermes-agent.nousresearch.com/docs/integrations/providers) |
+| Env variables | `hermes config env-path` · [Env vars reference](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) |
+| Gateway logs | `~/.hermes/logs/gateway.log` (or `hermes logs`) |
+| Sessions | `hermes sessions browse` (reads state.db) |
+

@@ -1,0 +1,362 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_send_path_history_isolation.py ===
+"""Send-path transforms must never write through into persisted history.
+
+The send path builds ``api_messages`` from the persisted conversation
+history and then rewrites the copies IN PLACE (tool-call argument
+canonicalization/repair, surrogate sanitization, non-ASCII sanitization,
+content strips). The build previously used a shallow ``msg.copy()``, which
+decouples only top-level fields: nested containers (tool_calls entries and
+their function dicts, multimodal content-part lists, reasoning_details)
+stayed aliased to the history's objects, so those in-place transforms
+silently rewrote the stored transcript. Incident #80498: an unrepairable
+``write_file`` argument string was replaced with ``{}`` in the persisted
+turn, destroying the streamed file content.
+
+``_clone_message_for_send`` closes the whole class at the chokepoint: it
+clones every container while sharing immutable leaves. These tests pin the
+invariant CLASS-WIDE — every send-path in-place transform runs over an
+adversarial fixture and the history must remain byte-identical — so any
+future transform added to the pipeline inherits the guarantee (or fails
+here loudly).
+"""
+
+import copy
+import json
+
+import agent.conversation_loop as cl
+from agent.message_sanitization import (
+    _sanitize_messages_non_ascii,
+    _sanitize_messages_surrogates,
+)
+
+TRUNCATED_ARGS = '{"content": "# chapter draft\\nline one'  # unrepairable
+VALID_ARGS = json.dumps({"path": "a.txt", "text": "héllo"})
+LONE_SURROGATE = "hello \ud83d world"
+
+
+def _adversarial_history():
+    """Every nested container + every dirty-leaf shape the transforms touch."""
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look at this " + LONE_SURROGATE},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "ok " + LONE_SURROGATE,
+            "reasoning_content": "thinking … " + LONE_SURROGATE,
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "chaîne " + LONE_SURROGATE}
+            ],
+            "tool_calls": [
+                {
+                    "id": "c1" + LONE_SURROGATE,
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": TRUNCATED_ARGS},
+                },
+                {
+                    "id": "c2",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": VALID_ARGS},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "done"},
+    ]
+
+
+def _api_copy(history):
+    """Exactly the send path's build shape."""
+    return [cl._clone_message_for_send(m) for m in history]
+
+
+# Every send-path transform that rewrites api_messages in place. Add new
+# transforms here when the pipeline grows — the invariant is class-wide.
+def _run_full_pipeline(api_messages):
+    for am in api_messages:
+        if isinstance(am.get("content"), str):
+            am["content"] = am["content"].strip()
+    cl._canonicalize_api_tool_calls(api_messages)
+    _sanitize_messages_surrogates(api_messages)
+    _sanitize_messages_non_ascii(api_messages)
+
+
+class TestSendPathNeverMutatesHistory:
+    def test_full_pipeline_leaves_history_byte_identical(self):
+        history = _adversarial_history()
+        before = copy.deepcopy(history)
+
+        api_messages = _api_copy(history)
+        _run_full_pipeline(api_messages)
+
+        assert history == before, (
+            "a send-path transform wrote through the api copy into the "
+            "persisted history — the clone is no longer structural"
+        )
+
+    def test_each_transform_in_isolation(self):
+        transforms = {
+            "canonicalize/repair": cl._canonicalize_api_tool_calls,
+            "surrogate sanitizer": _sanitize_messages_surrogates,
+            "non-ascii sanitizer": _sanitize_messages_non_ascii,
+        }
+        for name, fn in transforms.items():
+            history = _adversarial_history()
+            before = copy.deepcopy(history)
+            fn(_api_copy(history))
+            assert history == before, f"{name} mutated persisted history"
+
+    def test_clone_decouples_every_nested_container(self):
+        history = _adversarial_history()
+        api = _api_copy(history)
+
+        # Write into every nested container of the copy.
+        api[0]["content"][0]["text"] = "MUTATED"
+        api[0]["content"][1]["image_url"]["url"] = "MUTATED"
+        api[1]["tool_calls"][0]["function"]["arguments"] = "{}"
+        api[1]["tool_calls"][1]["id"] = "MUTATED"
+        api[1]["reasoning_details"][0]["text"] = "MUTATED"
+
+        assert history[0]["content"][0]["text"].startswith("look at this")
+        assert history[0]["content"][1]["image_url"]["url"].startswith("data:")
+        assert (
+            history[1]["tool_calls"][0]["function"]["arguments"]
+            == TRUNCATED_ARGS
+        )
+        assert history[1]["tool_calls"][1]["id"] == "c2"
+        assert history[1]["reasoning_details"][0]["text"].startswith("chaîne")
+
+    def test_clone_shares_immutable_leaves(self):
+        """Cost model: containers copied, strings shared (not duplicated)."""
+        history = _adversarial_history()
+        api = _api_copy(history)
+        # Same string object — no byte copy of large payloads.
+        assert (
+            api[1]["tool_calls"][1]["function"]["arguments"]
+            is history[1]["tool_calls"][1]["function"]["arguments"]
+        )
+        # Different container objects at every level.
+        assert api[1] is not history[1]
+        assert api[1]["tool_calls"] is not history[1]["tool_calls"]
+        assert api[1]["tool_calls"][0] is not history[1]["tool_calls"][0]
+        assert (
+            api[1]["tool_calls"][0]["function"]
+            is not history[1]["tool_calls"][0]["function"]
+        )
+
+    def test_non_dict_messages_pass_through(self):
+        sentinel = object()
+        assert cl._clone_message_for_send(sentinel) is sentinel
+        assert cl._clone_message_for_send("plain") == "plain"
+        assert cl._clone_message_for_send(None) is None
+
+
+class TestSendPathBuildIsWiredToTheClone:
+    """The api_messages build must actually USE the structural clone.
+
+    The isolation tests above exercise ``_clone_message_for_send`` directly,
+    so they cannot notice the build site quietly reverting to the shallow
+    ``msg.copy()`` (the mutation that recreates #80498). This AST contract
+    pins the wiring: inside ``run_conversation_loop``'s api_messages build,
+    the per-message copy expression must be a ``_clone_message_for_send``
+    call, and no ``.copy()``-shaped fallback may reappear on the history
+    iteration variable.
+    """
+
+    def test_history_build_calls_the_clone(self):
+        import ast
+        import inspect
+
+        import agent.turn_context as tc
+        import agent.turn_request_assembly as ra
+
+        # The history build lives in turn_context.build_api_messages; the
+        # prefill insert in turn_request_assembly.assemble_api_request. Scan all homes.
+        nodes = [
+            node
+            for mod in (cl, tc, ra)
+            for node in ast.walk(ast.parse(inspect.getsource(mod)))
+        ]
+
+        clone_calls = []
+        shallow_copies = []
+        for node in nodes:
+            if isinstance(node, ast.Call):
+                fn = node.func
+                if isinstance(fn, ast.Name) and fn.id == "_clone_message_for_send":
+                    if (
+                        node.args
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in ("msg", "pfm")
+                    ):
+                        clone_calls.append(node.args[0].id)
+                if (
+                    isinstance(fn, ast.Attribute)
+                    and fn.attr == "copy"
+                    and isinstance(fn.value, ast.Name)
+                    and fn.value.id in ("msg", "pfm")
+                ):
+                    shallow_copies.append(fn.value.id)
+
+        assert "msg" in clone_calls, (
+            "the api_messages history build no longer clones via "
+            "_clone_message_for_send(msg) — shallow aliasing (#80498) is back"
+        )
+        assert "pfm" in clone_calls, (
+            "the prefill insert no longer clones via "
+            "_clone_message_for_send(pfm)"
+        )
+        assert not shallow_copies, (
+            f"shallow .copy() reappeared on send-path message variables: "
+            f"{shallow_copies} — nested containers alias the persisted history"
+        )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_sequential_chats_live.py ===
+"""Live regression guardrail for the keepalive/transport bug class (#10933).
+
+AlexKucera reported on Discord (2026-04-16) that after ``hermes update`` pulled
+#10933, the FIRST chat in a session worked and EVERY subsequent chat failed
+with ``APIConnectionError('Connection error.')`` whose cause was
+``RuntimeError: Cannot send a request, as the client has been closed``.
+
+The companion ``test_create_openai_client_reuse.py`` pins this contract at
+object level with mocked ``OpenAI``. This file runs the same shape of
+reproduction against a real provider so we have a true end-to-end smoke test
+for any future keepalive / transport plumbing.
+
+Opt-in — not part of default CI:
+    HERMES_LIVE_TESTS=1 pytest tests/agent/test_sequential_chats_live.py -v
+
+Requires ``OPENROUTER_API_KEY`` to be set (or sourced via ~/.hermes/.env).
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+
+# Load ~/.hermes/.env so live runs pick up OPENROUTER_API_KEY without
+# needing the runner to shell-source it first. Silent if the file is absent.
+def _load_user_env() -> None:
+    env_file = Path.home() / ".hermes" / ".env"
+    if not env_file.exists():
+        return
+    for raw in env_file.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        # Don't clobber an already-set env var — lets the caller override.
+        os.environ.setdefault(k, v)
+
+
+_load_user_env()
+
+
+LIVE = os.environ.get("HERMES_LIVE_TESTS") == "1"
+OR_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+pytestmark = [
+    pytest.mark.skipif(not LIVE, reason="live-only — set HERMES_LIVE_TESTS=1"),
+    pytest.mark.skipif(not OR_KEY, reason="OPENROUTER_API_KEY not configured"),
+]
+
+# Cheap, fast, tool-capable. Swap if it ever goes dark.
+LIVE_MODEL = "google/gemini-2.5-flash"
+
+
+def _make_live_agent():
+    from run_agent import AIAgent
+
+    return AIAgent(
+        model=LIVE_MODEL,
+        provider="openrouter",
+        api_key=OR_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        max_iterations=3,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        # All toolsets off so the agent just produces a single text reply
+        # per turn — we want to test the HTTP client lifecycle, not tools.
+        disabled_toolsets=["*"],
+    )
+
+
+def _looks_like_error_reply(reply: str) -> tuple[bool, str]:
+    """AIAgent returns an error-sentinel string (not an exception) when the
+    underlying API call fails past retries. A naive ``assert reply and
+    reply.strip()`` misses this because the sentinel is truthy. This
+    checker enumerates the known-bad shapes so the live test actually
+    catches #10933 instead of rubber-stamping the error response.
+    """
+    lowered = reply.lower().strip()
+    bad_substrings = (
+        "api call failed",
+        "connection error",
+        "client has been closed",
+        "cannot send a request",
+        "max retries",
+    )
+    for marker in bad_substrings:
+        if marker in lowered:
+            return True, marker
+    return False, ""
+
+
+def _assert_healthy_reply(reply, turn_label: str) -> None:
+    assert reply and reply.strip(), f"{turn_label} returned empty: {reply!r}"
+    is_err, marker = _looks_like_error_reply(reply)
+    assert not is_err, (
+        f"{turn_label} returned an error-sentinel string instead of a real "
+        f"model reply — matched marker {marker!r}. This is the exact shape "
+        f"of #10933 (AlexKucera Discord report, 2026-04-16): the agent's "
+        f"retry loop burned three attempts against a closed httpx transport "
+        f"and surfaced 'API call failed after 3 retries: Connection error.' "
+        f"to the user. Reply was: {reply!r}"
+    )
+
+
+def test_three_sequential_chats_across_client_rebuild():
+    """Reproduces AlexKucera's exact failure shape end-to-end.
+
+    Turn 1 always worked under #10933. Turn 2 was the one that failed
+    because the shared httpx transport had been torn down between turns.
+    Turn 3 is here as extra insurance against any lazy-init shape where
+    the failure only shows up on call N>=3.
+
+    We also deliberately trigger ``_replace_primary_openai_client`` between
+    turn 2 and turn 3 — that is the real rebuild entrypoint (401 refresh,
+    credential rotation, model switch) and is the path that actually
+    stored the closed transport into ``self._client_kwargs`` in #10933.
+    """
+    agent = _make_live_agent()
+
+    r1 = agent.chat("Respond with only the word: ONE")
+    _assert_healthy_reply(r1, "turn 1")
+
+    r2 = agent.chat("Respond with only the word: TWO")
+    _assert_healthy_reply(r2, "turn 2")
+
+    # Force a client rebuild through the real path — mimics 401 refresh /
+    # credential rotation / model switch lifecycle.
+    rebuilt = agent._replace_primary_openai_client(reason="regression_test_rebuild")
+    assert rebuilt, "rebuild via _replace_primary_openai_client returned False"
+
+    r3 = agent.chat("Respond with only the word: THREE")
+    _assert_healthy_reply(r3, "turn 3 (post-rebuild)")
+

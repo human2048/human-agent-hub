@@ -1,0 +1,249 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\providers\test_meta_ai_profile.py ===
+"""Tests for the bundled Meta Model API (Muse Spark) provider plugin.
+
+Adapted from the plugin's original suite at
+https://github.com/albertodepaola/hermes-meta-provider — the plugin is now
+bundled, so profiles resolve through normal registry discovery.
+"""
+
+import pytest
+
+from providers import get_provider_profile
+from providers.base import ProviderProfile
+
+
+def _profile():
+    p = get_provider_profile("meta-ai")
+    assert p is not None
+    return p
+
+
+class TestMetaAIProfile:
+    def test_profile_registered(self):
+        p = _profile()
+        assert p.name == "meta-ai"
+        assert p.base_url == "https://api.meta.ai/v1"
+        assert p.auth_type == "api_key"
+        # Responses API engages Muse prompt caching (0% on chat/completions
+        # vs 93-99% on /v1/responses with prompt_cache_retention).
+        assert p.api_mode == "codex_responses"
+        assert "MODEL_API_KEY" in p.env_vars
+        assert p.supports_vision is True
+        # Images are accepted on user turns only; tool-result envelopes 400 (#101668).
+        assert p.supports_vision_tool_messages is False
+        assert p.default_aux_model == "muse-spark-1.2-contributor"
+        assert p.default_max_tokens == 16384
+        assert p.fallback_models == ("muse-spark-1.2",)
+
+    def test_live_catalog_filters_non_chat_models(self, monkeypatch):
+        p = _profile()
+        seen = []
+
+        def fake_fetch_models(_self, **_kwargs):
+            seen.append(True)
+            return [
+                "muse-voice-transcribe-1.0",
+                "muse-spark-latest",
+                "muse-image-1.0-eval",
+                "muse-nova-test",
+            ]
+
+        monkeypatch.setattr(ProviderProfile, "fetch_models", fake_fetch_models)
+
+        assert p.fetch_models() == ["muse-spark-latest", "muse-nova-test"]
+        assert seen
+
+    @pytest.mark.parametrize("alias", ["meta", "muse", "muse-spark", "model-api", "msl"])
+    def test_aliases_resolve(self, alias):
+        assert get_provider_profile(alias) is _profile()
+
+
+def _effort(cfg):
+    _eb, top = _profile().build_api_kwargs_extras(reasoning_config=cfg)
+    return top.get("reasoning_effort")
+
+
+class TestReasoningEffort:
+    def test_mapping(self):
+        assert _effort(None) == "medium"  # unset -> medium
+        assert _effort({"enabled": True, "effort": "high"}) == "high"
+        assert _effort({"enabled": True, "effort": "low"}) == "low"
+        assert _effort({"enabled": True, "effort": "max"}) == "xhigh"
+        assert _effort({"enabled": False}) == "minimal"  # disabled -> minimal
+        # Meta 400s on "none" — must map to "minimal"
+        assert _effort({"effort": "none"}) == "minimal"
+
+    def test_never_uses_extra_body(self):
+        """The dial must be top-level, not extra_body.reasoning (core-gated path)."""
+        eb, top = _profile().build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"}
+        )
+        assert eb == {}
+        assert "reasoning_effort" in top
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\providers\test_named_custom_reasoning.py ===
+"""Named custom routes use the same reasoning contract as bare custom."""
+from providers import get_provider_profile, register_provider
+from providers.base import ProviderProfile
+from agent.transports.chat_completions import ChatCompletionsTransport
+
+
+def test_named_custom_route_keeps_final_reasoning_effort():
+    transport = ChatCompletionsTransport()
+    for effort in ("low", "medium", "high"):
+        outputs = [transport.build_kwargs(
+            "fixture-model", [{"role": "user", "content": "fixture"}],
+            provider_profile=get_provider_profile(provider),
+            base_url="http://127.0.0.1:1/v1",
+            reasoning_config={"enabled": True, "effort": effort},
+        ) for provider in ("custom", "custom:fixture")]
+        assert outputs[0]["reasoning_effort"] == effort
+        assert outputs[1] == outputs[0]
+
+
+def test_named_custom_fallback_does_not_override_registered_routes(monkeypatch):
+    import providers
+    get_provider_profile("custom")
+    monkeypatch.setattr(providers, "_REGISTRY", dict(providers._REGISTRY))
+    monkeypatch.setattr(providers, "_ALIASES", dict(providers._ALIASES))
+    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+    dedicated = ProviderProfile(name="custom:fixture")
+    register_provider(dedicated)
+    assert get_provider_profile("custom:fixture") is dedicated
+    assert get_provider_profile("CUSTOM:unregistered") is get_provider_profile("custom")
+    assert get_provider_profile("NONEXISTENT") is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\providers\test_plugin_discovery.py ===
+"""Tests for the model-providers plugin discovery system.
+
+Verifies that:
+ 1. All bundled providers at plugins/model-providers/<name>/ are discovered
+ 2. User plugins at $HERMES_HOME/plugins/model-providers/<name>/ override bundled
+ 3. plugin.yaml manifests with kind=model-provider are correctly categorized
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _clear_provider_caches():
+    """Force providers/__init__.py to re-discover on next list_providers()."""
+    import providers as _pkg
+    _pkg._REGISTRY.clear()
+    _pkg._ALIASES.clear()
+    _pkg._PROVIDER_LIST_CACHE = None
+    _pkg._discovered = False
+    # Evict any cached plugin modules so the next import re-executes.
+    for mod in list(sys.modules.keys()):
+        if (
+            mod.startswith("plugins.model_providers")
+            or mod.startswith("_hermes_user_provider")
+        ):
+            del sys.modules[mod]
+
+
+def test_bundled_plugins_discovered():
+    """Every plugins/model-providers/<name>/ should contain a plugin.yaml + __init__.py."""
+    plugins_dir = REPO_ROOT / "plugins" / "model-providers"
+    assert plugins_dir.is_dir(), f"Missing {plugins_dir}"
+
+    child_dirs = [c for c in plugins_dir.iterdir() if c.is_dir()]
+    assert len(child_dirs) >= 28, f"Expected at least 28 provider plugins, found {len(child_dirs)}"
+
+    for child in child_dirs:
+        assert (child / "__init__.py").exists(), f"{child.name} missing __init__.py"
+        assert (child / "plugin.yaml").exists(), f"{child.name} missing plugin.yaml"
+
+
+def test_all_profiles_register():
+    """After discovery, the registry must contain every bundled provider directory.
+
+    This is an invariant — the number of profiles matches the number of plugin
+    directories, not a hardcoded count. Counts shift when providers are
+    added/removed; that's expected and shouldn't break CI.
+    """
+    _clear_provider_caches()
+    from providers import list_providers
+
+    plugins_dir = REPO_ROOT / "plugins" / "model-providers"
+    plugin_dir_count = sum(1 for c in plugins_dir.iterdir() if c.is_dir())
+
+    profiles = list_providers()
+    names = sorted(p.name for p in profiles)
+    # Some plugin __init__.py files register multiple profiles, so the registry
+    # count is >= the directory count (never less).
+    assert len(names) >= plugin_dir_count, (
+        f"Expected at least {plugin_dir_count} profiles (one per plugin dir), got {len(names)}: {names}"
+    )
+
+    # Spot-check representative providers from different categories
+    for required in (
+        "openrouter", "anthropic", "custom", "bedrock", "openai-codex",
+        "minimax-oauth", "gmi", "xiaomi", "alibaba-coding-plan", "fireworks",
+        "nebius-token-factory",
+    ):
+        assert required in names, f"Missing profile: {required}"
+
+
+def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
+    """A user plugin with the same name must override the bundled profile."""
+    # Point HERMES_HOME at a fresh temp dir
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    # get_hermes_home() may be module-cached depending on codebase; ensure the
+    # env var is the source of truth. Most code paths re-read it each call.
+
+    # Drop a user plugin that replaces 'gmi'
+    user_gmi = hermes_home / "plugins" / "model-providers" / "gmi"
+    user_gmi.mkdir(parents=True)
+    (user_gmi / "__init__.py").write_text(
+        "from providers import register_provider\n"
+        "from providers.base import ProviderProfile\n"
+        "\n"
+        "custom_gmi = ProviderProfile(\n"
+        '    name="gmi",\n'
+        '    aliases=("gmi-user-override-test",),\n'
+        '    env_vars=("GMI_API_KEY",),\n'
+        '    base_url="https://user-override.example.com/v1",\n'
+        '    auth_type="api_key",\n'
+        ")\n"
+        "register_provider(custom_gmi)\n"
+    )
+    (user_gmi / "plugin.yaml").write_text(
+        "name: gmi-user-override\n"
+        "kind: model-provider\n"
+        "version: 0.0.1\n"
+        "description: Test user override\n"
+    )
+
+    _clear_provider_caches()
+    from providers import get_provider_profile
+
+    gmi = get_provider_profile("gmi")
+    assert gmi is not None
+    assert gmi.base_url == "https://user-override.example.com/v1", (
+        f"User override not applied; got base_url={gmi.base_url!r}"
+    )
+    assert "gmi-user-override-test" in gmi.aliases
+
+    # Clean up: reset discovery state so other tests see the bundled version
+    _clear_provider_caches()
+
+
+    # No import means the module must NOT be in the plugins list as a loaded one.
+    # We check that the general loader didn't crash and didn't raise from the
+    # broken __init__.py.
+

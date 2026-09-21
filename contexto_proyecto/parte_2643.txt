@@ -1,0 +1,354 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_fence_chunker.py ===
+"""Invariant tests for the shared fence-aware markdown chunker core.
+
+The core lives in ``gateway.platforms.helpers`` and was extracted from the
+Yuanbao ``MarkdownProcessor`` (the richest of the four formerly duplicated
+implementations).  These tests assert the core's *contract* (invariants),
+not exact snapshots, so they survive internal tweaks that preserve behavior.
+"""
+
+import pytest
+
+from gateway.platforms.helpers import (
+    balance_fences_across_chunks,
+    greedy_pack_blocks,
+    infer_block_separator,
+    merge_streaming_fences,
+    split_at_paragraph_boundary,
+    split_markdown_atoms,
+    split_markdown_table_row,
+    split_text_fence_aware,
+    text_has_unclosed_fence,
+)
+
+
+def utf16_len(s: str) -> int:
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+
+
+LONG_PARAS = ("This is a sentence that goes on for a while. " * 8 + "\n\n") * 6
+FENCED = (
+    "Header line\n\n```js\n"
+    + "\n".join(f"console.log({i}); // padding padding" for i in range(30))
+    + "\n```\n\nTail paragraph after the code block ends here."
+)
+UNCLOSED = (
+    "Some text before.\n\n```bash\necho one\n"
+    + "echo more stuff here to pad the line out\n" * 10
+)
+TABLE = (
+    "Intro paragraph.\n\n| col1 | col2 |\n|------|------|\n"
+    + "\n".join(f"| value{i} | data{i} |" for i in range(40))
+    + "\n\nDone."
+)
+CJK = "这是一个中文段落，包含了很多字符。用于测试宽字符处理。这句话结束了。\n\n" * 10
+MIXED = (
+    "Start.\n\n```sql\nSELECT * FROM t;\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |\n\n"
+    "End paragraph with some extra words to pad things out."
+)
+
+SAMPLES = [LONG_PARAS, FENCED, UNCLOSED, TABLE, CJK, MIXED, "x" * 500]
+
+
+# ── split_text_fence_aware (paragraph mode: yuanbao-derived) ─────────────────
+
+
+@pytest.mark.parametrize("text", SAMPLES)
+@pytest.mark.parametrize("limit", [80, 200, 400])
+def test_paragraph_mode_chunks_within_limit_unless_atomic(text, limit):
+    chunks = split_text_fence_aware(text, limit, prefer_paragraphs=True)
+    atoms = split_markdown_atoms(text)
+    oversize_atom = any(len(a) > limit for a in atoms)
+    for chunk in chunks:
+        # A chunk may exceed the limit only when a single indivisible atom
+        # (code block / table) itself exceeds it.
+        if len(chunk) > limit:
+            assert oversize_atom, (
+                f"chunk of {len(chunk)} > {limit} without an oversize atom"
+            )
+
+
+# ── split_text_fence_aware (newline mode + balancing: stream_consumer) ───────
+
+
+@pytest.mark.parametrize("text", SAMPLES)
+def test_newline_mode_balanced_fences_every_chunk(text):
+    chunks = split_text_fence_aware(
+        text, 100, prefer_paragraphs=False, balance_fences=True
+    )
+    for chunk in chunks:
+        # Every delivered chunk must render standalone: even fence count.
+        assert chunk.count("\n```") % 2 == 0 or not text_has_unclosed_fence(chunk)
+        assert not text_has_unclosed_fence(chunk)
+
+
+# ── split_at_paragraph_boundary ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("text", SAMPLES)
+def test_split_at_paragraph_boundary_head_plus_tail(text):
+    head, tail = split_at_paragraph_boundary(text, 100)
+    assert head + tail == text
+    assert len(head) <= 100 or "\n" not in text[:100]
+
+
+# ── atoms ────────────────────────────────────────────────────────────────────
+
+
+def test_atoms_fence_kept_whole():
+    atoms = split_markdown_atoms(FENCED)
+    fence_atoms = [a for a in atoms if a.lstrip().startswith("```")]
+    assert len(fence_atoms) == 1
+    assert fence_atoms[0].rstrip().endswith("```")
+
+
+# ── streaming merge + separators ─────────────────────────────────────────────
+
+
+def test_merge_streaming_fences_rejoins_split_fence():
+    chunks = ["intro\n```py\ncode line", "more code\n```\ntail"]
+    merged = merge_streaming_fences(chunks)
+    assert len(merged) == 1
+    assert not text_has_unclosed_fence(merged[0])
+
+
+def test_infer_block_separator_rules():
+    assert infer_block_separator("text\n```", "next") == "\n"
+    assert infer_block_separator("text", "```py\nx") == "\n"
+    assert infer_block_separator("| a | b |", "| c | d |") == "\n"
+    assert infer_block_separator("plain", "plain") == "\n\n"
+
+
+# ── balance_fences_across_chunks ─────────────────────────────────────────────
+
+
+def test_balance_closes_and_reopens():
+    out = balance_fences_across_chunks(["a\n```go\nx", "y\n```\nb"])
+    assert out[0].endswith("\n```")
+    assert out[1].startswith("```go\n")
+    assert all(not text_has_unclosed_fence(c) for c in out)
+
+
+# ── greedy_pack_blocks ───────────────────────────────────────────────────────
+
+
+def test_greedy_pack_overflow_callback():
+    calls = []
+
+    def overflow(block):
+        calls.append(block)
+        return [block[:50], block[50:]]
+
+    packed = greedy_pack_blocks(["x" * 120], 60, overflow=overflow)
+    assert calls and packed == ["x" * 50, "x" * 70]
+
+
+# ── canonical table-row splitter delegation ──────────────────────────────────
+
+
+
+
+# ── UTF-16 length units at the Telegram limit (#55844) ──────────────────────
+
+
+def test_emoji_heavy_split_respects_utf16_limit():
+    """Telegram's 4096 limit is UTF-16 code units — emoji count as 2.
+
+    Regression for #55844: the fallback splitter must measure chunks with
+    the platform len_fn, not Python codepoints, or emoji-heavy messages
+    ship oversized chunks that Telegram rejects with MESSAGE_TOO_LONG.
+    """
+    limit = 3996  # gateway's safe limit: 4096 - 100 headroom
+    text = "🚀" * 3000  # 3000 codepoints == 6000 UTF-16 units
+    chunks = split_text_fence_aware(
+        text, limit, utf16_len, prefer_paragraphs=False, balance_fences=True
+    )
+    assert len(chunks) > 1
+    assert all(utf16_len(c) <= limit for c in chunks)
+    assert "".join(chunks) == text
+
+
+def test_mixed_emoji_newline_text_utf16_limit():
+    text = "emoji 🎉🎊 line with some more words attached\n" * 400
+    chunks = split_text_fence_aware(
+        text, 500, utf16_len, prefer_paragraphs=False, balance_fences=True
+    )
+    assert all(utf16_len(c) <= 500 for c in chunks)
+    assert all(c for c in chunks)
+
+
+# ── split_markdown_atoms: empty ``` ``` blocks (main parity) ─────────────────
+
+
+def test_empty_fence_block_atoms_match_main():
+    """An empty fenced block (``` immediately followed by ```) is its own
+    atom and the following text starts a fresh one — main's chunk boundaries."""
+    assert split_markdown_atoms("```\n```\ntext") == ["```\n```", "text"]
+    assert split_markdown_atoms("```\n```\ncode\n```\ntail") == ["```\n```", "code", "```\ntail"]
+    assert split_markdown_atoms("```py\n```\n\n```\n```") == ["```py\n```", "```\n```"]
+    assert split_markdown_atoms("a\n```\ncode\n```\nb") == ["a", "```\ncode\n```", "b"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_fifo_overflow_rescue.py ===
+"""Regression tests for #99882: FIFO overflow orphan rescue.
+
+When a follow-up is demoted to /queue during compression-in-flight,
+it lands in SessionState.conversation.queued_events (overflow) with
+the current turn's event occupying adapter._pending_messages[session_key]
+(slot).  After the slot's turn completes, _promote_queued_event moves
+the overflow head into the slot.  When that drain never runs — the
+busy window ended through an exit that skipped the promotion site
+(/stop, turn exception, generation bump) — the overflow is silently
+orphaned: never dispatched, never persisted, never logged.
+
+The rescue in GatewayRunner._rescue_orphaned_overflow pops the oldest
+orphan for the caller to run as the current turn and stages the next
+orphan in the slot, so FIFO order (#28503) holds and nothing runs twice.
+"""
+
+from unittest.mock import MagicMock
+
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    Platform,
+    PlatformConfig,
+)
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run import GatewayRunner
+
+
+class _StubAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        return SendResult(success=True, message_id="msg-1")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}
+
+
+def _text_event(text: str, msg_id: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=MagicMock(chat_id="123", platform=Platform.TELEGRAM, profile=None),
+        message_id=msg_id,
+    )
+
+
+def _runner() -> GatewayRunner:
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._queued_events = {}
+    return runner
+
+
+class TestRescueOrphanedOverflow:
+    def test_single_orphan_is_returned_and_removed_from_both_stores(self):
+        runner = _runner()
+        adapter = _StubAdapter()
+        session_key = "telegram:user:1"
+        runner._session_state(session_key).conversation.queued_events.append(
+            _text_event("orphan-1", "o1")
+        )
+        assert session_key not in adapter._pending_messages
+
+        rescued = runner._rescue_orphaned_overflow(session_key, adapter)
+
+        assert rescued is not None and rescued.text == "orphan-1"
+        # The rescued event runs as the current turn, so it must NOT also
+        # sit in the slot — the post-turn drain would run it a second time.
+        assert session_key not in adapter._pending_messages
+        assert runner._session_state(session_key).conversation.queued_events == []
+
+    def test_two_orphans_return_oldest_and_stage_next_in_slot(self):
+        runner = _runner()
+        adapter = _StubAdapter()
+        session_key = "telegram:user:1b"
+        runner._session_state(session_key).conversation.queued_events.extend(
+            [_text_event("orphan-1", "o1"), _text_event("orphan-2", "o2")]
+        )
+
+        rescued = runner._rescue_orphaned_overflow(session_key, adapter)
+
+        assert rescued is not None and rescued.text == "orphan-1"
+        # Slot now holds the NEXT orphan so the drain continues the chain.
+        assert adapter._pending_messages[session_key].text == "orphan-2"
+        assert runner._session_state(session_key).conversation.queued_events == []
+
+    def test_noop_when_slot_occupied(self):
+        runner = _runner()
+        adapter = _StubAdapter()
+        session_key = "telegram:user:2"
+        runner._session_state(session_key).conversation.queued_events.append(
+            _text_event("orphan", "o1")
+        )
+        adapter._pending_messages[session_key] = _text_event("busy-slot", "slot")
+
+        rescued = runner._rescue_orphaned_overflow(session_key, adapter)
+
+        assert rescued is None
+        assert adapter._pending_messages[session_key].text == "busy-slot"
+        assert len(runner._session_state(session_key).conversation.queued_events) == 1
+
+    def test_noop_when_no_overflow(self):
+        runner = _runner()
+        adapter = _StubAdapter()
+        session_key = "telegram:user:3"
+
+        rescued = runner._rescue_orphaned_overflow(session_key, adapter)
+
+        assert rescued is None
+        assert session_key not in adapter._pending_messages
+
+    def test_fifo_order_preserved_across_rescue_and_new_message(self):
+        """Oldest orphan runs first, new arrival last — FIFO (#28503).
+
+        Mirrors the idle-arrival call site: rescue → _enqueue_fifo(new).
+        """
+        runner = _runner()
+        adapter = _StubAdapter()
+        session_key = "telegram:user:4"
+        runner._session_state(session_key).conversation.queued_events.extend(
+            [_text_event("orphan-1", "o1"), _text_event("orphan-2", "o2")]
+        )
+
+        rescued = runner._rescue_orphaned_overflow(session_key, adapter)
+        assert rescued is not None and rescued.text == "orphan-1"
+        runner._enqueue_fifo(session_key, _text_event("new-msg", "new1"), adapter)
+
+        # Drain order after this turn: slot (orphan-2), then overflow (new-msg)
+        assert adapter._pending_messages[session_key].text == "orphan-2"
+        overflow_texts = [
+            e.text for e in runner._session_state(session_key).conversation.queued_events
+        ]
+        assert overflow_texts == ["new-msg"]
+
+    def test_single_orphan_then_new_message_lands_in_slot(self):
+        """With one orphan the slot is free after rescue, so the incoming
+        message must go to the slot (not overflow) or the drain never sees it."""
+        runner = _runner()
+        adapter = _StubAdapter()
+        session_key = "telegram:user:5"
+        runner._session_state(session_key).conversation.queued_events.append(
+            _text_event("orphan-1", "o1")
+        )
+
+        rescued = runner._rescue_orphaned_overflow(session_key, adapter)
+        assert rescued is not None and rescued.text == "orphan-1"
+        runner._enqueue_fifo(session_key, _text_event("new-msg", "new1"), adapter)
+
+        assert adapter._pending_messages[session_key].text == "new-msg"
+        assert runner._session_state(session_key).conversation.queued_events == []
+

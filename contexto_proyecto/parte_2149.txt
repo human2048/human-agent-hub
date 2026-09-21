@@ -1,0 +1,244 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nous_wire_auto.py ===
+"""``nous.anthropic_wire: auto`` decides a session's wire once, from its first response.
+
+Contracts:
+- the upstream classifier reads what Portal actually returns on both wires (OpenRouter stamps
+  ``provider`` + ``gen-…`` ids; GMI/Vertex returns Anthropic-native ``msg_…`` ids, no provider);
+- ``auto`` starts on chat and never promotes to native until GMI native is cleared;
+- one decision per session, only on call 1, only for nous + anthropic/*, never for chat/native;
+- through a real AIAgent and the real usage recorder, the hook fires exactly once and a switch
+  failure never breaks the turn.
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from agent import nous_wire
+from hermes_cli import providers as _providers
+
+
+def _resp(**kw):
+    return SimpleNamespace(**kw)
+
+
+class TestClassifier:
+    def test_openrouter_by_provider_field_or_gen_id(self):
+        assert nous_wire.classify_upstream(_resp(provider="Anthropic", id="gen-1788708403-xXjDsFw")) == "openrouter"
+        assert nous_wire.classify_upstream(_resp(provider="Claude Platform on AWS", id="x")) == "openrouter"
+        # native wire: no provider field, but the id is still OpenRouter-minted
+        assert nous_wire.classify_upstream(_resp(id="gen-1788680469-hyks5Nj9n7rmdAbMyQ5x")) == "openrouter"
+
+    def test_gmi_by_anthropic_native_id_without_provider(self):
+        assert nous_wire.classify_upstream(_resp(id="msg_01XrffvmxsRUWwCbVpBsADHo")) == "gmi"
+
+    @pytest.mark.parametrize("r", [None, _resp(), _resp(id=None), _resp(id="chatcmpl-abc"), _resp(id="", provider="")])
+    def test_unknown_never_classifies(self, r):
+        assert nous_wire.classify_upstream(r) is None
+
+
+class TestWireChoice:
+    def test_chat_for_openrouter_and_unknown(self):
+        assert nous_wire.wire_for_upstream("openrouter") == "chat_completions"
+        assert nous_wire.wire_for_upstream(None) == "chat_completions"
+
+    def test_gmi_is_chat_until_cleared_then_native(self, monkeypatch):
+        monkeypatch.setattr(nous_wire, "GMI_NATIVE_WIRE_CLEARED", False)
+        assert nous_wire.wire_for_upstream("gmi") == "chat_completions"
+        monkeypatch.setattr(nous_wire, "GMI_NATIVE_WIRE_CLEARED", True)
+        assert nous_wire.wire_for_upstream("gmi") == "anthropic_messages"
+
+
+def _agent(**kw):
+    a = SimpleNamespace(provider="nous", model="anthropic/claude-fable-5.1", api_mode="chat_completions",
+                        api_key="k", base_url="https://inference-api.nousresearch.com/v1", session_id="s")
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+class TestHook:
+    @pytest.fixture(autouse=True)
+    def _auto(self, monkeypatch):
+        monkeypatch.setattr(_providers, "_nous_anthropic_wire", lambda: "auto")
+        self.switches = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda agent, m, p, api_key="", base_url="", api_mode="", **k: self.switches.append(api_mode) or setattr(agent, "api_mode", api_mode))
+
+    def test_gmi_cleared_schedules_once_and_applies_at_next_iteration(self, monkeypatch):
+        monkeypatch.setattr(nous_wire, "GMI_NATIVE_WIRE_CLEARED", True)
+        a = _agent()
+        assert nous_wire.maybe_switch_wire_after_first_response(a, _resp(id="msg_01abc"), 1) is True
+        # decided but NOT switched yet: the response is still being consumed on the old wire
+        assert a.api_mode == "chat_completions" and self.switches == []
+        assert nous_wire.apply_pending_wire_switch(a) is True
+        assert a.api_mode == "anthropic_messages" and self.switches == ["anthropic_messages"]
+        assert nous_wire.apply_pending_wire_switch(a) is False  # nothing pending twice
+        # a later call, even with a different-looking response, never flips again
+        assert nous_wire.maybe_switch_wire_after_first_response(a, _resp(provider="Anthropic", id="gen-1-x"), 2) is False
+        assert nous_wire.maybe_switch_wire_after_first_response(a, _resp(provider="Anthropic", id="gen-1-x"), 1) is False
+        assert self.switches == ["anthropic_messages"]
+
+    def test_openrouter_stays_on_chat(self):
+        a = _agent()
+        assert nous_wire.maybe_switch_wire_after_first_response(a, _resp(provider="Anthropic", id="gen-1-x"), 1) is False
+        assert a.api_mode == "chat_completions" and self.switches == []
+
+    def test_gmi_uncleared_stays_on_chat(self, monkeypatch):
+        monkeypatch.setattr(nous_wire, "GMI_NATIVE_WIRE_CLEARED", False)
+        a = _agent()
+        assert nous_wire.maybe_switch_wire_after_first_response(a, _resp(id="msg_01abc"), 1) is False
+        assert a.api_mode == "chat_completions" and self.switches == []
+
+    @pytest.mark.parametrize("mode", ["chat", "native"])
+    def test_explicit_modes_never_auto_switch(self, monkeypatch, mode):
+        monkeypatch.setattr(_providers, "_nous_anthropic_wire", lambda: mode)
+        monkeypatch.setattr(nous_wire, "GMI_NATIVE_WIRE_CLEARED", True)
+        a = _agent(api_mode="chat_completions" if mode == "chat" else "anthropic_messages")
+        assert nous_wire.maybe_switch_wire_after_first_response(a, _resp(id="msg_01abc"), 1) is False
+        assert self.switches == []
+
+    def test_other_providers_and_models_untouched(self, monkeypatch):
+        monkeypatch.setattr(nous_wire, "GMI_NATIVE_WIRE_CLEARED", True)
+        assert nous_wire.maybe_switch_wire_after_first_response(_agent(provider="openrouter"), _resp(id="msg_01abc"), 1) is False
+        assert nous_wire.maybe_switch_wire_after_first_response(_agent(model="openai/gpt-5.6-sol"), _resp(id="msg_01abc"), 1) is False
+        assert self.switches == []
+
+    def test_switch_failure_is_swallowed_and_decision_is_final(self, monkeypatch):
+        monkeypatch.setattr(nous_wire, "GMI_NATIVE_WIRE_CLEARED", True)
+
+        def boom(*a, **k):
+            raise RuntimeError("no client")
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", boom)
+        a = _agent()
+        assert nous_wire.maybe_switch_wire_after_first_response(a, _resp(id="msg_01abc"), 1) is True
+        assert nous_wire.apply_pending_wire_switch(a) is False
+        assert a.api_mode == "chat_completions" and a._nous_wire_decided is True and a._nous_wire_pending is None
+
+
+def test_real_agent_usage_recorder_calls_the_hook_once(tmp_path, monkeypatch):
+    """The wiring: record_response_usage on a real AIAgent invokes the hook on call 1 only."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("nous:\n  anthropic_wire: auto\n", encoding="utf-8")
+    from run_agent import AIAgent
+    from agent import turn_usage
+    calls = []
+    monkeypatch.setattr(nous_wire, "maybe_switch_wire_after_first_response",
+                        lambda agent, response, n: calls.append((n, nous_wire.classify_upstream(response))) or False)
+    a = AIAgent(api_key="jwt", base_url="https://inference-api.nousresearch.com/v1", provider="nous",
+                api_mode="chat_completions", model="anthropic/claude-fable-5.1", session_id="t", platform="cli",
+                quiet_mode=True, skip_context_files=True, skip_memory=True, save_trajectories=False, enabled_toolsets=["file"])
+    try:
+        usage = SimpleNamespace(prompt_tokens=100, completion_tokens=5, total_tokens=105, prompt_tokens_details=None, completion_tokens_details=None)
+        for n in (1, 2, 3):
+            resp = SimpleNamespace(usage=usage, id="gen-1788708403-xXjDsFwabc", provider="Anthropic", model="anthropic/claude-fable-5.1")
+            turn_usage.record_response_usage(a, resp, messages=[{"role": "user", "content": "hi"}], api_call_count=n,
+                                             api_duration=0.1, compression_attempts=0, max_compression_attempts=3)
+    finally:
+        a.close()
+    assert calls == [(1, "openrouter")]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nt_namespace_guard.py ===
+"""Windows NT/device-namespace paths are rejected on the RAW string, before any resolution.
+
+On Windows, merely resolving ``\\??\\UNC\\host\\share`` (or the ``\\\\?\\UNC\\`` /
+``GLOBALROOT`` re-entry forms) initiates SMB authentication and leaks the user's
+NTLM hash, and the prefixes bypass the Win32 normalization that prefix denylists
+rely on. So the guard must fire on the model-supplied string before
+``resolve()``/``realpath()``/the task-base join, on every platform.
+"""
+
+import os
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from agent.file_safety import (
+    get_read_block_error,
+    get_write_denied_error,
+    is_nt_namespace_path,
+)
+
+BLOCKED_PATHS = [
+    "\\??\\UNC\\attacker.example\\share\\x",        # NT object namespace — the canonical leak form
+    "\\??\\C:\\Windows\\System32\\config\\SAM",
+    "/??/UNC/attacker.example/share/x",             # forward-slash spelling
+    "\\\\.\\PhysicalDrive0",                        # Win32 device namespace
+    "\\\\.\\pipe\\evil",
+    "//./pipe/evil",
+    "\\\\?\\UNC\\attacker.example\\share\\x",        # extended-length UNC (remote host)
+    "\\\\?\\unc\\attacker.example\\share\\x",        # case-insensitive
+    "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\x",  # NT-namespace re-entry
+    "//?/UNC/attacker.example/share/x",
+]
+
+ALLOWED_PATHS = [
+    "/tmp/test.py",
+    "C:\\Users\\me\\notes.txt",
+    "~/projects/readme.md",
+    "relative/path.txt",
+    "\\\\?\\C:\\Users\\me\\notes.txt",   # extended-length LOCAL drive: routine, no remote-auth trigger
+    "\\\\server\\share\\file.txt",       # plain UNC share: separate policy question, not this guard
+    "//server/share/file.txt",
+    "/tmp/??/weird-dir/file",            # '??' mid-path is data, not a namespace marker
+]
+
+
+class TestNtNamespaceGuard(unittest.TestCase):
+    def test_predicate_and_both_chokepoint_classifiers(self):
+        for p in BLOCKED_PATHS:
+            self.assertTrue(is_nt_namespace_path(p), p)
+            self.assertIn("NT/device namespace", get_read_block_error(p) or "", p)
+            self.assertIn("Write denied", get_write_denied_error(p) or "", p)
+        for p in ALLOWED_PATHS:
+            self.assertFalse(is_nt_namespace_path(p), p)
+            self.assertNotIn("NT/device namespace", get_read_block_error(p) or "", p)
+            self.assertNotIn("NT/device namespace", get_write_denied_error(p) or "", p)
+
+    def test_file_tools_reject_raw_string_without_resolving(self):
+        """Every file-tool entry — and the sibling paths that touch a file path before
+        the tool runs (checkpoint helper, ACP file bridge, @file: references) — refuses
+        BEFORE the task-base join / resolve: the resolve is the leak, and on POSIX the
+        join would hide the prefix."""
+        from pathlib import Path
+
+        from agent import context_references, copilot_acp_client, tool_executor
+        from tools.file_tools import patch_tool, read_file_tool, search_tool, write_file_tool
+
+        bad = "\\??\\UNC\\attacker.example\\share\\x"
+        with patch("agent.file_safety.Path") as fs_path, \
+                patch("tools.file_tools._resolve_path_for_task") as ft_resolve, \
+                patch("tools.file_tools_write_guards._resolve_path_for_task") as wg_resolve, \
+                patch("tools.file_tools_paths._resolve_path_for_task") as ckpt_resolve, \
+                patch.object(Path, "resolve", side_effect=AssertionError("must not resolve")), \
+                patch.object(os.path, "realpath", side_effect=AssertionError("must not realpath")):
+            results = [
+                read_file_tool(bad),
+                write_file_tool(bad, "data"),
+                patch_tool(mode="replace", path=bad, old_string="a", new_string="b"),
+                search_tool("x", path=bad),
+            ]
+            checkpoint_agent = SimpleNamespace(_checkpoint_mgr=MagicMock(enabled=True))
+            tool_executor._ensure_file_checkpoint(checkpoint_agent, "write_file", {"path": bad}, "default")
+            checkpoint_agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
+            for fs_handler in (copilot_acp_client._fs_read_text_file, copilot_acp_client._fs_write_text_file):
+                with self.assertRaisesRegex(PermissionError, "NT/device namespace"):
+                    fs_handler({"path": bad, "content": "x"}, "/tmp")
+            with self.assertRaisesRegex(ValueError, "NT/device namespace"):
+                context_references._resolve_path(Path("/tmp"), bad)
+            fs_path.assert_not_called()
+            ft_resolve.assert_not_called()
+            wg_resolve.assert_not_called()
+            ckpt_resolve.assert_not_called()
+        for r in results:
+            self.assertIn("NT/device namespace", r)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

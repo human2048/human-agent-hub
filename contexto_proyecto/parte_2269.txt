@@ -1,0 +1,193 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_strict_api_validation.py ===
+"""Test validation error prevention for strict APIs (Fireworks, etc.)"""
+
+import sys
+import types
+
+
+sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
+sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
+sys.modules.setdefault("fal_client", types.SimpleNamespace())
+
+from run_agent import AIAgent
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _tool_defs(*names):
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": n,
+                "description": f"{n} tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for n in names
+    ]
+
+
+class _FakeOpenAI:
+    def __init__(self, **kw):
+        self.api_key = kw.get("api_key", "test")
+        self.base_url = kw.get("base_url", "http://test")
+
+    def close(self):
+        pass
+
+
+def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="https://openrouter.ai/api/v1"):
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: _tool_defs("web_search", "terminal"))
+    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
+    return AIAgent(
+        api_key="test",
+        base_url=base_url,
+        provider=provider,
+        api_mode=api_mode,
+        max_iterations=4,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+
+class TestStrictApiValidation:
+    """Verify tool_call field sanitization prevents 400 errors on strict APIs."""
+
+    def test_fireworks_compatible_messages_after_sanitization(self, monkeypatch):
+        """Messages should be Fireworks-compatible after sanitization."""
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.api_mode = "chat_completions"  # Fireworks uses chat completions
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "Checking now.",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "call_id": "call_123",  # Codex-only field
+                        "response_item_id": "fc_123",  # Codex-only field
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": '{"command":"pwd"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_123", "content": "/tmp"},
+        ]
+
+        # After _build_api_kwargs, Codex fields should be stripped
+        kwargs = agent._build_api_kwargs(messages)
+
+        assistant_msg = kwargs["messages"][1]
+        tool_call = assistant_msg["tool_calls"][0]
+
+        # Fireworks rejects these fields
+        assert "call_id" not in tool_call
+        assert "response_item_id" not in tool_call
+        # Standard fields should remain
+        assert tool_call["id"] == "call_123"
+        assert tool_call["function"]["name"] == "terminal"
+
+    def test_codex_preserves_fields_for_replay(self, monkeypatch):
+        """Codex mode should preserve fields for Responses API replay."""
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.api_mode = "codex_responses"
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "Checking now.",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "call_id": "call_123",
+                        "response_item_id": "fc_123",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": '{"command":"pwd"}'},
+                    }
+                ],
+            },
+        ]
+
+        # In Codex mode, original messages should NOT be mutated
+        assert messages[1]["tool_calls"][0]["call_id"] == "call_123"
+        assert messages[1]["tool_calls"][0]["response_item_id"] == "fc_123"
+
+    def test_sanitize_method_with_fireworks_provider(self, monkeypatch):
+        """Simulating Fireworks provider should trigger sanitization."""
+        agent = _make_agent(
+            monkeypatch,
+            "fireworks",
+            api_mode="chat_completions",
+            base_url="https://api.fireworks.ai/inference/v1"
+        )
+
+        # Should sanitize for Fireworks (chat_completions mode)
+        assert agent._should_sanitize_tool_calls() is True
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_strip_reasoning_tags_cli.py ===
+"""Tests for cli.py::_strip_reasoning_tags — specifically the tool-call
+XML stripping added in openclaw/openclaw#67318 port.
+
+The CLI has its own copy of the stripper because it needs to run on the
+final displayed assistant text (after streaming) without depending on the
+AIAgent instance. It must stay in sync with run_agent.py::_strip_think_blocks
+for tool-call tag coverage."""
+
+
+from agent.agent_runtime_helpers import strip_think_blocks
+from cli import _strip_reasoning_tags
+
+# GLM text-channel tool call cut mid-serialization by a stream drop (#101899):
+# the first key and call name never arrived, only orphan argument markup.
+_CUT_FRAGMENT = (
+    "Both gates started.\n"
+    "wait</arg_value>\n<arg_key>session_id</arg_key>\n<arg_value>abc</arg_value>\n"
+    "<arg_key>timeout</arg_key>\n<arg_value>59"
+)
+_COMPLETE_WITH_PROSE = (
+    "Use <function> in JS. The arg_key field maps to arg_value.\n"
+    "<tool_call>x<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>\nDone."
+)
+
+
+class TestToolCallStripping:
+    def test_tool_call_block_stripped(self):
+        text = '<tool_call>{"name": "x"}</tool_call>result'
+        result = _strip_reasoning_tags(text)
+        assert "<tool_call>" not in result
+        assert "result" in result
+
+
+
+
+
+
+
+    def test_empty_string(self):
+        assert _strip_reasoning_tags("") == ""
+
+    def test_cut_tool_call_stripped_to_visible_prefix(self):
+        """Both strippers drop the unrecoverable tail; only prose survives."""
+        assert _strip_reasoning_tags(_CUT_FRAGMENT) == "Both gates started."
+        assert strip_think_blocks(None, _CUT_FRAGMENT).strip() == "Both gates started."
+        assert strip_think_blocks(None, "Waiting.\n<tool_call>process_manage").strip() == "Waiting."
+
+    def test_complete_block_and_inline_prose_mentions_untouched(self):
+        for out in (_strip_reasoning_tags(_COMPLETE_WITH_PROSE),
+                    strip_think_blocks(None, _COMPLETE_WITH_PROSE)):
+            assert "Use <function> in JS. The arg_key field maps to arg_value." in out
+            assert out.rstrip().endswith("Done.")
+            assert "<tool_call>" not in out
+
+

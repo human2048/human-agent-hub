@@ -1,0 +1,330 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_skills_install_flags.py ===
+"""
+Tests for --yes / --force flag separation in `hermes skills install`.
+
+--yes / -y  → skip_confirm (bypass interactive prompt, needed in TUI mode)
+--force     → force (install despite blocked scan verdict)
+
+Based on PR #1595 by 333Alden333 (salvaged).
+"""
+
+import sys
+
+
+def test_cli_skills_install_yes_sets_skip_confirm(monkeypatch):
+    """--yes should set skip_confirm=True but NOT force."""
+    from hermes_cli.main import main
+
+    captured = {}
+
+    def fake_skills_command(args):
+        captured["identifier"] = args.identifier
+        captured["force"] = args.force
+        captured["yes"] = args.yes
+
+    monkeypatch.setattr("hermes_cli.skills_hub.skills_command", fake_skills_command)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "skills", "install", "official/email/agentmail", "--yes"],
+    )
+
+    main()
+
+    assert captured["identifier"] == "official/email/agentmail"
+    assert captured["yes"] is True
+    assert captured["force"] is False
+
+
+def test_cli_skills_install_no_flags(monkeypatch):
+    """Without flags, both force and yes should be False."""
+    from hermes_cli.main import main
+
+    captured = {}
+
+    def fake_skills_command(args):
+        captured["force"] = args.force
+        captured["yes"] = args.yes
+
+    monkeypatch.setattr("hermes_cli.skills_hub.skills_command", fake_skills_command)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "skills", "install", "test/skill"],
+    )
+
+    main()
+
+    assert captured["force"] is False
+    assert captured["yes"] is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_skills_provider_filter.py ===
+"""Provider filters must run before a source's result limit can discard matches."""
+
+import argparse
+import json
+
+import pytest
+
+from hermes_cli import skills_hub as cli_hub
+from hermes_cli.subcommands.skills import build_skills_parser
+from tools.skills_hub_github import GitHubAuth, GitHubSource, _tap_cache_key, github_provider_for
+from tools.skills_hub_models import SkillMeta, _cache_metas, _skill_meta_to_dict
+from tools.skills_hub_official import HermesIndexSource
+from tools.skills_hub_search import _hermes_index_cache_file, parallel_search_sources
+
+
+@pytest.fixture(params=["index", "github"])
+def catalog(request, monkeypatch):
+    def entry(repo, provider, name):
+        return SkillMeta(
+            name=name, description="GPU utilities", source="github",
+            identifier=f"{repo}/skills/{name}", trust_level="trusted",
+            extra={"provider": provider},
+        )
+
+    # All match the same query, but the requested provider sits beyond the
+    # default per-source search window. Neither source's search is mocked.
+    others = [entry("openai/skills", "OpenAI", f"gpu-other-{i}") for i in range(60)]
+    wanted = [entry("NVIDIA/skills", "NVIDIA", f"gpu-target-{i}") for i in range(3)]
+    auth = GitHubAuth()
+    if request.param == "index":
+        path = _hermes_index_cache_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"skills": [_skill_meta_to_dict(m) for m in others + wanted]}), encoding="utf-8")
+        source = HermesIndexSource(auth)
+    else:
+        source = GitHubSource(auth)
+        for tap in source.taps:
+            key = _tap_cache_key(tap["repo"], tap.get("path", ""), tap.get("bucket"))
+            label = github_provider_for(tap["repo"])
+            entries = others if label == "OpenAI" else wanted if label == "NVIDIA" else []
+            _cache_metas(key, entries)
+    monkeypatch.setattr(cli_hub, "_sources", lambda: [source])
+    return source, others, wanted
+
+
+def test_cli_provider_search_finds_matches_beyond_global_window(catalog, capsys):
+    source, others, wanted = catalog
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_skills_parser(parser.add_subparsers(dest="command"), cmd_skills=cli_hub.skills_command)
+
+    for query in ("gpu", ""):
+        args = parser.parse_args([
+            "skills", "search", query, "--source", "nvidia", "--limit", "2", "--json",
+        ])
+        args.func(args)
+        result = json.loads(capsys.readouterr().out)
+        assert [row["identifier"] for row in result] == [m.identifier for m in wanted[:2]]
+
+    # Filtering one call must not mutate the cached catalog for later searches.
+    assert [m.identifier for m in source.search("gpu", limit=2)] == [m.identifier for m in others[:2]]
+
+    args = parser.parse_args(["skills", "search", "gpu", "--source", "anthropic", "--json"])
+    args.func(args)
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_parallel_provider_search_applies_per_source_limit_after_filter(catalog):
+    source, _, wanted = catalog
+    results, counts, timed_out = parallel_search_sources(
+        [source], query="gpu", source_filter=" NVIDIA ",
+        per_source_limits={source.source_id(): 2},
+    )
+    assert [m.identifier for m in results] == [m.identifier for m in wanted[:2]]
+    assert counts[source.source_id()] == len(results)
+    assert not timed_out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_skills_skip_confirm.py ===
+"""
+Tests for skip_confirm and invalidate_cache behavior in /skills install
+and /skills uninstall slash commands.
+
+Slash commands always skip confirmation (input() hangs in TUI).
+Cache invalidation is deferred by default; --now opts into immediate
+invalidation (at the cost of breaking prompt cache mid-session).
+
+Based on PR #1595 by 333Alden333 (salvaged).
+Updated for PR #3586 (cache-aware install/uninstall).
+"""
+
+from unittest.mock import patch
+
+
+class TestHandleSkillsSlashInstallFlags:
+    """Test flag parsing in handle_skills_slash for install."""
+
+    def test_yes_flag_sets_skip_confirm(self):
+        from hermes_cli.skills_hub import handle_skills_slash
+        with patch("hermes_cli.skills_hub.do_install") as mock_install:
+            handle_skills_slash("/skills install test/skill --yes")
+            mock_install.assert_called_once()
+            _, kwargs = mock_install.call_args
+            assert kwargs.get("skip_confirm") is True
+            assert kwargs.get("force") is False
+
+
+class TestHandleSkillsSlashUninstallFlags:
+    """Test flag parsing in handle_skills_slash for uninstall."""
+
+
+    def test_no_flags_still_skips_confirm(self):
+        """Slash commands always skip confirmation — input() hangs in TUI."""
+        from hermes_cli.skills_hub import handle_skills_slash
+        with patch("hermes_cli.skills_hub.do_uninstall") as mock_uninstall:
+            handle_skills_slash("/skills uninstall test-skill")
+            mock_uninstall.assert_called_once()
+            _, kwargs = mock_uninstall.call_args
+            assert kwargs.get("skip_confirm") is True
+
+    def test_default_defers_cache_invalidation(self):
+        """Without --now, cache invalidation is deferred to next session."""
+        from hermes_cli.skills_hub import handle_skills_slash
+        with patch("hermes_cli.skills_hub.do_uninstall") as mock_uninstall:
+            handle_skills_slash("/skills uninstall test-skill")
+            mock_uninstall.assert_called_once()
+            _, kwargs = mock_uninstall.call_args
+            assert kwargs.get("invalidate_cache") is False
+
+
+class TestDoInstallSkipConfirm:
+    """Test that do_install respects skip_confirm parameter."""
+
+    @patch("hermes_cli.skills_hub.input", return_value="n")
+    def test_without_skip_confirm_prompts_user(self, mock_input):
+        """Without skip_confirm, input() is called for confirmation."""
+        from hermes_cli.skills_hub import do_install
+        with patch("hermes_cli.skills_hub._console"), \
+             patch("tools.skills_hub.ensure_hub_dirs"), \
+             patch("tools.skills_hub_github.GitHubAuth"), \
+             patch("tools.skills_hub_search.create_source_router") as mock_router, \
+             patch("hermes_cli.skills_hub._resolve_short_name", return_value="test/skill"), \
+             patch("hermes_cli.skills_hub._resolve_source_meta_and_bundle") as mock_resolve:
+
+            # Make it return None so we exit early
+            mock_resolve.return_value = (None, None, None)
+            do_install("test-skill", skip_confirm=False)
+            # We don't get to the input() call because resolve returns None,
+            # but the parameter wiring is correct
+
+
+class TestDoUninstallSkipConfirm:
+    """Test that do_uninstall respects skip_confirm parameter."""
+
+    def test_skip_confirm_bypasses_input(self):
+        """With skip_confirm=True, input() should not be called."""
+        from hermes_cli.skills_hub import do_uninstall
+        with patch("hermes_cli.skills_hub._console") as mock_console, \
+             patch("tools.skills_hub_install.uninstall_skill", return_value=(True, "Removed")) as mock_uninstall, \
+             patch("builtins.input") as mock_input:
+            do_uninstall("test-skill", skip_confirm=True)
+            mock_input.assert_not_called()
+            mock_uninstall.assert_called_once_with("test-skill")
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_skills_subparser.py ===
+"""Test that skills subparser doesn't conflict (regression test for #898)."""
+
+import argparse
+
+
+def test_no_duplicate_skills_subparser():
+    """Ensure 'skills' subparser is only registered once to avoid Python 3.11+ crash.
+
+    Python 3.11 changed argparse to raise an exception on duplicate subparser
+    names instead of silently overwriting (see CPython #94331).
+
+    This test will fail with:
+        argparse.ArgumentError: argument command: conflicting subparser: skills
+
+    if the duplicate 'skills' registration is reintroduced.
+    """
+    # Force fresh import of the module where parser is constructed
+    # If there are duplicate 'skills' subparsers, this import will raise
+    # argparse.ArgumentError at module load time
+    import sys
+
+    # Remove cached module if present
+    if 'hermes_cli.main' in sys.modules:
+        del sys.modules['hermes_cli.main']
+
+    try:
+        import hermes_cli.main  # noqa: F401
+    except argparse.ArgumentError as e:
+        if "conflicting subparser" in str(e):
+            raise AssertionError(
+                f"Duplicate subparser detected: {e}. "
+                "See issue #898 for details."
+            ) from e
+        raise
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_skills_uninstall_flags.py ===
+"""
+Tests for --yes / -y flag in `hermes skills uninstall` CLI subcommand.
+
+Verifies the parser registers the flag and the value reaches
+``do_uninstall(skip_confirm=True)`` through the real ``skills_command``
+dispatch path (mirrors ``test_skills_install_flags.py``).
+"""
+
+import sys
+
+
+def _run_uninstall_cli(monkeypatch, argv):
+    captured = {}
+
+    def fake_do_uninstall(name, *, skip_confirm=False, **kwargs):
+        captured["name"] = name
+        captured["skip_confirm"] = skip_confirm
+
+    monkeypatch.setattr("hermes_cli.skills_hub.do_uninstall", fake_do_uninstall)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    from hermes_cli.main import main
+
+    main()
+    return captured
+
+
+def test_cli_skills_uninstall_yes_sets_skip_confirm(monkeypatch):
+    """`--yes` should propagate to do_uninstall(skip_confirm=True)."""
+    captured = _run_uninstall_cli(
+        monkeypatch,
+        ["hermes", "skills", "uninstall", "test-skill", "--yes"],
+    )
+
+    assert captured["name"] == "test-skill"
+    assert captured["skip_confirm"] is True
+
+
+def test_cli_skills_uninstall_y_alias_sets_skip_confirm(monkeypatch):
+    """`-y` should behave the same as `--yes`."""
+    captured = _run_uninstall_cli(
+        monkeypatch,
+        ["hermes", "skills", "uninstall", "test-skill", "-y"],
+    )
+
+    assert captured["name"] == "test-skill"
+    assert captured["skip_confirm"] is True
+
+
+def test_cli_skills_uninstall_no_flags_keeps_prompt(monkeypatch):
+    """Without --yes, skip_confirm must be False (prompt preserved)."""
+    captured = _run_uninstall_cli(
+        monkeypatch,
+        ["hermes", "skills", "uninstall", "test-skill"],
+    )
+
+    assert captured["name"] == "test-skill"
+    assert captured["skip_confirm"] is False

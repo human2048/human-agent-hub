@@ -1,0 +1,335 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_db_replaced_fallback.py ===
+"""Gateway SessionStore must not FTS-repair a replaced state.db (#89332)."""
+
+import json
+import os
+import shutil
+
+import pytest
+
+from gateway.config import GatewayConfig
+from gateway.session import SessionStore
+from hermes_state import SessionDB
+
+
+def _assert_diverted(tmp_path, sid, needle):
+    pending = list((tmp_path / "pending_messages").glob("pending-*.json"))
+    assert pending, "expected pending_messages/pending-*.json spool"
+    spooled = False
+    for path in pending:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        message = (payload.get("data") or {}).get("message") or {}
+        if needle in str(message.get("content", "")):
+            spooled = True
+            break
+    assert spooled, f"{needle!r} missing from pending spool"
+    jsonl = tmp_path / "sessions" / f"{sid}.jsonl"
+    assert jsonl.is_file()
+    assert needle in jsonl.read_text(encoding="utf-8")
+
+
+def test_replaced_state_db_diverts_pending_without_fts_rebuild(tmp_path, monkeypatch):
+    import hermes_state
+
+    live = tmp_path / "state.db"
+    other = tmp_path / "other.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", live)
+
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    sid = "gw-replaced"
+    store._db.create_session(session_id=sid, source="cli")
+    store.append_to_transcript(
+        sid, {"role": "user", "content": "before", "timestamp": 1.0}
+    )
+    if store._db._db_file_identity is None:
+        store.close_all_db_handles()
+        pytest.skip("filesystem does not expose st_dev/st_ino")
+
+    alt = SessionDB(db_path=other)
+    alt.create_session("other", "cli")
+    alt.close()
+    os.replace(other, live)
+
+    store.append_to_transcript(
+        sid, {"role": "user", "content": "after-replace", "timestamp": 2.0}
+    )
+
+    assert store._db._db_replaced is True
+    # No FTS surgery ran on either layer: state-level fail-open never
+    # detached, and the gateway one-shot rebuild was not consumed.
+    assert store._db._fts_enabled is True
+    assert store._db._fts_stale is False
+    assert store._fts_rebuild_last_attempt_at is None
+    _assert_diverted(tmp_path, sid, "after-replace")
+    store.close_all_db_handles()
+
+
+def test_copyfile_replaced_state_db_diverts_pending_without_fts_rebuild(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+
+    live = tmp_path / "state.db"
+    other = tmp_path / "other.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", live)
+
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    sid = "gw-cp-replaced"
+    store._db.create_session(session_id=sid, source="cli")
+    store.append_to_transcript(
+        sid, {"role": "user", "content": "before-cp", "timestamp": 1.0}
+    )
+    if not store._db._db_file_application_id:
+        store.close_all_db_handles()
+        pytest.skip("generation stamp not recorded")
+
+    alt = SessionDB(db_path=other)
+    alt.create_session("other", "cli")
+    alt.close()
+    shutil.copyfile(other, live)
+
+    store.append_to_transcript(
+        sid, {"role": "user", "content": "after-cp", "timestamp": 2.0}
+    )
+
+    assert store._db._db_replaced is True
+    # No FTS surgery ran on either layer: state-level fail-open never
+    # detached, and the gateway one-shot rebuild was not consumed.
+    assert store._db._fts_enabled is True
+    assert store._db._fts_stale is False
+    assert store._fts_rebuild_last_attempt_at is None
+    _assert_diverted(tmp_path, sid, "after-cp")
+    store.close_all_db_handles()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_db_warning_recheck.py ===
+"""#108031: the startup state.db warning must not be broadcast once the store has healed."""
+from __future__ import annotations
+
+import asyncio
+import threading
+
+import pytest
+
+import gateway.run as gateway_run
+import hermes_state
+import hermes_state_registry
+from gateway.run import _SESSION_DB_UNPINNED
+from gateway.session_db_recovery import RecoverableHandleCache
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _runner_with_startup_failure(monkeypatch, clock: _Clock, *, heals: bool):
+    """A runner whose priming open failed with a lock; the store heals (or not) on the next open."""
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db_pinned = _SESSION_DB_UNPINNED
+    runner._session_db_init_error = "database is locked"
+    runner._session_db_handles = {}
+    runner._session_db_handles_lock = threading.Lock()
+    cache = RecoverableHandleCache(
+        handles=runner._session_db_handles, lock=runner._session_db_handles_lock,
+        clock=clock, initial_retry_delay=1,
+    )
+    runner._session_db_handle_cache = cache
+    calls: list[str] = []
+
+    def acquire(db_path=None):
+        calls.append("open")
+        if len(calls) == 1 or not heals:  # the priming open always fails: that is the startup lock
+            raise RuntimeError("database is locked")
+        return object()
+
+    monkeypatch.setattr(hermes_state_registry, "acquire", acquire)
+    monkeypatch.setattr(hermes_state, "AsyncSessionDB", lambda db: ("async", db))
+    monkeypatch.setattr(runner, "session_store", None, raising=False)
+    # Record the startup failure the way __init__ does (one failed open in the cache).
+    with pytest.raises(RuntimeError):
+        runner._open_session_db_for_active_scope(raise_on_error=True)
+    clock.now = 5.0  # past the backoff: the pre-broadcast re-check is allowed to open
+    sent: list[str] = []
+    monkeypatch.setattr(runner, "_home_channel_transports", lambda: [("telegram", {}, "home", object())])
+
+    async def _capture(_platform, _home, _transport, message, _fmt):
+        sent.append(message)
+
+    monkeypatch.setattr(runner, "_send_home_channel_message", _capture)
+    return runner, sent
+
+
+@pytest.mark.parametrize("warning_notifications", [True, False])
+def test_lock_that_cleared_before_connect_is_not_broadcast(monkeypatch, tmp_path, warning_notifications):
+    (tmp_path / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(not warning_notifications).lower()}}}")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    clock = _Clock()
+    runner, sent = _runner_with_startup_failure(monkeypatch, clock, heals=True)
+    asyncio.run(runner._send_session_db_warning_notifications())
+    assert sent == []
+    assert runner._session_db_init_error is None
+
+
+def test_still_unavailable_store_is_still_broadcast(monkeypatch):
+    clock = _Clock()
+    runner, sent = _runner_with_startup_failure(monkeypatch, clock, heals=False)
+    asyncio.run(runner._send_session_db_warning_notifications())
+    assert len(sent) == 1 and "Session database unavailable" in sent[0]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_session_degraded_db_continuity.py ===
+"""Regression tests: session continuity when the default/global state.db is unavailable.
+
+Root cause (live incident, 2026-08-17): when the default/global state.db is
+corrupt or unreadable at gateway startup, ``SessionStore._db`` degrades to
+None (JSONL routing fallback) and ``GatewayRunner._session_db`` is None.
+Under multiplexed profile routes the AIAgent lazily opens the PROFILE's
+state.db (``AIAgent._get_session_db_for_recall``) and its
+``_ensure_db_session`` created the session row WITHOUT routing identity
+(session_key/chat_id/chat_type/thread_id/user_id/origin_json/display_name
+all NULL), so the row was unrecoverable by
+``find_latest_gateway_session_for_peer``. The gateway's own
+``record_gateway_session_peer`` self-heal never ran because ``_db`` was None.
+On the next message, ``SessionStore.load_transcript`` returned [] even though
+the transcript existed in the profile DB -> the agent lost prior context.
+
+These tests pin fix 1 (routing identity on lazy row creation):
+``AIAgent._ensure_db_session`` persists the full routing identity the
+agent already carries, so the lazily-created row is recoverable. (The
+transcript-recovery half of the original report is covered separately by
+the scope-aware session DB resolution on main.)
+"""
+
+import json
+import logging
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+SESSION_ID = "degraded-db-continuity-session"
+CHAT_ID = "-1001234567890"
+THREAD_ID = "42"
+SESSION_KEY = "agent:orion:telegram:group:-1001234567890:8148316720"
+
+
+def _make_gateway_agent(session_db):
+    """Build an AIAgent carrying gateway routing identity (multiplex profile route)."""
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            session_db=session_db,
+            session_id=SESSION_ID,
+            skip_context_files=True,
+            skip_memory=True,
+            platform="telegram",
+            user_id="8148316720",
+            user_name="testuser",
+            chat_id=CHAT_ID,
+            chat_name="Test Group",
+            chat_type="group",
+            thread_id=THREAD_ID,
+            gateway_session_key=SESSION_KEY,
+        )
+    # The multiplexed profile scope would resolve the active profile name to
+    # the route's profile (e.g. "orion"); pin it so the row + origin_json
+    # carry the profile deterministically.
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="orion"):
+        agent._ensure_db_session()
+    return agent
+
+
+class TestEnsureDbSessionPersistsRoutingIdentity:
+    def test_lazy_creation_writes_session_key_and_chat_identity(self):
+        """First-created row must carry gateway routing metadata (not identity-less)."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                _make_gateway_agent(db)
+                row = db.get_session(SESSION_ID)
+                assert row is not None
+                assert row["session_key"] == SESSION_KEY
+                assert row["chat_id"] == CHAT_ID
+                assert row["chat_type"] == "group"
+                assert row["thread_id"] == THREAD_ID
+                assert row["user_id"] == "8148316720"
+                assert row["display_name"] == "Test Group"
+                assert row["source"] == "telegram"
+                assert row["profile_name"] == "orion"
+                origin = json.loads(row["origin_json"])
+                assert origin["platform"] == "telegram"
+                assert origin["chat_id"] == CHAT_ID
+                assert origin["chat_name"] == "Test Group"
+                assert origin["chat_type"] == "group"
+                assert origin["user_id"] == "8148316720"
+                assert origin["user_name"] == "testuser"
+                assert origin["thread_id"] == THREAD_ID
+                assert origin["profile"] == "orion"
+            finally:
+                db.close()
+
+    def test_row_recoverable_by_peer_lookup(self):
+        """find_latest_gateway_session_for_peer must find the lazily-created row."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                _make_gateway_agent(db)
+                # The peer lookup keys on session_key + source; the regression
+                # left session_key NULL so this returned None on every restart.
+                found = db.find_latest_gateway_session_for_peer(
+                    session_key=SESSION_KEY,
+                    source="telegram",
+                )
+                assert found is not None
+                assert found["id"] == SESSION_ID
+            finally:
+                db.close()
+
+    def test_cli_session_stays_identity_less(self):
+        """A plain CLI agent (no gateway fields) keeps the old shape — no origin_json."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                    from run_agent import AIAgent
+
+                    agent = AIAgent(
+                        api_key="test-key",
+                        base_url="https://openrouter.ai/api/v1",
+                        model="test/model",
+                        quiet_mode=True,
+                        session_db=db,
+                        session_id=SESSION_ID + "-cli",
+                        skip_context_files=True,
+                        skip_memory=True,
+                    )
+                agent._ensure_db_session()
+                row = db.get_session(SESSION_ID + "-cli")
+                assert row is not None
+                assert row["session_key"] is None
+                assert row["chat_id"] is None
+                assert row["origin_json"] is None
+            finally:
+                db.close()
+

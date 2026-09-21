@@ -1,0 +1,394 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_fireworks_provider.py ===
+"""Focused tests for Fireworks AI first-class provider wiring.
+
+These tests pin the wiring that makes Fireworks a real provider — alias
+resolution through both CLI resolvers, config/doctor/overlay registration,
+and credential/base-URL resolution — without
+any live network calls.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import sys
+import types
+from argparse import Namespace
+
+import pytest
+
+if "dotenv" not in sys.modules:
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    sys.modules["dotenv"] = fake_dotenv
+
+from hermes_cli.auth import resolve_api_key_provider_credentials
+from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS, normalize_provider
+
+
+@pytest.fixture(autouse=True)
+def _clear_provider_env(monkeypatch):
+    for key in ("FIREWORKS_API_KEY", "FIREWORKS_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+
+
+class TestFireworksAliases:
+    """Both CLI resolvers must map the aliases — the plugin's aliases= tuple is
+    NOT consulted by these static maps, so they need explicit coverage."""
+
+    @pytest.mark.parametrize("alias", ["fireworks", "fireworks-ai", "fw", "FW", " Fireworks-AI "])
+    def test_models_normalize_provider(self, alias):
+        assert normalize_provider(alias) == "fireworks"
+
+    @pytest.mark.parametrize("alias", ["fireworks", "fireworks-ai", "fw"])
+    def test_providers_normalize_provider(self, alias):
+        from hermes_cli.providers import normalize_provider as normalize_in_providers
+
+        assert normalize_in_providers(alias) == "fireworks"
+
+
+class TestFireworksOrdering:
+    """Fireworks participates in the canonical provider catalog."""
+
+    def test_present_in_canonical_providers(self):
+        slugs = [p.slug for p in CANONICAL_PROVIDERS]
+        assert "fireworks" in slugs
+
+
+    def test_has_a_label(self):
+        assert _PROVIDER_LABELS.get("fireworks") == "Fireworks AI"
+
+
+class TestFireworksConfigRegistry:
+    def test_optional_env_vars_include_fireworks(self):
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+
+        assert "FIREWORKS_API_KEY" in OPTIONAL_ENV_VARS
+        assert OPTIONAL_ENV_VARS["FIREWORKS_API_KEY"]["category"] == "provider"
+        assert OPTIONAL_ENV_VARS["FIREWORKS_API_KEY"]["password"] is True
+
+        assert "FIREWORKS_BASE_URL" not in OPTIONAL_ENV_VARS
+
+
+class TestFireworksOverlay:
+    def test_overlay_exists(self):
+        from hermes_cli.providers import HERMES_OVERLAYS
+
+        assert "fireworks" in HERMES_OVERLAYS
+        overlay = HERMES_OVERLAYS["fireworks"]
+        assert overlay.transport == "openai_chat"
+        assert overlay.base_url_override == "https://api.fireworks.ai/inference/v1"
+        assert not overlay.base_url_env_var
+        assert not overlay.is_aggregator
+
+
+class TestFireworksDoctor:
+    def test_provider_env_hints_include_fireworks(self):
+        from hermes_cli.doctor import _PROVIDER_ENV_HINTS
+
+        assert "FIREWORKS_API_KEY" in _PROVIDER_ENV_HINTS
+
+    def test_slash_form_model_is_not_flagged_as_vendor_prefixed(self, monkeypatch, tmp_path):
+        """Fireworks' native model IDs are slash-form (accounts/fireworks/...),
+        so doctor must NOT warn that provider should be 'openrouter' / the prefix
+        dropped — that heuristic is for aggregator vendor slugs only."""
+        from hermes_cli import doctor as doctor_mod
+
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "model:\n"
+            "  provider: fireworks\n"
+            "  default: accounts/fireworks/models/kimi-k2p6\n"
+            "memory: {}\n",
+            encoding="utf-8",
+        )
+        (home / ".env").write_text("FIREWORKS_API_KEY=fw_test\n", encoding="utf-8")
+        project = tmp_path / "project"
+        project.mkdir()
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test")
+
+        # Keep the run offline and cheap.
+        import httpx
+
+        monkeypatch.setattr(httpx, "get", lambda *a, **k: types.SimpleNamespace(status_code=200))
+        monkeypatch.setitem(
+            sys.modules,
+            "model_tools",
+            types.SimpleNamespace(check_tool_availability=lambda *a, **k: ([], []), TOOLSET_REQUIREMENTS={}),
+        )
+        with contextlib.suppress(Exception):
+            from hermes_cli import auth as _auth_mod
+
+            monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+            monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+
+        buf = io.StringIO()
+        with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False))
+        out = buf.getvalue()
+
+        assert "vendor-prefixed" not in out
+        assert "vendor/model slug" not in out
+
+
+class TestFireworksCredentials:
+    def test_resolves_default_base_url(self, monkeypatch):
+        monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test_key")
+        creds = resolve_api_key_provider_credentials("fireworks")
+        assert creds["api_key"] == "fw_test_key"
+        assert creds["base_url"] == "https://api.fireworks.ai/inference/v1"
+
+class TestFireworksAuxiliary:
+    """resolve_provider_client wires the BYOK key and PAYG-safe aux model."""
+
+    def _resolve(self, name):
+        from unittest.mock import patch
+
+        from agent.auxiliary_client import resolve_provider_client
+
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = object()
+            client, model = resolve_provider_client(name)
+        return client, model, mock_openai.call_args.kwargs
+
+    def test_client_sends_attribution_headers(self, monkeypatch):
+        monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test_key")
+        client, model, kwargs = self._resolve("fireworks")
+        assert client is not None
+        headers = kwargs.get("default_headers", {})
+        assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+        assert headers["X-Title"] == "Hermes Agent"
+        assert kwargs["base_url"] == "https://api.fireworks.ai/inference/v1"
+
+    def test_client_sends_hermes_user_agent(self, monkeypatch):
+        """The profile's User-Agent survives the generic default_headers
+        fallback and reaches OpenAI client construction."""
+        monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test_key")
+        _client, _model, kwargs = self._resolve("fireworks")
+        headers = kwargs.get("default_headers", {})
+        assert headers["User-Agent"].startswith("HermesAgent/")
+
+
+class TestFireworksModelMetadata:
+    def test_url_infers_fireworks(self):
+        from agent.model_metadata import _infer_provider_from_url
+
+        assert _infer_provider_from_url("https://api.fireworks.ai/inference/v1") == "fireworks"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_fleet_config_migration_windows_live.py ===
+"""LIVE Windows E2E for the fleet-wide config migration (wine2e lane).
+
+Real profile homes on the Windows filesystem, real migration pipeline,
+fresh-process semantics via HERMES_HOME env — mirrors the Linux live E2E.
+"""
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+WORKTREE = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(WORKTREE))
+
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="live Windows E2E")
+
+
+def test_fleet_config_migration_live_windows(tmp_path, monkeypatch):
+    active = tmp_path / "hermes-home"
+    profiles = active / "profiles"
+    for name, ver in [("research", 12), ("work", 25)]:
+        home = profiles / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"_config_version": ver, "model": {"provider": "nous"}}),
+            encoding="utf-8",
+        )
+    active.mkdir(exist_ok=True)
+    (active / "config.yaml").write_text(
+        yaml.safe_dump({"_config_version": 12}), encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(active))
+
+    import hermes_cli.update_cmd as update_cmd
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    latest = int(DEFAULT_CONFIG["_config_version"])
+    migrated = update_cmd._migrate_sibling_profile_configs()
+
+    by_name = {m[0]: m for m in migrated}
+    assert set(by_name) == {"research", "work"}, migrated
+    assert by_name["research"][1] == 12 and by_name["research"][2] == latest
+
+    for name in ("research", "work"):
+        on_disk = yaml.safe_load((profiles / name / "config.yaml").read_text())
+        assert on_disk["_config_version"] == latest
+        assert on_disk["model"]["provider"] == "nous"
+
+    # active untouched; idempotent second run
+    assert yaml.safe_load((active / "config.yaml").read_text())["_config_version"] == 12
+    assert update_cmd._migrate_sibling_profile_configs() == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_fleet_matrix_down_state.py ===
+"""Fleet matrix DOWN-state coverage (Phase-1 verification gap, #91277).
+
+A gateway that was ALIVE at update start, got stopped by the restart phase,
+and never came back used to produce NO matrix row at all — the check passed
+silently on a fleet that lost messaging. Now it yields a `down` row and the
+matrix returns True (escalate/exit 1). Rollout safety: `down` requires the
+pid to be in the caller's pre-restart snapshot, so stale state files from
+long-dead gateways never false-positive.
+"""
+
+import json
+import os
+from pathlib import Path
+
+import hermes_cli.update_receipt as ur
+
+
+def _setup(monkeypatch, tmp_path, record: dict):
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        "hermes_cli.build_info.get_code_identity",
+        lambda refresh=False: {"sha": "HEADSHA", "version": "1.0"},
+    )
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "no-profiles"
+    )
+    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda h, **k: None)
+    (home / "gateway_state.json").write_text(json.dumps(record), encoding="utf-8")
+    return home
+
+
+def _verify_self_as_gateway(monkeypatch):
+    """Without a socket answer the state file is only a claim; the fallback classifies a LIVE
+    pid from it only when the home's identity resolver verifies that pid as the gateway
+    (#110420). The live-pid tests write the record about pytest itself, so verify it."""
+    monkeypatch.setattr("gateway.status.live_gateway_pid_for_home", lambda h: os.getpid())
+
+
+_DEAD_PID = 999999899  # never a live pid
+
+
+def test_killed_never_replaced_gateway_is_a_down_row(monkeypatch, tmp_path):
+    _setup(
+        monkeypatch,
+        tmp_path,
+        {"pid": _DEAD_PID, "gateway_state": "running", "kind": "hermes-gateway",
+         "code_version": "0.20.5"},
+    )
+    fleet = ur.collect_fleet_versions(pre_restart_pids=[_DEAD_PID])
+    assert len(fleet) == 1
+    assert fleet[0]["state"] == "down"
+    assert fleet[0]["pid"] == _DEAD_PID
+    # and the matrix escalates on it
+    assert ur.print_fleet_version_matrix(fleet) is True
+
+
+def test_dead_pid_not_in_pre_restart_snapshot_keeps_no_row(monkeypatch, tmp_path):
+    """Stale state file from a long-dead gateway: rollout-safe no-row."""
+    _setup(
+        monkeypatch,
+        tmp_path,
+        {"pid": _DEAD_PID, "gateway_state": "running", "kind": "hermes-gateway"},
+    )
+    assert ur.collect_fleet_versions(pre_restart_pids=[12345]) == []
+    assert ur.collect_fleet_versions(pre_restart_pids=None) == []
+    assert ur.collect_fleet_versions() == []
+
+
+def test_cleanly_stopped_gateway_is_not_down(monkeypatch, tmp_path):
+    for benign_state in ("stopped", "startup_failed"):
+        _setup(
+            monkeypatch,
+            tmp_path,
+            {"pid": _DEAD_PID, "gateway_state": benign_state, "kind": "hermes-gateway"},
+        )
+        assert ur.collect_fleet_versions(pre_restart_pids=[_DEAD_PID]) == []
+
+
+def test_recycled_pid_is_not_reported_stale(monkeypatch, tmp_path):
+    """A dead gateway's PID reused by an unrelated process (#93258) must not
+    be reported STALE just because *some* process now answers to that PID.
+    """
+    from gateway.status import _get_process_start_time
+
+    reused_pid = os.getpid()
+    wrong_start_time = (_get_process_start_time(reused_pid) or 0) + 12345
+    _setup(
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": reused_pid,
+            "start_time": wrong_start_time,
+            "gateway_state": "running",
+            "code_sha": "OLDSHA",
+            "kind": "hermes-gateway",
+        },
+    )
+    fleet = ur.collect_fleet_versions(pre_restart_pids=[reused_pid])
+    assert len(fleet) == 1
+    assert fleet[0]["state"] == "down"
+
+
+def test_matching_start_time_is_still_live(monkeypatch, tmp_path):
+    """A record whose start_time matches the live process is not recycled."""
+    from gateway.status import _get_process_start_time
+
+    pid = os.getpid()
+    _verify_self_as_gateway(monkeypatch)
+    _setup(
+        monkeypatch,
+        tmp_path,
+        {
+            "pid": pid,
+            "start_time": _get_process_start_time(pid),
+            "gateway_state": "running",
+            "code_sha": "HEADSHA",
+            "kind": "hermes-gateway",
+        },
+    )
+    fleet = ur.collect_fleet_versions(pre_restart_pids=[pid])
+    assert len(fleet) == 1
+    assert fleet[0]["state"] == "current"
+
+
+def test_live_gateway_rows_unchanged(monkeypatch, tmp_path):
+    """The live-pid path is untouched by the down-state addition."""
+    _verify_self_as_gateway(monkeypatch)
+    _setup(
+        monkeypatch,
+        tmp_path,
+        {"pid": os.getpid(), "gateway_state": "running", "code_sha": "HEADSHA",
+         "kind": "hermes-gateway"},
+    )
+    fleet = ur.collect_fleet_versions(pre_restart_pids=[os.getpid()])
+    assert len(fleet) == 1
+    assert fleet[0]["state"] == "current"
+    assert ur.print_fleet_version_matrix(fleet) is False
+
+
+def test_down_and_stale_both_escalate_with_remediation(capsys):
+    fleet = [
+        {"profile": "default", "pid": 1, "code_sha": "OLD", "state": "stale"},
+        {"profile": "coder", "pid": 2, "code_sha": None, "state": "down"},
+    ]
+    assert ur.print_fleet_version_matrix(fleet) is True
+    out = capsys.readouterr().out
+    assert "STALE" in out
+    assert "DOWN" in out
+    assert "hermes gateway restart" in out
+

@@ -1,0 +1,337 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_undo_command.py ===
+"""Tests for /undo handling in tui_gateway.
+
+The TUI routes ``/undo`` through ``command.dispatch`` (it's in
+``_PENDING_INPUT_COMMANDS`` because the CLI handler queues input the
+slash-worker subprocess can't read). The server handles it directly,
+mutates SessionDB to soft-delete rows, refreshes the in-memory session
+history, fires the memory-provider hook with ``rewound=True``, and
+returns ``{"type": "prefill", "message": <text>, "notice": ...}`` so
+the Ink client drops the message into the composer for editing.
+
+``/undo N`` backs up N user turns at once (default 1). See issue #21910.
+"""
+
+from __future__ import annotations
+
+import importlib
+import threading
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from hermes_state import SessionDB
+
+
+@pytest.fixture()
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    yield home
+
+
+@pytest.fixture()
+def server(hermes_home):
+    # Mocks are scoped to the initial import only (see
+    # tests/tui_gateway/test_protocol.py for the rationale).
+    with patch.dict(
+        "sys.modules",
+        {
+            "hermes_cli.env_loader": MagicMock(),
+            "hermes_cli.banner": MagicMock(),
+        },
+    ):
+        mod = importlib.import_module("tui_gateway.server")
+
+    methods = dict(mod._methods)
+    yield mod
+    # Restore in place instead of clear+reload: importlib.reload
+    # re-registers atexit hooks (duplicate ThreadPoolExecutor shutdowns
+    # race the stderr buffer at interpreter exit — same class as PR #34217)
+    # and re-captures module-level paths like _hermes_home against this
+    # test's soon-deleted tmpdir, breaking later files in the same process.
+    mod._methods.clear()
+    mod._methods.update(methods)
+    mod._sessions.clear()
+    __import__("tui_gateway.server_requests", fromlist=["x"]).reset_for_tests()
+    mod._db = None
+
+
+@pytest.fixture()
+def db(hermes_home):
+    return SessionDB(db_path=hermes_home / "state.db")
+
+
+@pytest.fixture()
+def session_with_history(server, db):
+    """Build a session with 3 user turns + assistant replies persisted in DB."""
+    sid = "sid-undo"
+    session_key = "tui-undo-1"
+    db.create_session(session_key, source="tui")
+    for i in range(1, 4):
+        db.append_message(session_key, "user", f"question {i}")
+        db.append_message(session_key, "assistant", f"answer {i}")
+    history = db.get_messages_as_conversation(session_key)
+    agent = MagicMock()
+    agent._memory_manager = MagicMock()
+    agent._last_flushed_db_idx = len(history)
+    s = {
+        "session_key": session_key,
+        "history": list(history),
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "agent": agent,
+        "attached_images": [],
+        "cols": 120,
+    }
+    server._sessions[sid] = s
+    # Wire the DB cache so _get_db() returns our fixture.
+    server._db = db
+    return sid, session_key, s, agent
+
+
+def _call(server, method, **params):
+    return server._methods[method](1, params)
+
+
+def test_undo_returns_prefill_with_target_text(server, session_with_history):
+    sid, session_key, s, agent = session_with_history
+    resp = _call(server, "command.dispatch", session_id=sid, name="undo", arg="")
+    result = resp["result"]
+    assert result["type"] == "prefill"
+    # Default /undo backs up one user turn — "question 3"
+    assert result["message"] == "question 3"
+    assert "Undid" in result["notice"]
+    assert s["history"]
+    assert all("_row_id" in message for message in s["history"])
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_user_messages.py ===
+"""Behaviour contracts for the user-facing copy the gateway sends to the TUI / Desktop.
+
+Each test asserts the message says WHAT happened and WHICH command to run next, and that
+the lead phrases clients pattern-match on (``session busy``, ``unknown method:``,
+``invalid params for``) survive the rewording.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from tui_gateway import user_messages as um
+
+
+def test_turn_error_text_leads_with_a_plain_title_and_keeps_the_raw_body_on_a_details_line():
+    raw = 'Error code: 401 - {"error": {"message": "Incorrect API key provided", "type": "invalid_request_error"}}'
+    text = um.turn_error_text(raw, {"layer": "auth", "code": "auth", "retryable": False, "provider": "openai"})
+    title, details, hint = text.split("\n")
+
+    assert not title.startswith("Error")
+    assert "401" not in title and "{" not in title
+    assert "API key" in title and "openai" in title
+    assert details.startswith("Details: ") and "Incorrect API key provided" in details
+    assert "/model" in hint and "/retry" in hint
+
+
+def test_turn_error_text_without_a_surface_still_names_the_next_step():
+    text = um.turn_error_text("HTTP 400: invalid model id 'kimi-k2.6'")
+
+    assert "kimi-k2.6" in text
+    assert "/retry" in text or "/model" in text
+    assert not text.startswith("Error:")
+
+
+@pytest.mark.parametrize("command", ["undo", "compress", "reload-mcp", "rollback restore"])
+def test_busy_message_names_the_real_gesture_not_a_missing_slash_command(command):
+    text = um.busy_message(command)
+
+    assert text.startswith("session busy")  # clients match this lead phrase (4009)
+    assert "/interrupt" not in text
+    # Shared gateway: name both gestures, never state the terminal one as the only option.
+    assert "Ctrl+C" in text and "Stop button" in text
+    assert "Press Ctrl+C" not in text
+    assert f"/{command}" in text
+
+
+def test_agent_init_and_resume_failures_point_at_existing_commands():
+    init = um.agent_init_failed_message(RuntimeError("Unknown provider 'openrouterr'"))
+    assert not init.startswith("agent init failed")
+    assert "openrouterr" in init and "/model" in init and "hermes setup" in init
+    assert "/setup" not in init  # ui-tui-only launcher; Desktop has no such command
+
+    resume = um.resume_failed_message(ValueError("corrupt row"))
+    assert not resume.startswith("resume failed")
+    assert "corrupt row" in resume and "/sessions" in resume and "/new" in resume
+    assert "/sessions new" not in resume  # ui-tui-only alias; Desktop ignores the argument
+
+
+def test_still_starting_copy_is_not_phrased_as_fatal():
+    assert "timed out" not in um.AGENT_STILL_STARTING
+    assert "try again" in um.AGENT_STILL_STARTING.lower()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_vault_methods.py ===
+"""Tests: vault.* JSON-RPC handlers (tui_gateway/methods_vault.py).
+
+The Desktop's Settings → Credential Vault panel. Contracts:
+- vault.list returns metadata only — secret values must never appear in
+  any response envelope;
+- vault.add validates via VaultStore.add_item and surfaces clean,
+  secret-free error messages;
+- vault.remove reports {removed: bool} idempotently.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+import tui_gateway.server as srv
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    h = tmp_path / ".hermes"
+    h.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(h))
+    return h
+
+
+def _result(envelope):
+    assert "error" not in envelope, envelope
+    return envelope["result"]
+
+
+def _error(envelope):
+    assert "error" in envelope, envelope
+    return envelope["error"]
+
+
+_LOGIN_PARAMS = {
+    "kind": "login",
+    "label": "Example login",
+    "origin": "https://example.com",
+    "secret": {
+        "identifier_type": "email",
+        "identifier": "user@example.com",
+        "password": "s3cret-pw-9000",
+    },
+}
+
+
+def test_add_then_list_is_password_free(home):
+    out = _result(srv._methods["vault.add"](1, dict(_LOGIN_PARAMS)))
+    assert out["id"].startswith("vault_")
+    # add's own envelope must not echo the secret back
+    assert "s3cret-pw-9000" not in json.dumps(out)
+
+    listed = _result(srv._methods["vault.list"](2, {}))
+    assert len(listed["items"]) == 1
+    item = listed["items"][0]
+    assert item["id"] == out["id"]
+    assert item["kind"] == "login"
+    assert item["label"] == "Example login"
+    assert item["origin"] == "https://example.com"
+    assert item["created_at"]
+    # Identifier is agent-visible metadata (design: only the password is secret).
+    assert item["identifier"] == "user@example.com"
+    assert item["identifier_type"] == "email"
+    dumped = json.dumps(listed)
+    assert "s3cret-pw-9000" not in dumped
+    assert "password" not in dumped
+
+
+def test_add_validation_errors_are_clean(home):
+    err = _error(
+        srv._methods["vault.add"](
+            1,
+            {
+                "kind": "login",
+                "label": "no origin",
+                "secret": {
+                    "identifier_type": "email",
+                    "identifier": "user@example.com",
+                    "password": "s3cret-pw-9000",
+                },
+            },
+        )
+    )
+    assert err["code"] == 5095
+    assert "origin is required" in err["message"]
+    assert "s3cret-pw-9000" not in json.dumps(err)
+
+    err = _error(srv._methods["vault.add"](2, {"kind": "login", "label": "x"}))
+    assert err["code"] == 5095
+    assert "secret payload is required" in err["message"]
+
+    err = _error(
+        srv._methods["vault.add"](
+            3, {"kind": "wat", "label": "x", "secret": {"password": "s3cret-pw-9000"}}
+        )
+    )
+    assert err["code"] == 5095
+    assert "unknown vault kind" in err["message"]
+    assert "s3cret-pw-9000" not in json.dumps(err)
+
+
+def _sources_rows(home):
+    out = _result(srv._methods["vault.sources"](90, {}))
+    return {row["name"]: row for row in out["sources"]}
+
+
+def test_enabling_a_detected_manager_reports_it_enabled(home, monkeypatch):
+    """The Settings toggle and `hermes vault sources --enable` both clear the opt-out override;
+    the shipped default must then agree with `is_enabled()`'s zero-config contract — an installed
+    manager becomes a login source instead of silently staying off (#109546)."""
+    monkeypatch.setattr(
+        "agent.vault_backends.base.is_installed", lambda name: name == "bitwarden"
+    )
+    _result(
+        srv._methods["vault.source.set"](80, {"name": "bitwarden", "enabled": True})
+    )
+    rows = _sources_rows(home)
+    assert rows["bitwarden"]["installed"] is True
+    assert rows["bitwarden"]["enabled"] is True
+
+
+def test_disabling_a_manager_persists_the_opt_out(home, monkeypatch):
+    monkeypatch.setattr(
+        "agent.vault_backends.base.is_installed", lambda name: name == "bitwarden"
+    )
+    _result(
+        srv._methods["vault.source.set"](81, {"name": "bitwarden", "enabled": False})
+    )
+    rows = _sources_rows(home)
+    assert rows["bitwarden"]["installed"] is True
+    assert rows["bitwarden"]["enabled"] is False
+
+
+def test_undetected_manager_stays_off(home, monkeypatch):
+    monkeypatch.setattr("agent.vault_backends.base.is_installed", lambda name: False)
+    rows = _sources_rows(home)
+    assert rows["bitwarden"]["installed"] is False
+    assert rows["bitwarden"]["enabled"] is False
+
+
+def test_remove_is_idempotent(home):
+    item_id = _result(srv._methods["vault.add"](1, dict(_LOGIN_PARAMS)))["id"]
+    assert _result(srv._methods["vault.remove"](2, {"id": item_id}))["removed"] is True
+    assert _result(srv._methods["vault.remove"](3, {"id": item_id}))["removed"] is False
+    assert _result(srv._methods["vault.list"](4, {}))["items"] == []
+
+
+def test_remove_requires_id(home):
+    err = _error(srv._methods["vault.remove"](1, {}))
+    assert err["code"] == 5095
+

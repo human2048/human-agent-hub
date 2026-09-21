@@ -1,0 +1,372 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_plugin_setup.py ===
+"""Tests for the Discord plugin's interactive_setup wizard home-channel flow.
+
+The interactive_setup wizard lazy-imports its CLI helpers from
+``hermes_cli.config`` (get_env_value / save_env_value / remove_env_value) and
+``hermes_cli.cli_output`` (prompt / prompt_yes_no / print_*); we patch those
+source modules. Covers the home-channel clear-on-blank behavior added in
+PR #58421 and extended in the follow-up.
+"""
+import hermes_cli.config as config_mod
+import hermes_cli.cli_output as cli_output_mod
+from plugins.platforms.discord.adapter import interactive_setup
+
+
+def _patch_setup_io(monkeypatch, prompts, saved, removed, existing, infos=None):
+    prompt_iter = iter(prompts)
+    monkeypatch.setattr(config_mod, "get_env_value", lambda key: existing.get(key, ""))
+    monkeypatch.setattr(config_mod, "save_env_value", lambda k, v: saved.update({k: v}))
+
+    def _remove(key):
+        removed.append(key)
+        return existing.pop(key, None) is not None
+
+    monkeypatch.setattr(config_mod, "remove_env_value", _remove)
+    monkeypatch.setattr(cli_output_mod, "prompt", lambda *_a, **_kw: next(prompt_iter))
+    monkeypatch.setattr(cli_output_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    for name in ("print_header", "print_success", "print_warning"):
+        monkeypatch.setattr(cli_output_mod, name, lambda *_a, **_kw: None)
+
+    def _info(*args, **_kw):
+        if infos is not None:
+            infos.append(" ".join(str(a) for a in args))
+
+    monkeypatch.setattr(cli_output_mod, "print_info", _info)
+
+
+# Discord prompts: bot_token (password), allowed_users, home_channel.
+_PROMPTS_NONEMPTY = ["«redacted:discord-bot-token»", "", "123456789012345678"]
+_PROMPTS_BLANK = ["«redacted:discord-bot-token»", "", ""]
+_PROMPTS_WHITESPACE = ["«redacted:discord-bot-token»", "", "   "]
+
+
+class TestDiscordHomeChannelClear:
+    """Blank home-channel answer must clear DISCORD_HOME_CHANNEL (#12423)."""
+
+    def test_blank_removes_existing_home_channel(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        saved, removed = {}, []
+        _patch_setup_io(
+            monkeypatch,
+            _PROMPTS_BLANK,
+            saved,
+            removed,
+            existing={"DISCORD_HOME_CHANNEL": "987654321098765432"},
+        )
+        interactive_setup()
+        assert "DISCORD_HOME_CHANNEL" in removed
+        assert "DISCORD_HOME_CHANNEL" not in saved
+
+
+class TestDiscordSetupPrivilegedIntentsGuidance:
+    """Setup must name Privileged Gateway Intents before asking for the token (#79430)."""
+
+    def test_setup_mentions_message_content_intent(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        saved, removed, infos = {}, [], []
+        _patch_setup_io(
+            monkeypatch,
+            _PROMPTS_BLANK,
+            saved,
+            removed,
+            existing={},
+            infos=infos,
+        )
+        interactive_setup()
+        joined = "\n".join(infos)
+        assert "Message Content Intent" in joined
+        assert "Privileged Gateway Intents" in joined
+        assert "discord.com/developers/applications" in joined
+
+
+
+
+class TestDiscordTokenShapeGuard:
+    """A numeric application ID pasted as the bot token is rejected with guidance
+    (port of openclaw/openclaw#140531)."""
+
+    def test_numeric_app_id_reprompts_then_accepts_real_token(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        saved, removed, errors = {}, [], []
+        real_token = "«redacted»." + "part2.part3"
+        _patch_setup_io(
+            monkeypatch,
+            ["1234567890123456789", real_token, "", ""],
+            saved,
+            removed,
+            existing={},
+        )
+        monkeypatch.setattr(cli_output_mod, "print_error", lambda *a, **_kw: errors.append(" ".join(map(str, a))))
+        interactive_setup()
+        assert saved.get("DISCORD_BOT_TOKEN") == real_token
+        assert any("application ID" in e for e in errors)
+
+    def test_non_numeric_token_saves_without_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        saved, removed, errors = {}, [], []
+        _patch_setup_io(monkeypatch, _PROMPTS_BLANK, saved, removed, existing={})
+        monkeypatch.setattr(cli_output_mod, "print_error", lambda *a, **_kw: errors.append(" ".join(map(str, a))))
+        interactive_setup()
+        assert saved.get("DISCORD_BOT_TOKEN") == _PROMPTS_BLANK[0]
+        assert errors == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_prompt_content_siblings.py ===
+"""Sibling coverage for the embed-invisibility fix (send_exec_approval got it
+in the same PR): slash confirm, clarify, and update prompts must also mirror
+their payload into plain message content, since embeds don't render on some
+Discord clients (web/mobile)."""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from plugins.platforms.discord.adapter import DiscordAdapter
+
+
+def _capture_channel(adapter):
+    sent = {}
+
+    async def fake_send(**kwargs):
+        sent.update(kwargs)
+        return SimpleNamespace(id=1234)
+
+    channel = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_slash_confirm_mirrors_message_into_content():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_slash_confirm(
+        chat_id="555",
+        title="Reset session?",
+        message="This will clear the current conversation history.",
+        session_key="discord:555",
+        confirm_id="c1",
+    )
+
+    assert result.success is True
+    assert sent["view"] is not None
+    assert sent["embed"] is not None
+    assert "Reset session?" in sent["content"]
+    assert "clear the current conversation history" in sent["content"]
+
+
+@pytest.mark.asyncio
+async def test_clarify_with_choices_mirrors_question_into_content():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_clarify(
+        chat_id="555",
+        question="Which environment should I deploy to?",
+        choices=["staging", "production"],
+        clarify_id="cl1",
+        session_key="discord:555",
+    )
+
+    assert result.success is True
+    assert sent["view"] is not None
+    assert "Hermes needs your input" in sent["content"]
+    assert "Which environment should I deploy to?" in sent["content"]
+    assert "Pick one below" in sent["content"]
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_prompt_timeout_config.py ===
+"""Tests for the configurable Discord interactive-view timeout.
+
+Previously hardcoded to 300s on ExecApprovalView, SlashConfirmView,
+UpdatePromptView, and ClarifyChoiceView. Now reads
+``approvals.discord_prompt_timeout`` with the same 300s default, clamped to
+``[_DISCORD_PROMPT_TIMEOUT_MIN, _DISCORD_PROMPT_TIMEOUT_MAX]`` so a typo
+can't make prompts disappear (too short) or outlive Discord's 15-min
+interaction-token expiry (too long).
+"""
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+
+def _ensure_discord_mock():
+    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+        return
+
+    discord_mod = MagicMock()
+    discord_mod.Intents.default.return_value = MagicMock()
+    discord_mod.Client = MagicMock
+    discord_mod.File = MagicMock
+    discord_mod.DMChannel = type("DMChannel", (), {})
+    discord_mod.Thread = type("Thread", (), {})
+    discord_mod.ForumChannel = type("ForumChannel", (), {})
+    discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
+    discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
+    discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
+    discord_mod.Interaction = object
+    discord_mod.Embed = MagicMock
+    discord_mod.app_commands = SimpleNamespace(
+        describe=lambda **kwargs: (lambda fn: fn),
+        choices=lambda **kwargs: (lambda fn: fn),
+        Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    ext_mod = MagicMock()
+    commands_mod = MagicMock()
+    commands_mod.Bot = MagicMock
+    ext_mod.commands = commands_mod
+
+    sys.modules.setdefault("discord", discord_mod)
+    sys.modules.setdefault("discord.ext", ext_mod)
+    sys.modules.setdefault("discord.ext.commands", commands_mod)
+
+
+_ensure_discord_mock()
+
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    _DISCORD_PROMPT_TIMEOUT_DEFAULT,
+    _DISCORD_PROMPT_TIMEOUT_MAX,
+    _DISCORD_PROMPT_TIMEOUT_MIN,
+    _read_discord_prompt_timeout,
+)
+
+
+def _patch_config(monkeypatch, cfg):
+    """Stub ``hermes_cli.config.read_raw_config`` to return ``cfg``."""
+    import hermes_cli.config
+    monkeypatch.setattr(hermes_cli.config, "read_raw_config", lambda: cfg)
+
+
+def test_explicit_int_value(monkeypatch):
+    _patch_config(monkeypatch, {"approvals": {"discord_prompt_timeout": 600}})
+    assert _read_discord_prompt_timeout() == 600
+
+
+def test_numeric_string_accepted(monkeypatch):
+    """YAML parsers occasionally return numbers as strings; tolerate it."""
+    _patch_config(monkeypatch, {"approvals": {"discord_prompt_timeout": "450"}})
+    assert _read_discord_prompt_timeout() == 450
+
+
+def test_malformed_value_falls_back_to_default(monkeypatch):
+    _patch_config(
+        monkeypatch,
+        {"approvals": {"discord_prompt_timeout": "five minutes"}},
+    )
+    assert _read_discord_prompt_timeout() == _DISCORD_PROMPT_TIMEOUT_DEFAULT
+
+
+def test_value_clamped_to_minimum(monkeypatch):
+    """A typo of e.g. 5 seconds must not make prompts disappear."""
+    _patch_config(monkeypatch, {"approvals": {"discord_prompt_timeout": 5}})
+    assert _read_discord_prompt_timeout() == _DISCORD_PROMPT_TIMEOUT_MIN
+
+
+def test_default_matches_previous_hardcoded_value():
+    """Behavioral parity assertion: existing installs (no new config) must
+    see exactly the 300s timeout the views were hardcoded to before this
+    change. Guards against the default drifting in a future refactor.
+    """
+    assert _DISCORD_PROMPT_TIMEOUT_DEFAULT == 300
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_discord_race_polish.py ===
+"""Discord adapter race polish: concurrent join_voice_channel must not
+double-invoke channel.connect() on the same guild."""
+
+import asyncio
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+
+
+def _make_adapter():
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    adapter = object.__new__(DiscordAdapter)
+    adapter._platform = Platform.DISCORD
+    adapter.config = PlatformConfig(enabled=True, token="t")
+    adapter._ready_event = asyncio.Event()
+    adapter._allowed_user_ids = set()
+    adapter._allowed_role_ids = set()
+    adapter._voice_clients = {}
+    adapter._voice_locks = {}
+    adapter._voice_receivers = {}
+    adapter._voice_listen_tasks = {}
+    adapter._voice_timeout_tasks = {}
+    adapter._voice_text_channels = {}
+    adapter._voice_sources = {}
+    adapter._client = MagicMock()
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_concurrent_joins_do_not_double_connect():
+    """Two concurrent join_voice_channel calls on the same guild must
+    serialize through the per-guild lock — only ONE channel.connect()
+    actually fires; the second sees the _voice_clients entry the first
+    just installed."""
+    adapter = _make_adapter()
+
+    connect_count = [0]
+    release = asyncio.Event()
+
+    class FakeVC:
+        def __init__(self, channel):
+            self.channel = channel
+
+        def is_connected(self):
+            return True
+
+        async def move_to(self, _channel):
+            return None
+
+    async def slow_connect(self):
+        connect_count[0] += 1
+        await release.wait()
+        return FakeVC(self)
+
+    channel = MagicMock()
+    channel.id = 111
+    channel.guild.id = 42
+    channel.connect = lambda: slow_connect(channel)
+
+    from plugins.platforms.discord import adapter as discord_mod
+    with patch.object(discord_mod, "VoiceReceiver",
+                      MagicMock(return_value=MagicMock(start=lambda: None))):
+        with patch.object(discord_mod.asyncio, "ensure_future",
+                          lambda _c: asyncio.create_task(asyncio.sleep(0))):
+            t1 = asyncio.create_task(adapter.join_voice_channel(channel))
+            t2 = asyncio.create_task(adapter.join_voice_channel(channel))
+            await asyncio.sleep(0.05)
+            release.set()
+            r1, r2 = await asyncio.gather(t1, t2)
+
+    assert connect_count[0] == 1, (
+        f"expected 1 channel.connect() call, got {connect_count[0]} — "
+        "per-guild lock is not serializing join_voice_channel"
+    )
+    assert r1 is True and r2 is True
+    assert 42 in adapter._voice_clients
+

@@ -1,0 +1,275 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_inline_rpc_gil_starvation.py ===
+"""Tests for tui_gateway inline-RPC pool routing under GIL pressure (#50005).
+
+The WS read loop in ``handle_ws()`` processes requests sequentially via
+``await asyncio.to_thread(server.dispatch, req, transport)``. Inline handlers
+(NOT in ``_LONG_HANDLERS``) run ``handle_request()`` synchronously inside
+``dispatch()``, blocking the loop from reading the next request. Under GIL
+pressure from multiple concurrent agent turns, even lightweight RPCs like
+``session.list`` and ``pet.info`` can take seconds, causing frontend requests
+to time out (120s) and the WebSocket to disconnect — the false "needs setup"
+failure mode (#50005).
+
+The fix routes all frontend-polled RPCs through ``_LONG_HANDLERS`` so
+``dispatch()`` returns immediately (``_pool.submit`` + ``return None``) and
+the WS read loop is never blocked.
+"""
+
+import io
+import json
+import sys
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+_original_stdout = sys.stdout
+
+
+@pytest.fixture(autouse=True)
+def _restore_stdout():
+    yield
+    sys.stdout = _original_stdout
+
+
+@pytest.fixture()
+def server():
+    # Mocks are scoped to the initial import only — keeping them active for
+    # the whole test would poison modules first imported inside test bodies
+    # (see tests/tui_gateway/test_protocol.py for the full rationale).
+    with patch.dict("sys.modules", {
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_cli.env_loader": MagicMock(),
+        "hermes_cli.banner": MagicMock(),
+        "hermes_state": MagicMock(),
+    }):
+        import importlib
+        mod = importlib.import_module("tui_gateway.server")
+
+    # Tests below stub handlers ("session.list", "prompt.submit", ...) in
+    # the module-level _methods dict shared with every other test file in
+    # the process — snapshot and restore it around each test.
+    methods = dict(mod._methods)
+    real_stdout = mod._real_stdout
+    yield mod
+    mod._methods.clear()
+    mod._methods.update(methods)
+    mod._real_stdout = real_stdout
+    mod._sessions.clear()
+    __import__("tui_gateway.server_requests", fromlist=["x"]).reset_for_tests()
+
+
+@pytest.fixture()
+def capture(server):
+    """Redirect server's real stdout to a StringIO and return (server, buf)."""
+    buf = io.StringIO()
+    server._real_stdout = buf
+    return server, buf
+
+
+# ─── RPCs that must be in _LONG_HANDLERS ────────────────────────────────
+
+# These are polled by the Desktop frontend. Before the fix they ran inline,
+# blocking the WS read loop under GIL pressure and causing false "needs setup"
+# (#50005). Each one does I/O (DB query, file read, network) that can take
+# seconds when the GIL is contended by concurrent agent turns.
+
+FRONTEND_POLLED_RPCS = [
+    "session.active_list",   # live-session rehydrate — in-memory registry
+    "session.list",          # loads session list — SQLite query
+    "pet.info",              # petdex poll — file/network read
+    "process.list",          # background process status — process registry scan
+    "setup.runtime_check",   # runtime readiness — resolve_runtime_provider() I/O
+    "setup.status",          # provider configured check — config/credential scan
+]
+
+
+@pytest.mark.parametrize("method", FRONTEND_POLLED_RPCS)
+def test_frontend_polled_rpc_is_pool_routed(server, method):
+    """Every frontend-polled RPC must be in _LONG_HANDLERS so dispatch()
+    returns immediately and the WS read loop is not blocked (#50005)."""
+    assert method in server._LONG_HANDLERS, (
+        f"{method!r} is not in _LONG_HANDLERS — it will block the WS read "
+        f"loop under GIL pressure, causing false 'needs setup' (#50005)."
+    )
+
+
+def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
+    """A slow inline-turned-long handler must not prevent a concurrent fast
+    handler from completing. This is the core invariant: dispatch() must
+    return immediately for _LONG_HANDLERS so the WS read loop stays free.
+
+    Simulates the GIL-pressure scenario from #50005: a slow handler (mimicking
+    a session.list query under GIL contention) must not block a fast handler
+    (mimicking setup.runtime_check).
+    """
+    released = threading.Event()
+
+    def slow_session_list(rid, params):
+        released.wait(timeout=5)
+        return server._ok(rid, {"sessions": []})
+
+    server._methods["session.list"] = slow_session_list
+    server._methods["fast.check"] = lambda rid, params: server._ok(rid, {"ok": True})
+
+    t0 = time.monotonic()
+    # session.list is in _LONG_HANDLERS → dispatch returns None immediately
+    assert server.dispatch({"id": "slow", "method": "session.list", "params": {}}) is None
+
+    # fast.check is inline → dispatch runs it synchronously and returns the result
+    fast_resp = server.dispatch({"id": "fast", "method": "fast.check", "params": {}})
+    fast_elapsed = time.monotonic() - t0
+
+    assert fast_resp["result"] == {"ok": True}
+    assert fast_elapsed < 2.0, (
+        f"fast handler blocked for {fast_elapsed:.2f}s behind slow session.list — "
+        f"the WS read loop would stall, causing false 'needs setup' (#50005)."
+    )
+
+    released.set()
+
+
+def test_rpc_pool_workers_supports_concurrent_long_handlers(server):
+    """The RPC thread pool must have enough workers to handle concurrent
+    long handlers without queueing. With 6+ frontend-polled RPCs added to
+    _LONG_HANDLERS, the default 4 workers can be exhausted when multiple
+    agent turns are running. The pool must be at least 8."""
+    assert server._rpc_pool_workers >= 8, (
+        f"_rpc_pool_workers is {server._rpc_pool_workers}, expected >= 8. "
+        f"Frontend-polled RPCs added to _LONG_HANDLERS need more workers to "
+        f"avoid queueing under multi-agent load (#50005)."
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_interim_assistant_callback.py ===
+"""Tests for the interim_assistant_callback config gating in tui_gateway.
+
+These tests exercise the real _agent_cbs() wiring rather than a local
+imitation, so a break in the production callback registration is caught.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+
+def test_load_interim_assistant_messages_defaults_true():
+    from tui_gateway.server import _load_interim_assistant_messages
+
+    with patch("tui_gateway.server._load_cfg", return_value={}):
+        assert _load_interim_assistant_messages() is True
+
+
+def test_agent_cbs_includes_interim_callback_when_enabled():
+    """_agent_cbs() includes interim_assistant_callback when the config is on.
+
+    Exercises the real _agent_cbs() wiring: the callback must be present in
+    the returned dict and, when invoked, must emit a message.interim event
+    with the text and already_streamed flag passed through.
+    """
+    from tui_gateway.server import _agent_cbs
+
+    emitted: list[tuple] = []
+
+    def fake_emit(event_type, sid, payload=None):
+        emitted.append((event_type, sid, payload))
+
+    with patch("tui_gateway.server._load_cfg", return_value={}), \
+         patch("tui_gateway.server._emit", side_effect=fake_emit):
+        cbs = _agent_cbs("test-session")
+
+        assert "interim_assistant_callback" in cbs
+        cb = cbs["interim_assistant_callback"]
+        assert callable(cb)
+
+        # Invoke the real callback inside the patch context — the lambda
+        # resolves _emit by name at call time, so it must be called while
+        # the patch is active.
+        cb("hello world", already_streamed=True)
+
+    assert len(emitted) == 1
+    assert emitted[0][0] == "message.interim"
+    assert emitted[0][1] == "test-session"
+    assert emitted[0][2]["text"] == "hello world"
+    assert emitted[0][2]["already_streamed"] is True
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_interrupt_agent_loop_stopped_hook.py ===
+"""The TUI/desktop ``session.interrupt`` path is a sibling of the gateway's
+``_interrupt_and_clear_session``: when a live turn is stopped, plugins holding
+per-turn external resources need the same ``agent_loop_stopped`` signal.
+"""
+
+import threading
+from unittest.mock import MagicMock, patch
+
+
+def _make_session(running: bool) -> dict:
+    return {
+        "history_lock": threading.Lock(),
+        "running": running,
+        "queued_prompt": None,
+        "session_key": "agent:main:tui:dm:s1",
+        "agent": MagicMock(),
+        "_run_thread": None,
+    }
+
+
+def _hook_calls(mock_invoke_hook):
+    return [
+        call
+        for call in mock_invoke_hook.call_args_list
+        if call.args and call.args[0] == "agent_loop_stopped"
+    ]
+
+
+@patch("hermes_cli.plugins.invoke_hook")
+def test_interrupt_running_turn_fires_agent_loop_stopped(mock_invoke_hook):
+    from tui_gateway import server
+
+    session = _make_session(running=True)
+    with patch.object(server, "_clear_pending"):
+        server._interrupt_session_turn("s1", session)
+
+    calls = _hook_calls(mock_invoke_hook)
+    assert len(calls) == 1
+    assert calls[0].kwargs == {
+        "session_key": "agent:main:tui:dm:s1",
+        "platform": "tui",
+        "reason": "user_stop",
+        "invalidation_reason": "session_interrupt",
+    }
+
+
+@patch("hermes_cli.plugins.invoke_hook")
+def test_interrupt_idle_session_does_not_fire_hook(mock_invoke_hook):
+    """No live turn -> nothing for a plugin to cancel -> no hook noise."""
+    from tui_gateway import server
+
+    session = _make_session(running=False)
+    with patch.object(server, "_clear_pending"):
+        server._interrupt_session_turn("s1", session)
+
+    assert _hook_calls(mock_invoke_hook) == []
+
+
+@patch("hermes_cli.plugins.invoke_hook")
+def test_hook_failure_does_not_break_interrupt(mock_invoke_hook):
+    """A misbehaving plugin must never prevent the interrupt itself."""
+    mock_invoke_hook.side_effect = RuntimeError("plugin exploded")
+    from tui_gateway import server
+
+    session = _make_session(running=True)
+    with patch.object(server, "_clear_pending"):
+        server._interrupt_session_turn("s1", session)
+
+    # The cancel flag was still set despite the hook blowing up.
+    assert session["_turn_cancel_requested"] is True
+

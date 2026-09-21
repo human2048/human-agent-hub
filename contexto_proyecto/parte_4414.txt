@@ -1,0 +1,339 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_xai_http_credentials.py ===
+import pytest
+
+
+def _set_xai_oauth_unavailable(monkeypatch):
+    from hermes_cli import auth
+    import hermes_cli.auth_xai as auth_xai
+
+    monkeypatch.setattr(auth, "resolve_xai_oauth_runtime_credentials", lambda **_: {})
+    monkeypatch.setattr(auth_xai, "resolve_xai_oauth_runtime_credentials", lambda **_: {})
+
+
+def test_xai_credentials_fail_closed_without_profile_scope(tmp_path, monkeypatch):
+    from agent import secret_scope
+    from hermes_cli.config import invalidate_env_cache
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XAI_API_KEY", "foreign-xai-key")
+    monkeypatch.setenv("XAI_BASE_URL", "https://foreign.example/v1")
+    _set_xai_oauth_unavailable(monkeypatch)
+    invalidate_env_cache()
+    previous_multiplex = secret_scope.is_multiplex_active()
+    token = secret_scope.set_secret_scope(None)
+    secret_scope.set_multiplex_active(True)
+    try:
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            resolve_xai_http_credentials(force_refresh=True)
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+        invalidate_env_cache()
+
+
+def test_xai_credentials_do_not_fall_back_to_environ_when_scope_has_no_key(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+    from hermes_cli.config import invalidate_env_cache
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XAI_API_KEY", "foreign-xai-key")
+    monkeypatch.setenv("XAI_BASE_URL", "https://foreign.example/v1")
+    _set_xai_oauth_unavailable(monkeypatch)
+    invalidate_env_cache()
+    previous_multiplex = secret_scope.is_multiplex_active()
+    token = secret_scope.set_secret_scope({})
+    secret_scope.set_multiplex_active(True)
+    try:
+        credentials = resolve_xai_http_credentials(force_refresh=True)
+        assert credentials == {
+            "provider": "xai",
+            "api_key": "",
+            "base_url": "https://api.x.ai/v1",
+        }
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+        invalidate_env_cache()
+
+
+# ---------------------------------------------------------------------------
+# prefer_api_key opt-in (#88040 x_search / #87045 TTS): explicit API key wins
+# over subscription OAuth, via the shared resolver — not per-caller inlining.
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_oauth_pool(monkeypatch, oauth_token: str) -> None:
+    from types import SimpleNamespace
+
+    entry = SimpleNamespace(
+        access_token=oauth_token,
+        runtime_api_key=None,
+        runtime_base_url=None,
+        base_url="https://api.x.ai/v1",
+    )
+
+    class _FakePool:
+        def select(self):
+            return entry
+
+        def try_refresh_matching(self, _hint):
+            return entry
+
+    def _fake_load_pool(provider_id):
+        if provider_id == "xai-oauth":
+            return _FakePool()
+        raise KeyError(provider_id)
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", _fake_load_pool)
+
+
+def test_prefer_api_key_wins_over_available_oauth(monkeypatch):
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda name, default=None: {"XAI_API_KEY": "paid-key-x1"}.get(name, default),
+    )
+    _install_fake_oauth_pool(monkeypatch, "oauth-token-x1")
+
+    creds = resolve_xai_http_credentials(prefer_api_key=True)
+    assert creds == {
+        "provider": "xai",
+        "api_key": "paid-key-x1",
+        "base_url": "https://api.x.ai/v1",
+    }
+
+    # Default order is unchanged: OAuth still wins without the opt-in.
+    creds = resolve_xai_http_credentials()
+    assert creds["provider"] == "xai-oauth"
+    assert creds["api_key"] == "oauth-token-x1"
+
+
+def test_prefer_api_key_falls_back_to_oauth_without_explicit_key(monkeypatch):
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value", lambda name, default=None: default
+    )
+    _install_fake_oauth_pool(monkeypatch, "oauth-token-x1")
+
+    creds = resolve_xai_http_credentials(prefer_api_key=True)
+    assert creds["provider"] == "xai-oauth"
+    assert creds["api_key"] == "oauth-token-x1"
+
+
+def test_prefer_api_key_honors_hermes_xai_base_url_with_validation(monkeypatch):
+    """The preferred-key path reads the same override pair as the OAuth
+    branch (HERMES_XAI_BASE_URL first, then XAI_BASE_URL) behind the same
+    origin-pinning validation: an *.x.ai override is honored, a foreign
+    origin is rejected in favor of the default."""
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda name, default=None: {
+            "XAI_API_KEY": "paid-key-x1",
+            "HERMES_XAI_BASE_URL": "https://staging.x.ai/v1",
+            "XAI_BASE_URL": "https://ignored.x.ai/v1",
+        }.get(name, default),
+    )
+    _install_fake_oauth_pool(monkeypatch, "oauth-token-x1")
+
+    creds = resolve_xai_http_credentials(prefer_api_key=True)
+    assert creds["base_url"] == "https://staging.x.ai/v1"
+
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda name, default=None: {
+            "XAI_API_KEY": "paid-key-x1",
+            "XAI_BASE_URL": "https://attacker.example/v1",
+        }.get(name, default),
+    )
+    creds = resolve_xai_http_credentials(prefer_api_key=True)
+    assert creds["base_url"] == "https://api.x.ai/v1"
+
+
+def test_prefer_api_key_honors_profile_scope_only_key(tmp_path, monkeypatch):
+    """A key present only in the active profile's secret scope (not in
+    os.environ / .env) is honored on the preferred path — the read goes
+    through resolve_provider_secret, not a raw env lookup."""
+    from agent import secret_scope
+    from hermes_cli.config import invalidate_env_cache
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_BASE_URL", raising=False)
+    monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
+    invalidate_env_cache()
+    previous_multiplex = secret_scope.is_multiplex_active()
+    token = secret_scope.set_secret_scope({"XAI_API_KEY": "scoped-key-x1"})
+    secret_scope.set_multiplex_active(True)
+    try:
+        creds = resolve_xai_http_credentials(prefer_api_key=True)
+        assert creds["provider"] == "xai"
+        assert creds["api_key"] == "scoped-key-x1"
+        assert creds["base_url"] == "https://api.x.ai/v1"
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+        invalidate_env_cache()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_xai_http_storage.py ===
+"""Tests for xAI Imagine storage helper behavior."""
+
+from __future__ import annotations
+
+import yaml
+
+
+def _invalidate_config_cache():
+    try:
+        import hermes_cli.config as cfg_mod
+
+        if hasattr(cfg_mod, "_invalidate_load_config_cache"):
+            cfg_mod._invalidate_load_config_cache()
+    except Exception:
+        pass
+
+
+def test_storage_defaults_to_permanent_public_urls(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _invalidate_config_cache()
+
+    from tools.xai_http import build_xai_storage_options
+
+    storage = build_xai_storage_options(
+        "image_gen",
+        filename_prefix="hermes-xai-image",
+        extension="png",
+    )
+
+    assert storage is not None
+    assert storage["public_url"] is True
+    assert "expires_after" not in storage
+    assert storage["filename"].startswith("hermes-xai-image-")
+    assert storage["filename"].endswith(".png")
+
+
+def test_invalid_storage_retention_falls_back_to_bounded_ttl(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "video_gen": {
+            "xai": {
+                "storage": {
+                    "expires_after": "definitely-not-a-duration",
+                },
+            },
+        },
+    }))
+    _invalidate_config_cache()
+
+    from tools.xai_http import build_xai_storage_options
+
+    storage = build_xai_storage_options(
+        "video_gen",
+        filename_prefix="hermes-xai-video",
+        extension="mp4",
+    )
+
+    assert storage is not None
+    assert storage["expires_after"] == 172800
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_xlsx_phonetic_text.py ===
+"""Phonetic guides (XLSX ``rPh``, DOCX ``w:rt`` ruby) annotate base text; they are not the value.
+
+See https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.phoneticrun
+(rPh is permitted under both si and is).
+"""
+import json
+import zipfile
+
+import pytest
+
+from tools import file_tools  # registers the public read_file handler
+from tools.read_extract import extract_document_text
+from tools.registry import registry
+
+S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+P = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _workbook(path, storage, text):
+    cell = '<c r="A1" t="s"><v>0</v></c>' if storage == "shared" else f'<c r="A1" t="inlineStr"><is>{text}</is></c>'
+    parts = {
+        "[Content_Types].xml": '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>',
+        "_rels/.rels": f'<Relationships xmlns="{P}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+        "xl/workbook.xml": f'<workbook xmlns="{S}" xmlns:r="{R}"><sheets><sheet name="Cities" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        "xl/_rels/workbook.xml.rels": f'<Relationships xmlns="{P}"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{R}/sharedStrings" Target="sharedStrings.xml"/></Relationships>',
+        "xl/sharedStrings.xml": f'<sst xmlns="{S}" count="1" uniqueCount="1"><si>{text}</si></sst>',
+        "xl/worksheets/sheet1.xml": f'<worksheet xmlns="{S}"><sheetData><row r="1">{cell}<c r="B1" t="inlineStr"><is><t>sentinel</t></is></c></row></sheetData></worksheet>',
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as package:
+        for name, xml in parts.items():
+            package.writestr(name, xml)
+    return path
+
+
+def _docx(path, paragraph_xml):
+    with zipfile.ZipFile(path, "w") as package:
+        package.writestr("[Content_Types].xml", "<Types/>")
+        package.writestr("word/document.xml",
+                         f'<w:document xmlns:w="{W}"><w:body><w:p>{paragraph_xml}</w:p></w:body></w:document>')
+    return path
+
+
+_XLSX_PHONETICS = '<rPh sb="0" eb="1"><t>トウ</t></rPh><rPh sb="1" eb="2"><t>キョウ</t></rPh>'
+_DOCX_RUBY = ('<w:r><w:ruby><w:rt><w:r><w:t>トウキョウ</w:t></w:r></w:rt>'
+              '<w:rubyBase><w:r><w:t>東京</w:t></w:r></w:rubyBase></w:ruby></w:r><w:r><w:tab/><w:t>sentinel</w:t></w:r>')
+
+
+def _document(tmp_path, kind):
+    if kind == "docx-ruby":
+        return _docx(tmp_path / "cities.docx", _DOCX_RUBY)
+    storage, rich = kind.split("-")
+    base = '<r><rPr><b/></rPr><t>東</t></r><r><t>京</t></r>' if rich == "rich" else '<t>東京</t>'
+    return _workbook(tmp_path / "cities.xlsx", storage, base + _XLSX_PHONETICS)
+
+
+@pytest.mark.parametrize("kind", ["shared-plain", "shared-rich", "inline-plain", "inline-rich", "docx-ruby"])
+def test_read_file_excludes_phonetic_guides(tmp_path, monkeypatch, kind):
+    path = _document(tmp_path, kind)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    task_id = f"phonetic-{kind}"
+    try:
+        result = json.loads(registry.dispatch("read_file", {"path": str(path)}, task_id=task_id))
+        assert not result.get("error"), result
+        assert result["extracted_document"] is True
+        row = result["content"].splitlines()[0 if kind == "docx-ruby" else 1]  # XLSX line 1 is the sheet header
+        assert row.split("|", 1)[1] == "東京\tsentinel"
+    finally:
+        file_tools.clear_file_ops_cache(task_id)
+
+
+@pytest.mark.parametrize("storage", ["shared", "inline"])
+@pytest.mark.parametrize("text, expected", [
+    ('<t xml:space="preserve"> plain </t>', ' plain '),
+    ('<r><t xml:space="preserve"> first </t></r><r><rPr><b/></rPr><t>second</t></r>', ' first second'),
+    ('<t/>', ''),
+])
+def test_string_values_without_phonetics_are_preserved(tmp_path, storage, text, expected):
+    path = _workbook(tmp_path / "control.xlsx", storage, text)
+    assert extract_document_text(str(path)).splitlines()[1] == expected + "\tsentinel"
+

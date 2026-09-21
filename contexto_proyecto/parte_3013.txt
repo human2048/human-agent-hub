@@ -1,0 +1,392 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_whatsapp_text_batching.py ===
+"""Text-debounce batching for the WhatsApp adapter (issue #35301).
+
+WhatsApp delivers rapid multi-message bursts (forwarded batches, paste-splits)
+individually.  Without debounce each fragment triggers a separate agent
+invocation, wasting tokens and flooding the user with reply fragments.  This
+mirrors the Telegram/WeCom/Feishu pattern.
+
+Batch delays are read from ``config.extra`` (config.yaml), not env vars.
+"""
+
+import asyncio
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
+from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+from gateway.session import SessionSource
+
+
+def _make_adapter(**extra):
+    base = {"session_name": "test"}
+    base.update(extra)
+    return WhatsAppAdapter(PlatformConfig(enabled=True, extra=base))
+
+
+def _event(text):
+    src = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="chat123",
+        chat_type="dm",
+        user_id="user1",
+        user_name="tester",
+    )
+    return MessageEvent(text=text, message_type=MessageType.TEXT, source=src)
+
+
+def test_batch_delays_overridden_via_config_extra():
+    adapter = _make_adapter(
+        text_batch_delay_seconds="2.5",
+        text_batch_split_delay_seconds=7,
+    )
+    assert adapter._text_batch_delay_seconds == 2.5
+    assert adapter._text_batch_split_delay_seconds == 7.0
+
+
+def test_invalid_config_value_falls_back_to_default():
+    adapter = _make_adapter(
+        text_batch_delay_seconds="garbage",
+        text_batch_split_delay_seconds=-3,
+    )
+    assert adapter._text_batch_delay_seconds == 5.0
+    assert adapter._text_batch_split_delay_seconds == 10.0
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_whatsapp_to_jid.py ===
+"""Unit tests for gateway.whatsapp_identity.to_whatsapp_jid.
+
+``to_whatsapp_jid`` is the outbound inverse of
+``normalize_whatsapp_identifier``: it builds the bridge-safe JID a send
+must use. Baileys' ``jidDecode`` crashes on a bare phone number (#8637),
+so every outbound target must be rewritten to ``<digits>@s.whatsapp.net``
+before it reaches the bridge.
+"""
+
+import pytest
+
+from gateway.whatsapp_identity import to_whatsapp_jid
+
+
+class TestToWhatsappJid:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            # bare phone numbers → user JID
+            ("+50766715226", "50766715226@s.whatsapp.net"),
+            ("50766715226", "50766715226@s.whatsapp.net"),
+            # human-formatted phone numbers get stripped to digits
+            ("+1 (555) 123-4567", "15551234567@s.whatsapp.net"),
+            ("+1.555.123.4567", "15551234567@s.whatsapp.net"),
+        ],
+    )
+    def test_bare_phone_becomes_user_jid(self, raw, expected):
+        assert to_whatsapp_jid(raw) == expected
+
+    @pytest.mark.parametrize(
+        "jid",
+        [
+            "50766715226@s.whatsapp.net",  # already a user JID
+            "123456789-987654321@g.us",    # group JID
+            "130631430344750@lid",         # linked identity
+            "status@broadcast",            # broadcast pseudo-chat
+            "123@newsletter",              # channel/newsletter
+        ],
+    )
+    def test_fully_qualified_jid_passes_through(self, jid):
+        assert to_whatsapp_jid(jid) == jid
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_ws_auth_retry.py ===
+"""Tests for auth-aware retry in the Mattermost WS loop.
+
+Mattermost's _ws_loop previously caught all exceptions with a broad
+``except Exception`` and retried forever, so permanent auth failures (401,
+403) looped indefinitely instead of stopping. These tests verify that auth
+errors now stop the reconnect. The Matrix sync-loop counterpart lives in
+tests/gateway/test_matrix.py::TestMatrixSyncLoop.
+"""
+
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+# ---------------------------------------------------------------------------
+# Mattermost: _ws_loop auth-aware retry
+# ---------------------------------------------------------------------------
+
+
+class TestMattermostWSAuthRetry:
+    """gateway/platforms/mattermost.py — _ws_loop()"""
+
+    def test_401_handshake_stops_reconnect(self):
+        """A WSServerHandshakeError with status 401 should stop the loop —
+        AND escalate through the fatal-error hook (a bare return used to
+        leave _running True: dead listener, healthy-looking adapter)."""
+        import aiohttp
+        from gateway.config import Platform
+
+        exc = aiohttp.WSServerHandshakeError(
+            request_info=MagicMock(),
+            history=(),
+            status=401,
+            message="Unauthorized",
+            headers=MagicMock(),
+        )
+
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        adapter = MattermostAdapter.__new__(MattermostAdapter)
+        adapter._closing = False
+        adapter._running = True
+        adapter.platform = Platform.MATTERMOST
+        notified = []
+
+        async def fatal_handler(a):
+            notified.append(a)
+
+        adapter._fatal_error_handler = fatal_handler
+
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            raise exc
+
+        adapter._ws_connect_and_listen = fake_connect
+
+        async def run():
+            await adapter._ws_loop()
+            # Let the detached fatal-handler task complete.
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        # Should have attempted once and stopped, not retried
+        assert call_count == 1
+        # Escalated: fatal error recorded, _running cleared, handler notified.
+        assert adapter._fatal_error_code == "mattermost_auth_error"
+        assert adapter._fatal_error_retryable is False
+        assert adapter._running is False
+        assert notified == [adapter]
+
+    def test_transient_401_substring_does_not_stop_reconnect(self):
+        """A transient exception whose stringified message merely contains
+        "401" (e.g. a proxy error body with digits) must not be mistaken
+        for a genuine auth rejection. The loop should log a warning and
+        retry, not return."""
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        adapter = MattermostAdapter.__new__(MattermostAdapter)
+        adapter._closing = False
+
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                # Stop the loop once we've proven a retry happened.
+                adapter._closing = True
+            raise RuntimeError(
+                "proxy returned HTTP/1.1 401 in body but connection reset"
+            )
+
+        adapter._ws_connect_and_listen = fake_connect
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            asyncio.run(adapter._ws_loop())
+
+        # The substring fallback is gone, so this must retry past the
+        # first attempt instead of returning immediately.
+        assert call_count == 2
+
+    def test_closing_flag_prevents_further_connect_attempts(self):
+        """Existing self._closing early-return behavior is unaffected by
+        the substring-fallback removal: once _closing is set, the loop
+        must not attempt to connect at all."""
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        adapter = MattermostAdapter.__new__(MattermostAdapter)
+        adapter._closing = True
+
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("should never be called")
+
+        adapter._ws_connect_and_listen = fake_connect
+
+        asyncio.run(adapter._ws_loop())
+
+        assert call_count == 0
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_ws_auth_retry_verifier_probe.py ===
+"""Adversarial verifier probes for the mattermost-ws-401-classify fix
+(commit fdd1a11ac5).
+
+The implementer's test_ws_auth_retry.py covers:
+  - WSServerHandshakeError(status=401) stops the loop
+  - a transient RuntimeError whose message contains "401" now retries
+  - the pre-existing _closing early-return path is untouched
+
+This file probes boundary/edge cases the implementer's tests did NOT
+cover, per the independent-verifier mandate to go beyond what the
+implementer thought to test:
+
+  1. WSServerHandshakeError(status=403) — the other structured-check
+     status value — must still stop the loop (only 401 was tested).
+  2. WSServerHandshakeError with a non-auth status (e.g. 500) must NOT
+     stop the loop — the structured check must not over-match.
+  3. A transient exception containing "unauthorized" (not "401"/"403")
+     must retry now that the substring fallback is fully removed —
+     the implementer only exercised the "401" substring variant.
+  4. Multiple consecutive transient errors must all retry (not just
+     one) — proves the removed code path isn't silently reintroduced
+     via some other mechanism after N attempts.
+"""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+# Optional dep: CI installs [all] extras, but local envs may lack aiohttp —
+# skip cleanly instead of crashing collection.
+aiohttp = pytest.importorskip("aiohttp")
+
+from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+
+def _make_adapter(closing: bool = False) -> MattermostAdapter:
+    adapter = MattermostAdapter.__new__(MattermostAdapter)
+    adapter._closing = closing
+    # The genuine-auth path now escalates via _set_fatal_error +
+    # _notify_fatal_error (OOF-156 follow-up), which touch these attributes
+    # that __init__ would normally provide.
+    from gateway.config import Platform
+
+    adapter.platform = Platform.MATTERMOST
+    adapter._running = True
+    adapter._fatal_error_handler = None
+    return adapter
+
+
+class TestMattermostWSAuthRetryBoundaryProbes:
+    def test_403_handshake_stops_reconnect(self):
+        """status=403 (the other half of the structured check's {401, 403}
+        set) must also stop the loop. The implementer only tested 401."""
+        exc = aiohttp.WSServerHandshakeError(
+            request_info=MagicMock(),
+            history=(),
+            status=403,
+            message="Forbidden",
+            headers=MagicMock(),
+        )
+
+        adapter = _make_adapter()
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            raise exc
+
+        adapter._ws_connect_and_listen = fake_connect
+
+        asyncio.run(adapter._ws_loop())
+
+        assert call_count == 1
+
+    def test_non_auth_handshake_status_does_not_stop_reconnect(self):
+        """A WSServerHandshakeError with a non-auth status (500) is a
+        structured exception of the RIGHT TYPE but the WRONG status —
+        it must NOT be classified as a permanent auth failure. This
+        guards against an overly broad isinstance-only check that
+        forgets to gate on .status."""
+        exc = aiohttp.WSServerHandshakeError(
+            request_info=MagicMock(),
+            history=(),
+            status=500,
+            message="Internal Server Error",
+            headers=MagicMock(),
+        )
+
+        adapter = _make_adapter()
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                adapter._closing = True
+            raise exc
+
+        adapter._ws_connect_and_listen = fake_connect
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            asyncio.run(adapter._ws_loop())
+
+        assert call_count == 2
+
+    def test_unauthorized_substring_no_longer_stops_reconnect(self):
+        """Before the fix, a transient error whose message contained the
+        word 'unauthorized' (not digits) would ALSO trip the removed
+        substring fallback. The implementer's regression test only
+        covered the '401' digit-substring case; this proves the
+        'unauthorized' word variant is equally fixed."""
+        adapter = _make_adapter()
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                adapter._closing = True
+            raise RuntimeError(
+                "upstream proxy replied: request unauthorized by WAF rule, retry"
+            )
+
+        adapter._ws_connect_and_listen = fake_connect
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            asyncio.run(adapter._ws_loop())
+
+        assert call_count == 2
+
+    def test_repeated_transient_errors_all_retry(self):
+        """Guards against a fix that only relaxes classification for the
+        FIRST occurrence (e.g. some hidden retry-budget/counter that
+        starts rejecting after N attempts). Runs 5 consecutive
+        transient errors and confirms every one retries."""
+        adapter = _make_adapter()
+        call_count = 0
+        target_attempts = 5
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= target_attempts:
+                adapter._closing = True
+            raise RuntimeError("403 seen in unrelated proxy diagnostic body")
+
+        adapter._ws_connect_and_listen = fake_connect
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            asyncio.run(adapter._ws_loop())
+
+        assert call_count == target_attempts
+

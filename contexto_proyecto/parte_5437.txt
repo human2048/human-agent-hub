@@ -1,0 +1,306 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\media\media-gif-search.md ===
+---
+title: "Gif Search — 通过 curl + jq 搜索/下载 Tenor GIF"
+sidebar_label: "Gif Search"
+description: "通过 curl + jq 搜索/下载 Tenor GIF"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Gif Search
+
+通过 curl + jq 搜索/下载 Tenor GIF。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/media/gif-search` |
+| 版本 | `1.1.0` |
+| 作者 | Hermes Agent |
+| 许可证 | MIT |
+| 平台 | linux, macos, windows |
+| 标签 | `GIF`, `Media`, `Search`, `Tenor`, `API` |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发该 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时所看到的指令内容。
+:::
+
+# GIF Search（Tenor API）
+
+通过 Tenor API 使用 curl 直接搜索和下载 GIF，无需额外工具。
+
+## 使用场景
+
+适用于查找反应 GIF、创建视觉内容以及在聊天中发送 GIF。
+
+## 配置
+
+在环境中设置 Tenor API 密钥（添加到 `~/.hermes/.env`）：
+
+```bash
+TENOR_API_KEY=your_key_here
+```
+
+在 https://developers.google.com/tenor/guides/quickstart 免费获取 API 密钥 —— Google Cloud Console Tenor API 密钥免费且具有较高的速率限制。
+
+## 前置条件
+
+- `curl` 和 `jq`（macOS/Linux 标准工具）
+- `TENOR_API_KEY` 环境变量
+
+## 搜索 GIF
+
+```bash
+# 搜索并获取 GIF URL
+curl -s "https://tenor.googleapis.com/v2/search?q=thumbs+up&limit=5&key=${TENOR_API_KEY}" | jq -r '.results[].media_formats.gif.url'
+
+# 获取较小的预览版本
+curl -s "https://tenor.googleapis.com/v2/search?q=nice+work&limit=3&key=${TENOR_API_KEY}" | jq -r '.results[].media_formats.tinygif.url'
+```
+
+## 下载 GIF
+
+```bash
+# 搜索并下载排名第一的结果
+URL=$(curl -s "https://tenor.googleapis.com/v2/search?q=celebration&limit=1&key=${TENOR_API_KEY}" | jq -r '.results[0].media_formats.gif.url')
+curl -sL "$URL" -o celebration.gif
+```
+
+## 获取完整元数据
+
+```bash
+curl -s "https://tenor.googleapis.com/v2/search?q=cat&limit=3&key=${TENOR_API_KEY}" | jq '.results[] | {title: .title, url: .media_formats.gif.url, preview: .media_formats.tinygif.url, dimensions: .media_formats.gif.dims}'
+```
+
+## API 参数
+
+| 参数 | 说明 |
+|-----------|-------------|
+| `q` | 搜索查询（空格用 `+` 进行 URL 编码） |
+| `limit` | 最大结果数（1-50，默认 20） |
+| `key` | API 密钥（来自 `$TENOR_API_KEY` 环境变量） |
+| `media_filter` | 过滤格式：`gif`、`tinygif`、`mp4`、`tinymp4`、`webm` |
+| `contentfilter` | 安全级别：`off`、`low`、`medium`、`high` |
+| `locale` | 语言：`en_US`、`es`、`fr` 等 |
+
+## 可用媒体格式
+
+每个结果在 `.media_formats` 下包含多种格式：
+
+| 格式 | 使用场景 |
+|--------|----------|
+| `gif` | 完整质量 GIF |
+| `tinygif` | 小型预览 GIF |
+| `mp4` | 视频版本（文件体积更小） |
+| `tinymp4` | 小型预览视频 |
+| `webm` | WebM 视频 |
+| `nanogif` | 微型缩略图 |
+
+## 注意事项
+
+- 对查询进行 URL 编码：空格用 `+`，特殊字符用 `%XX`
+- 在聊天中发送时，`tinygif` URL 更轻量
+- GIF URL 可直接用于 markdown：`![alt](https://github.com/NousResearch/hermes-agent/blob/main/skills/media/gif-search/url)`
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\media\media-songsee.md ===
+---
+title: "Songsee — 通过 CLI 生成音频频谱图/特征（mel、chroma、MFCC）"
+sidebar_label: "Songsee"
+description: "通过 CLI 生成音频频谱图/特征（mel、chroma、MFCC）"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Songsee
+
+通过 CLI 生成音频频谱图/特征（mel、chroma、MFCC）。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/media/songsee` |
+| 版本 | `1.0.0` |
+| 作者 | community |
+| 许可证 | MIT |
+| 平台 | linux, macos, windows |
+| 标签 | `Audio`, `Visualization`, `Spectrogram`, `Music`, `Analysis` |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+:::
+
+# songsee
+
+从音频文件生成频谱图（spectrogram）及多面板音频特征可视化图。
+
+## 前置条件
+
+需要安装 [Go](https://go.dev/doc/install)：
+```bash
+go install github.com/steipete/songsee/cmd/songsee@latest
+```
+
+可选：安装 `ffmpeg` 以支持 WAV/MP3 以外的格式。
+
+## 快速开始
+
+```bash
+# 基本频谱图
+songsee track.mp3
+
+# 保存到指定文件
+songsee track.mp3 -o spectrogram.png
+
+# 多面板可视化网格
+songsee track.mp3 --viz spectrogram,mel,chroma,hpss,selfsim,loudness,tempogram,mfcc,flux
+
+# 时间切片（从 12.5s 开始，持续 8s）
+songsee track.mp3 --start 12.5 --duration 8 -o slice.jpg
+
+# 从 stdin 读取
+cat track.mp3 | songsee - --format png -o out.png
+```
+
+## 可视化类型
+
+使用 `--viz` 并以逗号分隔多个值：
+
+| 类型 | 描述 |
+|------|-------------|
+| `spectrogram` | 标准频率频谱图 |
+| `mel` | Mel 尺度频谱图 |
+| `chroma` | 音高类别分布 |
+| `hpss` | 谐波/打击乐分离 |
+| `selfsim` | 自相似矩阵 |
+| `loudness` | 随时间变化的响度 |
+| `tempogram` | 节拍估计 |
+| `mfcc` | Mel 频率倒谱系数 |
+| `flux` | 频谱通量（起始点检测） |
+
+多个 `--viz` 类型将以网格形式渲染为单张图像。
+
+## 常用标志
+
+| 标志 | 描述 |
+|------|-------------|
+| `--viz` | 可视化类型（逗号分隔） |
+| `--style` | 色彩调色板：`classic`、`magma`、`inferno`、`viridis`、`gray` |
+| `--width` / `--height` | 输出图像尺寸 |
+| `--window` / `--hop` | FFT 窗口和跳跃大小 |
+| `--min-freq` / `--max-freq` | 频率范围过滤 |
+| `--start` / `--duration` | 音频时间切片 |
+| `--format` | 输出格式：`jpg` 或 `png` |
+| `-o` | 输出文件路径 |
+
+## 注意事项
+
+- WAV 和 MP3 原生解码；其他格式需要 `ffmpeg`
+- 输出图像可使用 `vision_analyze` 进行检查，以实现自动化音频分析
+- 适用于比较音频输出、调试合成过程或记录音频处理流水线
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\bundled\media\media-youtube-content.md ===
+---
+title: "Youtube Content — YouTube 视频转文字摘要、推文、博客"
+sidebar_label: "Youtube Content"
+description: "YouTube 视频转文字摘要、推文、博客"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Youtube Content
+
+YouTube 视频转文字摘要、推文、博客。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 内置（默认安装） |
+| 路径 | `skills/media/youtube-content` |
+| 平台 | linux, macos, windows |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+:::
+
+# YouTube Content Tool
+
+## 使用时机
+
+当用户分享 YouTube URL 或视频链接、要求总结视频、请求获取文字稿，或希望提取并重新格式化任意 YouTube 视频内容时使用。可将文字稿转换为结构化内容（章节、摘要、推文线程、博客文章）。
+
+从 YouTube 视频中提取文字稿并将其转换为实用格式。
+
+## 安装
+
+```bash
+pip install youtube-transcript-api
+```
+
+## 辅助脚本
+
+`SKILL_DIR` 是包含此 SKILL.md 文件的目录。该脚本接受任何标准 YouTube URL 格式、短链接（youtu.be）、Shorts、嵌入链接、直播链接，或原始 11 位视频 ID。
+
+```bash
+# JSON 输出（含元数据）
+python3 SKILL_DIR/scripts/fetch_transcript.py "https://youtube.com/watch?v=VIDEO_ID"
+
+# 纯文本输出（适合管道传递给后续处理）
+python3 SKILL_DIR/scripts/fetch_transcript.py "URL" --text-only
+
+# 带时间戳
+python3 SKILL_DIR/scripts/fetch_transcript.py "URL" --timestamps
+
+# 指定语言并设置回退链
+python3 SKILL_DIR/scripts/fetch_transcript.py "URL" --language tr,en
+```
+
+## 输出格式
+
+获取文字稿后，根据用户需求选择以下格式：
+
+- **章节（Chapters）**：按主题转换分组，输出带时间戳的章节列表
+- **摘要（Summary）**：对整个视频进行 5–10 句的简洁概述
+- **章节摘要（Chapter summaries）**：各章节附带简短段落摘要
+- **推文线程（Thread）**：Twitter/X 线程格式——编号帖子，每条不超过 280 字符
+- **博客文章（Blog post）**：含标题、各节及关键要点的完整文章
+- **引用（Quotes）**：带时间戳的精彩引用
+
+### 示例——章节输出
+
+```
+00:00 Introduction — host opens with the problem statement
+03:45 Background — prior work and why existing solutions fall short
+12:20 Core method — walkthrough of the proposed approach
+24:10 Results — benchmark comparisons and key takeaways
+31:55 Q&A — audience questions on scalability and next steps
+```
+
+## 工作流程
+
+1. **获取**：使用辅助脚本并加上 `--text-only --timestamps` 参数获取文字稿。
+2. **验证**：确认输出非空且语言符合预期。若为空，去掉 `--language` 参数重试以获取任意可用文字稿。若仍为空，告知用户该视频可能已禁用文字稿。
+3. **分块（如需）**：若文字稿超过约 50K 字符，将其拆分为有重叠的块（约 40K，重叠 2K），逐块摘要后再合并。
+4. **转换**：将内容转换为用户请求的输出格式。若用户未指定格式，默认输出摘要。
+5. **校验**：重新阅读转换后的输出，在呈现前检查连贯性、时间戳准确性及完整性。
+
+## 错误处理
+
+- **文字稿已禁用**：告知用户；建议其在视频页面检查字幕是否可用。
+- **视频不可用或为私密视频**：转达错误信息，请用户核实 URL。
+- **无匹配语言**：去掉 `--language` 参数重试以获取任意可用文字稿，并向用户说明实际语言。
+- **缺少依赖**：执行 `pip install youtube-transcript-api` 后重试。

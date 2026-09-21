@@ -1,0 +1,362 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_hermes_state_conn_lock_audit.py ===
+"""Lock audit for every call on the shared writer connection (#99349).
+
+``SessionDB._conn`` is opened with ``check_same_thread=False`` and shared
+across threads (``AsyncSessionDB`` offloads every method via
+``asyncio.to_thread``), so every *call* on it must hold ``self._lock``.
+A lock-free ``self._conn.execute(...)`` — even a pure SELECT — can run
+concurrently with ``close()`` deallocating the connection's pysqlite
+statement cache, which segfaults the interpreter (observed in the field:
+``_PyDict_GetItem_KnownHash`` via ``bounded_lru_cache_wrapper`` on one
+thread while ``pysqlite_connection_close`` tears the cache down on
+another). "Read-only" is not an exemption: the race is on the connection
+object, not the database file.
+
+Reads that must not contend on the writer lock go through
+``SessionDB._read_ctx()`` instead — it borrows a pooled read connection
+(exclusively checked out for the block) and its non-WAL fallback is the
+writer connection *under* ``self._lock``.
+
+This is an AST audit in the spirit of
+``tests/gateway/test_async_session_db.py``: it fails on the next
+``self._conn.<method>(...)`` call site added outside ``with self._lock:``.
+"""
+
+import ast
+from pathlib import Path
+
+# Functions allowed to touch self._conn without the lock: construction-time
+# code that runs before the instance is ever shared with another thread.
+_ALLOWED_UNLOCKED_FNS = frozenset({
+    "__init__",
+    "_connect_and_init",
+    "_connect_and_init_with_lock_patience",
+})
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _nearest_enclosing_fn(tree: ast.AST) -> dict:
+    """Map id(node) -> name of the nearest enclosing function ("<module>"
+    at module level). Nested defs override their parents."""
+    enclosing: dict = {}
+
+    def visit(node: ast.AST, current: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            current = node.name
+        enclosing[id(node)] = current
+        for child in ast.iter_child_nodes(node):
+            visit(child, current)
+
+    visit(tree, "<module>")
+    return enclosing
+
+
+def _unlocked_conn_calls(tree: ast.AST):
+    """Return (lineno, enclosing_fn, method) for each self._conn.<m>(...)
+    call that is not lexically inside a ``with self._lock:`` block."""
+    locked_ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                ctx = item.context_expr
+                if (
+                    isinstance(ctx, ast.Attribute)
+                    and ctx.attr == "_lock"
+                    and isinstance(ctx.value, ast.Name)
+                    and ctx.value.id == "self"
+                ):
+                    locked_ids.update(id(child) for child in ast.walk(node))
+
+    enclosing = _nearest_enclosing_fn(tree)
+
+    offending = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "_conn"
+            and isinstance(func.value.value, ast.Name)
+            and func.value.value.id == "self"
+        ):
+            continue
+        if id(node) in locked_ids:
+            continue
+        fn = enclosing.get(id(node), "<module>")
+        if fn in _ALLOWED_UNLOCKED_FNS:
+            continue
+        offending.append((node.lineno, fn, func.attr))
+    return offending
+
+
+def test_every_conn_call_outside_construction_holds_the_lock():
+    src = (_repo_root() / "hermes_state.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    offending = _unlocked_conn_calls(tree)
+    assert not offending, (
+        "self._conn.<method>() called without `with self._lock:` — this "
+        "races SessionDB.close() inside pysqlite's statement cache and "
+        "segfaults the process (#99349). Use `with self._read_ctx() as "
+        "conn:` for reads, or take self._lock. Sites: "
+        + ", ".join(
+            f"line {lineno} in {fn}(): self._conn.{meth}(...)"
+            for lineno, fn, meth in offending
+        )
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_hermes_state_ids.py ===
+"""Session-id minting contract: every surface that creates a session mints through
+``hermes_state_ids.new_session_id`` and the id it produces is what lost-and-found salvage classifies
+as a session id (the shape is the recovery sentinel for schema-less rows).
+"""
+
+from __future__ import annotations
+
+import importlib
+import re
+from datetime import datetime
+
+import pytest
+
+import hermes_state_ids
+from hermes_state_ids import SESSION_ID_PATTERN, new_session_id
+
+# (module, callable(mint) -> str) for each minting site; ``mint`` is the patched helper.
+SITES = [
+    ("hermes_cli.foreign_sessions", None),
+    ("agent.conversation_compression", None),
+    ("hermes_cli.cli_commands_mixin", None),
+    ("hermes_cli.cli_session_mixin", None),
+    ("agent.agent_init", None),
+    ("tui_gateway.server", lambda mod: mod._new_session_key()),
+    ("gateway.session_lifecycle", lambda mod: mod._new_session_id(datetime(2026, 1, 2, 3, 4, 5))),
+    ("hermes_state_portability", None),
+    ("cli", None),
+]
+
+
+@pytest.mark.parametrize("hex_len,expected_re", [(6, r"^\d{8}_\d{6}_[0-9a-f]{6}$"), (8, r"^\d{8}_\d{6}_[0-9a-f]{8}$"),
+                                                 (12, r"^\d{8}_\d{6}_[0-9a-f]{12}$")])
+def test_minted_ids_are_what_salvage_classifies_as_session_ids(hex_len, expected_re):
+    from hermes_cli.session_lost_and_found import _is_session_id
+    sid = new_session_id(datetime(2026, 1, 2, 3, 4, 5), hex_len=hex_len)
+    assert re.fullmatch(expected_re, sid) and sid.startswith("20260102_030405_")
+    assert _is_session_id(sid)
+    assert SESSION_ID_PATTERN is importlib.import_module("hermes_cli.session_lost_and_found").SESSION_ID_PATTERN
+
+
+@pytest.mark.parametrize("module_name,call", SITES)
+def test_every_minting_site_imports_the_one_helper(module_name, call):
+    mod = importlib.import_module(module_name)
+    minted = [name for name in ("new_session_id", "mint_session_id")
+              if getattr(mod, name, None) is hermes_state_ids.new_session_id]
+    assert minted, f"{module_name} does not mint through hermes_state_ids.new_session_id"
+    if call is not None:
+        assert SESSION_ID_PATTERN.match(call(mod))
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_hermes_state_readonly_preflight.py ===
+"""Tests for the read-only DB preflight (port of Kilo-Org/kilocode#12508).
+
+A stray read-only ``state.db`` / ``-wal`` / ``-shm`` (sudo run, restored
+backup, copied dotfiles) used to surface as an opaque
+``sqlite3.OperationalError: attempt to write a readonly database`` raised
+from deep inside ``_init_schema`` — naming no file and no fix.
+
+``preflight_db_writability`` now runs before the first connection:
+
+- files inside the Hermes home tree are repaired with ``chmod u+rw``
+  (the safe scope — chmod fails on files the user doesn't own);
+- anything else fails fast with an error naming the exact file and the
+  exact ``chmod`` command;
+- WAL sidecars are never deleted, so committed frames survive repair.
+"""
+
+import os
+import sqlite3
+import stat
+import sys
+from pathlib import Path
+
+import pytest
+
+import hermes_state
+from hermes_state import SessionDB, preflight_db_writability
+
+pytestmark = [
+    pytest.mark.skipif(sys.platform == "win32", reason="POSIX chmod semantics"),
+    pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root bypasses file permission checks",
+    ),
+]
+
+
+@pytest.fixture()
+def hermes_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME so the repair scope covers tmp DBs."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def _make_db(path: Path) -> None:
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.commit()
+    conn.close()
+
+
+def _make_wal_db(path: Path) -> None:
+    """Create a WAL-mode DB with committed-but-uncheckpointed frames."""
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    # Keep a READ-ONLY second connection open so neither close can
+    # checkpoint: the writer skips checkpoint-on-close because another
+    # connection exists, and the ro holder cannot checkpoint at all.
+    # The committed row therefore lives only in the -wal file.
+    holder = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    holder.execute("SELECT 1").fetchone()
+    conn.execute("INSERT INTO t VALUES (42)")
+    conn.commit()
+    conn.close()
+    holder.close()
+    assert path.with_name(path.name + "-wal").is_file(), (
+        "fixture precondition: -wal sidecar must survive with pending frames"
+    )
+
+
+class TestRepairScope:
+    def test_repairs_readonly_db_inside_home(self, hermes_home):
+        db = hermes_home / "state.db"
+        _make_db(db)
+        os.chmod(db, 0o444)
+
+        preflight_db_writability(db, db_label="state.db")
+
+        assert os.access(db, os.W_OK)
+
+    def test_repairs_readonly_sidecars(self, hermes_home):
+        db = hermes_home / "state.db"
+        _make_wal_db(db)
+        wal = db.with_name(db.name + "-wal")
+        assert wal.is_file(), "fixture must leave a -wal behind"
+        os.chmod(db, 0o444)
+        os.chmod(wal, 0o444)
+
+        preflight_db_writability(db, db_label="state.db")
+
+        assert os.access(db, os.W_OK)
+        assert os.access(wal, os.W_OK)
+
+
+    def test_repairs_readonly_parent_directory(self, hermes_home):
+        sub = hermes_home / "kanban"
+        sub.mkdir()
+        db = sub / "kanban.db"
+        _make_db(db)
+        os.chmod(sub, 0o555)
+        try:
+            preflight_db_writability(db, db_label="kanban.db")
+            assert os.access(sub, os.W_OK)
+        finally:
+            os.chmod(sub, 0o755)
+
+
+class TestRefusalOutsideScope:
+    def test_actionable_error_names_file_and_chmod(self, hermes_home, tmp_path):
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        db = outside / "custom.db"
+        _make_db(db)
+        os.chmod(db, 0o444)
+        try:
+            with pytest.raises(sqlite3.OperationalError) as exc_info:
+                preflight_db_writability(db, db_label="custom.db")
+            msg = str(exc_info.value)
+            assert str(db) in msg
+            assert "chmod u+rw" in msg
+            # Must NOT have silently chmod'd a file outside the home tree.
+            assert not os.access(db, os.W_OK)
+        finally:
+            os.chmod(db, 0o644)
+
+    def test_wal_error_warns_against_deletion(self, hermes_home, tmp_path):
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        db = outside / "custom.db"
+        _make_wal_db(db)
+        wal = db.with_name(db.name + "-wal")
+        os.chmod(wal, 0o444)
+        try:
+            with pytest.raises(sqlite3.OperationalError) as exc_info:
+                preflight_db_writability(db, db_label="custom.db")
+            msg = str(exc_info.value)
+            assert str(wal) in msg
+            assert "Do NOT delete" in msg
+        finally:
+            os.chmod(wal, 0o644)
+
+
+class TestSkips:
+
+
+
+    def test_healthy_db_untouched(self, hermes_home):
+        db = hermes_home / "state.db"
+        _make_db(db)
+        before = stat.S_IMODE(db.stat().st_mode)
+        preflight_db_writability(db)
+        assert stat.S_IMODE(db.stat().st_mode) == before
+
+
+class TestSessionDBIntegration:
+    def test_sessiondb_selfheals_readonly_db_in_home(self, hermes_home):
+        db_path = hermes_home / "state.db"
+        first = SessionDB(db_path)
+        first.close()
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            if p.is_file():
+                os.chmod(p, 0o444)
+
+        db = SessionDB(db_path)  # must not raise "readonly database"
+        try:
+            assert os.access(db_path, os.W_OK)
+        finally:
+            db.close()
+
+    def test_sessiondb_actionable_error_outside_home(
+        self, hermes_home, tmp_path
+    ):
+        outside = tmp_path / "custom-loc"
+        outside.mkdir()
+        db_path = outside / "state.db"
+        first = SessionDB(db_path)
+        first.close()
+        os.chmod(db_path, 0o444)
+        hermes_state._set_last_init_error(None)
+        try:
+            with pytest.raises(sqlite3.OperationalError) as exc_info:
+                SessionDB(db_path)
+            msg = str(exc_info.value)
+            assert str(db_path) in msg
+            assert "chmod" in msg
+        finally:
+            os.chmod(db_path, 0o644)
+            hermes_state._set_last_init_error(None)
+

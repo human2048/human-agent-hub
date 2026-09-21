@@ -1,0 +1,187 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_native_producer_owner_matrix.py ===
+"""Native media producers keep routed owner decisions across alternating homes."""
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from gateway.config import GatewayConfig, PlatformConfig
+from gateway.run import GatewayRunner
+from gateway.platforms.base import SendResult
+from hermes_constants import get_hermes_home
+
+
+@pytest.fixture(params=[None, False, True, "override", "managed", "null"])
+def owners(request, tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    (root / "config.yaml").write_text('display: {suppress_warning_notifications: true}')
+    mode = request.param
+    if mode == "managed":
+        (managed / "config.yaml").write_text('display: {suppress_warning_notifications: true}')
+    for name in ("a", "b"):
+        home = root / "profiles" / name
+        home.mkdir(parents=True)
+        value = mode if name == "a" else not bool(mode)
+        cfg = {} if value is None else {"display": {"suppress_warning_notifications": value is True}}
+        if name == "a" and mode in ("override", "null"):
+            cfg = {"display": {"suppress_warning_notifications": True, "platforms": {
+                p: {"suppress_warning_notifications": False if mode == "override" else None}
+                for p in ("slack", "signal")}}}
+        (home / "config.yaml").write_text(json.dumps(cfg))
+    def suppressed(name):
+        return mode == "managed" or (mode in (True, "null") if name == "a" else not bool(mode))
+    return root, suppressed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["image_file", "video", "document"])
+async def test_slack_upload_failure_owner_scope_keeps_caption_and_result(owners, tmp_path, caplog, kind):
+    from plugins.platforms.slack.adapter import SlackAdapter
+    root, suppressed = owners
+    adapter = SlackAdapter(PlatformConfig())
+    adapter.gateway_runner = GatewayRunner(GatewayConfig(multiplex_profiles=True))
+    attempts, wire = [], []
+    async def upload(**kwargs):
+        attempts.append((get_hermes_home(), kwargs))
+        raise RuntimeError("upload rejected")
+    client = SimpleNamespace(files_upload_v2=upload)
+    adapter._app = SimpleNamespace(client=client)
+    adapter._client_for = lambda chat_id, metadata: client
+    adapter._dm_target = AsyncMock(return_value="C123")
+    async def send(chat_id, content, **kwargs):
+        wire.append((get_hermes_home(), content, kwargs))
+        return SendResult(success=True, message_id="fallback")
+    adapter.send = send
+    path = tmp_path / "media.bin"
+    path.write_bytes(b"local bytes")
+    for name in ("a", "b", "a"):
+        source = adapter.build_source(chat_id="C123", user_id="U123")
+        source.profile = name
+        before = len(attempts)
+        with adapter._media_delivery_scope(source):
+            result = await getattr(adapter, "send_" + kind)("C123", str(path), caption="Warning: requested caption", metadata={"thread_id": "123.456"})
+        assert len(attempts) > before
+        assert all(home == root / "profiles" / name for home, _ in attempts[before:])
+        assert wire[-1][0] == root / "profiles" / name
+        assert wire[-1][2]["metadata"] == {"thread_id": "123.456"}
+        assert ("Couldn't deliver" in wire[-1][1]) is not suppressed(name)
+        assert "Warning: requested caption" in wire[-1][1]
+        assert result.success is not suppressed(name)
+        assert result.message_id == (None if suppressed(name) else "fallback")
+        assert get_hermes_home() == root
+    assert "upload rejected" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_signal_pacing_owner_scope_keeps_acquisition_and_upload(owners, tmp_path, monkeypatch):
+    import gateway.platforms.signal as module
+    root, suppressed = owners
+    adapter = module.SignalAdapter(PlatformConfig())
+    adapter.gateway_runner = GatewayRunner(GatewayConfig(multiplex_profiles=True))
+    scheduler = SimpleNamespace(state=lambda: {}, estimate_wait=lambda n: 120,
+        acquire=AsyncMock(), report_rpc_duration=AsyncMock())
+    monkeypatch.setattr(module, "get_scheduler", lambda: scheduler)
+    adapter._stop_typing_indicator = AsyncMock()
+    path = tmp_path / "image.png"
+    path.write_bytes(b"image")
+    adapter._resolve_image_path = AsyncMock(return_value=(str(path), None, None))
+    adapter._with_target = AsyncMock(side_effect=lambda params, chat: params)
+    uploads, warnings = [], []
+    async def rpc(method, params, **kwargs):
+        uploads.append((get_hermes_home(), params))
+        return {"timestamp": 123}
+    async def send(*args, **kwargs):
+        warnings.append(get_hermes_home())
+        return SendResult(success=True)
+    adapter._rpc, adapter.send = rpc, send
+    for name in ("a", "b", "a"):
+        source = adapter.build_source(chat_id="recipient", user_id="human")
+        source.profile = name
+        before = len(warnings)
+        with adapter._media_delivery_scope(source):
+            result = await adapter.send_multiple_images("recipient", [(path.as_uri(), "caption")])
+        assert result.success
+        assert len(warnings) - before == (0 if suppressed(name) else 1)
+        if not suppressed(name):
+            assert warnings[-1] == root / "profiles" / name
+        assert uploads[-1][0] == root / "profiles" / name
+        assert uploads[-1][1]["attachments"] == [str(path)]
+        assert get_hermes_home() == root
+    assert scheduler.acquire.await_count == 3
+    assert scheduler.report_rpc_duration.await_count == 3
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_native_stream_warning_composition.py ===
+"""Actual warning callback and media producer beside an armed native Slack stream."""
+import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from agent.status_output import StatusOutputMixin
+from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
+from gateway.session import SessionSource
+from gateway.config import Platform
+from tests.gateway.test_slack_native_streaming import _make_adapter, META
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", [None, False, True])
+async def test_warning_and_media_failure_do_not_seal_requested_final(tmp_path, monkeypatch, setting):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    cfg = {} if setting is None else {"display": {"suppress_warning_notifications": setting}}
+    (tmp_path / "config.yaml").write_text(json.dumps(cfg))
+    adapter, client = _make_adapter()
+    first = await adapter.send_draft("D1", 7, "Requested", metadata=META)
+    assert first.success
+    source = SessionSource(platform=Platform.SLACK, chat_id="D1", chat_type="dm", thread_id=META["thread_id"])
+    ctx = TurnContext(source=source, user_config=cfg, _run_still_current=lambda: True,
+        _status_adapter=adapter, _status_chat_id="D1", _status_thread_metadata=dict(META))
+    turn = TurnRunner(SimpleNamespace(), ctx)
+    loop = asyncio.get_running_loop()
+    scheduled = []
+    def schedule(coro, *args):
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        scheduled.append(future)
+        return future
+    turn._schedule = schedule
+    agent = StatusOutputMixin()
+    agent.suppress_status_output = True
+    agent.status_callback = turn._status_callback_sync
+    await asyncio.to_thread(agent._warn_uncompressed_context_overflow, 200, 100)
+    await asyncio.gather(*(asyncio.wrap_future(f) for f in scheduled))
+    assert bool(agent._last_ctx_overflow_warn)
+    assert client.chat_postMessage.await_count == (0 if setting is True else 1)
+    assert client.chat_stopStream.await_count == 0
+    # Actual upload producer; only Slack SDK rejects the local file.
+    client.files_upload_v2 = AsyncMock(side_effect=RuntimeError("fixture upload failure"))
+    adapter._client_for = lambda *args: client
+    adapter._dm_target = AsyncMock(return_value="D1")
+    document = tmp_path / "fixture.pdf"
+    document.write_bytes(b"fixture document")
+    media = await adapter.send_document("D1", str(document), metadata={**META, "_interim_send": True})
+    assert media.success is not (setting is True)  # legacy text fallback receipt
+    assert client.chat_postMessage.await_count == (0 if setting is True else 2)
+    assert client.chat_stopStream.await_count == 0
+    assert "D1" in adapter._active_streams
+    await adapter.send_draft("D1", 7, "Requested final", metadata=META)
+    result = await adapter.send("D1", "Requested final", metadata=META)
+    assert result.success
+    assert client.chat_startStream.await_count == 1
+    assert client.chat_stopStream.await_count == 1
+    assert "D1" not in adapter._active_streams
+    assert client.chat_postMessage.await_count == (0 if setting is True else 2)
+

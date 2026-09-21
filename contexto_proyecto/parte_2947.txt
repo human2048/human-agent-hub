@@ -1,0 +1,288 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_overflow_partial.py ===
+"""Regression coverage for partial Telegram overflow delivery."""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
+from plugins.platforms.telegram.adapter import TelegramAdapter
+from gateway.stream_consumer import GatewayStreamConsumer
+
+
+def _message(message_id: int | str) -> SimpleNamespace:
+    return SimpleNamespace(message_id=message_id)
+
+
+@pytest.fixture
+def telegram_adapter() -> TelegramAdapter:
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    adapter._bot = MagicMock()
+    object.__setattr__(adapter, "MAX_MESSAGE_LENGTH", 160)
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_edit_overflow_split_reports_later_partial_failure_after_some_continuations_land(telegram_adapter):
+    """Partial metadata tracks the last delivered continuation before failure."""
+    content = "word " * 120
+    telegram_adapter._bot.edit_message_text = AsyncMock(return_value=True)
+    telegram_adapter._bot.send_message = AsyncMock(
+        side_effect=[
+            _message(202),
+            RuntimeError("telegram send failed"),
+            RuntimeError("telegram send failed"),
+        ]
+    )
+
+    result = await telegram_adapter._edit_overflow_split(
+        "12345", "201", content, finalize=False, metadata={"thread_id": "77"}
+    )
+
+    assert result.success is False
+    assert result.message_id == "202"
+    assert result.raw_response["partial_overflow"] is True
+    assert result.raw_response["delivered_chunks"] == 2
+    assert result.raw_response["last_message_id"] == "202"
+    assert result.continuation_message_ids == ("202",)
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_pending_update_probe.py ===
+"""TelegramAdapter wedged-getUpdates detection via pending_update_count.
+
+PTB can report ``updater.running == True`` while its long-poll consumer is
+silently stuck (observed on WSL2), so DMs queue in the Bot API and never reach
+handlers (#42909). ``get_me()`` stays healthy (general request path), so the
+CLOSE-WAIT heartbeat is blind to it. ``_probe_pending_updates`` watches
+``get_webhook_info().pending_update_count`` and escalates to the existing
+network-error recovery ladder after two consecutive stuck probes.
+
+The same probe also covers the harsher case where the updater has stopped
+entirely (``running=False``) with no reconnect in flight — the long-poll task
+is gone, so the gateway silently stops receiving messages while the process
+stays alive (#55769) — and feeds it into the same recovery ladder.
+"""
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from gateway.config import PlatformConfig
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+def _make_adapter(*, pending: int) -> TelegramAdapter:
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._webhook_mode = False
+    adapter._app = MagicMock()
+    adapter._app.updater.running = True
+    bot = MagicMock()
+    bot.get_webhook_info = AsyncMock(
+        return_value=MagicMock(pending_update_count=pending)
+    )
+    adapter._app.bot = bot
+    adapter._bot = bot
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_single_stopped_updater_probe_does_not_escalate():
+    """One probe finding a stopped updater only increments the counter (#55769)."""
+    adapter = _make_adapter(pending=9)
+    adapter._app.updater.running = False
+    adapter._polling_pending_stuck_count = 1
+    with patch.object(adapter, "_handle_polling_network_error", new=AsyncMock()) as rec:
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+    # Stopped updater means no live consumer to query for a queue.
+    adapter._app.bot.get_webhook_info.assert_not_called()
+    assert adapter._polling_pending_stuck_count == 0
+    assert adapter._polling_not_running_count == 1
+    rec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_two_stopped_updater_probes_trigger_recovery():
+    """A stopped updater that stays stopped routes into recovery (#55769)."""
+    adapter = _make_adapter(pending=9)
+    adapter._app.updater.running = False
+    recovery = AsyncMock()
+    with patch.object(adapter, "_handle_polling_network_error", new=recovery):
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+        assert adapter._polling_not_running_count == 1
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+        task = adapter._polling_error_task
+        assert task is not None
+        await task
+    recovery.assert_awaited_once()
+    assert adapter._polling_not_running_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_in_flight_skips_stopped_updater_escalation():
+    """A stopped updater during an in-flight reconnect must not re-escalate."""
+    adapter = _make_adapter(pending=9)
+    adapter._app.updater.running = False
+    adapter._polling_not_running_count = 1
+    inflight = MagicMock()
+    inflight.done.return_value = False
+    adapter._polling_error_task = inflight
+    with patch.object(adapter, "_handle_polling_network_error", new=AsyncMock()) as rec:
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+    # The in-flight reconnect owns recovery; the stopped-updater counter resets
+    # so the transient stop()->start_polling() window never trips a re-trigger.
+    assert adapter._polling_not_running_count == 0
+    rec.assert_not_called()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_photo_interrupts.py ===
+from unittest.mock import MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource, build_session_key
+from gateway.run import GatewayRunner
+
+
+class _PendingAdapter:
+    def __init__(self):
+        self._pending_messages = {}
+
+
+def _make_runner():
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+    runner.adapters = {Platform.TELEGRAM: _PendingAdapter()}
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._voice_mode = {}
+    runner._is_user_authorized = lambda _source: True
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_handle_message_does_not_priority_interrupt_photo_followup():
+    runner = _make_runner()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+
+    event = MessageEvent(
+        text="caption",
+        message_type=MessageType.PHOTO,
+        source=source,
+        media_urls=["/tmp/photo-a.jpg"],
+        media_types=["image/jpeg"],
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    running_agent.interrupt.assert_not_called()
+    assert runner.adapters[Platform.TELEGRAM]._pending_messages[session_key] is event
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_polling_health_confirmation.py ===
+"""Regression tests for the Telegram polling health-confirmation log (#90504).
+
+Both reconnect paths end on ``health pending getUpdates progress`` and
+``_record_polling_progress`` used to complete silently, so the log stream for
+"reconnected and healthy" was byte-identical to "reconnected and hung". The
+first confirmed getUpdates round-trip of each generation now emits an INFO
+line, turning the pending line into a resolvable pair whose *absence* after a
+reconnect is a reliable hung-poll signature.
+"""
+
+import asyncio
+import logging
+from gateway.config import Platform  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+def _bare_adapter():
+    a = TelegramAdapter.__new__(TelegramAdapter)
+    a.platform = Platform.TELEGRAM
+    a._fatal_error_code = None
+    a._fatal_error_message = None
+    a._fatal_error_retryable = True
+    a._polling_teardown_started = False
+    a._polling_progress_accepting = True
+    a._polling_generation = 1
+    a._polling_progress_event = asyncio.Event()
+    a._polling_network_error_count = 2
+    a._polling_conflict_count = 3
+    a._polling_conflict_recovery_generation = None
+    a._send_path_degraded = True
+    return a
+
+
+class TestPollingHealthConfirmation:
+    def test_first_progress_emits_confirmed_healthy(self, caplog):
+        a = _bare_adapter()
+        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+            a._record_polling_progress(1)
+        rendered = " | ".join(rec.getMessage() for rec in caplog.records)
+        assert "polling recovered" in rendered
+        assert "generation 1" in rendered
+        assert a._polling_progress_event.is_set()
+
+    def test_subsequent_progress_is_silent(self, caplog):
+        """Only the FIRST round-trip of a generation logs — a quiet evening
+        must not spam one INFO per getUpdates poll."""
+        a = _bare_adapter()
+        a._record_polling_progress(1)  # first — logs
+        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+            a._record_polling_progress(1)  # second — silent
+            a._record_polling_progress(1)  # third — silent
+        assert not [rec for rec in caplog.records if "Telegram polling" in rec.getMessage()]
+
+    def test_clean_bootstrap_stays_confirmed_healthy(self, caplog):
+        """No preceding network errors → no fake "recovered" wording."""
+        a = _bare_adapter()
+        a._polling_network_error_count = 0
+        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+            a._record_polling_progress(1)
+        rendered = " | ".join(rec.getMessage() for rec in caplog.records)
+        assert "confirmed healthy" in rendered
+        assert "recovered" not in rendered
+
+    def test_new_generation_logs_again(self, caplog):
+        """A reconnect starts a new generation with a fresh event; its first
+        progress must re-emit the confirmation so the pending line of THAT
+        reconnect also resolves."""
+        a = _bare_adapter()
+        a._record_polling_progress(1)
+        # reconnect: new generation, event reset, counters possibly nonzero
+        a._polling_generation = 2
+        a._polling_progress_event = asyncio.Event()
+        a._polling_network_error_count = 1
+        a._send_path_degraded = True
+        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+            a._record_polling_progress(2)
+        rendered = " | ".join(rec.getMessage() for rec in caplog.records)
+        assert "polling recovered" in rendered
+        assert "generation 2" in rendered
+
+    def test_stale_generation_progress_stays_silent(self, caplog):
+        """Progress from an abandoned generation must neither log nor set the
+        current event (pre-existing guard, pinned here because the log line
+        must inherit the same generation-scoping)."""
+        a = _bare_adapter()
+        a._polling_generation = 2
+        a._polling_progress_event = asyncio.Event()
+        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+            a._record_polling_progress(1)
+        assert not [rec for rec in caplog.records if rec.levelno == logging.INFO]
+        assert not a._polling_progress_event.is_set()
+

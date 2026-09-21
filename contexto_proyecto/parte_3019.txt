@@ -1,0 +1,386 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_yuanbao_reconnect_set_active.py ===
+"""test_yuanbao_reconnect_set_active.py - Verify _do_reconnect restores the active singleton.
+
+Regression test for #58363: after a WS disconnect/reconnect cycle,
+``YuanbaoAdapter.get_active()`` must return the live adapter (not ``None``).
+The original ``_do_reconnect()`` succeeded but never called
+``YuanbaoAdapter.set_active()``, leaving the singleton permanently
+``None`` until a full gateway restart.
+"""
+
+import sys
+import os
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import pytest
+from gateway.platforms.yuanbao import (
+    YuanbaoAdapter,
+    ConnectionManager,
+)
+
+
+def _make_adapter(**kwargs):
+    """Create a minimal YuanbaoAdapter mock."""
+    adapter = MagicMock(spec=YuanbaoAdapter)
+    adapter.name = "yuanbao"
+    adapter._app_key = "test_key"
+    adapter._app_secret = "test_secret"
+    adapter._api_domain = "https://test.example.com"
+    adapter._route_env = None
+    adapter._bot_id = "test_bot"
+    adapter._ws_url = "wss://test.example.com/ws"
+    adapter._mark_connected = MagicMock()
+    adapter._mark_disconnected = MagicMock()
+    adapter._release_platform_lock = MagicMock()
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_do_reconnect_calls_set_active_on_success():
+    """After a successful reconnect, set_active(adapter) must be called."""
+    adapter = _make_adapter()
+    cm = ConnectionManager(adapter)
+
+    # Mock the reconnect internals to succeed on first attempt
+    mock_ws = AsyncMock()
+    mock_ws.close = AsyncMock()
+
+    with (
+        patch.object(cm, "_cleanup_ws", new_callable=AsyncMock) as mock_cleanup,
+        patch(
+            "gateway.platforms.yuanbao.SignManager.force_refresh",
+            new_callable=AsyncMock,
+            return_value={"bot_id": "test_bot", "token": "test_token"},
+        ),
+        patch("gateway.platforms.yuanbao.websockets.connect", new_callable=AsyncMock, return_value=mock_ws),
+        patch.object(cm, "_authenticate", new_callable=AsyncMock, return_value=True),
+        patch.object(cm, "_heartbeat_loop", new_callable=AsyncMock),
+        patch.object(cm, "_receive_loop", new_callable=AsyncMock),
+        patch("gateway.platforms.yuanbao.MAX_RECONNECT_ATTEMPTS", 1),
+    ):
+        # Clear any existing active instance
+        YuanbaoAdapter.set_active(None)
+        assert YuanbaoAdapter.get_active() is None
+
+        # Run reconnect
+        result = await cm._do_reconnect()
+
+        # Reconnect should succeed
+        assert result is True
+
+        # After successful reconnect, get_active() must return the adapter
+        assert YuanbaoAdapter.get_active() is adapter
+
+
+@pytest.mark.asyncio
+async def test_do_reconnect_does_not_set_active_on_failure():
+    """When all reconnect attempts fail, set_active should NOT be called."""
+    adapter = _make_adapter()
+    cm = ConnectionManager(adapter)
+
+    with (
+        patch.object(cm, "_cleanup_ws", new_callable=AsyncMock),
+        patch(
+            "gateway.platforms.yuanbao.SignManager.force_refresh",
+            new_callable=AsyncMock,
+            side_effect=Exception("auth failed"),
+        ),
+        patch("gateway.platforms.yuanbao.MAX_RECONNECT_ATTEMPTS", 1),
+    ):
+        # Clear any existing active instance
+        YuanbaoAdapter.set_active(None)
+        assert YuanbaoAdapter.get_active() is None
+
+        # Run reconnect - should fail
+        result = await cm._do_reconnect()
+
+        # Reconnect should fail
+        assert result is False
+
+        # get_active() should still be None
+        assert YuanbaoAdapter.get_active() is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_yuanbao_secret_scope.py ===
+"""Yuanbao authorization-scope regression tests (#93522).
+
+``dm_policy``/``group_policy``/allowlist reads and the ``AccessPolicy``
+allow-all opt-in must honor the active profile secret scope under
+multiplexing: a secondary profile's own scope is authoritative and must
+not inherit the default profile's process-env authorization config.
+"""
+
+import pytest
+
+from agent import secret_scope
+from gateway.config import PlatformConfig
+from gateway.platforms.yuanbao import AccessPolicy, YuanbaoAdapter
+
+
+@pytest.fixture()
+def multiplex_on():
+    previous = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        yield
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+
+class TestYuanbaoAdapterAuthzScope:
+    def test_scoped_construction_reads_authz_from_scope_not_environ(self, multiplex_on, monkeypatch):
+        monkeypatch.setenv("YUANBAO_DM_POLICY", "pairing")
+        monkeypatch.setenv("YUANBAO_DM_ALLOW_FROM", "default-user")
+        token = secret_scope.set_secret_scope(
+            {"YUANBAO_DM_POLICY": "allowlist", "YUANBAO_DM_ALLOW_FROM": "scoped-user"}
+        )
+        try:
+            adapter = YuanbaoAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._access_policy._dm_policy == "allowlist"
+        assert adapter._access_policy._allow_from == ["scoped-user"]
+
+    def test_scoped_miss_does_not_admit_default_profiles_allowlist(self, multiplex_on, monkeypatch):
+        monkeypatch.setenv("YUANBAO_DM_POLICY", "allowlist")
+        monkeypatch.setenv("YUANBAO_DM_ALLOW_FROM", "default-user")
+        token = secret_scope.set_secret_scope({"SOMETHING_ELSE": "x"})
+        try:
+            adapter = YuanbaoAdapter(PlatformConfig(enabled=True))
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert adapter._access_policy._dm_policy == "pairing"
+        assert adapter._access_policy._allow_from == []
+
+
+class TestYuanbaoAccessPolicyOpenDmOptIn:
+    def test_scoped_allow_all_admits(self, multiplex_on, monkeypatch):
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("YUANBAO_ALLOW_ALL_USERS", raising=False)
+        policy = AccessPolicy(dm_policy="open", dm_allow_from=[], group_policy="pairing", group_allow_from=[])
+        token = secret_scope.set_secret_scope({"YUANBAO_ALLOW_ALL_USERS": "true"})
+        try:
+            assert policy._open_dm_opted_in() is True
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    def test_default_profiles_allow_all_does_not_leak_into_scoped_miss(self, multiplex_on, monkeypatch):
+        """The default profile's env-only GATEWAY_ALLOW_ALL_USERS must not
+        admit a secondary profile that never opted in."""
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        policy = AccessPolicy(dm_policy="open", dm_allow_from=[], group_policy="pairing", group_allow_from=[])
+        token = secret_scope.set_secret_scope({"SOMETHING_ELSE": "x"})
+        try:
+            assert policy._open_dm_opted_in() is False
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_yuanbao_shutdown.py ===
+"""test_yuanbao_shutdown.py - Yuanbao adapter shutdown teardown timing.
+
+Regression coverage for #40383: a non-responsive Yuanbao WS server must not
+stall gateway shutdown. ``websockets`` ``ws.close()`` blocks up to the
+connection's ``close_timeout`` (5s) waiting for the server's close-frame echo;
+on an idle shutdown the server never replies, so ``_cleanup_ws`` used to wait
+the full ~5s. The cleanup path now bounds the close await so a hung server
+cannot stall teardown.
+
+These tests assert the *bounding/timing* contract of ``_cleanup_ws`` using
+lightweight fakes; force-closing the underlying TCP transport on cancellation
+is ``websockets``' responsibility (and harmless at shutdown, where the loop is
+tearing down regardless), so it is intentionally out of scope here.
+"""
+
+import sys
+import os
+import asyncio
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import pytest
+from gateway.config import PlatformConfig
+from gateway.platforms.yuanbao import (
+    YuanbaoAdapter,
+    ConnectionManager,
+    WS_CLOSE_TIMEOUT_S,
+)
+
+
+def make_config(**kwargs):
+    extra = kwargs.pop("extra", {})
+    extra.setdefault("app_id", "test_key")
+    extra.setdefault("app_secret", "test_secret")
+    extra.setdefault("ws_url", "wss://test.example.com/ws")
+    extra.setdefault("api_domain", "https://test.example.com")
+    return PlatformConfig(extra=extra, **kwargs)
+
+
+class _HangingWS:
+    """Fake WS whose close() never gets a server echo — sleeps past the bound."""
+
+    def __init__(self, sleep_s: float):
+        self._sleep_s = sleep_s
+        self.close_called = False
+
+    async def close(self):
+        self.close_called = True
+        await asyncio.sleep(self._sleep_s)
+
+
+class _FastWS:
+    """Fake WS whose close() returns promptly (responsive server)."""
+
+    def __init__(self):
+        self.close_called = False
+
+    async def close(self):
+        self.close_called = True
+
+
+class _RaisingWS:
+    async def close(self):
+        raise RuntimeError("connection already reset")
+
+
+def _connection() -> ConnectionManager:
+    return YuanbaoAdapter(make_config())._connection
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ws_does_not_stall_on_hung_server():
+    """A server that never echoes the close frame must not stall teardown."""
+    cm = _connection()
+    hung = _HangingWS(sleep_s=WS_CLOSE_TIMEOUT_S + 4.0)
+    cm._ws = hung
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await cm._cleanup_ws()
+    elapsed = loop.time() - start
+
+    assert hung.close_called
+    assert cm._ws is None
+    # Bounded by WS_CLOSE_TIMEOUT_S (+ small scheduling slack), not the 5s
+    # close_timeout the server would otherwise hold us to.
+    assert elapsed < WS_CLOSE_TIMEOUT_S + 1.0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ws_fast_path_returns_immediately():
+    """A responsive server completes the handshake well under the bound."""
+    cm = _connection()
+    fast = _FastWS()
+    cm._ws = fast
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await cm._cleanup_ws()
+    elapsed = loop.time() - start
+
+    assert fast.close_called
+    assert cm._ws is None
+    assert elapsed < 1.0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ws_swallows_close_errors():
+    """A close() that raises must still clear the ws reference."""
+    cm = _connection()
+    cm._ws = _RaisingWS()
+
+    await cm._cleanup_ws()
+
+    assert cm._ws is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\_plugin_adapter_loader.py ===
+"""Shared helper for loading platform-plugin ``adapter.py`` modules in tests.
+
+Every platform plugin under ``plugins/platforms/<name>/`` ships its own
+``adapter.py``. If two tests independently do::
+
+    sys.path.insert(0, "plugins/platforms/irc")
+    from adapter import IRCAdapter
+
+    sys.path.insert(0, "plugins/platforms/teams")
+    from adapter import TeamsAdapter
+
+…then whichever collects first in an xdist worker wins
+``sys.modules["adapter"]``, and the other raises ``ImportError`` at
+collection time. The fallout cascades across unrelated tests sharing that
+worker because ``sys.path`` is still polluted.
+
+Use :func:`load_plugin_adapter` instead of ad-hoc ``sys.path`` tricks.
+It loads the adapter from an explicit file path under a unique module
+name (``plugin_adapter_<plugin_name>``), so it cannot collide with any
+other plugin's adapter module.
+
+The ``tests/gateway/conftest.py`` guard rejects the anti-pattern at
+collection time so this can't regress when new plugin adapter tests are
+added.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_PLUGINS_DIR = _REPO_ROOT / "plugins" / "platforms"
+
+
+def load_plugin_adapter(plugin_name: str) -> ModuleType:
+    """Import ``plugins/platforms/<plugin_name>/adapter.py`` in isolation.
+
+    The module is registered under the unique name
+    ``plugin_adapter_<plugin_name>`` in ``sys.modules``. No ``sys.path``
+    mutation. Safe to call multiple times — repeat calls return the
+    already-loaded module.
+    """
+    module_name = f"plugin_adapter_{plugin_name}"
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        return cached
+
+    adapter_path = _PLUGINS_DIR / plugin_name / "adapter.py"
+    if not adapter_path.is_file():
+        raise FileNotFoundError(
+            f"Plugin adapter not found: {adapter_path}. "
+            f"Known plugins: {sorted(p.name for p in _PLUGINS_DIR.iterdir() if p.is_dir())}"
+        )
+
+    spec = importlib.util.spec_from_file_location(module_name, adapter_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not build import spec for {adapter_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec so the module can find itself if needed (some
+    # modules do ``sys.modules[__name__]`` reflection during import).
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\__init__.py ===
+

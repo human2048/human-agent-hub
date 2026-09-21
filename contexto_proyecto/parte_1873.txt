@@ -1,0 +1,377 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_client_proxy_env.py ===
+"""Regression guard: auxiliary OpenAI clients must use env-only proxy policy.
+
+On macOS, httpx with default ``trust_env=True`` reads system proxy settings
+via ``urllib.request.getproxies()`` but not the macOS proxy exception list.
+Auxiliary clients (vision, title generation, etc.) must mirror the main
+agent: explicit ``HTTPS_PROXY`` / ``NO_PROXY`` env vars only, via a custom
+keepalive transport that suppresses automatic system-proxy detection.
+"""
+from unittest.mock import patch
+
+import httpx
+
+from agent.auxiliary_client import _create_openai_client, _openai_http_client_kwargs
+from agent.process_bootstrap import _get_proxy_for_base_url
+
+
+def _pool_types(http_client) -> list:
+    return [
+        type(mount._pool).__name__
+        for mount in http_client._mounts.values()
+        if mount is not None and hasattr(mount, "_pool")
+    ]
+
+
+@patch("agent.auxiliary_client.OpenAI")
+def test_create_openai_client_routes_via_env_proxy(mock_openai, monkeypatch):
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+
+    _create_openai_client(
+        api_key="test-key",
+        base_url="https://litellm.internal.example.com/v1",
+    )
+
+    http_client = mock_openai.call_args.kwargs.get("http_client")
+    assert isinstance(http_client, httpx.Client)
+    assert "HTTPProxy" in _pool_types(http_client)
+    http_client.close()
+
+
+
+
+
+
+def test_get_proxy_for_base_url_respects_no_proxy(monkeypatch):
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("NO_PROXY", "internal.example.com")
+
+    assert _get_proxy_for_base_url("https://litellm.internal.example.com/v1") is None
+    assert _get_proxy_for_base_url("https://api.openai.com/v1") == "http://127.0.0.1:7897"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_client_resolve_dedup.py ===
+"""Tests for resolve_provider_client fall-through log dedup (salvage #56283).
+
+Both fall-through branches (unknown provider, unhandled auth_type) were demoted
+from ``logger.warning`` to ``logger.debug`` with per-process dedup: the first
+occurrence surfaces for diagnostics; identical repeats are suppressed for the
+lifetime of the process so a retry loop can't spam the logs.
+"""
+
+import logging
+
+import agent.auxiliary_client as ac
+from agent.auxiliary_client import resolve_provider_client
+
+
+class TestUnknownProviderDedup:
+    def setup_method(self):
+        ac._LOGGED_UNKNOWN_PROVIDER_KEYS.clear()
+
+    def test_unknown_provider_logs_debug_once_not_warning(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            client, model = resolve_provider_client("no_such_provider_xyz", "")
+        assert (client, model) == (None, None)
+        recs = [
+            r for r in caplog.records
+            if "unknown provider" in r.getMessage()
+        ]
+        # Exactly one record, and it is DEBUG (never WARNING).
+        assert len(recs) == 1
+        assert recs[0].levelno == logging.DEBUG
+        assert not any(r.levelno >= logging.WARNING for r in recs)
+
+    def test_unknown_provider_repeat_is_suppressed(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            resolve_provider_client("no_such_provider_xyz", "")
+            resolve_provider_client("no_such_provider_xyz", "")
+            resolve_provider_client("no_such_provider_xyz", "")
+        recs = [
+            r for r in caplog.records
+            if "unknown provider" in r.getMessage()
+        ]
+        # Three calls, one log line — dedup suppressed the repeats.
+        assert len(recs) == 1
+
+    def test_distinct_unknown_providers_each_log_once(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            resolve_provider_client("bogus_a", "")
+            resolve_provider_client("bogus_b", "")
+        recs = [
+            r for r in caplog.records
+            if "unknown provider" in r.getMessage()
+        ]
+        assert len(recs) == 2
+
+
+class TestUnhandledAuthTypeDedup:
+    def setup_method(self):
+        ac._LOGGED_UNHANDLED_AUTHTYPE_KEYS.clear()
+
+    def test_unhandled_auth_type_logs_debug_once_not_warning(self, caplog, monkeypatch):
+        import hermes_cli.auth as auth
+        from hermes_cli.auth import ProviderConfig
+
+        # A registered provider whose auth_type matches no handled branch →
+        # the terminal "unhandled auth_type" fall-through.
+        bogus = ProviderConfig(
+            id="bogus_authtype",
+            name="Bogus",
+            auth_type="totally_unhandled_scheme",
+        )
+        patched = dict(auth.PROVIDER_REGISTRY)
+        patched["bogus_authtype"] = bogus
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", patched)
+
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            client, model = resolve_provider_client("bogus_authtype", "")
+            resolve_provider_client("bogus_authtype", "")  # repeat → suppressed
+
+        assert (client, model) == (None, None)
+        recs = [
+            r for r in caplog.records
+            if "unhandled auth_type" in r.getMessage()
+        ]
+        # Two calls, one DEBUG record, never WARNING.
+        assert len(recs) == 1
+        assert recs[0].levelno == logging.DEBUG
+        assert not any(r.levelno >= logging.WARNING for r in recs)
+
+
+class TestUnsupportedOAuthDedup:
+    def setup_method(self):
+        ac._LOGGED_UNSUPPORTED_OAUTH_KEYS.clear()
+
+    def test_unsupported_oauth_provider_logs_debug_once(self, caplog, monkeypatch):
+        import hermes_cli.auth as auth
+        from hermes_cli.auth import ProviderConfig
+
+        # A registered oauth_* provider that is not one of the directly-handled
+        # names (nous / openai-codex / xai-oauth) → the OAuth dead-end branch.
+        bogus = ProviderConfig(
+            id="bogus_oauth",
+            name="BogusOAuth",
+            auth_type="oauth_device_code",
+        )
+        patched = dict(auth.PROVIDER_REGISTRY)
+        patched["bogus_oauth"] = bogus
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", patched)
+
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            resolve_provider_client("bogus_oauth", "")
+            resolve_provider_client("bogus_oauth", "")
+
+        recs = [
+            r for r in caplog.records
+            if "OAuth provider" in r.getMessage() and "not " in r.getMessage()
+        ]
+        assert len(recs) == 1
+        assert recs[0].levelno == logging.DEBUG
+        assert not any(r.levelno >= logging.WARNING for r in recs)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_client_ssl_verify.py ===
+"""Regression: auxiliary-client keepalive httpx client must honor custom CA bundles.
+
+The main OpenAI client resolves per-provider ``ssl_ca_cert`` / ``ssl_verify`` and
+``HERMES_CA_BUNDLE`` via ``agent.ssl_verify.resolve_httpx_verify``. Auxiliary calls
+(compression, vision, web_extract, title generation, session_search) build their own
+keepalive client through ``agent.process_bootstrap.build_keepalive_http_client`` and must
+apply the same TLS settings — otherwise an HTTPS custom_providers endpoint signed by a
+private CA works for chat but fails ``APIConnectionError`` on every auxiliary task.
+"""
+
+import ssl
+
+import certifi
+import httpx
+import pytest
+
+from agent.process_bootstrap import build_keepalive_http_client
+
+_CA_ENV_VARS = ("HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY")
+
+
+@pytest.fixture
+def clean_tls_env(monkeypatch):
+    for var in _CA_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_build_keepalive_http_client_forwards_verify_context(clean_tls_env):
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    client = build_keepalive_http_client("https://ollama.example.com/v1", verify=ctx)
+    assert isinstance(client, httpx.Client)
+    assert client._transport._pool._ssl_context is ctx
+
+
+
+
+
+
+
+
+def test_resolve_aux_verify_ssl_verify_false(clean_tls_env, monkeypatch):
+    import hermes_cli.config as cfg
+    import hermes_cli.config_providers as config_providers
+    from agent import auxiliary_client
+
+    monkeypatch.setattr(
+        cfg,
+        "get_custom_provider_tls_settings",
+        lambda *a, **k: {"ssl_verify": False},
+    )
+    monkeypatch.setattr(
+        config_providers,
+        "get_custom_provider_tls_settings",
+        lambda *a, **k: {"ssl_verify": False},
+    )
+    assert auxiliary_client._resolve_aux_verify("https://ollama.example.com/v1") is False
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_auxiliary_client_xai_oauth_recovery.py ===
+"""Tests for xAI OAuth 403 error recovery in auxiliary_client.
+
+xAI returns HTTP 403 (not 401) with "unauthenticated:bad-credentials" when
+an OAuth2 access token has expired.  These tests verify the three fixes:
+
+1. _is_auth_error detects xAI 403 as an auth failure
+2. _recoverable_pool_provider maps api.x.ai to xai-oauth
+3. _refresh_provider_credentials includes xai-oauth refresh logic
+"""
+
+import pytest
+
+
+# ── _is_auth_error ──────────────────────────────────────────────────────────
+
+def _import_is_auth_error():
+    from agent.auxiliary_client import _is_auth_error
+    return _is_auth_error
+
+
+class TestIsAuthErrorXaiOauth403:
+    """Verify _is_auth_error correctly identifies xAI's 403 bad-credentials."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        self.is_auth_error = _import_is_auth_error()
+
+    def test_xai_403_bad_credentials_is_auth_error(self):
+        """The exact error xAI returns for expired OAuth tokens."""
+        exc = Exception(
+            "Error code: 403 - {'code': 'The caller does not have permission "
+            "to execute the specified operation', 'error': 'The OAuth2 access "
+            "token could not be validated. [WKE=unauthenticated:bad-credentials]'}"
+        )
+        exc.status_code = 403  # openai.PermissionDenied sets this
+        assert self.is_auth_error(exc) is True
+
+    def test_xai_403_bad_credentials_without_status_code(self):
+        """Fallback match when status_code attribute is missing."""
+        exc = Exception(
+            "Error code: 403 - unauthenticated:bad-credentials"
+        )
+        # No status_code attribute — should still match via string pattern
+        assert self.is_auth_error(exc) is True
+
+    def test_generic_403_is_not_auth_error(self):
+        """A generic 403 (e.g. rate limit, forbidden) should NOT be treated as auth."""
+        exc = Exception("Error code: 403 - rate limit exceeded")
+        exc.status_code = 403
+        assert self.is_auth_error(exc) is False
+
+
+
+
+
+
+    def test_unauthenticated_without_bad_credentials_is_not_auth_error(self):
+        """'unauthenticated' alone (without 'bad-credentials') should not match."""
+        exc = Exception("unauthenticated request")
+        assert self.is_auth_error(exc) is False
+
+
+# ── _recoverable_pool_provider ──────────────────────────────────────────────
+
+def _import_recoverable_pool_provider():
+    from agent.auxiliary_client import _recoverable_pool_provider
+    return _recoverable_pool_provider
+
+
+class TestRecoverablePoolProviderXaiOAuth:
+    """Verify _recoverable_pool_provider maps api.x.ai to xai-oauth."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        self.recover = _import_recoverable_pool_provider()
+
+    def test_explicit_xai_oauth_provider(self):
+        """Explicit provider name passes through."""
+        result = self.recover("xai-oauth", None)
+        assert result == "xai-oauth"
+
+    def test_api_x_ai_host_match(self):
+        """api.x.ai base URL maps to xai-oauth pool."""
+        class MockClient:
+            base_url = "https://api.x.ai/v1/"
+
+        result = self.recover("auto", MockClient())
+        assert result == "xai-oauth"
+
+    def test_auto_with_unknown_host_returns_none(self):
+        """auto provider with unknown host returns None."""
+        class MockClient:
+            base_url = "https://unknown.example.com/v1/"
+
+        result = self.recover("auto", MockClient())
+        assert result is None
+
+
+# ── _refresh_provider_credentials (structure check) ─────────────────────────
+
+def _import_refresh_provider_credentials():
+    from agent.auxiliary_client import _refresh_provider_credentials
+    return _refresh_provider_credentials
+
+
+class TestRefreshProviderCredentialsXaiOAuth:
+    """Verify _refresh_provider_credentials has xai-oauth branch.
+
+    Full integration testing requires live OAuth tokens, so we verify
+    the branch exists and handles the no-credential case gracefully.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        self.refresh = _import_refresh_provider_credentials()
+
+    def test_xai_oauth_no_pool_returns_false(self):
+        """When no xai-oauth pool exists, refresh returns False gracefully."""
+        # This tests that the branch exists and doesn't crash.
+        # It may return True if the singleton resolver finds tokens,
+        # or False if neither pool nor singleton has credentials.
+        # Either way, it should not raise an exception.
+        result = self.refresh("xai-oauth")
+        assert isinstance(result, bool)
+
+    def test_unknown_provider_returns_false(self):
+        """Unknown providers fall through to return False."""
+        result = self.refresh("unknown-provider-xyz")
+        assert result is False

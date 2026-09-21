@@ -1,0 +1,255 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_xai_oauth_profile_auth.py ===
+"""Regression tests for xAI OAuth auth resolution in profile/cron contexts."""
+
+import pytest
+
+from hermes_cli import auth
+from hermes_cli.auth import AuthError
+
+
+def test_read_xai_oauth_tokens_uses_credential_pool_when_provider_tokens_empty(monkeypatch):
+    """Profile auth can have fresh pool tokens while singleton provider state is empty.
+
+    This mirrors profiled cron after re-auth/credential-pool sync: the xAI
+    OAuth credential is usable, but `providers.xai-oauth.tokens` may be empty
+    or stale. Treating that as missing auth makes cron keep failing after the
+    user has successfully re-authenticated.
+    """
+    store = {
+        "providers": {"xai-oauth": {"tokens": {}, "last_auth_error": {}}},
+        "credential_pool": {
+            "xai-oauth": [
+                {
+                    "access_token": "pool-access",
+                    "refresh_token": "pool-refresh",
+                    "token_type": "Bearer",
+                    "last_refresh": "2026-06-03T19:00:00Z",
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(auth, "_load_auth_store", lambda: store)
+
+    resolved = auth._read_xai_oauth_tokens(_lock=False)
+
+    assert resolved["tokens"]["access_token"] == "pool-access"
+    assert resolved["tokens"]["refresh_token"] == "pool-refresh"
+    assert resolved["tokens"]["token_type"] == "Bearer"
+    assert resolved["last_refresh"] == "2026-06-03T19:00:00Z"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_xai_oauth_refresh.py ===
+from __future__ import annotations
+
+import base64
+import json
+import time
+
+from hermes_cli import auth
+
+
+def _jwt_with_exp(exp: int) -> str:
+    header = (
+        base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode())
+        .decode()
+        .rstrip("=")
+    )
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode())
+        .decode()
+        .rstrip("=")
+    )
+    return f"{header}.{payload}.sig"
+
+
+def test_xai_oauth_refresh_skew_is_one_hour() -> None:
+    assert auth.XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS == 3600
+
+
+def test_xai_oauth_token_expiring_uses_one_hour_skew() -> None:
+    token = _jwt_with_exp(int(time.time()) + 30 * 60)
+
+    assert auth._xai_access_token_is_expiring(
+        token,
+        auth.XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    )
+
+
+def test_xai_proactive_refresh_skew_short_lived_token() -> None:
+    token = _jwt_with_exp(int(time.time()) + 15 * 60)
+    skew = auth._xai_proactive_refresh_skew_seconds(token)
+
+    assert skew == 120
+    assert not auth._xai_access_token_is_expiring(token, skew)
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_xai_provider_labels.py ===
+"""Regression tests for xAI provider label disambiguation."""
+
+from hermes_cli.models import provider_label
+from hermes_cli.providers import get_label
+
+
+def test_xai_oauth_provider_label_is_not_collapsed_to_api_key_label():
+    """The model picker must distinguish xAI API-key and OAuth providers."""
+    assert get_label("xai") == "xAI"
+    assert get_label("xai-oauth") == "xAI Grok OAuth (SuperGrok / Premium+)"
+    assert get_label("grok-oauth") == "xAI Grok OAuth (SuperGrok / Premium+)"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_xai_retirement.py ===
+"""Unit tests for hermes_cli.xai_retirement (May 15, 2026 model retirement)."""
+from __future__ import annotations
+
+
+from hermes_cli.xai_retirement import (
+    MIGRATION_GUIDE_URL,
+    RETIREMENT_DATE,
+    RetirementIssue,
+    _RETIRED_MODELS,
+    _looks_like_xai,
+    _normalize,
+    find_retired_xai_refs,
+    format_issue,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _paths(issues):
+    return [i.config_path for i in issues]
+
+
+# ---------------------------------------------------------------------------
+# _normalize / _looks_like_xai
+# ---------------------------------------------------------------------------
+
+class TestNormalize:
+    def test_strips_x_ai_prefix(self):
+        assert _normalize("x-ai/grok-4") == "grok-4"
+
+
+class TestLooksLikeXai:
+
+    def test_non_grok_returns_false(self):
+        assert not _looks_like_xai("gpt-4")
+        assert not _looks_like_xai("claude-sonnet-4-6")
+        assert not _looks_like_xai("openrouter/openai/gpt-4")
+
+
+# ---------------------------------------------------------------------------
+# find_retired_xai_refs — config scanning
+# ---------------------------------------------------------------------------
+
+class TestFindRetiredEdgeCases:
+    def test_empty_config_no_issues(self):
+        assert find_retired_xai_refs({}) == []
+
+    def test_non_dict_config_returns_empty(self):
+        assert find_retired_xai_refs(None) == []  # type: ignore[arg-type]
+        assert find_retired_xai_refs("nope") == []  # type: ignore[arg-type]
+
+    def test_no_xai_models_no_issues(self):
+        cfg = {
+            "principal": {"provider": "openai", "model": "gpt-4o"},
+            "auxiliary": {"vision": {"model": "claude-sonnet-4-6"}},
+            "delegation": {"model": "openai/o3"},
+        }
+        assert find_retired_xai_refs(cfg) == []
+
+
+class TestFindRetiredPerSlot:
+    def test_principal_retired(self):
+        cfg = {"principal": {"model": "grok-code-fast-1"}}
+        issues = find_retired_xai_refs(cfg)
+        assert len(issues) == 1
+        assert issues[0].config_path == "principal.model"
+        assert issues[0].current_model == "grok-code-fast-1"
+        assert issues[0].replacement == "grok-4.3"
+        assert issues[0].reasoning_effort is None
+
+
+# ---------------------------------------------------------------------------
+# Migration semantics
+# ---------------------------------------------------------------------------
+
+class TestMigrationSemantics:
+
+
+    def test_imagine_pro_maps_to_imagine_quality(self):
+        cfg = {"plugins": {"image_gen": {"xai": {"model": "grok-imagine-image-pro"}}}}
+        issue = find_retired_xai_refs(cfg)[0]
+        assert issue.replacement == "grok-imagine-image-quality"
+
+    def test_all_retired_have_replacement(self):
+        for name, entry in _RETIRED_MODELS.items():
+            assert entry.get("replacement"), f"{name} has no replacement"
+
+
+# ---------------------------------------------------------------------------
+# format_issue
+# ---------------------------------------------------------------------------
+
+class TestFormatIssue:
+    def test_basic_format(self):
+        issue = RetirementIssue(
+            config_path="principal.model",
+            current_model="grok-3",
+            replacement="grok-4.3",
+        )
+        s = format_issue(issue)
+        assert "principal.model" in s
+        assert "'grok-3'" in s
+        assert "'grok-4.3'" in s
+
+
+    def test_includes_note_when_set(self):
+        issue = RetirementIssue(
+            config_path="principal.model",
+            current_model="grok-3",
+            replacement="grok-4.3",
+            note="ambiguous variant",
+        )
+        s = format_issue(issue)
+        assert "[note: ambiguous variant]" in s
+
+
+# ---------------------------------------------------------------------------
+# Module-level constants sanity
+# ---------------------------------------------------------------------------
+
+class TestModuleConstants:
+    def test_retirement_date_is_may_15(self):
+        assert "May 15, 2026" == RETIREMENT_DATE
+
+    def test_migration_guide_url_points_to_xai(self):
+        assert MIGRATION_GUIDE_URL.startswith("https://docs.x.ai/")
+        assert "may-15" in MIGRATION_GUIDE_URL.lower()
+
+    def test_retired_models_keyset_matches_doc(self):
+        # Snapshot test: if xAI's list changes we want CI to flag it.
+        expected = {
+            "grok-4-0709",
+            "grok-4-fast-reasoning",
+            "grok-4-fast-non-reasoning",
+            "grok-4-1-fast-reasoning",
+            "grok-4-1-fast-non-reasoning",
+            "grok-code-fast-1",
+            "grok-3",
+            "grok-imagine-image-pro",
+        }
+        assert set(_RETIRED_MODELS.keys()) == expected
+

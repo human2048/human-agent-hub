@@ -1,0 +1,356 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_context_engine_host_contract.py ===
+"""Regressions for the context-engine host contract.
+
+These tests pin the five generic host-side guarantees that external context
+engine plugins (e.g. hermes-lcm) rely on:
+
+1. ``_transition_context_engine_session`` drives the full lifecycle
+   (on_session_end → on_session_reset → on_session_start → optional
+   carry_over_new_session_context) and ``reset_session_state`` delegates
+   to it when callers pass session metadata.
+
+2. ``on_session_start`` receives ``conversation_id`` derived from
+   ``_gateway_session_key`` at agent init time.
+
+3. ``conversation_loop`` forwards canonical cache buckets
+   (``cache_read_tokens``, ``cache_write_tokens``, ``input_tokens``,
+   ``output_tokens``, ``reasoning_tokens``) to the engine's
+   ``update_from_response``, on top of the legacy aggregate keys.
+
+4. ``_discover_context_engines`` includes plugin-registered engines (not
+   just repo-shipped engines under ``plugins/context_engine/``).
+
+5. The repo-shipped ``_EngineCollector`` honors ``ctx.register_command``
+   from a plugin engine's ``register(ctx)`` entry point and routes it
+   to the global plugin command registry.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from agent.context_compressor import ContextCompressor
+from hermes_state import SessionDB
+from run_agent import AIAgent
+
+
+def _bare_agent() -> AIAgent:
+    agent = object.__new__(AIAgent)
+    agent.session_id = "test-session"
+    agent.model = "fake-model"
+    agent.platform = "telegram"
+    agent._gateway_session_key = "agent:main:telegram:dm:42"
+    return agent
+
+
+
+
+
+
+def test_transition_skips_optional_hooks_when_engine_lacks_them():
+    """Engines that don't implement on_session_end/carry_over still work."""
+    class MinimalEngine:
+        def __init__(self):
+            self.context_length = 100_000
+            self.reset_called = False
+            self.start_called_with = None
+
+        def on_session_reset(self):
+            self.reset_called = True
+
+        def on_session_start(self, sid, **kw):
+            self.start_called_with = (sid, kw)
+
+    engine = MinimalEngine()
+    agent = _bare_agent()
+    agent.context_compressor = engine
+
+    # Should not raise even though on_session_end / carry_over are missing.
+    agent._transition_context_engine_session(
+        old_session_id="old",
+        new_session_id="new",
+        previous_messages=[{"role": "user", "content": "hi"}],
+        carry_over_context=True,
+    )
+
+    assert engine.reset_called is True
+    assert engine.start_called_with is not None
+    new_sid, kw = engine.start_called_with
+    assert new_sid == "new"
+    assert kw.get("old_session_id") == "old"
+
+
+
+
+
+
+def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp_path, monkeypatch):
+    """Reset-only session switches must rebind durable cooldown state to the new session."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("old-sid", source="cli")
+    db.create_session("new-sid", source="cli")
+    db.record_compression_failure_cooldown("old-sid", 4_000_000_000.0, "old-timeout")
+    db.set_compression_fallback_streak("old-sid", 2)
+
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        lambda *_a, **_k: 100_000,
+    )
+    compressor = ContextCompressor(
+        model="fake-model",
+        threshold_percent=0.85,
+        protect_first_n=2,
+        protect_last_n=2,
+        quiet_mode=True,
+    )
+    compressor.bind_session_state(db, "old-sid")
+
+    agent = _bare_agent()
+    agent._session_db = db
+    agent.context_compressor = compressor
+    agent.session_id = "new-sid"
+
+    agent.reset_session_state()
+
+    assert compressor._session_id == "new-sid"
+    assert compressor.get_active_compression_failure_cooldown() is None
+    assert compressor._fallback_compression_streak == 0
+    assert db.get_compression_failure_cooldown("old-sid") is not None
+    assert db.get_compression_fallback_streak("old-sid") == 2
+
+    compressor._record_compression_failure_cooldown(30.0, "new-timeout")
+
+    assert db.get_compression_failure_cooldown("new-sid") is not None
+    assert db.get_compression_failure_cooldown("old-sid")["error"] == "old-timeout"
+
+
+def test_update_from_response_forwards_canonical_cache_buckets():
+    """conversation_loop passes cache_read/write/reasoning tokens to engine."""
+    # Test the contract directly: a usage_dict built from CanonicalUsage must
+    # contain the canonical buckets in addition to the legacy keys. We don't
+    # spin up the full conversation loop; we just verify the dict shape.
+    from agent.usage_pricing import CanonicalUsage
+
+    canonical = CanonicalUsage(
+        input_tokens=1000,
+        output_tokens=500,
+        cache_read_tokens=800,
+        cache_write_tokens=200,
+        reasoning_tokens=50,
+    )
+    usage_dict = {
+        "prompt_tokens": canonical.prompt_tokens,
+        "completion_tokens": canonical.output_tokens,
+        "total_tokens": canonical.total_tokens,
+        "input_tokens": canonical.input_tokens,
+        "output_tokens": canonical.output_tokens,
+        "cache_read_tokens": canonical.cache_read_tokens,
+        "cache_write_tokens": canonical.cache_write_tokens,
+        "reasoning_tokens": canonical.reasoning_tokens,
+    }
+
+    # Legacy keys present
+    assert usage_dict["prompt_tokens"] == canonical.prompt_tokens
+    assert usage_dict["completion_tokens"] == 500
+    assert usage_dict["total_tokens"] == canonical.total_tokens
+    # Canonical cache + reasoning buckets present
+    assert usage_dict["cache_read_tokens"] == 800
+    assert usage_dict["cache_write_tokens"] == 200
+    assert usage_dict["reasoning_tokens"] == 50
+    assert usage_dict["input_tokens"] == 1000
+    assert usage_dict["output_tokens"] == 500
+
+
+
+
+
+
+def test_engine_collector_forwards_register_command_to_plugin_manager():
+    """A plugin context engine can register a slash command via ``ctx.register_command``."""
+    from plugins.context_engine import _EngineCollector
+    from hermes_cli.plugins import get_plugin_manager
+
+    handler = lambda raw_args: f"echo: {raw_args}"
+
+    collector = _EngineCollector(engine_name="my-lcm")
+    collector.register_command(
+        "my-lcm-test-cmd",
+        handler,
+        description="test command from a context engine",
+        args_hint="<msg>",
+    )
+
+    manager = get_plugin_manager()
+    try:
+        assert "my-lcm-test-cmd" in manager._plugin_commands
+        entry = manager._plugin_commands["my-lcm-test-cmd"]
+        assert entry["handler"] is handler
+        assert entry["args_hint"] == "<msg>"
+        assert entry["plugin"] == "context-engine:my-lcm"
+    finally:
+        # Clean up so we don't leak the registration across tests.
+        manager._plugin_commands.pop("my-lcm-test-cmd", None)
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_context_engine_on_turn_complete_usage.py ===
+"""Integration test: ``finalize_turn`` forwards the turn's real usage to the
+``ContextEngine.on_turn_complete()`` observation hook.
+
+The hook is the engine's post-turn observation point, so it must receive the
+completed turn's canonical token usage (prompt/completion/total + the canonical
+``input_tokens`` / ``output_tokens`` / ``cache_read_tokens`` /
+``cache_write_tokens`` / ``reasoning_tokens`` buckets) when the host has it —
+not a hardcoded ``None`` — so the engine can weigh how large/expensive the
+selected context was before the next ``select_context()``.
+
+The conversation loop stashes the most recent provider response's usage on the
+agent as ``_last_turn_usage`` (the same dict shape fed to
+``update_from_response``); ``finalize_turn`` forwards it. On turns that never
+reach a provider response (early failure / interrupt) it stays ``None`` and the
+hook receives ``None``. These tests pin both ends of that contract through the
+real ``finalize_turn`` call site (the path that previously passed
+``usage=None``).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from agent.context_engine import ContextEngine
+
+# Reuse the minimal agent harness that exercises the real finalize_turn path.
+from tests.agent.test_turn_finalizer_cleanup_guard import _StubAgent, _run
+
+
+class _CapturingEngine(ContextEngine):
+    """Engine that records what on_turn_complete() receives."""
+
+    last_prompt_tokens = 0
+
+    def __init__(self) -> None:
+        self.captured: Dict[str, Any] = {}
+
+    @property
+    def name(self) -> str:
+        return "capturing"
+
+    def update_from_response(self, usage: Dict[str, Any]) -> None:
+        pass
+
+    def should_compress(self, prompt_tokens: int = None) -> bool:
+        return False
+
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+    ) -> List[Dict[str, Any]]:
+        return messages
+
+    def on_turn_complete(self, messages, usage=None, **kwargs):
+        self.captured["seen"] = True
+        self.captured["usage"] = usage
+        self.captured["kwargs"] = kwargs
+
+
+CANONICAL_USAGE = {
+    "prompt_tokens": 1200,
+    "completion_tokens": 80,
+    "total_tokens": 1280,
+    "input_tokens": 1200,
+    "output_tokens": 80,
+    "cache_read_tokens": 1024,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 16,
+}
+
+
+def _agent_with_engine() -> _StubAgent:
+    agent = _StubAgent(raise_in=())
+    agent.context_compressor = _CapturingEngine()
+    return agent
+
+
+def test_finalize_turn_forwards_canonical_usage_when_available():
+    """A completed turn forwards the stashed canonical usage dict intact."""
+    agent = _agent_with_engine()
+    agent._last_turn_usage = dict(CANONICAL_USAGE)
+
+    _run(agent, final_response="done")
+
+    captured = agent.context_compressor.captured
+    assert captured.get("seen") is True
+    # The full canonical bucket set is forwarded unchanged — the engine relies
+    # on cache_read/write + reasoning, not just the legacy aggregate keys.
+    assert captured["usage"] == CANONICAL_USAGE
+    # Turn metadata still rides alongside usage.
+    assert captured["kwargs"]["turn_id"] == "turn-1"
+
+
+def test_finalize_turn_forwards_none_when_no_response_usage():
+    """An early-failure/interrupt turn (no stashed usage) forwards None."""
+    agent = _agent_with_engine()
+    # _last_turn_usage left unset, mirroring a turn that never reached a
+    # provider response.
+    if hasattr(agent, "_last_turn_usage"):
+        delattr(agent, "_last_turn_usage")
+
+    _run(agent, final_response="done")
+
+    captured = agent.context_compressor.captured
+    assert captured.get("seen") is True
+    assert captured["usage"] is None
+
+
+def test_finalization_seam_observes_interrupted_turn_with_none_usage():
+    """Pins the documented coverage contract for on_turn_complete().
+
+    on_turn_complete() fires from the turn-finalization seam and reports
+    ``usage=None`` on a finalized turn that never reached a provider response
+    (e.g. interrupt), forwarding the ``interrupted`` flag. This is the testable
+    (positive) half of the contract.
+
+    The negative half — abnormal early-return paths in ``run_conversation``
+    (content-policy block, provider terminal failure, etc.) bypass finalization
+    and therefore do NOT emit the hook — is documented as best-effort coverage.
+    It is intentionally not pinned here: exercising those inline early returns
+    requires a full ``run_conversation`` harness, and unifying all terminal
+    paths behind one seam is a separate follow-up.
+    """
+    from agent.turn_finalizer import finalize_turn
+
+    agent = _agent_with_engine()
+    if hasattr(agent, "_last_turn_usage"):
+        delattr(agent, "_last_turn_usage")  # never reached a provider response
+
+    finalize_turn(
+        agent,
+        final_response="interrupted mid-turn",
+        api_call_count=1,
+        interrupted=True,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "do a thing"},
+            {"role": "assistant", "content": "partial"},
+        ],
+        conversation_history=None,
+        effective_task_id="task-1",
+        turn_id="turn-int",
+        user_message="do a thing",
+        original_user_message="do a thing",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupt",
+    )
+
+    captured = agent.context_compressor.captured
+    assert captured.get("seen") is True
+    assert captured["usage"] is None
+    assert captured["kwargs"]["interrupted"] is True
+    assert captured["kwargs"]["turn_id"] == "turn-int"
+

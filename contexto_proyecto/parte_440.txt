@@ -1,0 +1,302 @@
+
+
+=== ARCHIVO: .\hermes-agent\gateway\hosted_rooms_common.py ===
+"""Shared leaf helpers for the gateway hosted-room modules.
+
+Each hosted-room module validates identifiers, bounded integers, exact field sets and
+canonical JSON with its own error class and pinned error strings; these helpers take the
+error class and message templates as parameters so failures stay byte-identical while the
+logic lives once. Must stay a leaf: never import a hosted_room* module (import cycle).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
+
+
+IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+DbPath = Path | str
+
+
+def identifier(
+    value: Any, *, label: str, error: type[Exception], max_chars: int = 128,
+    pattern: re.Pattern[str] | None = IDENTIFIER_RE, invalid: str | None = None) -> str:
+    """Strip and validate a bounded string; ``pattern=None`` skips the shape check."""
+    if not isinstance(value, str):
+        raise error(f"{label} must be a string")
+    value = value.strip()
+    if not value or len(value) > max_chars or (pattern is not None and not pattern.fullmatch(value)):
+        raise error(invalid or f"invalid {label}")
+    return value
+
+
+def bounded_int(value: Any, *, error: type[Exception], message: str, low: int = 0, high: int | None = None) -> int:
+    """Reject bools, non-ints and values outside ``[low, high]`` (``message`` is the exact text)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < low or (high is not None and value > high):
+        raise error(message)
+    return value
+
+
+def exact_fields(
+    value: Any, *, label: str, required: frozenset[str] | set[str], optional: frozenset[str] | set[str] = frozenset(),
+    error: type[Exception], not_object: str | None = None, missing_fmt: str = "{label} is missing fields: {fields}",
+    unknown_fmt: str = "{label} has unknown fields: {fields}") -> Mapping[str, Any]:
+    """Require exactly ``required`` (+ any ``optional``) keys; formats name the offenders sorted."""
+    if not isinstance(value, Mapping):
+        raise error(not_object or f"{label} must be an object")
+    keys = frozenset(value)
+    missing = required - keys
+    unknown = keys - required - optional
+    if missing:
+        raise error(missing_fmt.format(label=label, fields=", ".join(sorted(missing))))
+    if unknown:
+        raise error(unknown_fmt.format(label=label, fields=", ".join(sorted(unknown))))
+    return value
+
+
+def text(value: Any, *, error: type[Exception], label: str, max_bytes: int, strip: bool = True) -> str:
+    """Non-blank string bounded by ``max_bytes`` of UTF-8; ``strip=False`` keeps and measures the raw text."""
+    if not isinstance(value, str):
+        raise error(f"{label} must be a string")
+    if not value.strip():
+        raise error(f"{label} must not be empty")
+    if strip:
+        value = value.strip()
+    if len(value.encode("utf-8")) > max_bytes:
+        raise error(f"{label} is too large")
+    return value
+
+
+def compact_json(value: Any, *, ensure_ascii: bool = True) -> str:
+    """Sorted-key, separator-free JSON (the digest/storage canonical form)."""
+    return json.dumps(value, ensure_ascii=ensure_ascii, sort_keys=True, separators=(",", ":"))
+
+
+def canonical_json(value: Any, *, error: type[Exception], label: str, max_bytes: int, ensure_ascii: bool) -> str:
+    """``compact_json`` bounded by ``max_bytes`` of UTF-8; unserializable input raises ``error``."""
+    try:
+        encoded = compact_json(value, ensure_ascii=ensure_ascii)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise error(f"{label} must be JSON-serializable") from exc
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise error(f"{label} is too large")
+    return encoded
+
+
+def utf8_len(*parts: str) -> int:
+    return len("".join(parts).encode("utf-8"))
+
+
+def clock(now: float | None) -> float:
+    """``now`` as a float, or the current wall clock when ``None``."""
+    return time.time() if now is None else float(now)
+
+
+def open_sqlite(path: DbPath, *, timeout: float = 10) -> sqlite3.Connection:
+    """Row-factory connection with foreign keys on; no journal or schema work (steady-state readers)."""
+    from hermes_cli.sqlite_util import open_db
+
+    return open_db(path, db_label="shared-state.db", busy_timeout_ms=int(timeout * 1000), wal=False,
+                   foreign_keys=True)
+
+
+def connect(
+    db_path: DbPath, *, db_label: str, ready: Callable[[sqlite3.Connection], bool],
+    initialize: Callable[[sqlite3.Connection], None], lock_retries: int = 1) -> sqlite3.Connection:
+    """Open the shared root store: WAL, foreign keys, then ``initialize`` in one IMMEDIATE txn if not ``ready``.
+
+    Multiple profile gateways share this database, so every draft-schema transition
+    is serialized in SQLite itself: a crash rolls back the whole DDL/data migration and
+    another process can safely retry it.
+    """
+    def _initialize(conn: sqlite3.Connection) -> None:
+        if not ready(conn):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                initialize(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+    # Late import: a gateway that outlives an on-disk upgrade has the OLD sqlite_util cached.
+    from hermes_cli.sqlite_util import open_db
+
+    return open_db(db_path, db_label=db_label, busy_timeout_ms=10_000, foreign_keys=True,
+                   wal_lock_retries=lock_retries, initialize=_initialize)
+
+
+def fenced_update(conn: sqlite3.Connection, sql: str, params: tuple, error: Exception) -> None:
+    """Run a compare-and-swap UPDATE; anything but exactly one row means the fence was lost."""
+    if conn.execute(sql, params).rowcount != 1:
+        raise error
+
+
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row is not None
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> frozenset[str]:
+    return frozenset(row[1] for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def transaction(
+    connect: Callable[[DbPath], sqlite3.Connection], db_path: DbPath, *, immediate: bool
+) -> Iterator[sqlite3.Connection]:
+    """Open via ``connect``, optionally ``BEGIN IMMEDIATE``, commit on success, always close."""
+    from hermes_cli.sqlite_util import transaction as _transaction
+
+    return _transaction(connect(db_path), immediate=immediate)
+
+
+
+=== ARCHIVO: .\hermes-agent\gateway\hosted_rooms_legacy_import.py ===
+"""One-shot import of the pre-isolation ``hosted_room*`` rows into ``shared-state.db``.
+
+``0e422e0ece`` repointed the room store from the root ``state.db`` to ``shared-state.db`` without
+moving the rows it already held, so an install that had rooms started with an empty coordination
+set and every pre-existing room resolved to "hosted room not found" (#109775). The first open after
+the upgrade copies the rows across once; the marker row keeps that a one-shot step, because a purge
+in THIS store must never be undone by re-importing rows the legacy store still holds.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from contextlib import closing
+from pathlib import Path
+
+from gateway.hosted_rooms_common import clock, table_columns, table_exists
+
+logger = logging.getLogger(__name__)
+
+SOURCE_NAME = "state.db"
+MARKER_TABLE = "hosted_room_legacy_imports"
+# Liveness state, never copied: a lease is a ~15s heartbeat plus a process generation, so a copied
+# lease names a process that is gone. The driver claims a fresh one instead.
+_SKIP_TABLES = frozenset({"hosted_room_driver_leases"})
+# Sources this process could not import (unreadable file, rows the target refused). Every store open
+# re-checks readiness, so without this a broken legacy file would re-run the copy and re-warn on
+# every poll; the retry happens on the next process start instead.
+_failed_sources: set[Path] = set()
+
+
+def source_path(db_path: Path) -> Path | None:
+    """The pre-isolation store for ``db_path``, or ``None`` when this database has no predecessor.
+
+    Only the shared coordination database has one: callers that pass any other path (older
+    layouts, tests) own that file directly.
+    """
+    return db_path.with_name(SOURCE_NAME) if db_path.name == "shared-state.db" else None
+
+
+def settled(conn: sqlite3.Connection, db_path: Path) -> bool:
+    """True once the import for this database has been recorded, given up on for this process, or never applies."""
+    source = source_path(db_path)
+    if source is None or source in _failed_sources:
+        return True
+    return table_exists(conn, MARKER_TABLE) and conn.execute(
+        f"SELECT 1 FROM {MARKER_TABLE} WHERE source=?", (SOURCE_NAME,)).fetchone() is not None
+
+
+def _select_expressions(legacy: sqlite3.Connection, target: sqlite3.Connection, name: str) -> list[tuple[str, str]]:
+    """``(target column, source expression)`` pairs for copying ``name``.
+
+    Columns only the target has take the same default the in-place column migration applies, so a
+    legacy layout from before the actor/authority columns imports instead of tripping NOT NULL.
+    Columns only the source has are dropped; columns the target added without a default are left
+    to its DDL default.
+    """
+    from gateway.hosted_rooms import _LEGACY_COLUMNS
+
+    defaults = {(table, column): default for table, column, _, default in _LEGACY_COLUMNS if default is not None}
+    source_columns = [str(row[1]) for row in legacy.execute(f"PRAGMA table_info({name})")]
+    target_columns = table_columns(target, name)
+    pairs = [(column, column) for column in source_columns if column in target_columns]
+    pairs.extend((column, default) for (table, column), default in defaults.items()
+                 if table == name and column in target_columns and column not in source_columns)
+    return pairs
+
+
+def _copy_rows(target: sqlite3.Connection, source: Path) -> int:
+    """Copy every room ``target`` does not have yet, with all of its child rows; returns rooms copied.
+
+    A room id present in both stores is skipped as a unit: grafting the legacy events under this
+    store's room would leave ``next_seq`` behind ``MAX(seq)`` and every later append colliding.
+    Room-scoped tables therefore use a plain INSERT — a row the target refuses raises and aborts
+    the whole import rather than being dropped in silence. A table this store has not created yet
+    (the driver, policy and replica schemas are initialized by their own modules) is created from
+    the source's own DDL so its rows survive the upgrade too.
+    """
+    from gateway.hosted_rooms import _EVENT_BYTES_BACKFILL
+
+    copied_rooms: list[str] = []
+    existing = {str(row[0]) for row in target.execute("SELECT room_id FROM hosted_rooms")}
+    with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10)) as legacy:
+        names = [str(row[0]) for row in legacy.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'hosted_room*'")]
+        # Parents first: hosted_room_events carries a foreign key into hosted_rooms.
+        for name in sorted(names, key=lambda name: (name != "hosted_rooms", name)):
+            if name in _SKIP_TABLES or name == MARKER_TABLE or name.endswith(("_next", "_migrating")):
+                continue
+            if not table_exists(target, name):
+                target.execute(str(legacy.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()[0]))
+            pairs = _select_expressions(legacy, target, name)
+            if not pairs:
+                continue
+            columns = [column for column, _ in pairs]
+            rows = legacy.execute(f"SELECT {', '.join(expr for _, expr in pairs)} FROM {name}")
+            if "room_id" in columns:
+                room_index = columns.index("room_id")
+                rows = (row for row in rows if str(row[room_index]) not in existing)
+                verb = "INSERT"
+            else:
+                verb = "INSERT OR IGNORE"
+            if name == "hosted_rooms":
+                rows = list(rows)
+                copied_rooms = [str(row[room_index]) for row in rows]
+            target.executemany(
+                f"{verb} INTO {name} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})", rows)
+        if copied_rooms and "event_bytes" not in table_columns(legacy, "hosted_rooms"):
+            target.execute(
+                _EVENT_BYTES_BACKFILL.format(where=f"room_id IN ({', '.join('?' * len(copied_rooms))})"), copied_rooms)
+    return len(copied_rooms)
+
+
+def import_legacy_rooms(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Copy the pre-isolation rows in once, then record the marker; never fails the open.
+
+    The copy runs inside the caller's schema transaction under its own savepoint, so a crash or a
+    refused row leaves either both the copied rows and the marker or neither.
+    """
+    source = source_path(db_path)
+    if source is None or settled(conn, db_path):
+        return
+    conn.execute("SAVEPOINT legacy_import")
+    try:
+        copied = _copy_rows(conn, source) if source.is_file() else 0
+    except (OSError, sqlite3.Error) as exc:
+        # A locked, unreadable or incompatible legacy store must not take hosted rooms down with
+        # it: drop the partial copy, leave the marker unset, retry on the next process start.
+        conn.execute("ROLLBACK TO legacy_import")
+        conn.execute("RELEASE legacy_import")
+        _failed_sources.add(source)
+        logger.warning("hosted rooms: could not import the pre-isolation %s (%s); will retry on the next start",
+                       source, exc)
+        return
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {MARKER_TABLE} (source TEXT PRIMARY KEY, imported_at REAL NOT NULL, rooms INTEGER NOT NULL)")
+    conn.execute(
+        f"INSERT OR IGNORE INTO {MARKER_TABLE} (source, imported_at, rooms) VALUES (?, ?, ?)",
+        (SOURCE_NAME, clock(None), copied))
+    conn.execute("RELEASE legacy_import")
+    if copied:
+        logger.info("hosted rooms: imported %d pre-isolation Group Chat(s) from %s", copied, source)
+

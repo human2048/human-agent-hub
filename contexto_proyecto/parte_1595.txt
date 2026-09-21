@@ -1,0 +1,248 @@
+
+
+=== ARCHIVO: .\hermes-agent\skills\apple\findmy\SKILL.md ===
+---
+name: findmy
+description: "Track Apple devices/AirTags via FindMy.app on macOS."
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms: [macos]
+metadata:
+  hermes:
+    tags: [FindMy, AirTag, location, tracking, macOS, Apple]
+---
+
+# Find My (Apple)
+
+Track Apple devices and AirTags via the FindMy.app on macOS. Since Apple doesn't
+provide a CLI for FindMy, this skill uses AppleScript to open the app and
+screen capture to read device locations.
+
+## Prerequisites
+
+- **macOS** with Find My app and iCloud signed in
+- Devices/AirTags already registered in Find My
+- Screen Recording permission for terminal (System Settings → Privacy → Screen Recording)
+- **Optional but recommended**: Install `peekaboo` for better UI automation:
+  `brew install steipete/tap/peekaboo`
+
+## When to Use
+
+- User asks "where is my [device/cat/keys/bag]?"
+- Tracking AirTag locations
+- Checking device locations (iPhone, iPad, Mac, AirPods)
+- Monitoring pet or item movement over time (AirTag patrol routes)
+
+## Method 1: AppleScript + Screenshot (Basic)
+
+### Open FindMy and Navigate
+
+```bash
+# Open Find My app
+osascript -e 'tell application "FindMy" to activate'
+
+# Wait for it to load
+sleep 3
+
+# Take a screenshot of the Find My window
+screencapture -w -o /tmp/findmy.png
+```
+
+Then use `vision_analyze` to read the screenshot:
+```
+vision_analyze(image_url="/tmp/findmy.png", question="What devices/items are shown and what are their locations?")
+```
+
+### Switch Between Tabs
+
+```bash
+# Switch to Devices tab
+osascript -e '
+tell application "System Events"
+    tell process "FindMy"
+        click button "Devices" of toolbar 1 of window 1
+    end tell
+end tell'
+
+# Switch to Items tab (AirTags)
+osascript -e '
+tell application "System Events"
+    tell process "FindMy"
+        click button "Items" of toolbar 1 of window 1
+    end tell
+end tell'
+```
+
+## Method 2: Peekaboo UI Automation (Recommended)
+
+If `peekaboo` is installed, use it for more reliable UI interaction:
+
+```bash
+# Open Find My
+osascript -e 'tell application "FindMy" to activate'
+sleep 3
+
+# Capture and annotate the UI
+peekaboo see --app "FindMy" --annotate --path /tmp/findmy-ui.png
+
+# Click on a specific device/item by element ID
+peekaboo click --on B3 --app "FindMy"
+
+# Capture the detail view
+peekaboo image --app "FindMy" --path /tmp/findmy-detail.png
+```
+
+Then analyze with vision:
+```
+vision_analyze(image_url="/tmp/findmy-detail.png", question="What is the location shown for this device/item? Include address and coordinates if visible.")
+```
+
+## Workflow: Track AirTag Location Over Time
+
+For monitoring an AirTag (e.g., tracking a cat's patrol route):
+
+```bash
+# 1. Open FindMy to Items tab
+osascript -e 'tell application "FindMy" to activate'
+sleep 3
+
+# 2. Click on the AirTag item (stay on page — AirTag only updates when page is open)
+
+# 3. Periodically capture location
+while true; do
+    screencapture -w -o /tmp/findmy-$(date +%H%M%S).png
+    sleep 300  # Every 5 minutes
+done
+```
+
+Analyze each screenshot with vision to extract coordinates, then compile a route.
+
+## Limitations
+
+- FindMy has **no CLI or API** — must use UI automation
+- AirTags only update location while the FindMy page is actively displayed
+- Location accuracy depends on nearby Apple devices in the FindMy network
+- Screen Recording permission required for screenshots
+- AppleScript UI automation may break across macOS versions
+
+## Rules
+
+1. Keep FindMy app in the foreground when tracking AirTags (updates stop when minimized)
+2. Use `vision_analyze` to read screenshot content — don't try to parse pixels
+3. For ongoing tracking, use a cronjob to periodically capture and log locations
+4. Respect privacy — only track devices/items the user owns
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\apple\imessage\SKILL.md ===
+---
+name: imessage
+description: Send and receive iMessages/SMS via the imsg CLI on macOS.
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms: [macos]
+metadata:
+  hermes:
+    tags: [iMessage, SMS, messaging, macOS, Apple]
+prerequisites:
+  commands: [imsg]
+---
+
+# iMessage
+
+Use `imsg` to read and send iMessage/SMS via macOS Messages.app.
+
+## Prerequisites
+
+- **macOS** with Messages.app signed in
+- Install: `brew install steipete/tap/imsg`
+- Grant Full Disk Access for terminal (System Settings → Privacy → Full Disk Access)
+- Grant Automation permission for Messages.app when prompted
+
+## When to Use
+
+- User asks to send an iMessage or text message
+- Reading iMessage conversation history
+- Checking recent Messages.app chats
+- Sending to phone numbers or Apple IDs
+
+## When NOT to Use
+
+- Telegram/Discord/Slack/WhatsApp messages → use the appropriate gateway channel
+- Group chat management (adding/removing members) → not supported
+- Bulk/mass messaging → always confirm with user first
+
+## Quick Reference
+
+### List Chats
+
+```bash
+imsg chats --limit 10 --json
+```
+
+### View History
+
+```bash
+# By chat ID
+imsg history --chat-id 1 --limit 20 --json
+
+# With attachments info
+imsg history --chat-id 1 --limit 20 --attachments --json
+```
+
+### Send Messages
+
+```bash
+# Text only
+imsg send --to "+14155551212" --text "Hello!"
+
+# With attachment
+imsg send --to "+14155551212" --text "Check this out" --file /path/to/image.jpg
+
+# Force iMessage or SMS
+imsg send --to "+14155551212" --text "Hi" --service imessage
+imsg send --to "+14155551212" --text "Hi" --service sms
+```
+
+### Watch for New Messages
+
+```bash
+imsg watch --chat-id 1 --attachments
+```
+
+## Service Options
+
+- `--service imessage` — Force iMessage (requires recipient has iMessage)
+- `--service sms` — Force SMS (green bubble)
+- `--service auto` — Let Messages.app decide (default)
+
+## Rules
+
+1. **Always confirm recipient and message content** before sending
+2. **Never send to unknown numbers** without explicit user approval
+3. **Verify file paths** exist before attaching
+4. **Don't spam** — rate-limit yourself
+
+## Example Workflow
+
+User: "Text mom that I'll be late"
+
+```bash
+# 1. Find mom's chat
+imsg chats --limit 20 --json | jq '.[] | select(.displayName | contains("Mom"))'
+
+# 2. Confirm with user: "Found Mom at +1555123456. Send 'I'll be late' via iMessage?"
+
+# 3. Send after confirmation
+imsg send --to "+1555123456" --text "I'll be late"
+```
+
+
+
+=== ARCHIVO: .\hermes-agent\skills\autonomous-ai-agents\DESCRIPTION.md ===
+---
+description: Skills for spawning and orchestrating autonomous AI coding agents and multi-agent workflows — running independent agent processes, delegating tasks, and coordinating parallel workstreams.
+---
+

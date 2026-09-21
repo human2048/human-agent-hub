@@ -1,0 +1,259 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\web\firecrawl\__init__.py ===
+"""Firecrawl web search + extract plugin — bundled, auto-loaded."""
+from __future__ import annotations
+from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
+
+
+def register(ctx) -> None:
+    ctx.register_web_search_provider(FirecrawlWebSearchProvider())
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\web\keenable\provider.py ===
+"""Keenable (https://keenable.ai) web search + fetch — keyless-ring member.
+
+Env: ``KEENABLE_API_KEY`` (optional; keyless free tier works without it).
+Config: ``web.provider_tier.keenable: free|paid`` pins the tier (unset = auto).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List
+
+from plugins.web._common import (
+    SEARCH_LIMIT_CAP, BaseWebSearchProvider, document, http_status_detail, keyless_extract, keyless_search,
+    keyless_variant_schema, page_error, provider_env, run_extract, run_search, search_fail, search_ok, use_keyless, web_hit,
+)
+
+logger = logging.getLogger(__name__)
+
+_KEENABLE_API_URL = "https://api.keenable.ai"
+
+
+def _keenable_headers(api_key: str) -> Dict[str, str]:
+    # The keyless tier structurally requires an app-identifier header; no user identifiers are sent.
+    headers = {"X-Keenable-Title": "hermes-agent"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+class KeenableWebSearchProvider(BaseWebSearchProvider):
+    """Keenable search + extract provider (keyed or keyless)."""
+
+    NAME = "keenable"
+    DISPLAY_NAME = "Keenable"
+    KEY_ENV = "KEENABLE_API_KEY"
+    EXTRACT = True
+    KEYLESS = True
+
+    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+        def _body() -> Dict[str, Any]:
+            api_key = provider_env("KEENABLE_API_KEY")
+            if use_keyless("keenable", api_key):
+                return keyless_search("Keenable", "keenable", query, limit, logger)
+            import requests
+            logger.info("Keenable search: '%s' (limit=%d)", query, limit)
+            response = requests.post(
+                f"{_KEENABLE_API_URL}/v1/search",
+                json={"query": query, "max_results": min(max(1, int(limit)), SEARCH_LIMIT_CAP)},
+                headers=_keenable_headers(api_key), timeout=30,
+            )
+            if response.status_code >= 400:
+                return search_fail(f"Keenable search failed: {http_status_detail(response)}")
+            return search_ok([
+                web_hit(r.get("url") or "", r.get("title") or "", r.get("snippet") or r.get("description") or "", i + 1)
+                for i, r in enumerate(response.json().get("results") or [])
+            ])
+
+        return run_search("Keenable", logger, _body, verbatim_value_error=False)
+
+    def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+        def _body() -> List[Dict[str, Any]]:
+            api_key = provider_env("KEENABLE_API_KEY")
+            if use_keyless("keenable", api_key):
+                return keyless_extract("Keenable", "keenable", urls, logger)
+            import requests
+            logger.info("Keenable extract: %d URL(s)", len(urls))
+            results: List[Dict[str, Any]] = []
+            for url in urls:
+                try:
+                    response = requests.get(f"{_KEENABLE_API_URL}/v1/fetch", params={"url": url}, headers=_keenable_headers(api_key), timeout=30)
+                    if response.status_code >= 400:
+                        raise ValueError(http_status_detail(response))
+                    data = response.json()
+                    results.append(document(data.get("url") or url, data.get("title") or "", data.get("content") or "", source_url=url))
+                except Exception as exc:  # noqa: BLE001 — per-URL error entry
+                    results.append(page_error(url, f"Keenable extract failed: {exc}"))
+            return results
+
+        return run_extract("Keenable", logger, urls, _body, verbatim_value_error=False)
+
+    def get_setup_schema(self) -> Dict[str, Any]:
+        return keyless_variant_schema(
+            "Keenable", "KEENABLE_API_KEY", "https://keenable.ai",
+            free_tag="Independent web index for AI apps — fast search + page fetch on Keenable's anonymous free tier.",
+            paid_tag="Independent web index for AI apps. Keyed access with higher limits and guaranteed service.",
+        )
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'WebSearchProvider': ('agent.web_search_provider', 'WebSearchProvider'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\web\keenable\__init__.py ===
+"""Keenable web search + extract plugin — bundled, auto-loaded; keyless-ring member."""
+from __future__ import annotations
+from plugins.web.keenable.provider import KeenableWebSearchProvider
+
+
+def register(ctx) -> None:
+    ctx.register_web_search_provider(KeenableWebSearchProvider())
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\web\parallel\provider.py ===
+"""Parallel.ai web search (sync ``Parallel`` SDK) + async extract (``AsyncParallel``).
+
+Env: ``PARALLEL_API_KEY`` (https://parallel.ai), optional
+``PARALLEL_SEARCH_MODE`` = agentic (default) | fast | one-shot.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from typing import Any, Dict, List
+
+from plugins.web._common import (
+    SEARCH_LIMIT_CAP, BaseWebSearchProvider, cached_sdk_client, document, keyless_extract, keyless_search,
+    keyless_variant_schema, page_error, provider_env, run_extract_async, run_search, search_ok, use_keyless, web_hit,
+)
+
+logger = logging.getLogger(__name__)
+
+_MISSING_KEY = "PARALLEL_API_KEY environment variable not set. Get your API key at https://parallel.ai"
+
+
+def _client(slot: str, cls_name: str) -> Any:
+    def _factory(api_key: str) -> Any:
+        import parallel  # deliberately lazy
+        return getattr(parallel, cls_name)(api_key=api_key)
+
+    return cached_sdk_client(slot, "PARALLEL_API_KEY", _MISSING_KEY, "search.parallel", _factory)
+
+
+def _get_sync_client() -> Any:
+    return _client("_parallel_client", "Parallel")
+
+
+def _get_async_client() -> Any:
+    return _client("_async_parallel_client", "AsyncParallel")
+
+
+def _resolve_search_mode() -> str:
+    mode = os.getenv("PARALLEL_SEARCH_MODE", "agentic").lower().strip()
+    return mode if mode in {"fast", "one-shot", "agentic"} else "agentic"
+
+
+class ParallelWebSearchProvider(BaseWebSearchProvider):
+    """Parallel.ai search + async extract provider."""
+
+    NAME = "parallel"
+    DISPLAY_NAME = "Parallel"
+    KEY_ENV = "PARALLEL_API_KEY"
+    EXTRACT = True
+    KEYLESS = True
+
+    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+        def _body() -> Dict[str, Any]:
+            if use_keyless("parallel", provider_env("PARALLEL_API_KEY")):
+                return keyless_search("Parallel", "parallel", query, limit, logger)
+            mode = _resolve_search_mode()
+            logger.info("Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit)
+            response = _get_sync_client().beta.search(search_queries=[query], objective=query, mode=mode, max_results=min(limit, SEARCH_LIMIT_CAP))
+            return search_ok([
+                web_hit(r.url or "", r.title or "", " ".join(r.excerpts or []), i + 1)
+                for i, r in enumerate(response.results or [])
+            ])
+
+        return run_search("Parallel", logger, _body, sdk=True)
+
+    async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+        async def _body() -> List[Dict[str, Any]]:
+            if use_keyless("parallel", provider_env("PARALLEL_API_KEY")):
+                # Keyless ring is blocking HTTP — hop off the event loop.
+                return await asyncio.to_thread(keyless_extract, "Parallel", "parallel", urls, logger)
+            logger.info("Parallel extract: %d URL(s)", len(urls))
+            response = await _get_async_client().beta.extract(urls=urls, full_content=True)
+            results = [document(r.url or "", r.title or "", r.full_content or "\n\n".join(r.excerpts or [])) for r in response.results or []]
+            return results + [
+                {**page_error(e.url or "", e.content or e.error_type or "extraction failed"), "metadata": {"sourceURL": e.url or ""}}
+                for e in response.errors or []
+            ]
+
+        return await run_extract_async("Parallel", logger, urls, _body, sdk=True)
+
+    def get_setup_schema(self) -> Dict[str, Any]:
+        return keyless_variant_schema(
+            "Parallel", "PARALLEL_API_KEY", "https://parallel.ai",
+            free_tag="Objective-tuned search + page extraction on Parallel's anonymous free tier. Rate-limited under burst load.",
+            paid_tag="Objective-tuned search + parallel page extraction via the Parallel SDK. Unthrottled, guaranteed service.",
+        )
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'WebSearchProvider': ('agent.web_search_provider', 'WebSearchProvider'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\web\parallel\__init__.py ===
+"""Parallel.ai web search + extract plugin — bundled, auto-loaded; async-native ``extract``."""
+from __future__ import annotations
+from plugins.web.parallel.provider import ParallelWebSearchProvider
+
+
+def register(ctx) -> None:
+    ctx.register_web_search_provider(ParallelWebSearchProvider())
+

@@ -1,0 +1,285 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_server_normalize.py ===
+"""Tests for _normalize_chat_content in the API server adapter."""
+
+from gateway.platforms import api_server
+from gateway.platforms.api_server import _normalize_chat_content
+
+
+class TestNormalizeChatContent:
+    """Content normalization converts array-based content parts to plain text."""
+
+    def test_none_returns_empty_string(self):
+        assert _normalize_chat_content(None) == ""
+
+    def test_plain_string_returned_as_is(self):
+        assert _normalize_chat_content("hello world") == "hello world"
+
+
+    def test_text_content_part(self):
+        content = [{"type": "text", "text": "hello"}]
+        assert _normalize_chat_content(content) == "hello"
+
+    def test_input_text_content_part(self):
+        content = [{"type": "input_text", "text": "user input"}]
+        assert _normalize_chat_content(content) == "user input"
+
+    def test_output_text_content_part(self):
+        content = [{"type": "output_text", "text": "assistant output"}]
+        assert _normalize_chat_content(content) == "assistant output"
+
+
+    def test_empty_text_parts_filtered(self):
+        content = [
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "actual"},
+            {"type": "text", "text": ""},
+        ]
+        assert _normalize_chat_content(content) == "actual"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_server_profile_prefix_misdelivery.py ===
+"""A ``/p/<profile>/`` prefix on a non-multiplexed gateway must not misdeliver.
+
+The prefix is an address: the caller is naming WHICH agent the request is
+for. The old behavior ignored it whenever ``gateway.multiplex_profiles`` was
+off and answered as the process's own (single) profile — so a request
+explicitly addressed to one agent was silently answered by a different one.
+Observed live (Aug 2026): ``hermes peer dm mini/researcher`` was answered by
+the mini's *default* agent, with no error on either side, because the mini
+runs one LaunchDaemon per profile and only the default daemon hosted an
+api_server.
+
+The contract now: with multiplexing off, a prefix naming this process's own
+profile is honored (peers address single-profile daemons this way without
+knowing the host's topology); any other name fails closed with the existing
+404, because a wrong-agent answer is strictly worse than an error.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.platforms.api_server import _PROFILE_REJECTED, APIServerAdapter
+from gateway.config import PlatformConfig
+
+
+@pytest.fixture()
+def adapter():
+    # No gateway_runner configured -> multiplex_profiles is falsy, the exact
+    # shape of a standalone single-profile daemon.
+    return APIServerAdapter(PlatformConfig(enabled=True))
+
+
+def _request(profile: str | None):
+    return SimpleNamespace(match_info={} if profile is None else {"profile": profile})
+
+
+class TestResolverWithMultiplexOff:
+    def test_no_prefix_is_untouched(self, adapter):
+        assert adapter._resolve_request_profile(_request(None)) is None
+
+    def test_prefix_naming_own_profile_is_honored(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_matches_home",
+            lambda name, home=None: name == "researcher",
+        )
+        assert adapter._resolve_request_profile(_request("researcher")) is None
+
+    def test_prefix_naming_default_on_default_home_is_honored(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_matches_home",
+            lambda name, home=None: name == "default",
+        )
+        assert adapter._resolve_request_profile(_request("default")) is None
+
+    def test_prefix_naming_another_agent_fails_closed(self, adapter, monkeypatch):
+        """The misdelivery case: addressed to researcher, running as default."""
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_matches_home",
+            lambda name, home=None: name == "default",
+        )
+        assert adapter._resolve_request_profile(_request("researcher")) is _PROFILE_REJECTED
+
+    def test_unresolvable_own_identity_fails_closed(self, adapter, monkeypatch):
+        """If the process cannot prove who it is, it must not answer as anyone."""
+
+        def boom(name, home=None):
+            raise RuntimeError("no home")
+
+        monkeypatch.setattr("hermes_cli.profiles.profile_matches_home", boom)
+        assert adapter._resolve_request_profile(_request("researcher")) is _PROFILE_REJECTED
+
+
+class TestMultiplexOnUnchanged:
+    def test_served_profile_resolves(self, adapter, monkeypatch):
+        adapter.gateway_runner = SimpleNamespace(
+            config=SimpleNamespace(multiplex_profiles=True)
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("worker", object())],
+        )
+        assert adapter._resolve_request_profile(_request("worker")) == "worker"
+        assert adapter._resolve_request_profile(_request("ghost")) is _PROFILE_REJECTED
+
+
+@pytest.mark.asyncio
+async def test_http_request_addressed_to_another_agent_is_404_not_answered(
+    adapter, monkeypatch
+):
+    """End to end through the real middleware: the wrong-agent request must
+    404 instead of being served — a body would mean the misdelivery is back."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+    )
+
+    async def handler(request):
+        return web.json_response({"served_by": "default"})
+
+    app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+    app.router.add_get("/p/{profile}/v1/test", handler)
+    app.router.add_get("/v1/test", handler)
+
+    async with TestClient(TestServer(app)) as cli:
+        # Addressed to a different agent: refused.
+        resp = await cli.get("/p/researcher/v1/test")
+        assert resp.status == 404
+        body = await resp.json()
+        assert "profile" in str(body.get("error", "")).lower()
+
+        # Addressed to this agent, and unaddressed: both served.
+        assert (await cli.get("/p/default/v1/test")).status == 200
+        assert (await cli.get("/v1/test")).status == 200
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_server_reasoning_ladder.py ===
+"""API-server reasoning-effort request parsing accepts the full ladder.
+
+_request_reasoning_config() previously whitelisted only none..xhigh, so an
+API/browser client sending ``max`` or ``ultra`` (both valid /reasoning and
+config.yaml levels) was silently ignored and the session ran at the default
+effort. The server now accepts the full internal ladder; per-provider wire
+clamping happens downstream in the transports/profiles via
+agent.reasoning_effort (#78216's api_server observation).
+"""
+
+from gateway.platforms.api_server import _request_reasoning_config
+from hermes_constants import VALID_REASONING_EFFORTS
+
+
+class TestRequestReasoningFullLadder:
+    def test_every_configurable_level_is_accepted(self):
+        for level in VALID_REASONING_EFFORTS:
+            out = _request_reasoning_config({"reasoning_effort": level})
+            assert out == {"enabled": True, "effort": level}, level
+
+    def test_none_disables(self):
+        assert _request_reasoning_config({"reasoning_effort": "none"}) == {
+            "enabled": False
+        }
+
+    def test_structured_object_shape(self):
+        out = _request_reasoning_config(
+            {"reasoning": {"enabled": True, "effort": "ultra"}}
+        )
+        assert out == {"enabled": True, "effort": "ultra"}
+
+    def test_unknown_level_still_ignored(self):
+        assert _request_reasoning_config({"reasoning_effort": "turbo"}) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_api_server_room_dispatch.py ===
+"""Compatibility seams for extracted RoomLink dispatch handling."""
+
+import json
+import sys
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.platforms import api_server
+from gateway.platforms import api_server_room_dispatch as room_dispatch
+
+
+def test_api_server_keeps_room_dispatch_methods_on_the_adapter_class():
+    assert {
+        "_ensure_hosted_member_session",
+        "_normalize_room_dispatch",
+    } <= api_server.APIServerAdapter.__dict__.keys()
+
+
+@pytest.mark.asyncio
+async def test_hidden_member_session_method_delegates(monkeypatch):
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    dispatch = object()
+    implementation = AsyncMock(return_value="room_session")
+    monkeypatch.setattr(
+        room_dispatch,
+        "_ensure_hosted_member_session",
+        implementation,
+    )
+
+    assert await adapter._ensure_hosted_member_session(dispatch) == "room_session"
+    implementation.assert_awaited_once_with(adapter, dispatch)
+
+
+@pytest.mark.asyncio
+async def test_room_dispatch_normalizer_method_delegates(monkeypatch):
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    request = object()
+    body = {"input": "hello"}
+    expected = ({"input": "normalized"}, None)
+    implementation = AsyncMock(return_value=expected)
+    monkeypatch.setattr(room_dispatch, "_normalize_room_dispatch", implementation)
+
+    assert await adapter._normalize_room_dispatch(request, body) == expected
+    implementation.assert_awaited_once_with(
+        adapter,
+        request,
+        body,
+        _api_server=sys.modules[api_server.__name__],
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_room_run_body_passes_through_unchanged():
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    adapter._room_grant_token = MagicMock(return_value="")
+    request = object()
+    body = {"input": "ordinary run"}
+
+    normalized, error = await adapter._normalize_room_dispatch(request, body)
+
+    assert normalized is body
+    assert error is None
+    adapter._room_grant_token.assert_called_once_with(request)
+
+
+@pytest.mark.asyncio
+async def test_room_dispatch_rejects_extra_fields_before_grant_verification():
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    adapter._room_grant_token = MagicMock(return_value="room-grant")
+    request = object()
+    body = {
+        "input": "room prompt",
+        "hosted_room_dispatch": {},
+        "unexpected": True,
+    }
+
+    normalized, error = await adapter._normalize_room_dispatch(request, body)
+
+    assert normalized is body
+    assert error.status == 400
+    assert json.loads(error.text)["error"]["code"] == "invalid_room_dispatch"
+

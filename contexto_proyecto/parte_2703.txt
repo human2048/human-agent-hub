@@ -1,0 +1,378 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_approval_reaction_fail_closed.py ===
+"""Tests for Matrix adapter fail-closed approval reaction auth.
+
+When MATRIX_ALLOWED_USERS is not configured, _on_reaction must deny
+approval reactions by default unless GATEWAY_ALLOW_ALL_USERS=true.
+Mirrors the Telegram _is_callback_user_authorized fix (commit 89d32052e,
+PR #28494).
+"""
+
+import asyncio
+import sys
+import types
+from collections import deque
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Stub mautrix so plugins.platforms.matrix.adapter can be imported without the SDK.
+# ---------------------------------------------------------------------------
+
+def _stub_mautrix():
+    stub = types.ModuleType("mautrix")
+    for sub in ("mautrix.types", "mautrix.client", "mautrix.client.api",
+                "mautrix.errors", "mautrix.crypto", "mautrix.util",
+                "mautrix.util.config"):
+        sys.modules.setdefault(sub, types.ModuleType(sub))
+    sys.modules.setdefault("mautrix", stub)
+    m = sys.modules["mautrix.types"]
+
+    class EventType:
+        ROOM_MESSAGE = "m.room.message"
+        REACTION = "m.reaction"
+        ROOM_ENCRYPTED = "m.room.encrypted"
+        ROOM_NAME = "m.room.name"
+
+    class PaginationDirection:
+        BACKWARD = "b"
+        FORWARD = "f"
+
+    class PresenceState:
+        ONLINE = "online"
+        OFFLINE = "offline"
+        UNAVAILABLE = "unavailable"
+
+    class RoomCreatePreset:
+        PRIVATE = "private_chat"
+        PUBLIC = "public_chat"
+        TRUSTED_PRIVATE = "trusted_private_chat"
+
+    class TrustState:
+        UNVERIFIED = 0
+        VERIFIED = 1
+
+    for attr in ("ContentURI", "EventID", "RoomID", "SyncToken", "UserID"):
+        setattr(m, attr, str)
+    m.EventType = EventType
+    m.PaginationDirection = PaginationDirection
+    m.PresenceState = PresenceState
+    m.RoomCreatePreset = RoomCreatePreset
+    m.TrustState = TrustState
+
+
+_stub_mautrix()
+
+from plugins.platforms.matrix.adapter import MatrixAdapter, _MatrixApprovalPrompt  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_adapter(allowed_user_ids=None):
+    """Construct a MatrixAdapter with only the state needed by _on_reaction."""
+    adapter = object.__new__(MatrixAdapter)
+    adapter._user_id = "@bot:matrix.org"
+    adapter._allowed_user_ids = set(allowed_user_ids) if allowed_user_ids else set()
+    adapter._approval_reaction_map = {"✅": "once", "❎": "deny"}
+    adapter._approval_prompts_by_event = {}
+    adapter._approval_prompt_by_session = {}
+    adapter._processed_events = deque(maxlen=512)
+    adapter._processed_events_set = set()
+    return adapter
+
+
+def _make_event(sender, reacts_to, key="✅"):
+    """Minimal Matrix reaction event."""
+    return SimpleNamespace(
+        sender=sender,
+        event_id=f"$reaction-{sender.split(':')[0]}",
+        room_id="!testroom:matrix.org",
+        content={"m.relates_to": {"event_id": reacts_to, "key": key}},
+    )
+
+
+def _make_prompt(chat_id="!testroom:matrix.org"):
+    return _MatrixApprovalPrompt(
+        session_key="session-abc",
+        chat_id=chat_id,
+        message_id="$prompt-event-1",
+    )
+
+
+def _run(adapter, event):
+    """Run _on_reaction and return whether the prompt was resolved."""
+    prompt_event_id = "$prompt-event-1"
+    prompt = _make_prompt()
+    adapter._approval_prompts_by_event[prompt_event_id] = prompt
+    adapter._redact_bot_approval_reactions = AsyncMock()
+
+    fake_approval = types.ModuleType("tools.approval")
+    fake_approval.resolve_gateway_approval = lambda session_key, choice: 1
+    with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+        asyncio.run(adapter._on_reaction(event))
+
+    return prompt.resolved
+
+
+# ---------------------------------------------------------------------------
+# Test class
+# ---------------------------------------------------------------------------
+
+class TestApprovalReactionFailClosed:
+    """_on_reaction approval auth must be fail-closed (parity with Telegram)."""
+
+    def test_no_allowlist_no_allow_all_denies(self, monkeypatch):
+        """No MATRIX_ALLOWED_USERS + no GATEWAY_ALLOW_ALL_USERS → deny."""
+        monkeypatch.delenv("MATRIX_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter(allowed_user_ids=None)
+        event = _make_event("@stranger:matrix.org", "$prompt-event-1")
+        assert _run(adapter, event) is False
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_crypto_store_per_profile.py ===
+"""Matrix crypto store must be pinned per profile at connect(), not at import.
+
+Under ``gateway.multiplex_profiles`` one process imports
+``plugins.platforms.matrix.adapter`` once; the old module-level
+``_STORE_DIR``/``_CRYPTO_DB_PATH`` resolved against the root HERMES_HOME at
+import time, so every profile's adapter opened the SAME crypto.db and inbound
+E2EE failed with "no session found" (#89168). ``connect()`` calls
+``_resolve_store_dir()`` inside ``_profile_runtime_scope`` (context-local
+HERMES_HOME), so resolving there -- and caching on the instance -- gives each
+profile its own store. Exercised via ``_resolve_store_dir`` directly so the
+test needs no mautrix install.
+"""
+from gateway.config import PlatformConfig
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from plugins.platforms.matrix import adapter as matrix_adapter
+
+
+def _make_adapter() -> matrix_adapter.MatrixAdapter:
+    return matrix_adapter.MatrixAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="syt_test_token",
+            extra={"homeserver": "https://matrix.example.org", "user_id": "@bot:example.org"},
+        )
+    )
+
+
+def test_store_dir_pinned_to_each_profile_home(tmp_path):
+    """Two profiles resolving in one process get two stores, and each
+    adapter keeps reporting its own store after the scope is gone."""
+    stores = {}
+    for profile in ("accountant", "engineering-lead"):
+        home = tmp_path / "profiles" / profile
+        home.mkdir(parents=True)
+        adapter = _make_adapter()
+        token = set_hermes_home_override(str(home))
+        try:
+            adapter._resolve_store_dir().mkdir(parents=True, exist_ok=True)
+        finally:
+            reset_hermes_home_override(token)
+        # Cached on the instance: correct even when read outside the scope.
+        path = adapter.get_diagnostics()["e2ee"]["crypto_store_path"]
+        assert path.startswith(str(home)), f"store not profile-scoped: {path}"
+        assert adapter._store_dir.is_dir()
+        stores[profile] = path
+
+    assert stores["accountant"] != stores["engineering-lead"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_dm_invite_recording.py ===
+"""Tests for Matrix DM room recording on invite (issue #44679).
+
+When the bot's Matrix account has no ``m.direct`` account data (common for
+accounts created solely for Hermes), DM rooms are silently treated as groups.
+This tests the fix that records DM rooms in ``m.direct`` when the invite
+event carries ``is_direct: true``.
+"""
+
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from gateway.config import PlatformConfig
+
+
+def _make_adapter(tmp_path=None):
+    """Create a MatrixAdapter with mocked config."""
+    from plugins.platforms.matrix.adapter import MatrixAdapter
+
+    config = PlatformConfig(
+        enabled=True,
+        token="syt_test_token",
+        extra={
+            "homeserver": "https://matrix.example.org",
+            "user_id": "@hermes:example.org",
+        },
+    )
+    adapter = MatrixAdapter(config)
+    adapter._text_batch_delay_seconds = 0
+    adapter.handle_message = AsyncMock()
+    adapter._startup_ts = time.time() - 10
+    # Authorize the inviter used throughout this module so the invite-auth
+    # gate in _on_invite (rejects auto-joins from non-allow-listed users)
+    # lets the join through and the DM-recording side effects are exercised.
+    adapter._allowed_user_ids = {"@alice:example.org"}
+    return adapter
+
+
+def _make_invite_event(
+    room_id="!dm_room:example.org",
+    sender="@alice:example.org",
+    is_direct=True,
+):
+    """Create a fake invite event with is_direct in content."""
+    content = SimpleNamespace(is_direct=is_direct)
+    return SimpleNamespace(
+        room_id=room_id,
+        sender=sender,
+        content=content,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _on_invite DM recording
+# ---------------------------------------------------------------------------
+
+
+class TestOnInviteRecordsDM:
+    """_on_invite schedules a join that records the DM when is_direct is True.
+
+    The join itself is non-blocking (``_schedule_invite_join`` spawns a task),
+    so these tests drive ``_on_invite`` and then await the scheduled task to
+    observe its side effects.
+    """
+
+    @staticmethod
+    async def _drain_invite_tasks(adapter):
+        """Await any tasks _schedule_invite_join spawned."""
+        tasks = list(adapter._invite_join_tasks.values())
+        for task in tasks:
+            await task
+
+    @pytest.mark.asyncio
+    async def test_dm_invite_records_room(self):
+        adapter = _make_adapter()
+        adapter._join_room_by_id = AsyncMock(return_value=True)
+        adapter._record_dm_room = AsyncMock()
+
+        event = _make_invite_event(is_direct=True, sender="@alice:example.org")
+        await adapter._on_invite(event)
+        await self._drain_invite_tasks(adapter)
+
+        adapter._join_room_by_id.assert_awaited_once_with("!dm_room:example.org")
+        adapter._record_dm_room.assert_awaited_once_with(
+            "!dm_room:example.org", "@alice:example.org"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_dm_invite_does_not_record(self):
+        adapter = _make_adapter()
+        adapter._join_room_by_id = AsyncMock(return_value=True)
+        adapter._record_dm_room = AsyncMock()
+
+        event = _make_invite_event(is_direct=False)
+        await adapter._on_invite(event)
+        await self._drain_invite_tasks(adapter)
+
+        adapter._join_room_by_id.assert_awaited_once()
+        adapter._record_dm_room.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _record_dm_room
+# ---------------------------------------------------------------------------
+
+
+class TestRecordDMRoom:
+    """_record_dm_room should update m.direct account data and local cache."""
+
+    @pytest.mark.asyncio
+    async def test_creates_m_direct_when_absent(self):
+        """When m.direct doesn't exist (404), creates it from scratch."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._client.get_account_data = AsyncMock(side_effect=Exception("M_NOT_FOUND"))
+        adapter._client.set_account_data = AsyncMock()
+
+        await adapter._record_dm_room("!new:example.org", "@alice:example.org")
+
+        adapter._client.set_account_data.assert_awaited_once_with(
+            "m.direct", {"@alice:example.org": ["!new:example.org"]}
+        )
+        assert adapter._dm_rooms.get("!new:example.org") is True
+
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_room_in_m_direct(self):
+        """If room is already in m.direct, does not append again."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        existing_data = {"@alice:example.org": ["!room:example.org"]}
+        adapter._client.get_account_data = AsyncMock(return_value=existing_data)
+        adapter._client.set_account_data = AsyncMock()
+
+        await adapter._record_dm_room("!room:example.org", "@alice:example.org")
+
+        adapter._client.set_account_data.assert_not_awaited()
+        assert adapter._dm_rooms.get("!room:example.org") is True
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_matrix_exec_approval.py ===
+import types
+
+import pytest
+from unittest.mock import AsyncMock, patch
+
+from gateway.config import PlatformConfig
+
+
+class TestMatrixExecApprovalReactions:
+
+
+    @pytest.mark.asyncio
+    async def test_reaction_resolves_pending_approval(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@liizfq:liizfq.top")
+        from plugins.platforms.matrix.adapter import MatrixAdapter, _MatrixApprovalPrompt
+
+        adapter = MatrixAdapter(PlatformConfig(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.org"}))
+        # Resolve user_id so _is_self_sender doesn't defensively drop all traffic (#15763).
+        adapter._user_id = "@bot:example.org"
+        adapter._approval_prompts_by_event["$target"] = _MatrixApprovalPrompt(
+            session_key="sess-1", chat_id="!room:example.org", message_id="$target"
+        )
+        adapter._approval_prompt_by_session["sess-1"] = "$target"
+
+        content = {"m.relates_to": {"event_id": "$target", "key": "✅"}}
+        event = types.SimpleNamespace(
+            sender="@liizfq:liizfq.top",
+            event_id="$react1",
+            room_id="!room:example.org",
+            content=content,
+        )
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._on_reaction(event)
+
+        mock_resolve.assert_called_once_with("sess-1", "once")
+        assert "$target" not in adapter._approval_prompts_by_event
+        assert "sess-1" not in adapter._approval_prompt_by_session
+

@@ -1,0 +1,298 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\platforms\test_interactive_setup_reconfigure_gate.py ===
+"""Every platform plugin's ``interactive_setup`` routes its "already configured? Reconfigure?"
+gate through ``hermes_cli.setup_platforms.declines_reconfigure``.
+
+The wizards used to hand-roll the gate (env check + info line + ``prompt_yes_no(..., False)``)
+with drifting wording and, for two of them, raw ``input()`` loops. Fixes to the shared gate
+(wording, default, non-interactive handling) only reach a wizard that actually calls it, so the
+test spies on the real primitive: with the primary env var set and the user answering "no", the
+wizard must have asked the shared gate about that env var and returned without persisting or
+prompting anything else.
+"""
+
+import importlib
+
+import pytest
+
+import hermes_cli.setup_platforms as setup_platforms_mod
+
+# (plugin module, primary env var the shared gate keys on)
+_WIZARDS = [
+    ("plugins.platforms.buzz.adapter", "BUZZ_RELAY_URL"),
+    ("plugins.platforms.dingtalk.adapter", "DINGTALK_CLIENT_ID"),
+    ("plugins.platforms.discord.adapter", "DISCORD_BOT_TOKEN"),
+    ("plugins.platforms.feishu.adapter", "FEISHU_APP_ID"),
+    ("plugins.platforms.google_chat.adapter", "GOOGLE_CHAT_SUBSCRIPTION_NAME"),
+    ("plugins.platforms.irc.adapter", "IRC_SERVER"),
+    ("plugins.platforms.line.adapter", "LINE_CHANNEL_ACCESS_TOKEN"),
+    ("plugins.platforms.matrix.adapter", "MATRIX_PASSWORD"),
+    ("plugins.platforms.mattermost.adapter", "MATTERMOST_TOKEN"),
+    ("plugins.platforms.raft.adapter", "RAFT_PROFILE"),
+    ("plugins.platforms.simplex.adapter", "SIMPLEX_WS_URL"),
+    ("plugins.platforms.slack.adapter", "SLACK_BOT_TOKEN"),
+    ("plugins.platforms.teams.adapter", "TEAMS_CLIENT_ID"),
+    ("plugins.platforms.wecom.adapter", "WECOM_BOT_ID"),
+]
+
+
+@pytest.mark.parametrize("module_name, env_var", _WIZARDS, ids=[m.split(".")[-2] for m, _ in _WIZARDS])
+def test_declining_reconfigure_goes_through_shared_gate(monkeypatch, tmp_path, module_name, env_var):
+    import hermes_cli.cli_output as cli_output_mod
+    import hermes_cli.config as config_mod
+    import hermes_cli.setup as setup_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv(env_var, "already-set")
+
+    gated: list[tuple[str, ...]] = []
+    real_gate = setup_platforms_mod.declines_reconfigure
+
+    def _spy_gate(label, question, *env_vars):
+        gated.append(env_vars)
+        return real_gate(label, question, *env_vars)
+
+    def _no_save(*_a, **_kw):
+        raise AssertionError("wizard persisted env after the user declined to reconfigure")
+
+    def _no_prompt(*_a, **_kw):
+        raise AssertionError("wizard fell through to its own prompts after the user declined")
+
+    # Wizards import the gate lazily from setup_platforms; the gate reads prompt_yes_no through
+    # hermes_cli.setup. Everything else a wizard could do after declining must not happen.
+    monkeypatch.setattr(setup_platforms_mod, "declines_reconfigure", _spy_gate)
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    monkeypatch.setattr(cli_output_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    for mod in (setup_mod, cli_output_mod):
+        monkeypatch.setattr(mod, "prompt", _no_prompt)
+        monkeypatch.setattr(mod, "save_env_value", _no_save, raising=False)
+    monkeypatch.setattr(config_mod, "save_env_value", _no_save)
+
+    importlib.import_module(module_name).interactive_setup()
+
+    assert gated and env_var in gated[0], f"{module_name}: gate not routed through declines_reconfigure: {gated}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\platforms\buzz\test_buzz_unscoped_requirement_gate.py ===
+"""Regression tests for the Buzz requirement gate vs external secrets (#95216).
+
+``check_requirements()`` runs at gateway startup BEFORE the per-profile
+secret scope is installed, so a Bitwarden-managed ``BUZZ_PRIVATE_KEY`` (only
+``BWS_ACCESS_TOKEN`` in ``.env``) was invisible to the bare env read and Buzz
+was silently skipped. The fix adds a one-shot ``build_profile_secret_scope``
+consultation to the unscoped fallback of ``_shared.get_scoped_secret(external_fallback=True)``.
+
+The key values below are synthesized placeholders (never a usable secret).
+"""
+
+import os
+
+import pytest
+
+# Synthesized, non-credential placeholder (any non-empty string exercises
+# the gate; no real key material is ever embedded here).
+_STUB_KEY = os.environ.get("BUZZ_TEST_STUB_KEY") or ("k" * 8)
+
+
+@pytest.fixture(autouse=True)
+def _reset_unscoped_cache():
+    import gateway.platforms._shared as shared
+
+    prev = shared._UNSCOPED_PROFILE_SECRETS
+    shared._UNSCOPED_PROFILE_SECRETS = None
+    yield
+    shared._UNSCOPED_PROFILE_SECRETS = prev
+
+
+def _install_fake_scope(monkeypatch, secrets):
+    """Point build_profile_secret_scope at a fake external-secret snapshot."""
+    import agent.secret_scope as secret_scope
+
+    calls = []
+
+    def fake_build(home):  # noqa: ANN001 - test double
+        calls.append(home)
+        return dict(secrets)
+
+    monkeypatch.setattr(secret_scope, "build_profile_secret_scope", fake_build)
+    return calls
+
+
+class TestRequirementGateSeesExternalSecrets:
+    def test_externally_managed_key_passes_gate(self, monkeypatch):
+        import plugins.platforms.buzz.adapter as adapter
+
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        monkeypatch.setenv("BWS_ACCESS_TOKEN", "stub-token")
+        _install_fake_scope(
+            monkeypatch,
+            {"BUZZ_RELAY_URL": "wss://relay.example", "BUZZ_PRIVATE_KEY": _STUB_KEY},
+        )
+
+        assert adapter.check_requirements() is True
+
+    def test_gate_fails_cleanly_when_nothing_resolves(self, monkeypatch):
+        import plugins.platforms.buzz.adapter as adapter
+
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        _install_fake_scope(monkeypatch, {})
+
+        assert adapter.check_requirements() is False
+
+    def test_relay_from_env_still_passes_with_external_key(self, monkeypatch):
+        import plugins.platforms.buzz.adapter as adapter
+
+        monkeypatch.setenv("BUZZ_RELAY_URL", "wss://relay.example")
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        _install_fake_scope(monkeypatch, {"BUZZ_PRIVATE_KEY": _STUB_KEY})
+
+        assert adapter.check_requirements() is True
+
+    def test_profile_scope_build_failure_degrades_to_not_configured(
+        self, monkeypatch
+    ):
+        import agent.secret_scope as secret_scope
+        import plugins.platforms.buzz.adapter as adapter
+
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+
+        def boom(home):  # noqa: ANN001 - test double
+            raise RuntimeError("external secret resolver unavailable")
+
+        monkeypatch.setattr(secret_scope, "build_profile_secret_scope", boom)
+        assert adapter.check_requirements() is False
+
+    def test_scope_snapshot_is_built_once_and_cached(self, monkeypatch):
+        import plugins.platforms.buzz.adapter as adapter
+
+        monkeypatch.setenv("BUZZ_RELAY_URL", "wss://relay.example")
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        calls = _install_fake_scope(monkeypatch, {"BUZZ_PRIVATE_KEY": _STUB_KEY})
+
+        assert adapter.check_requirements() is True
+        assert adapter.check_requirements() is True
+        assert adapter.validate_config(type("Cfg", (), {"extra": {}})()) is True
+        assert len(calls) == 1, "the external-secret snapshot must be cached"
+
+
+class TestScopedSemanticsUnchanged:
+    def test_active_scope_miss_does_not_fall_through_to_unscoped_build(
+        self, monkeypatch
+    ):
+        """A scoped miss must keep returning default: the unscoped build is
+        only for the no-scope startup gate, never a cross-profile borrow."""
+        import agent.secret_scope as secret_scope
+        import plugins.platforms.buzz.adapter as adapter
+
+        monkeypatch.setenv("BUZZ_RELAY_URL", "wss://relay.example")
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        calls = _install_fake_scope(
+            monkeypatch, {"BUZZ_PRIVATE_KEY": _STUB_KEY * 2}
+        )
+        token = secret_scope.set_secret_scope({})  # active, empty scope
+
+        try:
+            assert adapter.check_requirements() is False
+            assert calls == [], "an active scope must shadow the unscoped build"
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\platforms\buzz\test_buzz_ws_dial_happy_eyeballs.py ===
+"""Buzz WebSocket dial races IPv6/IPv4 (#114265): ``happy_eyeballs_delay`` reaches
+``loop.create_connection`` through ``websockets.connect`` — see tests/gateway/test_ws_dial_happy_eyeballs.py."""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+pytest.importorskip("websockets")
+
+EXPECTED_DELAY = 0.25
+
+
+@pytest.mark.asyncio
+async def test_buzz_websocket_loop_dial_races_ipv6_ipv4(monkeypatch):
+    import websockets
+
+    from plugins.platforms.buzz.adapter import BuzzAdapter
+
+    adapter = BuzzAdapter.__new__(BuzzAdapter)
+    adapter.relay_url = "https://relay.example.com/"
+    adapter._ws_ready = None
+    adapter._mark_connected = MagicMock()
+    recorded: dict = {}
+
+    def fake_connect(*_args, **kwargs):
+        recorded.update(kwargs)
+        raise asyncio.CancelledError  # first dial ends the loop: only the kwargs matter here
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._websocket_loop()
+    assert recorded["happy_eyeballs_delay"] == EXPECTED_DELAY
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\plugins\platforms\matrix\test_blank_config_env_fallback.py ===
+"""A present-but-blank ``matrix:`` key in config.yaml means "unset": the env-var fallback must fire
+exactly as it does when the key is absent (0.21.2 started seeding blank YAML values into
+``config.extra``, which flipped the precedence and silently disabled free-response rooms)."""
+
+import pytest
+
+from gateway.config import PlatformConfig
+
+
+@pytest.mark.parametrize("blank", ["", "  \t "])
+def test_blank_yaml_values_fall_through_to_env(monkeypatch, blank):
+    from plugins.platforms.matrix.adapter import MatrixAdapter, _extra_csv_set, _resolve_max_message_length
+
+    monkeypatch.setenv("MATRIX_FREE_RESPONSE_ROOMS", "!home:example.org")
+    monkeypatch.setenv("MATRIX_MAX_MESSAGE_LENGTH", "9000")
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+    config = PlatformConfig(enabled=True, extra={
+        "free_response_rooms": blank, "max_message_length": blank, "auto_thread": blank})
+
+    assert _extra_csv_set(config, "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS") == {"!home:example.org"}
+    assert _resolve_max_message_length(config) == 9000
+    assert MatrixAdapter._extra_truthy(config, "auto_thread", "MATRIX_AUTO_THREAD", "true") is False
+
+
+def test_explicit_env_beats_yaml_and_yaml_beats_default(monkeypatch):
+    """Per-profile precedence: explicit scoped env → the profile's YAML → default. A blank env
+    value is unset (it must not clobber YAML); an explicit empty list is a real "no rooms" value."""
+    from plugins.platforms.matrix.adapter import MatrixAdapter, _extra_csv_set, _resolve_max_message_length
+
+    yaml_config = PlatformConfig(enabled=True, extra={
+        "free_response_rooms": ["!a:example.org", " !b:example.org "], "max_message_length": 4000,
+        "auto_thread": False})
+
+    monkeypatch.setenv("MATRIX_FREE_RESPONSE_ROOMS", "!env:example.org")
+    monkeypatch.setenv("MATRIX_MAX_MESSAGE_LENGTH", "9000")
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "true")
+    assert _extra_csv_set(yaml_config, "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS") == {"!env:example.org"}
+    assert _resolve_max_message_length(yaml_config) == 9000
+    assert MatrixAdapter._extra_truthy(yaml_config, "auto_thread", "MATRIX_AUTO_THREAD", "true") is True
+
+    for name in ("MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_MAX_MESSAGE_LENGTH", "MATRIX_AUTO_THREAD"):
+        monkeypatch.setenv(name, "  ")
+    assert _extra_csv_set(yaml_config, "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS") == {"!a:example.org", "!b:example.org"}
+    assert _resolve_max_message_length(yaml_config) == 4000
+    assert MatrixAdapter._extra_truthy(yaml_config, "auto_thread", "MATRIX_AUTO_THREAD", "true") is False
+
+    monkeypatch.delenv("MATRIX_AUTO_THREAD")
+    assert MatrixAdapter._extra_truthy(PlatformConfig(enabled=True, extra={}), "auto_thread", "MATRIX_AUTO_THREAD", "true") is True
+    assert _extra_csv_set(PlatformConfig(enabled=True, extra={"free_response_rooms": []}),
+                          "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS") == set()
+

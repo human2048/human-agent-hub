@@ -1,0 +1,408 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\lsp\test_multi_root.py ===
+"""Multi-root servers share ONE process across project roots.
+
+A profiled session with subagents editing across ~30 git worktrees ran
+30-60 pyright processes.  Pyright supports multi-root workspaces, so
+the service keys such clients by ``server_id`` alone and attaches each
+new root via ``workspace/didChangeWorkspaceFolders``.  Single-root
+servers keep the one-client-per-root behaviour.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from agent.lsp.manager import LSPService
+from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
+from agent.lsp.workspace import clear_cache
+
+MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
+
+
+@pytest.fixture(autouse=True)
+def _clear_workspace_cache():
+    clear_cache()
+    yield
+    clear_cache()
+
+
+def _make_repo(tmp_path: Path, name: str) -> Path:
+    repo = tmp_path / name
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("", encoding="utf-8")
+    (repo / "x.py").write_text("print('hi')\n", encoding="utf-8")
+    return repo
+
+
+@pytest.fixture
+def two_repos(tmp_path):
+    return _make_repo(tmp_path, "repo-a"), _make_repo(tmp_path, "repo-b")
+
+
+@pytest.fixture
+def mock_pyright(monkeypatch, tmp_path):
+    """Install the mock as ``pyright``; yield (spawn_count, folders_log, set_multi_root)."""
+    idx = next(i for i, s in enumerate(SERVERS) if s.server_id == "pyright")
+    original = SERVERS[idx]
+    spawns = {"value": 0}
+    folders_log = tmp_path / "folders.jsonl"
+
+    def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
+        spawns["value"] += 1
+        return SpawnSpec(
+            command=[sys.executable, MOCK_SERVER],
+            workspace_root=root,
+            cwd=root,
+            env={"MOCK_LSP_SCRIPT": "errors", "MOCK_LSP_FOLDERS_LOG": str(folders_log)},
+        )
+
+    def _install(multi_root: bool) -> None:
+        SERVERS[idx] = ServerDef(
+            server_id="pyright",
+            extensions=original.extensions,
+            resolve_root=lambda fp, ws: ws,
+            build_spawn=_spawn,
+            multi_root=multi_root,
+            description="mock pyright",
+        )
+
+    yield spawns, folders_log, _install
+    SERVERS[idx] = original
+
+
+def _service() -> LSPService:
+    return LSPService(
+        enabled=True, wait_mode="document", wait_timeout=3.0, install_strategy="manual"
+    )
+
+
+def test_multi_root_server_shares_one_client_across_roots(two_repos, mock_pyright, monkeypatch):
+    repo_a, repo_b = two_repos
+    spawns, folders_log, install = mock_pyright
+    install(multi_root=True)
+    svc = _service()
+    try:
+        monkeypatch.chdir(str(repo_a))
+        diags_a = svc.get_diagnostics_sync(str(repo_a / "x.py"))
+        monkeypatch.chdir(str(repo_b))
+        diags_b = svc.get_diagnostics_sync(str(repo_b / "x.py"))
+
+        # Exactly one process; the second root arrived as a folder change.
+        assert spawns["value"] == 1
+        assert len(svc._clients) == 1
+        client = next(iter(svc._clients.values()))
+        assert client.workspace_folders == [str(repo_a), str(repo_b)]
+        events = [json.loads(line) for line in folders_log.read_text(encoding="utf-8").splitlines()]
+        assert [f["uri"] for e in events for f in e["event"]["added"]] == [
+            Path(repo_b).as_uri()
+        ]
+        # Diagnostics still resolve per file in both folders.
+        assert len(diags_a) == 1 and len(diags_b) == 1
+        status = svc.get_status()["clients"][0]
+        assert status["workspace_root"] == str(repo_a)
+        assert status["workspace_folders"] == [str(repo_a), str(repo_b)]
+    finally:
+        svc.shutdown()
+
+
+def test_single_root_server_still_spawns_per_root(two_repos, mock_pyright, monkeypatch):
+    repo_a, repo_b = two_repos
+    spawns, folders_log, install = mock_pyright
+    install(multi_root=False)
+    svc = _service()
+    try:
+        monkeypatch.chdir(str(repo_a))
+        svc.get_diagnostics_sync(str(repo_a / "x.py"))
+        monkeypatch.chdir(str(repo_b))
+        svc.get_diagnostics_sync(str(repo_b / "x.py"))
+        assert spawns["value"] == 2
+        assert set(svc._clients) == {("pyright", str(repo_a)), ("pyright", str(repo_b))}
+        assert not folders_log.exists()
+    finally:
+        svc.shutdown()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\lsp\test_nested_root_current_diagnostics.py ===
+"""``_current_diags_async`` must find a single-root client under the root it was spawned with.
+
+``_get_or_spawn`` keys single-root servers by ``srv.resolve_root(...)`` (a nested ``package.json``
+project), but the current-diagnostics lookup keyed by the enclosing workspace root, so the delta
+baseline was refreshed from ``[]`` while the live client held diagnostics.
+"""
+from __future__ import annotations
+
+import dataclasses
+import sys
+from pathlib import Path
+
+from agent.lsp import manager, servers
+
+MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
+
+
+def test_nested_single_root_client_is_found_by_current_lookup(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    nested = repo / "package"
+    nested.mkdir()
+    (nested / "package.json").write_text("{}", encoding="utf-8")
+    src = nested / "x.ts"
+    src.write_text("const x = 1;\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    original = next(s for s in servers.SERVERS if s.server_id == "typescript")
+    assert original.resolve_root(str(src), str(repo)) == str(nested) and not original.multi_root
+
+    def spawn(root, ctx):
+        return servers.SpawnSpec(command=[sys.executable, MOCK_SERVER], workspace_root=root, cwd=root,
+                                 env={"MOCK_LSP_SCRIPT": "errors"}, initialization_options={})
+
+    mocked = dataclasses.replace(original, build_spawn=spawn)
+    monkeypatch.setattr(servers, "SERVERS", [mocked if s is original else s for s in servers.SERVERS])
+
+    svc = manager.LSPService(enabled=True, wait_mode="document", wait_timeout=5, install_strategy="manual")
+    try:
+        svc.snapshot_baseline(str(src))
+        live = svc.get_diagnostics_sync(str(src), delta=False)
+        assert live
+        assert svc._loop.run(svc._current_diags_async(str(src)), timeout=5) == live
+    finally:
+        svc.shutdown()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\lsp\test_powershell_server.py ===
+"""Tests for the PowerShellEditorServices (PSES) server registration.
+
+PSES is unusual among the registry entries: it's a PowerShell module
+bundle (GitHub release zip) driven by a ``pwsh`` bootstrap script, not a
+single binary on PATH. These tests cover the registry wiring plus the
+two-prerequisite spawn logic (pwsh host + module bundle).
+"""
+from __future__ import annotations
+
+import os
+
+import agent.lsp.servers as srv
+from agent.lsp.install import detect_status
+from agent.lsp.servers import (
+    ServerContext,
+    find_server_for_file,
+    language_id_for,
+)
+
+
+def test_powershell_extensions_route_to_pses():
+    for ext in ("script.ps1", "module.psm1", "manifest.psd1"):
+        s = find_server_for_file(ext)
+        assert s is not None, ext
+        assert s.server_id == "powershell"
+
+
+
+
+
+
+
+
+
+
+def _make_fake_bundle(root) -> str:
+    bundle = root / "PowerShellEditorServices"
+    inner = bundle / "PowerShellEditorServices"
+    inner.mkdir(parents=True)
+    (inner / "Start-EditorServices.ps1").write_text("# fake")
+    return str(bundle)
+
+
+def test_spawn_builds_command_with_bundle_via_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "_which", lambda *names: "/usr/bin/pwsh")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    bundle = _make_fake_bundle(tmp_path)
+    monkeypatch.setenv("PSES_BUNDLE_PATH", bundle)
+
+    ctx = ServerContext(workspace_root=str(tmp_path), install_strategy="manual")
+    spec = srv._spawn_powershell_es(str(tmp_path), ctx)
+    assert spec is not None
+    assert spec.command[0] == "/usr/bin/pwsh"
+    assert "-Stdio" in spec.command[-1]
+    assert "Start-EditorServices.ps1" in spec.command[-1]
+    assert bundle in spec.command[-1]
+    # -NonInteractive / -NoProfile keep the host from hanging on a prompt.
+    assert "-NonInteractive" in spec.command
+    assert "-NoProfile" in spec.command
+
+
+
+
+def test_bundle_path_init_override_not_leaked_into_init_options(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "_which", lambda *names: "/usr/bin/pwsh")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("PSES_BUNDLE_PATH", raising=False)
+    bundle = _make_fake_bundle(tmp_path)
+
+    ctx = ServerContext(
+        workspace_root=str(tmp_path),
+        install_strategy="manual",
+        init_overrides={"powershell": {"bundlePath": bundle, "foo": "bar"}},
+    )
+    spec = srv._spawn_powershell_es(str(tmp_path), ctx)
+    assert spec is not None
+    # bundlePath is a Hermes-internal resolution key — it must not be sent
+    # to the server as an LSP initializationOption.
+    assert "bundlePath" not in spec.initialization_options
+    assert spec.initialization_options.get("foo") == "bar"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\lsp\test_protocol.py ===
+"""Tests for the LSP protocol framing layer.
+
+The framer is small but load-bearing — Content-Length parsing is the
+single most common reason for hand-rolled LSP clients to silently
+deadlock.  These tests exercise:
+
+- exact wire format of outgoing messages (encode_message)
+- partial-read tolerance + EOF handling (read_message)
+- envelope helpers (request, response, notification, error)
+- message classification
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import pytest
+
+from agent.lsp.protocol import (
+    ERROR_CONTENT_MODIFIED,
+    ERROR_METHOD_NOT_FOUND,
+    LSPProtocolError,
+    LSPRequestError,
+    classify_message,
+    encode_message,
+    make_error_response,
+    make_notification,
+    make_request,
+    make_response,
+    read_message,
+)
+
+
+# ---------------------------------------------------------------------------
+# encode_message
+# ---------------------------------------------------------------------------
+
+
+def test_encode_message_uses_compact_separators_and_utf8():
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "x", "params": {"k": "ä"}}
+    out = encode_message(msg)
+    # Header is plain ASCII Content-Length CRLF CRLF
+    header_end = out.index(b"\r\n\r\n") + 4
+    header = out[:header_end].decode("ascii")
+    body = out[header_end:]
+    assert "Content-Length:" in header
+    declared = int(header.split("Content-Length:")[1].split("\r\n")[0].strip())
+    # Declared length must equal actual body bytes.
+    assert declared == len(body)
+    # Body parses as JSON and round-trips.
+    parsed = json.loads(body.decode("utf-8"))
+    assert parsed == msg
+    # Body uses compact separators (no spaces between kv).
+    assert b'"id":1' in body
+
+
+
+
+# ---------------------------------------------------------------------------
+# read_message
+# ---------------------------------------------------------------------------
+
+
+async def _stream_from_bytes(data: bytes) -> asyncio.StreamReader:
+    """Build an asyncio.StreamReader pre-populated with ``data``."""
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+    return reader
+
+
+
+
+
+
+
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_read_message_rejects_runaway_header():
+    """A pathological server that streams headers without ever emitting
+    the CRLF-CRLF terminator must not loop forever — the 8 KiB cap kicks
+    in and surfaces a protocol error."""
+    flood = (b"X-Junk: " + b"A" * 200 + b"\r\n") * 60   # ~12 KiB worth
+    reader = await _stream_from_bytes(flood)
+    with pytest.raises(LSPProtocolError) as exc:
+        await read_message(reader)
+    assert "8 KiB" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# envelope helpers
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+def test_make_notification_omits_id():
+    msg = make_notification("log", {"line": "hi"})
+    assert "id" not in msg
+    assert msg["method"] == "log"
+
+
+
+
+def test_make_error_response_shape():
+    msg = make_error_response(7, ERROR_CONTENT_MODIFIED, "stale", {"hint": "retry"})
+    assert msg["error"]["code"] == ERROR_CONTENT_MODIFIED
+    assert msg["error"]["message"] == "stale"
+    assert msg["error"]["data"] == {"hint": "retry"}
+
+
+# ---------------------------------------------------------------------------
+# classify_message
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+def test_classify_message_invalid():
+    assert classify_message({"id": 1})[0] == "invalid"
+    assert classify_message({"jsonrpc": "1.0", "method": "x"})[0] == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# LSPRequestError
+# ---------------------------------------------------------------------------
+
+
+def test_lsp_request_error_carries_code_and_data():
+    e = LSPRequestError(ERROR_METHOD_NOT_FOUND, "no", {"x": 1})
+    assert e.code == ERROR_METHOD_NOT_FOUND
+    assert e.message == "no"
+    assert e.data == {"x": 1}
+

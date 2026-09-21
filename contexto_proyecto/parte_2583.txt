@@ -1,0 +1,305 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_delivery_ledger_fd_leak.py ===
+"""Regression: the gateway delivery ledger must close every SQLite connection.
+
+Sibling of the cron execution-ledger leak (#69567 / PR #69594). The ledger used
+``with _connect() as conn:`` where ``sqlite3.Connection.__exit__`` commits or
+rolls back but never closes, leaking the db/-wal/-shm file descriptors on every
+call until a long-running gateway exhausts ``RLIMIT_NOFILE``. ``record_obligation``
+runs on every outbound final response, so this is the highest-frequency leaker of
+the set. These tests fail if the deterministic ``close()`` is ever removed again.
+"""
+
+import sqlite3
+
+import pytest
+
+from gateway import delivery_ledger as dl
+
+
+class _TrackingConnection:
+    """Delegates to a real sqlite3.Connection while recording close() calls.
+
+    sqlite3.Connection is a static C type: it has no per-instance __dict__ and
+    its methods can't be monkeypatched, so open/close tracking is done via a
+    delegating wrapper returned in place of the real connection.
+    """
+
+    def __init__(self, real, closed_ids):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_closed_ids", closed_ids)
+
+    def close(self):
+        self._closed_ids.append(id(self._real))
+        self._real.close()
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._real.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._real, name, value)
+
+
+def _point_ledger(monkeypatch, tmp_path):
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "state.db")
+    return dl
+
+
+def _track_connections(monkeypatch):
+    opened, closed = [], []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(id(conn))
+        return _TrackingConnection(conn, closed)
+
+    monkeypatch.setattr(dl.sqlite3, "connect", tracking_connect)
+    return opened, closed
+
+
+def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
+    """Every public ledger operation must close the connection it opened."""
+    _point_ledger(monkeypatch, tmp_path)
+    opened, closed = _track_connections(monkeypatch)
+
+    oid = dl.compute_obligation_id("sess", "msg", "content")
+    dl.record_obligation(
+        obligation_id=oid, session_key="sess", platform="telegram",
+        chat_id="123", thread_id=None, content="hello",
+    )
+    dl.mark_attempting(oid)
+    dl.mark_delivered(oid)
+    dl.sweep_recoverable()
+
+    assert opened, "expected at least one connection to be opened"
+    assert len(opened) == len(closed)
+    assert set(opened) == set(closed)
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_delivery_ledger_producer.py ===
+"""Producer-hook tests: _process_message_background records delivery
+obligations around the final send (gateway/platforms/base.py).
+
+Contract: obligation recorded (pending→attempting) BEFORE the send await,
+delivered/failed by SendResult afterward; slash commands, ephemeral
+replies, and empty responses are never recorded; ledger failures never
+block the send.
+"""
+
+import asyncio
+import threading
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from gateway import delivery_ledger as dl
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource
+
+
+@pytest.fixture(autouse=True)
+def _fresh_db(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
+    yield
+
+
+class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
+    """Minimal concrete adapter driving the real base-class pipeline."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True), Platform.SLACK)
+        self.sent = []
+
+    async def connect(self, *, is_reconnect: bool = False):  # pragma: no cover
+        return True
+
+    async def disconnect(self):  # pragma: no cover - unused
+        return None
+
+    async def get_chat_info(self, chat_id):  # pragma: no cover - unused
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(content)
+        return SendResult(success=True, message_id="m1")
+
+
+def _event(text="hello agent"):
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.SLACK, chat_id="C1", chat_type="channel"
+        ),
+        message_id="msg-42",
+    )
+
+
+def _rows():
+    with dl._connect() as conn:
+        return conn.execute(
+            """SELECT obligation_id, state, content, adapter_profile
+               FROM delivery_obligations"""
+        ).fetchall()
+
+
+def _blocking_probe():
+    """Return a blocking ledger call and an event-loop progress witness."""
+    ledger_started = threading.Event()
+    event_loop_progressed = threading.Event()
+    blocked_event_loop = []
+
+    def _slow_ledger_call(*args, **kwargs):
+        ledger_started.set()
+        # Generous timeout: a genuinely blocked loop can never set the event
+        # (the witness coroutine cannot run), so a longer wait only guards
+        # against loaded-CI scheduling flake, not against missing the bug.
+        if not event_loop_progressed.wait(timeout=5.0):
+            blocked_event_loop.append(True)
+
+    async def _event_loop_witness():
+        deadline = asyncio.get_running_loop().time() + 10
+        while not ledger_started.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("ledger call never started")
+            await asyncio.sleep(0)
+        event_loop_progressed.set()
+
+    return _slow_ledger_call, _event_loop_witness, blocked_event_loop
+
+
+async def _run(adapter, event, response="final answer"):
+    adapter._message_handler = AsyncMock(return_value=response)
+    session_key = "agent:main:slack:channel:C1"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    await adapter._process_message_background(event, session_key)
+
+
+class TestProducerHook:
+    @pytest.mark.asyncio
+    async def test_normal_turn_records_and_delivers(self):
+        adapter = _Adapter()
+        await _run(adapter, _event())
+
+        assert adapter.sent == ["final answer"]
+        rows = _rows()
+        assert len(rows) == 1
+        assert rows[0][1] == "delivered"
+        assert rows[0][2] == "final answer"
+
+    @pytest.mark.asyncio
+    async def test_send_failure_leaves_failed_row(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="chat_not_found")
+        )
+        await _run(adapter, _event())
+
+        rows = _rows()
+        assert len(rows) == 1
+        assert rows[0][1] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_late_transient_failure_signals_reconnected_runner(self):
+        """A replacement installed mid-send must trigger another ledger sweep."""
+        adapter = _Adapter()
+        adapter._owner_profile = "reviewer"
+        replacement = _Adapter()
+        replacement._owner_profile = "reviewer"
+        runner = MagicMock()
+        runner._adapter_for_source.side_effect = [adapter, replacement]
+        runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
+        adapter.gateway_runner = runner
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="send_path_degraded",
+                retryable=True,
+            )
+        )
+
+        await _run(adapter, _event())
+
+        assert _rows()[0][1] == "failed"
+        assert _rows()[0][3] == "reviewer"
+        runner._redeliver_failed_obligations_for_platform.assert_awaited_once_with(
+            Platform.SLACK, profile="reviewer"
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_slow_ledger_record_does_not_block_event_loop(self):
+        adapter = _Adapter()
+        slow_record, event_loop_witness, blocked_event_loop = _blocking_probe()
+
+        with patch(
+            "gateway.delivery_ledger.record_obligation",
+            side_effect=slow_record,
+        ), patch("gateway.delivery_ledger.mark_attempting"):
+            await asyncio.gather(_run(adapter, _event()), event_loop_witness())
+
+        assert blocked_event_loop == []
+        assert adapter.sent == ["final answer"]
+
+    @pytest.mark.asyncio
+    async def test_slow_ledger_update_does_not_block_event_loop(self):
+        adapter = _Adapter()
+        slow_delivered, event_loop_witness, blocked_event_loop = _blocking_probe()
+
+        with patch("gateway.delivery_ledger.record_obligation"), patch(
+            "gateway.delivery_ledger.mark_attempting"
+        ), patch(
+            "gateway.delivery_ledger.mark_delivered",
+            side_effect=slow_delivered,
+        ):
+            await asyncio.gather(_run(adapter, _event()), event_loop_witness())
+
+        assert blocked_event_loop == []
+        assert adapter.sent == ["final answer"]
+
+    @pytest.mark.asyncio
+    async def test_crash_between_attempting_and_ack_is_recoverable(self):
+        """The core scenario (#58818): process dies mid-send. The row must
+        be claimable by a later process and carry the ambiguity marker."""
+        adapter = _Adapter()
+
+        async def _dies_mid_send(chat_id, content, reply_to=None, metadata=None):
+            raise ConnectionError("gateway killed mid-await")
+
+        adapter.send = _dies_mid_send
+        # _send_with_retry raising propagates; the background task catches
+        # broadly — drive only through the send block by tolerating the error.
+        try:
+            await _run(adapter, _event())
+        except Exception:
+            pass
+
+        rows = _rows()
+        assert len(rows) == 1
+        # Row is stuck in 'attempting' (or failed if retry wrapper caught it):
+        # either way it is non-delivered and recoverable.
+        assert rows[0][1] in ("attempting", "failed")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1"
+            )
+        claimed = dl.sweep_recoverable()
+        assert len(claimed) == 1
+        assert claimed[0]["needs_marker"] is True
+

@@ -1,0 +1,141 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\fixtures\spark_failing_turn_shape.json ===
+[
+  {
+    "role": "user",
+    "content": "Investigate the installed 'agy' CLI and summarize its version and capabilities in one report."
+  },
+  {
+    "role": "assistant",
+    "content": "",
+    "codex_reasoning_items": [
+      {"type": "reasoning", "id": "rs_fixture_01", "summary": [{"type": "summary_text", "text": "Batched three tool calls to inspect the CLI."}], "encrypted_content": "synthetic-encrypted-content-placeholder-0001-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+      {"type": "reasoning", "id": "rs_fixture_02", "summary": [], "encrypted_content": "synthetic-encrypted-content-placeholder-0002-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}
+    ],
+    "tool_calls": [
+      {
+        "id": "call_fixture_01",
+        "call_id": "call_fixture_01",
+        "type": "function",
+        "function": {"name": "terminal", "arguments": "{\"command\": \"which agy; agy --version\"}"}
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_fixture_01",
+    "content": "[tool output elided — 11,269 chars in the original failing run]"
+  },
+  {
+    "role": "assistant",
+    "content": "",
+    "codex_reasoning_items": [
+      {"type": "reasoning", "id": "rs_fixture_03", "summary": [], "encrypted_content": "synthetic-encrypted-content-placeholder-0003-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"},
+      {"type": "reasoning", "id": "rs_fixture_04", "summary": [], "encrypted_content": "synthetic-encrypted-content-placeholder-0004-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"}
+    ],
+    "tool_calls": [
+      {
+        "id": "call_fixture_02",
+        "call_id": "call_fixture_02",
+        "type": "function",
+        "function": {"name": "terminal", "arguments": "{\"command\": \"agy agent --help\"}"}
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_fixture_02",
+    "content": "[tool output elided — 3,169 chars in the original failing run]"
+  },
+  {
+    "role": "assistant",
+    "content": "",
+    "codex_reasoning_items": [
+      {"type": "reasoning", "id": "rs_fixture_05", "summary": [], "encrypted_content": "synthetic-encrypted-content-placeholder-0005-EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"}
+    ],
+    "tool_calls": [
+      {
+        "id": "call_fixture_03",
+        "call_id": "call_fixture_03",
+        "type": "function",
+        "function": {"name": "terminal", "arguments": "{\"command\": \"agy mcp --help\"}"}
+      },
+      {
+        "id": "call_fixture_04",
+        "call_id": "call_fixture_04",
+        "type": "function",
+        "function": {"name": "terminal", "arguments": "{\"command\": \"agy changelog | head -40\"}"}
+      },
+      {
+        "id": "call_fixture_05",
+        "call_id": "call_fixture_05",
+        "type": "function",
+        "function": {"name": "terminal", "arguments": "{\"command\": \"ls ~/.config/agy/ 2>&1 || true\"}"}
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_fixture_03",
+    "content": "[tool output elided — 1,494 chars in the original failing run]"
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_fixture_04",
+    "content": "[tool output elided — 32,686 chars in the original failing run]"
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_fixture_05",
+    "content": "[tool output elided — 598 chars in the original failing run]"
+  }
+]
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\fixtures\plugins\example-dashboard\dashboard\manifest.json ===
+{
+  "name": "example",
+  "label": "Example",
+  "description": "Test-only dashboard plugin fixture — installed by tests that need a stable plugin API endpoint to verify auth + static-asset behaviour",
+  "icon": "Sparkles",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/example",
+    "position": "after:skills"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\fixtures\plugins\example-dashboard\dashboard\plugin_api.py ===
+"""Example dashboard plugin — backend API routes (test fixture).
+
+This plugin lives under ``tests/fixtures/plugins/`` so it is NOT shipped as
+part of the bundled-plugins set; a stock hermes-agent install does not see
+an "Example" tab in its sidebar. The ``_install_example_plugin`` pytest
+fixture in ``tests/hermes_cli/test_web_server.py`` copies this directory
+into ``$HERMES_HOME/plugins/example-dashboard/`` and forces the dashboard
+plugin discovery cache to rescan, so tests that need a stable, side-effect-
+free GET endpoint to verify plugin API auth + static-asset behaviour can
+hit ``/api/plugins/example/hello`` (and ``/dashboard-plugins/example/
+manifest.json``) without depending on any production-facing plugin.
+
+Mounted at /api/plugins/example/ by the dashboard plugin system.
+"""
+
+from fastapi import APIRouter
+
+router = APIRouter()
+
+
+@router.get("/hello")
+async def hello():
+    """Simple greeting endpoint to demonstrate plugin API routes."""
+    return {"message": "Hello from the example plugin!", "plugin": "example", "version": "1.0.0"}
+

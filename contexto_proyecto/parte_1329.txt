@@ -1,0 +1,93 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\legal\ccpa.md ===
+# CCPA / CPRA (California)
+
+Use for California residents (`residency_jurisdiction` starts with `US-CA`) and, in practice, many US
+brokers that honor CCPA-style requests nationwide.
+
+## Rights invoked
+
+- **Delete** personal information (Cal. Civ. Code 1798.105).
+- **Opt out** of sale/sharing of personal information (1798.120).
+
+## Request content
+
+Render with `legal.render_request("ccpa", broker, fields)` -> `templates/emails/ccpa-deletion.txt`.
+Include only: full legal name, the contact email for correspondence, and the confirmed listing
+URL(s). Do **not** include SSN or government IDs.
+
+## Authorized agent
+
+When acting for another consenting subject, use `render_request("ccpa_agent", ...)`
+(`templates/emails/ccpa-authorized-agent.txt`) and attach the authorization artifact recorded in the
+dossier (`consent.authorization_artifact`). The broker may separately verify the consumer's identity.
+
+## Notes
+
+- Brokers must respond within 45 days (extendable). Track as `awaiting_processing` until confirmed.
+- "Hidden from free search" is not deletion - verify the record is actually gone before
+  `confirmed_removed`.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\legal\drop.md ===
+# California DROP portal (highest-leverage lever)
+
+The California **Delete Request and Opt-out Platform** (`privacy.ca.gov/drop`) lets a California
+resident demand deletion from **every registered data broker** with a single verified request, for
+free. DROP is **live** (as of 2026); registered brokers must begin processing requests on
+**2026-08-01**. The registered universe is the **California Data Broker Registry** (~545 brokers in
+2025), which this skill ingests as its own coverage lane (`pdd.py registry`); one DROP request covers
+all of them, which is how this skill reaches (and exceeds) the breadth of commercial services.
+
+## When to use
+
+For any subject with `residency_jurisdiction` starting `US-CA`, sequence DROP **first**: `pdd.py next`
+surfaces a single `drop_submit` action covering the whole registry. Then handle the individual
+people-search sites (which are also worked directly because they hold free, indexed listings). After
+filing, run `pdd.py drop <subject> --filed` so the loop stops re-surfacing it. For non-CA subjects
+DROP does not apply; cover the registry brokers with targeted CCPA/GDPR deletion emails
+(`pdd.py registry --search`, then `pdd.py send-email`).
+
+## Flow (agent-assisted, mostly human verification)
+
+1. The operator creates/verifies a DROP account (identity verification is required by the state; this
+   is a human step - `human_task_queued`).
+2. Submit one deletion request covering all registered brokers.
+3. Record a single ledger case `case_<subject>_drop` to track it; mark `submitted` ->
+   `awaiting_processing`. Registered brokers must process deletions on the state's schedule.
+4. After the DROP cycle, re-scan the people-search long tail and only act on sites still showing data.
+
+## Caveats
+
+- DROP covers **registered data brokers**, not every people-search site. Keep doing the individual
+  opt-outs for non-registered sites.
+- Identity verification means parts of this cannot (and should not) be fully automated.
+- FCRA-regulated brokers (flagged in the registry, `optout.fcra`) hold consumer-report data with
+  separate rules; deletion may be limited and a dispute or security-freeze may apply instead.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\legal\gdpr.md ===
+# GDPR / UK-GDPR (roadmap - Phase 3)
+
+For EU/UK subjects. Not part of the P0 US-first scope; templates and routing land in Phase 3.
+
+## Rights invoked
+
+- **Erasure** ("right to be forgotten") - Article 17.
+- **Object** to processing - Article 21.
+
+## Request content
+
+Render with `legal.render_request("gdpr", broker, fields)` ->
+`templates/emails/gdpr-erasure.txt`. Address the controller's privacy/DPO contact. Include the data
+subject's name, the contact email, and the listing URL(s); cite Article 17.
+
+## Notes
+
+- Controllers must respond within one month (Article 12(3)).
+- EU-specific brokers and portals (e.g. Acxiom's EU consumer portals) are added in Phase 3 with
+  `jurisdictions: ["EU"]` records and residency-aware routing.
+

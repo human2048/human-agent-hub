@@ -1,0 +1,266 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_hermes_home_key_cache.py ===
+"""Tests for the remembered results in `hermes_home_key`.
+
+`Path.resolve()` is a filesystem call. `hermes_home_key` sits under
+`ToolRegistry.current_scope_key()`, which runs on every registry lookup, so
+before the results were remembered the registry paid a syscall per lookup.
+
+The value this returns must not change, so most of these tests compare
+against the plain uncached calculation.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+import hermes_constants as hc
+
+
+def _uncached(path=None) -> str:
+    """The calculation as it was before results were remembered."""
+    candidate = Path(path) if path is not None else hc.get_hermes_home()
+    return os.path.normcase(str(candidate.expanduser().resolve(strict=False)))
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    hc.reset_hermes_home_key_cache()
+    yield
+    hc.reset_hermes_home_key_cache()
+
+
+class TestSameAnswerAsBefore:
+    """Remembering a result must not change what comes back."""
+
+    @pytest.mark.parametrize("case", ["real", "missing", "trailing_sep", "dot_dot"])
+    def test_matches_the_uncached_calculation(self, tmp_path, case):
+        (tmp_path / "real").mkdir()
+        target = {
+            "real": str(tmp_path / "real"),
+            "missing": str(tmp_path / "not_there"),
+            "trailing_sep": str(tmp_path / "real") + os.sep,
+            "dot_dot": str(tmp_path / "real" / ".." / "real"),
+        }[case]
+        assert hc.hermes_home_key(target) == _uncached(target)
+
+    def test_matches_for_the_default_home(self):
+        assert hc.hermes_home_key() == _uncached()
+
+    def test_matches_for_a_tilde_path(self):
+        assert hc.hermes_home_key("~") == _uncached("~")
+
+    def test_accepts_a_path_object(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        assert hc.hermes_home_key(tmp_path / "real") == _uncached(tmp_path / "real")
+
+    def test_second_call_returns_the_same_string(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        first = hc.hermes_home_key(str(tmp_path / "real"))
+        second = hc.hermes_home_key(str(tmp_path / "real"))
+        assert first == second == _uncached(str(tmp_path / "real"))
+
+
+class TestWhatGetsRemembered:
+    def test_an_existing_path_is_remembered(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        hc.hermes_home_key(str(tmp_path / "real"))
+        assert len(hc._HOME_KEY_CACHE) == 1
+
+    def test_a_missing_path_is_not_remembered(self, tmp_path):
+        # The answer can change once the directory is created, for example
+        # when part of the path turns out to be a link, so it must not stick.
+        hc.hermes_home_key(str(tmp_path / "not_there"))
+        assert hc._HOME_KEY_CACHE == {}
+
+    def test_a_path_created_later_picks_up_the_real_answer(self, tmp_path):
+        later = tmp_path / "later"
+        before = hc.hermes_home_key(str(later))
+        later.mkdir()
+        after = hc.hermes_home_key(str(later))
+        assert after == _uncached(str(later))
+        assert hc._HOME_KEY_CACHE == {str(later): after}
+        # On a plain directory both answers agree anyway. The point is that
+        # the first one was never stored.
+        assert before == after
+
+    def test_different_paths_get_their_own_entries(self, tmp_path):
+        for name in ("a", "b", "c"):
+            (tmp_path / name).mkdir()
+            hc.hermes_home_key(str(tmp_path / name))
+        assert len(hc._HOME_KEY_CACHE) == 3
+
+    def test_reset_clears_everything(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        hc.hermes_home_key(str(tmp_path / "real"))
+        assert hc._HOME_KEY_CACHE
+        hc.reset_hermes_home_key_cache()
+        assert hc._HOME_KEY_CACHE == {}
+
+
+class TestHomeChanges:
+    def test_pointing_hermes_home_somewhere_else_gives_a_new_key(
+        self, tmp_path, monkeypatch,
+    ):
+        # A different home is a different input path, so it lands on its own
+        # entry rather than reusing the first one.
+        first = tmp_path / "home_one"
+        second = tmp_path / "home_two"
+        first.mkdir()
+        second.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(first))
+        key_one = hc.hermes_home_key()
+        monkeypatch.setenv("HERMES_HOME", str(second))
+        key_two = hc.hermes_home_key()
+
+        assert key_one != key_two
+        assert key_one == _uncached(str(first))
+        assert key_two == _uncached(str(second))
+
+
+class TestSymlinks:
+    def test_a_link_resolves_to_its_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("this platform or account cannot create symlinks")
+        assert hc.hermes_home_key(str(link)) == _uncached(str(link))
+        assert hc.hermes_home_key(str(link)) == hc.hermes_home_key(str(target))
+
+
+class TestRegistryLookupsDoNotHitTheDisk:
+    def test_scope_key_resolves_the_path_once(self, monkeypatch):
+        # The reason this cache exists. ToolRegistry.current_scope_key() runs
+        # on every registry lookup, so it must not resolve the home path on
+        # the filesystem every time.
+        from tools.registry import registry
+
+        calls = {"n": 0}
+        real_resolve = Path.resolve
+
+        def counting_resolve(self, *a, **kw):
+            calls["n"] += 1
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", counting_resolve)
+
+        registry.current_scope_key()
+        after_first = calls["n"]
+        for _ in range(50):
+            registry.current_scope_key()
+
+        assert calls["n"] == after_first, (
+            f"current_scope_key resolved the path on the filesystem "
+            f"{calls['n'] - after_first} extra times across 50 calls"
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_hermes_home_profile_warning.py ===
+"""Tests for get_hermes_home() profile-mode fallback warning.
+
+Regression test for https://github.com/NousResearch/hermes-agent/issues/18594.
+
+When HERMES_HOME is unset but an active_profile file indicates a non-default
+profile is active, get_hermes_home() should:
+  1. STILL return ~/.hermes (raising would brick 30+ module-level callers)
+  2. Emit a loud one-shot warning to stderr so operators can diagnose
+     cross-profile data contamination after the fact.
+
+The warning goes to stderr directly (not through logging) because this
+function is called at module-import time from 30+ sites, often before the
+logging subsystem has been configured.
+"""
+
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def fresh_constants(monkeypatch, tmp_path):
+    """Import hermes_constants fresh and reset the one-shot warn flag."""
+    import importlib
+    import hermes_constants
+    importlib.reload(hermes_constants)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    return hermes_constants
+
+
+class TestGetHermesHomeProfileWarning:
+    def test_classic_mode_no_active_profile_no_warning(
+        self, fresh_constants, tmp_path, capsys
+    ):
+        """Classic mode: no active_profile file → silent, returns ~/.hermes."""
+        result = fresh_constants.get_hermes_home()
+        assert result == tmp_path / ".hermes"
+        assert "HERMES_HOME fallback" not in capsys.readouterr().err
+
+
+    def test_named_profile_unset_home_warns_once(
+        self, fresh_constants, tmp_path, capsys
+    ):
+        """active_profile=coder + HERMES_HOME unset → warn loudly, still return fallback."""
+        hermes_dir = tmp_path / ".hermes"
+        hermes_dir.mkdir()
+        (hermes_dir / "active_profile").write_text("coder\n")
+
+        result = fresh_constants.get_hermes_home()
+
+        # 1. Still returns the fallback — no import-time crash
+        assert result == tmp_path / ".hermes"
+        # 2. Stderr got the warning exactly once
+        err = capsys.readouterr().err
+        assert err.count("HERMES_HOME fallback") == 1
+        assert "'coder'" in err
+        assert "#18594" in err
+
+        # 3. One-shot: second and third calls don't re-warn
+        fresh_constants.get_hermes_home()
+        fresh_constants.get_hermes_home()
+        err2 = capsys.readouterr().err
+        assert "HERMES_HOME fallback" not in err2
+
+    def test_hermes_home_set_suppresses_warning(
+        self, fresh_constants, tmp_path, capsys, monkeypatch
+    ):
+        """Even if active_profile is 'coder', setting HERMES_HOME suppresses warning."""
+        profile_dir = tmp_path / ".hermes" / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        (tmp_path / ".hermes" / "active_profile").write_text("coder\n")
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+
+        result = fresh_constants.get_hermes_home()
+
+        assert result == profile_dir
+        assert "HERMES_HOME fallback" not in capsys.readouterr().err
+
+    def test_unreadable_active_profile_no_crash(
+        self, fresh_constants, tmp_path, capsys
+    ):
+        """active_profile that can't be decoded → fall through silently."""
+        hermes_dir = tmp_path / ".hermes"
+        hermes_dir.mkdir()
+        # Write bytes that aren't valid utf-8
+        (hermes_dir / "active_profile").write_bytes(b"\xff\xfe\x00\x00")
+
+        result = fresh_constants.get_hermes_home()
+
+        assert result == tmp_path / ".hermes"
+        # Shouldn't crash; shouldn't warn either (can't tell what profile was intended)
+        assert "HERMES_HOME fallback" not in capsys.readouterr().err
+
+

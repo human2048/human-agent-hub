@@ -1,0 +1,224 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_cron_inline_api_call.py ===
+"""Regression guard for #62151 — gateway cron must not wedge on the 2nd+ call.
+
+Gateway-fired cron jobs hung forever on the 2nd+ API call because both the
+non-streaming (``interruptible_api_call``) and the default streaming
+(``interruptible_streaming_api_call``) paths run the request on a spawned
+daemon worker thread. Inside the gateway's nested cron thread pools that extra
+worker wedged before the socket opened; the same job succeeded via ``hermes
+cron tick`` (foreground, no nested pools). Cron has no interactive interrupt
+surface, so both paths now run inline on the conversation thread for the
+``cron`` platform.
+
+These tests pin: (1) the inline gate is cron-only, (2) the inline call runs on
+the *calling* thread — no worker is spawned — for both entry points, and (3)
+the shared dispatch closes the per-request client.
+"""
+
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from run_agent import AIAgent
+
+from agent.chat_completion_helpers import (
+    direct_api_call,
+    interruptible_api_call,
+    interruptible_streaming_api_call,
+    should_use_direct_api_call,
+)
+
+
+def _make_agent(*, platform="cron"):
+    agent = MagicMock()
+    agent.platform = platform
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent._interrupt_requested = False
+    agent._consecutive_stale_streams = 0
+    agent._touch_activity = MagicMock()
+    agent._close_request_openai_client = MagicMock()
+    return agent
+
+
+def test_should_use_direct_api_call_only_for_cron_openai_wire():
+    assert should_use_direct_api_call(_make_agent(platform="cron")) is True
+    assert should_use_direct_api_call(_make_agent(platform="cli")) is False
+    assert should_use_direct_api_call(_make_agent(platform="telegram")) is False
+    assert should_use_direct_api_call(_make_agent(platform=None)) is False
+
+    for api_mode in ("codex_responses", "anthropic_messages", "bedrock_converse"):
+        agent = _make_agent(platform="cron")
+        agent.api_mode = api_mode
+        assert should_use_direct_api_call(agent) is False
+
+    moa = _make_agent(platform="cron")
+    moa.provider = "moa"
+    assert should_use_direct_api_call(moa) is False
+
+
+
+
+
+
+def test_direct_api_call_interrupt_aborts_active_client_and_raises():
+    """Cron's outer watchdog interrupts from another thread while inline."""
+    agent = _make_agent()
+    client_ready = threading.Event()
+    release_request = threading.Event()
+    fake_client = MagicMock()
+
+    def _create(**_kwargs):
+        client_ready.set()
+        return fake_client
+
+    def _request(**_kwargs):
+        assert release_request.wait(timeout=2)
+        raise RuntimeError("socket closed")
+
+    fake_client.chat.completions.create.side_effect = _request
+    agent._create_request_openai_client.side_effect = _create
+    result = {}
+
+    def _run():
+        try:
+            direct_api_call(agent, {"model": "m", "messages": []})
+        except Exception as exc:
+            result["exception"] = exc
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    assert client_ready.wait(timeout=1)
+    assert callable(agent._active_request_abort)
+    AIAgent.interrupt(agent, "cron timeout")
+    agent._abort_request_openai_client.assert_called_once_with(
+        fake_client, reason="interrupt_abort"
+    )
+    release_request.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert isinstance(result.get("exception"), InterruptedError)
+    assert agent._active_request_abort is None
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_crossloop_client_cache.py ===
+"""Tests for cross-loop client cache isolation fix (#2681).
+
+Verifies that _get_cached_client() returns different AsyncOpenAI clients
+when called from different event loops, preventing the httpx deadlock
+that occurs when a cached async client bound to loop A is reused on loop B.
+
+This test file is self-contained and does not import the full tool chain,
+so it can run without optional dependencies like firecrawl.
+"""
+
+import asyncio
+import threading
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Minimal stubs so we can import _get_cached_client without the full tree
+# ---------------------------------------------------------------------------
+
+def _stub_resolve_provider_client(provider, model, async_mode, **kw):
+    """Return a unique mock client each time, simulating AsyncOpenAI creation."""
+    client = MagicMock(name=f"client-{provider}-async={async_mode}")
+    client.api_key = "test"
+    client.base_url = kw.get("explicit_base_url", "http://localhost:8081/v1")
+    return client, model or "test-model"
+
+
+@pytest.fixture(autouse=True)
+def _clean_client_cache():
+    """Clear the client cache before each test."""
+    # We need to patch before importing
+    with patch.dict("sys.modules", {}):
+        pass
+    # Import and clear
+    import agent.auxiliary_client as ac
+    ac._client_cache.clear()
+    yield
+    ac._client_cache.clear()
+
+
+class TestCrossLoopCacheIsolation:
+    """Verify async clients are cached per-event-loop, not globally."""
+
+
+    def test_different_loops_get_different_clients(self):
+        """Different event loops must get separate client instances."""
+        from agent.auxiliary_client import _get_cached_client
+
+        results = {}
+
+        def _get_client_on_new_loop(name):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            with patch("agent.auxiliary_client.resolve_provider_client",
+                        side_effect=_stub_resolve_provider_client):
+                client, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                                 base_url="http://localhost:8081/v1")
+            results[name] = (id(client), id(loop))
+            # Don't close loop — simulates real usage where loops persist
+
+        t1 = threading.Thread(target=_get_client_on_new_loop, args=("a",))
+        t2 = threading.Thread(target=_get_client_on_new_loop, args=("b",))
+        t1.start(); t1.join()
+        t2.start(); t2.join()
+
+        client_id_a, loop_id_a = results["a"]
+        client_id_b, loop_id_b = results["b"]
+
+        assert loop_id_a != loop_id_b, "Test setup error: same loop on both threads"
+        assert client_id_a != client_id_b, (
+            "Different event loops got the SAME cached client — this causes "
+            "httpx cross-loop deadlocks in gateway mode (#2681)"
+        )
+
+
+    def test_gateway_simulation_no_deadlock(self):
+        """Simulate gateway mode: _run_async spawns a thread with asyncio.run(),
+        which creates a new loop. The cached client must be created on THAT loop,
+        not reused from a different one."""
+        from agent.auxiliary_client import _get_cached_client
+
+        # Simulate: first call on "gateway loop"
+        gateway_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(gateway_loop)
+
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    side_effect=_stub_resolve_provider_client):
+            gateway_client, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                                     base_url="http://localhost:8081/v1")
+
+        # Simulate: _run_async spawns a thread with asyncio.run()
+        worker_client_id = [None]
+        def _worker():
+            async def _inner():
+                with patch("agent.auxiliary_client.resolve_provider_client",
+                            side_effect=_stub_resolve_provider_client):
+                    client, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                                     base_url="http://localhost:8081/v1")
+                worker_client_id[0] = id(client)
+            asyncio.run(_inner())
+
+        t = threading.Thread(target=_worker)
+        t.start()
+        t.join()
+
+        assert worker_client_id[0] != id(gateway_client), (
+            "Worker thread (asyncio.run) got the gateway's cached client — "
+            "this is the exact cross-loop scenario that causes httpx deadlocks. "
+            "The cache key must include the event loop identity (#2681)"
+        )
+        gateway_loop.close()
+
+

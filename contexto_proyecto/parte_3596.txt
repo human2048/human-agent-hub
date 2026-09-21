@@ -1,0 +1,237 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_tools_disable_enable.py ===
+"""Tests for hermes tools disable/enable/list command (backend)."""
+from argparse import Namespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from gateway.platform_registry import platform_registry
+from hermes_cli.tools_config import tools_disable_enable_command
+
+
+# ── Built-in toolset disable ────────────────────────────────────────────────
+
+
+class TestToolsDisableBuiltin:
+
+    def test_disable_removes_toolset_from_platform(self):
+        config = {"platform_toolsets": {"cli": ["web", "memory", "terminal"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(tools_action="disable", names=["web"], platform="cli"))
+        saved = mock_save.call_args[0][0]
+        assert "web" not in saved["platform_toolsets"]["cli"]
+        assert "memory" in saved["platform_toolsets"]["cli"]
+
+
+# ── Built-in toolset enable ─────────────────────────────────────────────────
+
+
+# ── MCP tool disable ────────────────────────────────────────────────────────
+
+
+class TestToolsDisableMcp:
+
+
+    def test_disable_unknown_server_prints_error(self, capsys):
+        config = {"mcp_servers": {}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config"):
+            tools_disable_enable_command(
+                Namespace(tools_action="disable", names=["unknown:tool"], platform="cli")
+            )
+        out = capsys.readouterr().out
+        assert "MCP server 'unknown' not found in config" in out
+
+
+# ── MCP tool enable ──────────────────────────────────────────────────────────
+
+
+# ── Mixed targets ────────────────────────────────────────────────────────────
+
+
+# ── List output ──────────────────────────────────────────────────────────────
+
+
+class TestToolsList:
+
+
+    def test_list_shows_mcp_excluded_tools(self, capsys):
+        config = {
+            "mcp_servers": {"github": {"tools": {"exclude": ["create_issue"]}}},
+        }
+        with patch("hermes_cli.tools_config.load_config", return_value=config):
+            tools_disable_enable_command(Namespace(tools_action="list", platform="cli"))
+        out = capsys.readouterr().out
+        assert "github" in out
+        assert "create_issue" in out
+
+
+# ── Validation ───────────────────────────────────────────────────────────────
+
+
+class TestToolsValidation:
+
+
+    def test_mixed_valid_and_invalid_applies_valid_only(self):
+        config = {"platform_toolsets": {"cli": ["web", "memory"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(
+                Namespace(tools_action="disable", names=["web", "bad_toolset"], platform="cli")
+            )
+        saved = mock_save.call_args[0][0]
+        assert "web" not in saved["platform_toolsets"]["cli"]
+        assert "memory" in saved["platform_toolsets"]["cli"]
+
+
+@pytest.mark.parametrize("action", ["list", "enable", "disable"])
+def test_tools_action_accepts_deferred_plugin_without_materializing(action, capsys):
+    platform = "deferred-tools-test"
+    loader = MagicMock()
+    configured_tools = ["memory", "web"] if action == "disable" else ["memory"]
+    config = {"platform_toolsets": {platform: configured_tools}}
+    args = Namespace(tools_action=action, platform=platform)
+    if action != "list":
+        args.names = ["web"]
+
+    def discover_deferred_platform():
+        platform_registry.register_deferred(platform, loader)
+
+    try:
+        with patch(
+            "hermes_cli.plugins.discover_plugins",
+            side_effect=discover_deferred_platform,
+        ) as discover, \
+             patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as save:
+            tools_disable_enable_command(args)
+
+        out = capsys.readouterr().out
+        assert "Unknown platform" not in out
+        discover.assert_called()
+        loader.assert_not_called()
+        if action == "list":
+            assert f"Built-in toolsets ({platform}):" in out
+            save.assert_not_called()
+        else:
+            save.assert_called()
+            saved_tools = save.call_args.args[0]["platform_toolsets"][platform]
+            assert ("web" in saved_tools) is (action == "enable")
+    finally:
+        platform_registry.unregister(platform)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_tool_availability_notices.py ===
+"""Invariants for the CLI startup 'some tools disabled' notice (tools-runtime-01 / -02)."""
+
+from hermes_cli.tool_availability_notices import filter_to_enabled_toolsets, tool_availability_warning_lines
+
+_TERMINAL = {"name": "terminal", "env_vars": [], "tools": ["terminal", "process_manage"]}
+_WEB = {"name": "web", "env_vars": ["EXA_API_KEY", "TAVILY_API_KEY"], "tools": ["web_search"]}
+_RL = {"name": "rl", "env_vars": ["TINKER_API_KEY"], "tools": ["rl_tool"]}
+
+
+def test_terminal_line_names_backend_reason_and_fix_commands():
+    lines = tool_availability_warning_lines(
+        [_TERMINAL], terminal_reason="Docker is installed but the Docker daemon is not running",
+        terminal_backend="docker")
+    text = "\n".join(lines)
+    assert "Terminal tool disabled" in text
+    assert "'docker'" in text
+    assert "Docker daemon is not running" in text
+    assert "hermes doctor" in text and "hermes setup terminal" in text
+    assert "TERMINAL_ENV" not in text
+
+
+def test_terminal_without_reason_still_gets_a_line():
+    lines = tool_availability_warning_lines([_TERMINAL], terminal_reason=None, terminal_backend="ssh")
+    assert any("Terminal tool disabled" in line and "'ssh'" in line for line in lines)
+
+
+def test_web_collapses_env_dump_into_one_provider_sentence():
+    lines = tool_availability_warning_lines([_WEB], terminal_reason=None, terminal_backend="local")
+    text = "\n".join(lines)
+    assert "EXA_API_KEY" not in text
+    assert "Web search is off" in text and "hermes setup tools" in text
+
+
+def test_generic_toolset_lists_vars_and_setup_hint():
+    lines = tool_availability_warning_lines([_RL], terminal_reason=None, terminal_backend="local")
+    text = "\n".join(lines)
+    assert "rl" in text and "TINKER_API_KEY" in text and "hermes setup" in text
+
+
+def test_nothing_to_report_returns_no_lines():
+    assert tool_availability_warning_lines([], terminal_reason=None, terminal_backend="local") == []
+    # A toolset with no env vars and no special notice (e.g. lazy check_fn) stays silent.
+    assert tool_availability_warning_lines([{"name": "honcho", "env_vars": [], "tools": []}],
+                                           terminal_reason=None, terminal_backend="local") == []
+
+
+def test_web_notice_cites_setup_tools_not_the_toggle_menu():
+    # `hermes tools` with no subcommand is the enable/disable menu; providers live under `hermes setup tools`.
+    lines = tool_availability_warning_lines([_WEB], terminal_reason=None, terminal_backend="local")
+    text = "\n".join(lines)
+    assert "hermes setup tools" in text
+    assert "hermes tools[/]" not in text
+
+
+class TestFilterToEnabledToolsets:
+    _BUNDLE = {"hermes-cli": ["terminal", "process_manage", "web_search", "read_file"],
+               "terminal": ["terminal", "process_manage"]}
+
+    def _resolve(self, name):
+        return self._BUNDLE.get(name, [])
+
+    def test_composite_bundle_keeps_terminal_notice_on_default_install(self):
+        kept = filter_to_enabled_toolsets([_TERMINAL, _WEB, _RL], ["hermes-cli"], self._resolve)
+        assert [k["name"] for k in kept] == ["terminal", "web"]
+
+    def test_direct_toolset_name_and_unknown_bundle(self):
+        assert [k["name"] for k in filter_to_enabled_toolsets([_TERMINAL, _RL], ["terminal"], self._resolve)] == ["terminal"]
+        assert filter_to_enabled_toolsets([_TERMINAL], ["no-such-bundle"], self._resolve) == []
+
+    def test_empty_selection_means_everything(self):
+        assert filter_to_enabled_toolsets([_TERMINAL, _RL], [], self._resolve) == [_TERMINAL, _RL]
+
+    def test_resolver_error_is_not_fatal(self):
+        def boom(name):
+            raise RuntimeError("registry not ready")
+        assert filter_to_enabled_toolsets([_TERMINAL], ["hermes-cli"], boom) == []
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_tool_gen_start_dedupe.py ===
+"""A batch of parallel tool calls announces "preparing <tool>…" once per tool, not once per call (#10478)."""
+
+from unittest.mock import patch
+
+from tests.hermes_cli.test_tool_progress_scrollback import _make_cli
+import tests.hermes_cli.test_tool_progress_scrollback as _scrollback
+
+
+def _announce(cli, names):
+    printed = []
+    with patch.object(_scrollback._cli_mod, "_cprint", lambda line: printed.append(line)):
+        for n in names:
+            cli._on_tool_gen_start(n)
+    return printed
+
+
+def test_repeated_tool_in_one_batch_prints_once():
+    cli = _make_cli(tool_progress="off")
+    printed = _announce(cli, ["terminal", "terminal", "terminal", "read_file"])
+    assert sum("preparing terminal" in p for p in printed) == 1
+    assert sum("preparing read_file" in p for p in printed) == 1
+    # A tool actually starting closes the batch; the next generation announces again.
+    with patch.object(_scrollback._cli_mod, "_cprint", lambda line: None):
+        cli._on_tool_progress("tool.started", "terminal", "ls", {"command": "ls"})
+    assert sum("preparing terminal" in p for p in _announce(cli, ["terminal"])) == 1
+    # A batch that never reached tool.started (cancel/error) must not mute the next invocation.
+    cli._reset_stream_state()
+    assert sum("preparing terminal" in p for p in _announce(cli, ["terminal"])) == 1
+

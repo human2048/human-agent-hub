@@ -1,0 +1,396 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_boot_preset_staleness.py ===
+"""Every staged model must launch with a policy decision, never stock fit.
+
+The managed server autoloads any GGUF in its models dir; a model missing
+from the preset INI loads with llama-server defaults (f16 KV at max
+context, no placement) — on Windows/WDDM that silently demotes VRAM and
+decodes at a crawl. Boot must therefore refuse to adopt a running server
+whose presets predate the staged set."""
+
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def _stage(home, name):
+    mdir = home / "models"
+    mdir.mkdir(parents=True, exist_ok=True)
+    (mdir / f"{name}.gguf").write_bytes(b"GGUF" + b"\x00" * 32)
+
+
+def _write_presets(home, *model_ids):
+    pdir = home / "runtimes" / "llamacpp"
+    pdir.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(f"[{m}]\nmodel = {home / 'models' / (m + '.gguf')}\nctx-size = 65536\n" for m in model_ids)
+    (pdir / "presets.ini").write_text(body, encoding="utf-8")
+
+
+def test_presets_stale_when_a_staged_model_has_no_section(hermes_home):
+    from hermes_cli.local_runtime.bootstrap import _presets_stale
+
+    _stage(hermes_home, "model-a")
+    _stage(hermes_home, "model-b")
+    _write_presets(hermes_home, "model-a")
+    assert _presets_stale() is True
+
+
+def test_presets_current_when_every_staged_model_is_covered(hermes_home):
+    from hermes_cli.local_runtime.bootstrap import _presets_stale
+
+    _stage(hermes_home, "model-a")
+    _write_presets(hermes_home, "model-a")
+    assert _presets_stale() is False
+
+
+def test_legacy_presets_without_model_paths_are_regenerated(hermes_home):
+    from hermes_cli.local_runtime.bootstrap import _presets_stale
+
+    _stage(hermes_home, "model-a")
+    _write_presets(hermes_home, "model-a")
+    ini = hermes_home / "runtimes/llamacpp/presets.ini"
+    ini.write_text("[model-a]\nctx-size = 65536\n")
+    assert _presets_stale()
+
+
+def test_no_models_is_never_stale(hermes_home):
+    from hermes_cli.local_runtime.bootstrap import _presets_stale
+
+    _write_presets(hermes_home, "model-a")
+    assert _presets_stale() is False
+
+
+def test_boot_replaces_incumbent_with_stale_presets(hermes_home, monkeypatch):
+    """ensure_local_runtime must not adopt a running server whose presets
+    miss a staged model — it stops it and boots fresh (boot itself is
+    stubbed; the contract under test is the adopt/replace decision)."""
+    import hermes_cli.local_runtime.bootstrap as boot
+
+    _stage(hermes_home, "model-a")
+    _stage(hermes_home, "model-b")
+    _write_presets(hermes_home, "model-a")
+
+    stopped = {}
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.endpoint._state_endpoint",
+        lambda: {"base_url": "http://127.0.0.1:18434/v1", "pid": 12345})
+    monkeypatch.setattr(boot, "_stop_state_server",
+                        lambda state: stopped.setdefault("pid", state["pid"]))
+
+    sentinel = object()
+
+    def fake_boot(*a, **k):
+        raise _BootReached()
+
+    class _BootReached(Exception):
+        pass
+
+    # Fail fast once boot proper begins — reaching it IS the assertion.
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.binaries.ensure_runtime_installed", fake_boot)
+
+    result = boot.ensure_local_runtime({"local_runtime": {"enabled": True}})
+    assert stopped.get("pid") == 12345, "stale incumbent was not stopped"
+    # Boot proceeded past adoption (our fake raised inside the try block,
+    # which ensure_local_runtime swallows into a None return).
+    assert result is None or result is sentinel
+
+
+def test_refresh_bounces_an_adopted_server(hermes_home, monkeypatch):
+    """refresh_local_runtime with no in-process supervisor but a running
+    state-file server (the post-restart shape) must stop that server and
+    boot fresh — NOT silently no-op. Regression: the no-op meant every
+    download/delete after a backend restart left the router serving a
+    stale model catalog, and picking the new model failed with
+    'not found in this provider's model listing'."""
+    import hermes_cli.local_runtime.bootstrap as boot
+
+    stopped = {}
+    monkeypatch.setattr(boot, "_SUPERVISOR", None)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.endpoint._state_endpoint",
+        lambda: {"base_url": "http://127.0.0.1:18434/v1", "pid": 4242})
+    monkeypatch.setattr(boot, "_stop_state_server",
+                        lambda state: stopped.setdefault("pid", state["pid"]))
+    booted = {}
+    monkeypatch.setattr(boot, "ensure_local_runtime",
+                        lambda cfg, force=False: booted.setdefault("force", force) or object())
+
+    assert boot.refresh_local_runtime() is True
+    assert stopped.get("pid") == 4242, "adopted server was not stopped"
+    assert booted.get("force") is True, "fresh boot did not follow the stop"
+
+
+def test_refresh_no_server_anywhere_is_a_noop(hermes_home, monkeypatch):
+    import hermes_cli.local_runtime.bootstrap as boot
+
+    monkeypatch.setattr(boot, "_SUPERVISOR", None)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.endpoint._state_endpoint", lambda: None)
+    assert boot.refresh_local_runtime() is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_bounded_probe_run.py ===
+"""``bounded_probe_run`` — deadlock-safe capture for fail-open probes (#87134).
+
+On Windows, ``subprocess.run(..., capture_output=True, timeout=N)`` can hang
+FOREVER after its timeout fires: run()'s cleanup kills the direct child and
+then joins the pipe reader threads with an unbounded ``communicate()``.  A
+descendant (``conhost.exe`` under wmic/powershell, ``git.exe`` under a
+launcher shim) holding duplicated pipe handles keeps the pipes from EOF and
+the join never returns.  ``hermes update`` wedged exactly there inside
+``_scan_gateway_pids`` on machines where the full ``Win32_Process`` scan
+exceeds its budget.
+
+``bounded_probe_run`` is the shared, generalized form of the fix that
+``bounded_git_probe`` already proved for git probes (#68609 / #66037):
+explicit ``communicate(timeout)``, tree-kill on failure, bounded 1s drain,
+then abandon.
+
+These tests use REAL subprocesses (no mocks) for the semantics: a mock cannot
+reproduce pipe-handle inheritance or timeout behavior.  The POSIX-only
+descendant-survival cases live in ``test_git_probe_tree_kill.py`` and now
+exercise the same code path through the ``bounded_git_probe`` delegation.
+"""
+
+import subprocess
+import sys
+import time
+
+import pytest
+
+from hermes_cli._subprocess_compat import bounded_git_probe, bounded_probe_run
+
+_PY = sys.executable
+
+
+def test_success_returns_completed_process():
+    result = bounded_probe_run([_PY, "-c", "print('ok'); import sys; sys.exit(0)"], timeout=30)
+    assert result is not None
+    assert result.returncode == 0
+    assert result.stdout.strip() == "ok"
+
+
+def test_nonzero_exit_is_returned_not_swallowed():
+    """Unlike bounded_git_probe, callers see the real returncode — the gateway
+    scan branches on ``returncode != 0`` to trip the wmic→powershell fallback."""
+    result = bounded_probe_run([_PY, "-c", "print('partial'); import sys; sys.exit(3)"], timeout=30)
+    assert result is not None
+    assert result.returncode == 3
+    assert result.stdout.strip() == "partial"
+
+
+def test_spawn_failure_returns_none():
+    result = bounded_probe_run(["definitely-not-a-real-binary-87134"], timeout=5)
+    assert result is None
+
+
+def test_timeout_returns_none_within_bounded_time():
+    """A child that sleeps past the timeout must produce ``None`` promptly —
+    timeout + tree-kill + 1s bounded drain, not an unbounded join."""
+    start = time.monotonic()
+    result = bounded_probe_run(
+        [_PY, "-c", "import time; time.sleep(300)"],
+        timeout=1.0,
+    )
+    elapsed = time.monotonic() - start
+    assert result is None
+    # 1s timeout + tree-kill + 1s drain + slack.  The pre-fix failure mode is
+    # an indefinite hang, so any bound proves the property; keep it loose for
+    # slow CI runners.
+    assert elapsed < 30
+
+
+def test_decode_errors_configurable():
+    """The process scans pass errors='ignore' (wmic emits system code page);
+    undecodable bytes must not raise or None out stdout (#17049 class)."""
+    result = bounded_probe_run(
+        [_PY, "-c", "import sys; sys.stdout.buffer.write(b'ok\\xff\\xfe')"],
+        timeout=30,
+        errors="ignore",
+    )
+    assert result is not None
+    assert result.returncode == 0
+    assert "ok" in result.stdout
+
+
+def test_stdin_is_devnull_not_inherited():
+    """A probe must never block reading the caller's stdin."""
+    result = bounded_probe_run(
+        [_PY, "-c", "import sys; print(repr(sys.stdin.read()))"],
+        timeout=30,
+    )
+    assert result is not None
+    assert result.returncode == 0
+    assert result.stdout.strip() == "''"
+
+
+def test_bounded_git_probe_delegates_same_contract():
+    """The historical git-probe wrapper keeps its exact contract on top of
+    bounded_probe_run: stripped stdout on rc==0, '' on any failure."""
+    assert bounded_git_probe([_PY, "-c", "print('  x  ')"], timeout=30) == "x"
+    assert bounded_git_probe([_PY, "-c", "import sys; sys.exit(1)"], timeout=30) == ""
+    assert bounded_git_probe(["definitely-not-a-real-binary-87134"], timeout=5) == ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group check")
+def test_posix_child_gets_own_process_group():
+    """POSIX spawns use process_group=0 so timeout cleanup can killpg the
+    whole tree (same contract bounded_git_probe had)."""
+    result = bounded_probe_run(
+        [_PY, "-c", "import os; print(os.getpgid(0) == os.getpid())"],
+        timeout=30,
+    )
+    assert result is not None
+    assert result.stdout.strip() == "True"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_bracketed_paste_timeout.py ===
+"""Tests for bracketed-paste timeout safety valve (#16263).
+
+Verifies the production helper in cli.py monkey-patches prompt_toolkit's
+Vt100Parser.feed() so the parser auto-escapes from bracketed-paste mode when
+the ESC[201~ end mark is never received.
+"""
+import ast
+import importlib
+import logging
+import time
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from prompt_toolkit.keys import Keys
+
+
+ROOT = Path(__file__).resolve().parents[2]
+CLI_PATH = ROOT / "cli.py"
+
+
+def _load_production_patch_helper():
+    """Load cli._apply_bracketed_paste_timeout_patch without importing cli.
+
+    Importing cli.py pulls optional runtime deps that aren't required for this
+    parser-level regression.  AST-loading the exact helper keeps the test tied
+    to production code while avoiding unrelated import side effects.  If the
+    production helper is removed, this test fails.
+    """
+    source = CLI_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper_node = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_apply_bracketed_paste_timeout_patch"
+        ),
+        None,
+    )
+    assert helper_node is not None, (
+        "cli.py must define _apply_bracketed_paste_timeout_patch()"
+    )
+    helper_source = ast.get_source_segment(source, helper_node)
+    namespace = {"time": time, "logger": logging.getLogger("test.cli")}
+    exec(helper_source, namespace)
+    return namespace["_apply_bracketed_paste_timeout_patch"]
+
+
+def _reset_and_apply_production_patch():
+    """Reload prompt_toolkit's parser and apply Hermes' production patch."""
+    import prompt_toolkit.input.vt100_parser as vt100_mod
+
+    vt100_mod = importlib.reload(vt100_mod)
+    # importlib.reload() preserves module dict entries that the reloaded source
+    # does not redefine, so clear Hermes' sentinel before re-applying.
+    if hasattr(vt100_mod, "_hermes_bp_timeout_patched"):
+        delattr(vt100_mod, "_hermes_bp_timeout_patched")
+    _load_production_patch_helper()()
+    assert getattr(vt100_mod, "_hermes_bp_timeout_patched", False)
+    return vt100_mod
+
+
+class TestBracketedPasteTimeout:
+    """Verify the Vt100Parser monkey-patch prevents frozen bracketed-paste."""
+
+    def _make_parser(self):
+        """Create a Vt100Parser after applying the production patch."""
+        vt100_mod = _reset_and_apply_production_patch()
+        callback = MagicMock()
+        parser = vt100_mod.Vt100Parser(callback)
+        return parser, callback
+
+    def test_normal_bracketed_paste_works(self):
+        """A complete bracketed-paste sequence should work normally."""
+        parser, callback = self._make_parser()
+        parser.feed("\x1b[200~hello world\x1b[201~")
+        callback.assert_called_once()
+        call_args = callback.call_args[0][0]
+        assert call_args.data == "hello world"
+
+    def test_incomplete_paste_times_out(self):
+        """If ESC[201~ is never received, parser should recover after timeout."""
+        parser, callback = self._make_parser()
+        parser.feed("\x1b[200~some pasted text")
+        assert parser._in_bracketed_paste
+
+        parser._hermes_bp_start = time.monotonic() - 3.0
+        parser.feed("more data")
+
+        assert not parser._in_bracketed_paste
+        assert callback.called
+
+
+    def test_normal_keys_after_timeout_recovery(self):
+        """After timeout recovery, normal key processing should resume."""
+        parser, callback = self._make_parser()
+        parser.feed("\x1b[200~stuck")
+        parser._hermes_bp_start = time.monotonic() - 3.0
+        parser.feed("")
+
+        assert not parser._in_bracketed_paste
+        callback.reset_mock()
+        parser.feed("a")
+        assert not parser._in_bracketed_paste
+
+
+    def test_subsequent_data_after_incomplete_paste(self):
+        """Data arriving after a stuck paste should be processable."""
+        parser, callback = self._make_parser()
+        parser.feed("\x1b[200~content")
+        parser._hermes_bp_start = time.monotonic() - 5.0
+        parser.feed("x")
+
+        assert not parser._in_bracketed_paste
+        assert callback.call_count >= 1
+
+    def test_torn_end_mark_recovers(self):
+        """If end mark arrives split across feeds within timeout, it still works."""
+        parser, callback = self._make_parser()
+        parser.feed("\x1b[200~some content\x1b[20")
+        assert parser._in_bracketed_paste
+
+        parser.feed("1~")
+        assert not parser._in_bracketed_paste
+        callback.assert_called_once()
+        assert callback.call_args[0][0].data == "some content"
+
+    def test_no_timeout_under_threshold(self):
+        """Bracketed-paste mode should not timeout within the 2s window."""
+        parser, callback = self._make_parser()
+        parser.feed("\x1b[200~waiting")
+        parser._hermes_bp_start = time.monotonic() - 0.5
+        parser.feed("more waiting")
+
+        assert parser._in_bracketed_paste
+        assert not callback.called
+

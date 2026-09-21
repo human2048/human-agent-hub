@@ -1,0 +1,361 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_dispatch_claim_allowlist.py ===
+"""kanban.dispatch_profiles: per-home claim allowlist for shared boards (#110995).
+
+On a board shared across Hermes homes (one kanban.db mounted in several
+containers) every home's ``profile_exists("default")`` is True, so any home's
+dispatcher could claim cards assigned to ``default``. The allowlist wraps the
+same predicate consumed by the spawn gate and the spawnable telemetry, so a
+foreign assignee lands in ``skipped_nonspawnable`` and does not keep the
+gateway wake-up loop hot.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with an empty kanban DB."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+def test_allowlist_without_default_skips_default_card(kanban_home, all_assignees_spawnable):
+    """Fail-closed: the allowlist is set and ``default`` is not on it, so the
+    card is neither spawnable (wake-up telemetry) nor claimed (spawn gate),
+    even though every profile exists locally."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  dispatch_profiles:\n    - sage\n", encoding="utf-8",
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        assert kbd.has_spawnable_ready(conn) is False
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert res.spawned == []
+    assert res.skipped_nonspawnable == [tid]
+
+
+def test_default_assignee_outside_allowlist_leaves_card_unassigned(
+    kanban_home, all_assignees_spawnable,
+):
+    """Invariant: a ``default_assignee`` this home may not claim must not be
+    persisted onto an unassigned shared-board card (no row write, no
+    ``assigned`` event) — another home owns that card."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  dispatch_profiles:\n    - sage\n  default_assignee: default\n",
+        encoding="utf-8",
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unassigned card")
+        res = kbd.dispatch_once(
+            conn, dry_run=False, spawn_fn=lambda _t, _w: 4242,
+            default_assignee="default",
+        )
+        task = kb.get_task(conn, tid)
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert res.spawned == []
+    assert res.auto_assigned_default == []
+    assert task.assignee is None
+    assert "assigned" not in kinds
+
+
+def test_unset_allowlist_keeps_default_claimable(kanban_home, all_assignees_spawnable):
+    """No key = upstream behaviour: any existing profile, ``default`` included."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="local card", assignee="default")
+        assert kbd.has_spawnable_ready(conn) is True
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert [t for t, _a, _w in res.spawned] == [tid]
+    assert res.skipped_nonspawnable == []
+
+
+@pytest.mark.parametrize("value", ["", None], ids=["empty_string", "bare_key"])
+def test_present_blank_or_null_allowlist_skips_all_cards(
+    kanban_home, all_assignees_spawnable, value, caplog,
+):
+    """A present key with no names must not fall back to unrestricted claims,
+    and must say so once in the log so an upgraded home that copied the old
+    ``dispatch_profiles: null`` example is not silently idle (#113620)."""
+    rendered = "" if value is None else ' ""'
+    (kanban_home / "config.yaml").write_text(
+        f"kanban:\n  dispatch_profiles:{rendered}\n", encoding="utf-8",
+    )
+    with kbc.connect() as conn, caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
+        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert res.spawned == []
+    assert res.skipped_nonspawnable == [tid]
+    assert any("present but empty" in r.getMessage() and "omit the key" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_allowlist_config_read_failure_skips_all_cards(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A broken config read must not make this shared home claim every profile."""
+    from hermes_cli import config_effective
+
+    def raise_read_error(**_kwargs):
+        raise OSError("config unavailable")
+
+    monkeypatch.setattr(config_effective, "load_user_config_effective", raise_read_error)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert res.spawned == []
+    assert res.skipped_nonspawnable == [tid]
+
+
+@pytest.mark.parametrize("config, expected", [
+    ("", "any"),
+    ("kanban:\n  dispatch_profiles: [researcher, sage]\n", "researcher, sage"),
+    ("kanban:\n  dispatch_profiles: []\n", "none (fail-closed"),
+], ids=["absent", "listed", "empty_list"])
+def test_diagnostics_reports_resolved_allowlist(kanban_home, capsys, config, expected):
+    """`hermes kanban diagnostics` (text and --json) shows what this home may claim."""
+    import argparse
+    import json
+
+    from hermes_cli import kanban as kanban_cli
+
+    if config:
+        (kanban_home / "config.yaml").write_text(config, encoding="utf-8")
+    assert kanban_cli._cmd_diagnostics(argparse.Namespace(task=None, severity=None, json=False)) == 0
+    text = capsys.readouterr().out
+    assert f"kanban.dispatch_profiles: {expected}" in text
+    assert kanban_cli._cmd_diagnostics(argparse.Namespace(task=None, severity=None, json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [{"task_id": None, "dispatch_profiles": payload[-1]["dispatch_profiles"], "diagnostics": []}]
+    assert payload[-1]["dispatch_profiles"].startswith(expected)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_dispatch_lock.py ===
+"""Tests for the kanban dispatcher single-writer lock (issue #35240).
+
+A ``hermes gateway run --replace`` / ``gateway restart`` from a shell on a
+systemd/launchd host can leave an orphan dispatcher that escapes the
+service cgroup, survives ``systemctl restart``, and becomes a second
+long-lived writer on the same ``kanban.db`` — the documented root cause of
+multi-writer SQLite WAL corruption. ``dispatch_once`` now wraps each tick in
+a non-blocking, board-scoped dispatch lock so two dispatchers can never run
+a reclaim/spawn/write tick concurrently. The losing dispatcher returns an
+empty ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = kb.kanban_db_path(board="default")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db()
+    return home
+
+
+@pytest.fixture
+def conn(kanban_home):
+    with kbc.connect() as c:
+        yield c
+
+
+
+
+def test_held_lock_skips_the_tick_without_writes(conn):
+    """While another holder owns the board lock, dispatch_once must skip and
+    must NOT invoke spawn_fn (no DB writes happen on a skipped tick)."""
+    kb.create_task(conn, title="t", assignee="w")
+    db_path = kb.kanban_db_path(board="default")
+
+    spawn_calls: list = []
+
+    def spy_spawn(task, workspace_path, board=None):
+        spawn_calls.append(getattr(task, "id", task))
+        return 999999
+
+    # Hold the lock, then attempt a contended tick.
+    with kbc._dispatch_tick_lock(db_path) as held:
+        assert held is True  # we genuinely acquired it
+        result = kbd.dispatch_once(conn, spawn_fn=spy_spawn)
+
+    assert result.skipped_locked is True
+    assert result.spawned == []
+    assert spawn_calls == [], "spawn_fn must not run while the tick is locked out"
+
+
+
+
+def test_lock_is_board_scoped(conn):
+    """Holding board A's dispatch lock must not block a tick on board B —
+    distinct boards have distinct DB files and tick independently."""
+    db_default = kb.kanban_db_path(board="default")
+    db_other = db_default.with_name("other-board-kanban.db")
+
+    # Two different lock files → both acquirable simultaneously.
+    with kbc._dispatch_tick_lock(db_default) as held_a:
+        assert held_a is True
+        with kbc._dispatch_tick_lock(db_other) as held_b:
+            assert held_b is True, "a lock on a different board must be independent"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_kanban_dispatch_tick_hook.py ===
+"""Tests for the ``on_kanban_dispatch_tick`` observer hook.
+
+Re-port of PR #56066 per the #64231 batch disposition: renamed to the
+taxonomy form and fired by ``kanban_db.dispatch_once`` strictly AFTER the
+board's single-writer dispatch lock has been released — the original fired
+inside ``_dispatch_tick_lock``, so a slow subscriber could extend the
+critical section and stall a sibling dispatcher. Verifies the post-lock
+contract directly, the ``outcome`` classification (including idle and
+contended ticks), ``dry_run`` propagation, and that a misbehaving
+subscriber never breaks the dispatcher.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+@pytest.fixture
+def captured_ticks(monkeypatch):
+    """Register a capturing callback for the dispatch tick hook."""
+    mgr = get_plugin_manager()
+    events: list[dict] = []
+    saved = {k: list(v) for k, v in mgr._hooks.items()}
+    mgr._hooks.setdefault("on_kanban_dispatch_tick", []).append(
+        lambda **kw: events.append(kw)
+    )
+    try:
+        yield events
+    finally:
+        mgr._hooks = saved
+
+def test_active_tick_fires_hook_with_outcome_ok(
+    kanban_home, all_assignees_spawnable, captured_ticks,
+):
+    """A tick that spawns a worker fires the hook with outcome='ok'."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="alice")
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
+    finally:
+        conn.close()
+    ok_events = [kw for kw in captured_ticks if kw["outcome"] == "ok"]
+    assert ok_events, (
+        f"expected an ok tick, got {[kw['outcome'] for kw in captured_ticks]}"
+    )
+    result = ok_events[-1]["result"]
+    assert any(row[0] == tid for row in result.spawned)
+
+def test_tick_hook_fires_after_dispatch_lock_released(kanban_home):
+    """The #56066 sweeper finding, as a contract: subscribers run OUTSIDE
+    the single-writer critical section. From the callback, acquiring the
+    board's dispatch lock must succeed — flock conflicts across file
+    descriptors within one process, so this fails if the hook still fires
+    while ``dispatch_once`` holds the lock."""
+    db_path = kb.kanban_db_path()
+    mgr = get_plugin_manager()
+    saved = {k: list(v) for k, v in mgr._hooks.items()}
+    acquired: list[bool] = []
+
+    def _probe_lock(**kw):
+        with kbc._dispatch_tick_lock(db_path) as held:
+            acquired.append(held)
+
+    mgr._hooks.setdefault("on_kanban_dispatch_tick", []).append(_probe_lock)
+    try:
+        conn = kbc.connect()
+        try:
+            kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+        finally:
+            conn.close()
+    finally:
+        mgr._hooks = saved
+    assert acquired == [True]
+
+
+def test_misbehaving_subscriber_does_not_break_dispatcher(kanban_home):
+    """A hook callback that raises must not break the dispatch tick."""
+    mgr = get_plugin_manager()
+    saved = {k: list(v) for k, v in mgr._hooks.items()}
+
+    def _boom(**kw):
+        raise RuntimeError("subscriber exploded")
+
+    mgr._hooks.setdefault("on_kanban_dispatch_tick", []).append(_boom)
+    try:
+        conn = kbc.connect()
+        try:
+            result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+            assert isinstance(result, kb.DispatchResult)
+        finally:
+            conn.close()
+    finally:
+        mgr._hooks = saved
+
+
+def test_no_subscriber_short_circuits_tick_hook(kanban_home, monkeypatch):
+    """With nothing registered, the tick observer is never invoked."""
+    from hermes_cli import lifecycle
+
+    invoked: list[str] = []
+    real_invoke = lifecycle.invoke_hook
+
+    def _spy(hook_name, **kw):
+        invoked.append(hook_name)
+        return real_invoke(hook_name, **kw)
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
+    conn = kbc.connect()
+    try:
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+    finally:
+        conn.close()
+    assert "on_kanban_dispatch_tick" not in invoked
+

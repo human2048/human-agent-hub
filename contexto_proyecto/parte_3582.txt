@@ -1,0 +1,333 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_stream_partial_line_flush.py ===
+"""Streaming display: logical lines are emitted ONLY at real newlines.
+
+The July 2026 TTFT force-flush hard-wrapped long partial lines at
+terminal width, baking real '\\n's into every long paragraph — exactly
+what polluted highlight-copy/paste. Now paragraphs stay one logical
+line (the terminal soft-wraps them and rejoins on copy, matching the
+TUI's selection copy), and TTFT perception is served by mirroring the
+partial line's tail into the spinner status text instead.
+"""
+import os
+import re
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _strip_ansi(s: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+@pytest.fixture
+def cli_stub(monkeypatch):
+    from cli import HermesCLI
+    import cli as climod
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.show_reasoning = False
+    cli.final_response_markdown = "raw"
+    cli.show_timestamps = False
+    cli._reset_stream_state()
+    cli._spinner_text = ""
+    cli._invalidate = lambda *a, **kw: None
+
+    emitted = []
+    monkeypatch.setattr(climod, "_cprint", lambda s: emitted.append(s))
+    monkeypatch.setattr(climod, "_terminal_width_for_streaming", lambda: 74)
+    return cli, emitted
+
+
+class TestLogicalLineStreaming:
+    def test_long_paragraph_not_hard_wrapped_before_newline(self, cli_stub):
+        cli, emitted = cli_stub
+        text = (
+            "This is a long opening paragraph that previously got chopped "
+            "into terminal-width chunks with real newlines, which is what "
+            "made copy/paste come out full of broken lines. "
+        ) * 3
+        for i in range(0, len(text), 12):
+            cli._stream_delta(text[i : i + 12])
+        # No newline seen yet → no content lines printed (box header only).
+        plain = _strip_ansi("\n".join(emitted))
+        assert "opening paragraph" not in plain
+        # The paragraph is still buffered as ONE logical line.
+        assert cli._stream_buf.startswith("This is a long opening")
+
+    def test_partial_tail_mirrored_into_spinner(self, cli_stub):
+        cli, emitted = cli_stub
+        text = "A long paragraph streaming in without any newline " * 4
+        for i in range(0, len(text), 16):
+            cli._stream_delta(text[i : i + 16])
+        assert cli._spinner_text.startswith("…")
+        assert "newline" in cli._spinner_text
+
+
+    def test_no_content_lost_across_stream(self, cli_stub):
+        cli, emitted = cli_stub
+        words = [f"word{i}" for i in range(120)]
+        text = " ".join(words)
+        for i in range(0, len(text), 7):
+            cli._stream_delta(text[i : i + 7])
+        cli._flush_stream()
+        plain = " ".join(_strip_ansi("\n".join(emitted)).split())
+        for w in words:
+            assert w in plain, f"lost {w}"
+
+
+    def test_table_rows_not_previewed_in_spinner(self, cli_stub):
+        cli, emitted = cli_stub
+        row = "| " + " | ".join(f"cell{i}" for i in range(20)) + " |"
+        cli._stream_delta(row)  # no newline
+        plain = _strip_ansi("\n".join(emitted))
+        assert "cell19" not in plain
+        assert cli._spinner_text == ""
+
+    def test_newline_lines_still_emit_normally(self, cli_stub):
+        cli, emitted = cli_stub
+        cli._stream_delta("line one\nline two\n")
+        plain = _strip_ansi("\n".join(emitted))
+        assert "line one" in plain
+        assert "line two" in plain
+
+    def test_unbreakable_run_stays_single_line(self, cli_stub):
+        cli, emitted = cli_stub
+        blob = "x" * 300  # no spaces
+        cli._stream_delta(blob)
+        cli._flush_stream()
+        plain = _strip_ansi("\n".join(emitted))
+        assert plain.count("x") == 300
+        content = [
+            _strip_ansi(e) for e in emitted if "x" in _strip_ansi(e)
+        ]
+        assert len(content) == 1, "unbreakable run was hard-wrapped"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_stt_picker.py ===
+"""Tests for the Speech-to-Text category in `hermes tools` (tools_config).
+
+Covers the STT provider picker rows, config writes (stt.provider /
+use_gateway), the model picker catalog, config-only checklist exclusion,
+and the faster_whisper post-setup readiness hook.
+"""
+
+import sys
+import types
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from hermes_cli.tools_config import (  # noqa: E402
+    _CONFIG_ONLY_TOOLSETS,
+    CONFIGURABLE_TOOLSETS,
+    STT_MODEL_CATALOG,
+    TOOL_CATEGORIES,
+    _checklist_toolset_keys,
+    _configure_stt_model,
+    _is_provider_active,
+    _write_provider_config,
+    apply_provider_selection,
+)
+
+
+def _stt_cat():
+    return TOOL_CATEGORIES["stt"]
+
+
+def _stt_provider_named(name):
+    return next(p for p in _stt_cat()["providers"] if p["name"] == name)
+
+
+class TestSttCategory:
+    def test_stt_category_exists(self):
+        cat = _stt_cat()
+        assert cat["name"] == "Speech-to-Text"
+        assert len(cat["providers"]) >= 5
+
+
+
+
+    def test_managed_row_shares_tts_coverage_category(self):
+        from hermes_cli.nous_subscription import MANAGED_FEATURE_COVERAGE_CATEGORY
+
+        managed = [p for p in _stt_cat()["providers"] if p.get("managed_nous_feature")]
+        assert managed, "expected a Nous Subscription row"
+        for p in managed:
+            assert p["managed_nous_feature"] == "stt"
+        assert MANAGED_FEATURE_COVERAGE_CATEGORY["stt"] == "openai-audio"
+
+
+class TestConfigWrites:
+    def test_write_provider_config_sets_stt_provider(self):
+        config = {"stt": {"use_gateway": True}}
+        prov = _stt_provider_named("Groq")
+        _write_provider_config(prov, config, managed_feature=None)
+        assert config["stt"]["provider"] == "groq"
+        # Legacy key is popped so the read-time shim can't override the pick.
+        assert "use_gateway" not in config["stt"]
+
+
+    def test_apply_provider_selection_stt(self):
+        config = {}
+        with patch(
+            "hermes_cli.tools_config.get_nous_subscription_features"
+        ) as feats:
+            feats.return_value = MagicMock(
+                nous_auth_present=False, account_info=None
+            )
+            apply_provider_selection("stt", "OpenAI", config)
+        assert config["stt"]["provider"] == "openai"
+
+
+class TestActiveDetection:
+    def test_active_matches_config(self):
+        config = {"stt": {"provider": "groq"}}
+        assert _is_provider_active(_stt_provider_named("Groq"), config)
+        assert not _is_provider_active(_stt_provider_named("OpenAI"), config)
+
+    def test_unset_provider_defaults_to_local(self):
+        assert _is_provider_active(_stt_provider_named("Local Whisper"), {})
+
+
+class TestModelPicker:
+
+    def test_catalog_matches_runtime_model_sets(self):
+        from tools.transcription_common import GROQ_MODELS, OPENAI_MODELS
+
+        assert set(STT_MODEL_CATALOG["openai"]) == OPENAI_MODELS
+        assert set(STT_MODEL_CATALOG["groq"]) == GROQ_MODELS
+
+
+
+
+    def test_configure_stt_model_defaults_to_current(self):
+        config = {"stt": {"openai": {"model": "gpt-transcribe"}}}
+        with patch(
+            "hermes_cli.tools_config._prompt_choice", return_value=0
+        ) as pc:
+            _configure_stt_model("openai", config)
+        # default index should point at the currently configured model
+        args = pc.call_args[0]
+        assert args[2] == STT_MODEL_CATALOG["openai"].index("gpt-transcribe")
+
+
+class TestConfigOnlyExclusion:
+    def test_stt_is_config_only(self):
+        assert "stt" in _CONFIG_ONLY_TOOLSETS
+
+    def test_stt_excluded_from_checklist_universe(self):
+        assert "stt" not in _checklist_toolset_keys("cli")
+        # sanity: tts (a real toolset) stays in
+        assert "tts" in _checklist_toolset_keys("cli")
+
+
+class TestPostSetup:
+    def test_faster_whisper_in_post_setup_ready(self):
+        from hermes_cli.tools_config import _POST_SETUP_READY
+
+        assert "faster_whisper" in _POST_SETUP_READY
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_subagent_dock_collapse.py ===
+"""Collapsing the passive dock never takes space or focus from the editor."""
+import asyncio
+from types import SimpleNamespace
+
+
+def test_collapsed_dock_reserves_one_shaded_row_without_changing_editor():
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.layout import HSplit, Layout
+    from prompt_toolkit.output import DummyOutput
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.widgets import TextArea
+    from hermes_cli import cli_subagent_monitor as dock
+    from hermes_cli.skin_engine import get_prompt_toolkit_style_overrides
+
+    cli = SimpleNamespace(agent=None)
+    dock.install_dock(cli)
+    monitor = cli._subagent_monitor
+    monitor.entries = [dict(subagent_id=str(i), goal='Worker 界 ' * 20,
+        elapsed=12, last_tool='terminal', status='running') for i in range(6)]
+    submitted = []
+    editor = TextArea(height=1, multiline=False,
+                      accept_handler=lambda buffer: submitted.append(buffer.text))
+    output = DummyOutput()
+
+    async def run():
+        with create_pipe_input() as pipe:
+            app = Application(layout=Layout(HSplit([cli._subagent_dock_widget, editor]),
+                focused_element=editor), input=pipe, output=output,
+                style=Style.from_dict(get_prompt_toolkit_style_overrides()))
+            cli._invalidate = app.invalidate
+            painted = asyncio.Event()
+            app.after_render += lambda _: painted.set()
+            output.get_size = lambda: Size(rows=30, columns=100)
+            task = asyncio.create_task(app.run_async())
+            await asyncio.wait_for(painted.wait(), 3)
+            try:
+                def height():
+                    return app.renderer._last_screen.visible_windows_to_write_positions[editor.window].ypos
+
+                preview_height = height()
+                assert preview_height > 1
+                editor.buffer.document = Document('keep this draft', 5)
+                dock.toggle_dock(cli)
+                for columns, rows in [(100, 30), (80, 20), (40, 14)]:
+                    output.get_size = lambda: Size(rows=rows, columns=columns)
+                    painted.clear()
+                    app.invalidate()
+                    await asyncio.wait_for(painted.wait(), 3)
+                    assert height() == 1
+                    assert app.layout.has_focus(editor)
+                    assert (editor.text, editor.buffer.cursor_position) == ('keep this draft', 5)
+                    screen = app.renderer._last_screen
+                    for x in (0, columns // 2, columns - 1):
+                        attrs = app._merged_style.get_attrs_for_style_str(screen.data_buffer[0][x].style)
+                        assert attrs.bgcolor and attrs.color != attrs.bgcolor
+                painted.clear()
+                pipe.send_text('X\r')
+                await asyncio.wait_for(painted.wait(), 3)
+                assert submitted == ['keep Xthis draft']
+                assert height() == 1
+                output.get_size = lambda: Size(rows=30, columns=100)
+                painted.clear()
+                dock.toggle_dock(cli)
+                await asyncio.wait_for(painted.wait(), 3)
+                assert height() == preview_height
+            finally:
+                app.exit()
+                await task
+    asyncio.run(run())
+
+
+def test_collapsed_summary_prioritizes_live_count_and_controls_at_small_widths():
+    from prompt_toolkit.utils import get_cwidth
+    from hermes_cli.cli_subagent_monitor import SubagentMonitor
+
+    monitor = SubagentMonitor(SimpleNamespace())
+    monitor.entries = [dict(goal='Inspect 界 ' * 40, elapsed=12,
+        last_tool='terminal', status='running') for _ in range(6)]
+    monitor.collapsed = True
+    for width in (100, 80, 40, 24, 10, 1):
+        text = monitor.dock_text(columns=width, rows=20)
+        assert len(text.splitlines()) == 1
+        assert get_cwidth(text) <= width
+        if width >= 24:
+            assert '6 live' in text and 'Ctrl+T' in text and 'F7' in text
+        if width >= 80:
+            assert 'last: terminal' in text and 'Ctrl+T expand' in text and 'F7 restore' in text
+    monitor.entries.clear()
+    assert monitor.dock_text(columns=80, rows=20) == ''
+

@@ -1,0 +1,372 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_media_spaced_paths_and_history_dedupe.py ===
+"""Regression tests: spaced paths, GIS extensions, cross-turn dedupe plumbing,
+and code-block-safe streaming display strip.
+
+Covers the follow-up wave after PR #72170:
+
+* #24032 — GIS extensions (.kmz/.kml/.geojson/.gpx) are deliverable, and
+  unknown-extension paths containing spaces extract via the
+  validation-gated progressive right-trim (``_spaced_path_candidates``).
+* #16434 half — ``strip_media_directives_for_display`` (streaming path) no
+  longer strips MEDIA tags out of fenced code blocks / inline-code examples;
+  protected spans are a mask-locator, matching ``extract_media``.
+* #53586 — ``_collect_history_media_paths`` also collects tags from
+  assistant messages, and the post-stream delivery path filters against it.
+"""
+
+import os
+
+import pytest
+
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MEDIA_DELIVERY_EXTS,
+)
+from gateway.run import _collect_history_media_paths
+
+
+class TestGisExtensions:
+    def test_gis_extensions_in_delivery_set(self):
+        for ext in (".kmz", ".kml", ".geojson", ".gpx"):
+            assert ext in MEDIA_DELIVERY_EXTS
+
+
+class TestSpacedPaths:
+
+
+    def test_spaced_path_followed_by_prose_keeps_prose(self, tmp_path):
+        p = tmp_path / "my server.log"
+        p.write_text("log line\n")
+        media, cleaned = BasePlatformAdapter.extract_media(
+            f"MEDIA:{p} is the log you asked for"
+        )
+        assert [os.path.realpath(x) for x, _ in media] == [os.path.realpath(str(p))]
+        assert "is the log you asked for" in cleaned
+
+
+    def test_forward_extension_stops_at_next_media_tag(self, tmp_path):
+        a = tmp_path / "Caddyfile"
+        b = tmp_path / "Dockerfile"
+        a.write_text("localhost\n")
+        b.write_text("FROM alpine\n")
+        media, cleaned = BasePlatformAdapter.extract_media(
+            f"MEDIA:{a} MEDIA:{b}"
+        )
+        got = sorted(os.path.realpath(x) for x, _ in media)
+        assert got == sorted(
+            [os.path.realpath(str(a)), os.path.realpath(str(b))]
+        )
+        assert "MEDIA:" not in cleaned
+
+
+class TestStreamingDisplayStripCodeBlocks:
+    def test_fenced_code_example_preserved(self, tmp_path):
+        p = tmp_path / "real.pdf"
+        p.write_text("x")
+        text = f"Example:\n```\nMEDIA:{p}\n```\ndone MEDIA:{p}"
+        out = BasePlatformAdapter.strip_media_directives_for_display(text)
+        # The example inside the fence survives verbatim; the real tag outside
+        # is stripped.
+        assert f"MEDIA:{p}" in out
+        assert out.count(f"MEDIA:{p}") == 1
+        assert "```" in out
+
+
+class TestHistoryMediaDedupe:
+    def test_assistant_message_tags_collected(self):
+        history = [
+            {"role": "user", "content": "make a chart"},
+            {"role": "assistant", "content": "Done! MEDIA:/tmp/chart.png"},
+            {"role": "user", "content": "thanks"},
+        ]
+        paths = _collect_history_media_paths(history)
+        assert "/tmp/chart.png" in paths
+
+    def test_quoted_spaced_home_path_is_collected_in_delivery_form(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        history = [
+            {
+                "role": "assistant",
+                "content": 'MEDIA:"~/audio cache/old.ogg"',
+            },
+        ]
+
+        paths = _collect_history_media_paths(history)
+
+        assert str(tmp_path / "audio cache" / "old.ogg") in paths
+
+    def test_empty_history_empty_set(self):
+        assert _collect_history_media_paths([]) == set()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_media_tag_cleanup.py ===
+"""Tests for MEDIA_TAG_CLEANUP_RE regex matching behavior (#63632)."""
+
+
+class TestMediaTagCleanup:
+    """Tests for MEDIA_TAG_CLEANUP_RE regex matching behavior."""
+
+    def test_media_tag_with_directive_glued_to_extension(self):
+        """Regression: MEDIA:<path>[[as_document]] must match when directive is glued
+        directly to the extension without whitespace (#63632).
+
+        The fix adds `\\[` to the lookahead character class in MEDIA_TAG_CLEANUP_RE.
+        """
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        # Issue case: [[as_document]] glued directly to .xlsx
+        text = "Готово. MEDIA:/home/hermes/report.xlsx[[as_document]]"
+        assert MEDIA_TAG_CLEANUP_RE.search(text) is not None
+        stripped = MEDIA_TAG_CLEANUP_RE.sub("", text)
+        assert "MEDIA:" not in stripped
+        assert "/home/hermes/report.xlsx" not in stripped
+
+        # Same with whitespace (should still work)
+        text_with_space = "Готово. MEDIA:/home/hermes/report.xlsx [[as_document]]"
+        assert MEDIA_TAG_CLEANUP_RE.search(text_with_space) is not None
+        stripped = MEDIA_TAG_CLEANUP_RE.sub("", text_with_space)
+        assert "MEDIA:" not in stripped
+        assert "/home/hermes/report.xlsx" not in stripped
+
+        # Other directives ([[as_image]]) should also work
+        text_image = "Done. MEDIA:/tmp/chart.png[[as_image]]"
+        assert MEDIA_TAG_CLEANUP_RE.search(text_image) is not None
+        stripped = MEDIA_TAG_CLEANUP_RE.sub("", text_image)
+        assert "MEDIA:" not in stripped
+        assert "/tmp/chart.png" not in stripped
+
+
+class TestMediaTagCjkTerminators:
+    """#88038: CJK full-width punctuation after a MEDIA path is a valid
+    terminator, exactly like its ASCII counterparts. Chinese-language agent
+    output naturally writes ``MEDIA:D:\\...\\zhibao.pdf（782.6 KB）`` — the
+    ASCII-only lookahead silently dropped the attachment."""
+
+    def test_full_width_suffixes_terminate_the_path(self):
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        cases = [
+            "MEDIA:D:/workspace/out/report.pdf（782.6 KB）",
+            "MEDIA:D:/workspace/out/report.pdf：内容",
+            "MEDIA:D:/workspace/out/report.pdf。",
+            "MEDIA:D:/workspace/out/report.pdf，下一条",
+            "MEDIA:D:/workspace/out/report.pdf；",
+            "MEDIA:D:/workspace/out/report.pdf！",
+            "MEDIA:D:/workspace/out/report.pdf？",
+            "MEDIA:D:/workspace/out/report.pdf、",
+            "MEDIA:D:/workspace/out/report.pdf”",
+            "MEDIA:D:/workspace/out/report.pdf’",
+        ]
+        for text in cases:
+            m = MEDIA_TAG_CLEANUP_RE.search(text)
+            assert m is not None, text
+            assert m.group("path").endswith(".pdf"), (text, m.group("path"))
+
+    def test_real_chinese_cron_delivery_line(self):
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        text = (
+            "## 交付物\n\n- **PDF 早报**："
+            "MEDIA:D:/workspace/zaobao/output/早报_2026-08-16.pdf（782.6 KB）"
+        )
+        m = MEDIA_TAG_CLEANUP_RE.search(text)
+        assert m is not None
+        assert m.group("path") == "D:/workspace/zaobao/output/早报_2026-08-16.pdf"
+
+    def test_ascii_terminators_still_work(self):
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        for text in (
+            "MEDIA:/tmp/report.pdf",
+            "MEDIA:/tmp/report.pdf 782 KB",
+            "MEDIA:/tmp/report.pdf, next",
+        ):
+            m = MEDIA_TAG_CLEANUP_RE.search(text)
+            assert m is not None and m.group("path").endswith(".pdf"), text
+
+    def test_adjacent_tags_still_split(self):
+        """#68773 guard: the widened class must not let tags glue together."""
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        found = MEDIA_TAG_CLEANUP_RE.findall("MEDIA:/a.pngMEDIA:/b.png")
+        assert list(found) == ["/a.png", "/b.png"]
+
+    def test_extensionless_variant_accepts_full_width_colon(self):
+        from gateway.platforms.base import MEDIA_EXTENSIONLESS_TAG_RE
+
+        m = MEDIA_EXTENSIONLESS_TAG_RE.search("MEDIA:/tmp/Caddyfile：内容")
+        assert m is not None and m.group("path") == "/tmp/Caddyfile"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_media_tag_formatting_variants.py ===
+"""Regression tests: MEDIA tag formatting variants that previously broke delivery.
+
+Covers the two follow-up fixes layered on top of the salvaged contributor PRs:
+
+1. Sentence-final punctuation — ``MEDIA:/x/data.csv.`` at the end of a
+   sentence must extract ``data.csv`` (the trailing ``.`` is a boundary, not
+   part of the path), while multi-part extensions (``archive.tar.gz``)
+   remain intact.
+
+2. Inline-code-wrapped tags — a whole ``MEDIA:`` tag inside inline backticks
+   (`` `MEDIA:/path.csv` ``) is a real delivery directive when the path
+   validates on disk; prose examples with non-existent paths stay masked
+   (#35695), and fenced code blocks are always masked.
+"""
+
+import os
+
+import pytest
+
+from gateway.platforms.base import BasePlatformAdapter
+
+
+@pytest.fixture()
+def real_file(tmp_path):
+    p = tmp_path / "data.csv"
+    p.write_text("x,y\n1,2\n")
+    return str(p)
+
+
+@pytest.fixture()
+def real_targz(tmp_path):
+    p = tmp_path / "archive.tar.gz"
+    p.write_bytes(b"\x1f\x8b")
+    return str(p)
+
+
+class TestTrailingPunctuation:
+
+
+    def test_multipart_extension_not_truncated(self, real_targz):
+        media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{real_targz}")
+        assert [p for p, _ in media] == [real_targz]
+
+
+class TestInlineCodeWrappedTags:
+    def test_real_path_in_inline_code_delivers(self, real_file):
+        media, cleaned = BasePlatformAdapter.extract_media(
+            f"Here is your file `MEDIA:{real_file}`"
+        )
+        assert [p for p, _ in media] == [real_file]
+        assert "MEDIA:" not in cleaned
+
+
+class TestEmphasisAndDedupeIntegration:
+    """End-to-end matrix over the salvaged contributor fixes."""
+
+    def test_bold_wrapped_tag_delivers(self, real_file):
+        media, cleaned = BasePlatformAdapter.extract_media(f"**MEDIA:{real_file}**")
+        assert [p for p, _ in media] == [real_file]
+        assert "MEDIA:" not in cleaned
+
+    def test_two_tags_one_line_both_deliver(self, tmp_path):
+        a = tmp_path / "a.csv"
+        b = tmp_path / "b.csv"
+        a.write_text("1")
+        b.write_text("2")
+        media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{a} MEDIA:{b}")
+        assert [p for p, _ in media] == [str(a), str(b)]
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_media_tag_separator.py ===
+"""Regression tests for #68773 — MEDIA tags without a separator merge paths.
+
+Before the fix, ``MEDIA_EXTENSIONLESS_TAG_RE`` used a greedy character class
+``[^\s\n`\"']+`` that would silently absorb the next ``MEDIA:`` keyword when
+two tags were emitted back-to-back (``MEDIA:/a.pngMEDIA:/b.png``), producing
+an invalid merged path that was then rejected by
+``validate_media_delivery_path`` and dropped silently.
+
+The same pattern also failed for ``MEDIA:/path/file.pngSome text`` — the
+fallback would treat the trailing text as part of the path.
+"""
+
+from gateway.platforms.base import (
+    MEDIA_EXTENSIONLESS_TAG_RE,
+    MEDIA_TAG_CLEANUP_RE,
+    _strip_media_tag_directives,
+)
+
+
+def test_known_extension_regex_splits_glued_tags():
+    """``MEDIA_TAG_CLEANUP_RE`` must stop at the next ``MEDIA:`` keyword (#68773).
+
+    Previously the primary regex used greedy ``\S+`` in the path class,
+    so two tags glued together (``MEDIA:/a.pngMEDIA:/b.png``) merged into
+    one invalid path (``/a.pngMEDIA:/b.png``) and were silently dropped by
+    ``validate_media_delivery_path``. The fix uses non-greedy quantifiers
+    and accepts ``MEDIA:`` in the trailing lookahead.
+    """
+    text = "MEDIA:/tmp/file.pngMEDIA:/tmp/file2.png"
+    matches = list(MEDIA_TAG_CLEANUP_RE.finditer(text))
+    paths = [m.group("path") for m in matches]
+    assert paths == ["/tmp/file.png", "/tmp/file2.png"], paths
+
+
+def test_strip_media_directives_handles_glued_known_extension_tags(tmp_path):
+    """Two known-extension tags glued together must each be delivered (#68773)."""
+    png1 = tmp_path / "a.png"
+    png1.write_bytes(b"\x89PNG\r\n\x1a\n")
+    png2 = tmp_path / "b.png"
+    png2.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    text = f"MEDIA:{png1}MEDIA:{png2}"
+    cleaned = _strip_media_tag_directives(text)
+    # Both MEDIA: tokens consumed; the leading MEDIA: prefix is gone.
+    assert "MEDIA:" not in cleaned, f"Greedy merge leaked: {cleaned!r}"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_media_terminal_sentinel.py ===
+"""A leaked terminal ``<|eos|>`` sentinel must not hide a MEDIA attachment (#111046)."""
+
+import pytest
+
+from gateway.platforms.base import BasePlatformAdapter
+
+
+@pytest.mark.parametrize("sentinel", ["<|eos|>", "<|eos|><|eos|>"])
+@pytest.mark.parametrize("filename", ["chart.png", "payload.weirdext", "Caddyfile"])
+def test_terminal_eos_sentinel_leaves_extraction_and_cleanup_unchanged(tmp_path, monkeypatch, filename, sentinel):
+    """Known-extension, unknown-extension and extension-less tags glued to a (possibly repeated)
+    ``<|eos|>`` extract and clean exactly like the same response without the sentinel."""
+    root = tmp_path / "media-cache"
+    root.mkdir()
+    media_file = root / filename
+    media_file.write_bytes(b"media")
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (root,))
+    clean = f"Here is the file.\nMEDIA:{media_file}"
+
+    assert BasePlatformAdapter.extract_media(clean + sentinel) == BasePlatformAdapter.extract_media(clean)
+    assert BasePlatformAdapter.strip_media_directives_for_display(clean + sentinel) == "Here is the file."
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "MEDIA:/tmp/example.png<|EOS|>",  # not the exact token: still not a path delimiter
+        "MEDIA:/tmp/example.png<|eos|> trailing prose",  # not terminal
+        "```text\nMEDIA:/tmp/example.png<|eos|>\n```",  # protected code stays byte-identical
+        '{"example":"MEDIA:/tmp/example.png<|eos|>"}',  # protected JSON value
+    ],
+)
+def test_non_terminal_or_protected_sentinel_is_not_a_media_boundary(text):
+    assert BasePlatformAdapter.extract_media(text) == ([], text)
+    assert BasePlatformAdapter.strip_media_directives_for_display(text) == text
+

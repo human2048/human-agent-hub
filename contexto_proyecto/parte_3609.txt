@@ -1,0 +1,230 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_cold_start_gateway_liveness.py ===
+"""#84185: a Windows gateway cold-started after update that dies immediately
+(e.g. a job object denying breakaway) must not be reported as started.
+
+``_cold_start_windows_gateway_after_update`` used to print the success line
+straight off a successful ``Popen`` return, which only proves the process was
+created, not that it survived. This asserts the observable output: the
+success line is gated on the process actually being found alive afterwards,
+same as every other ``_spawn_detached`` caller.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_cli import gateway as hermes_gateway
+from hermes_cli import gateway_windows
+from hermes_cli import main as cli_main
+import hermes_cli.main_install_repair as main_install_repair
+from hermes_cli import update_cmd
+
+
+def _run_cold_start(monkeypatch, capsys, *, surviving_pids):
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
+    monkeypatch.setattr(main_install_repair, "_is_windows", lambda: True)
+
+    # The pre-spawn re-check (``all_profiles=True``) must find nothing
+    # running so the cold-start path proceeds and actually spawns.
+    monkeypatch.setattr(
+        hermes_gateway,
+        "find_gateway_pids",
+        lambda all_profiles=False: [] if all_profiles else surviving_pids,
+    )
+    # This fixture exercises a standalone cold start, not Desktop ownership.
+    # A live Desktop for this install must not short-circuit the liveness poll.
+    monkeypatch.setattr(update_cmd, "_desktop_owns_gateway_lifecycle", lambda: False)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda: 4242)
+    # Avoid the real 6s/0.4s poll loop in _report_gateway_start.
+    monkeypatch.setattr(
+        gateway_windows, "_wait_for_gateway_ready", lambda *a, **k: surviving_pids
+    )
+
+    update_cmd._cold_start_windows_gateway_after_update()
+
+    return capsys.readouterr().out
+
+
+def test_cold_start_raises_when_process_does_not_survive(monkeypatch, capsys):
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        _run_cold_start(monkeypatch, capsys, surviving_pids=[])
+
+    assert "✓ Starting Windows gateway after update" not in capsys.readouterr().out
+
+
+def test_failed_readiness_keeps_the_dead_attestation_for_the_retry(monkeypatch, tmp_path, capsys):
+    """#110020 review: the attestation is the retry's only authority to spawn under Desktop
+    ownership, so a spawn that returns a PID but never becomes ready must NOT consume it —
+    otherwise the registered retry sees ownership with no marker and "succeeds" with no gateway."""
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(tmp_path))
+    gateway_windows._write_start_attestation([555], "direct spawn (PID 555)")
+    marker = tmp_path / "state" / "gateway.start-attestation.json"
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        _run_cold_start(monkeypatch, capsys, surviving_pids=[])
+    assert marker.exists()
+    assert gateway_windows.attested_death_generation(current_pids=[]) is not None
+
+
+def test_cold_start_reports_success_when_process_survives(monkeypatch, capsys):
+    out = _run_cold_start(monkeypatch, capsys, surviving_pids=[4242])
+
+    assert "✓ Gateway started via cold-start after update" in out
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_command.py ===
+"""Tests for the /update slash command in the classic CLI and TUI launcher.
+
+Verifies that ``HermesCLI._handle_update_command`` correctly:
+- Refuses to run under a managed install (Homebrew, Docker, etc.)
+- Sets ``_pending_relaunch`` and returns ``True`` on confirmation
+- Cancels cleanly on a "no"-shaped answer or unrecognized input
+- Cancels cleanly when ``_prompt_text_input_modal`` returns None (timeout /
+  modal dismissed)
+
+Also verifies that ``main_tui_launch._launch_tui`` correctly handles exit
+code 42 (the TUI's signal to trigger an update) by calling
+``relaunch(["update"], preserve_inherited=False)`` from the Python wrapper
+side.  The companion Vitest (``ui-tui/src/__tests__/createSlashHandler.test.ts``)
+covers the TypeScript slash-handler that *emits* code 42; this file covers
+the Python wrapper branch that *acts on* it.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from cli import HermesCLI
+from hermes_cli import main_tui_launch
+
+
+def _bound(fn, instance):
+    """Bind an unbound method to a stand-in instance."""
+    return fn.__get__(instance, type(instance))
+
+
+def _make_self(modal_response):
+    """Build a minimal stand-in 'self' for ``_handle_update_command``.
+
+    Uses the same SimpleNamespace pattern as ``test_destructive_slash_confirm``
+    so we don't need a full ``HermesCLI`` construction.
+    ``_prompt_text_input_modal`` is stubbed to return *modal_response*
+    directly so tests can drive the entire confirmation branch without
+    touching stdin or prompt_toolkit internals.
+    """
+    self_ = SimpleNamespace(
+        _app=None,
+        _pending_relaunch=None,
+        _prompt_text_input_modal=lambda **_kw: modal_response,
+    )
+    self_._normalize_slash_confirm_choice = _bound(
+        HermesCLI._normalize_slash_confirm_choice, self_
+    )
+    return self_
+
+
+def _call(self_):
+    """Invoke the real ``_handle_update_command`` on the stub."""
+    return HermesCLI._handle_update_command(self_)
+
+
+# ---------------------------------------------------------------------------
+# Managed-install guard
+# ---------------------------------------------------------------------------
+
+
+def test_managed_install_refuses_and_does_not_set_pending_relaunch(capsys):
+    """Under a managed install (brew/docker), /update prints a hint and
+    returns without setting ``_pending_relaunch``."""
+    self_ = SimpleNamespace(
+        _app=None,
+        _pending_relaunch=None,
+        # Use pytest.fail so any unexpected modal invocation surfaces as a failure.
+        _prompt_text_input_modal=lambda **_kw: pytest.fail("Modal should not be called"),
+    )
+    self_._normalize_slash_confirm_choice = _bound(
+        HermesCLI._normalize_slash_confirm_choice, self_
+    )
+    with (
+        patch("hermes_cli.config.is_managed", return_value=True),
+        patch(
+            "hermes_cli.config.format_managed_message",
+            return_value="Use `sudo nixos-rebuild switch` to update.",
+        ),
+    ):
+        result = _call(self_)
+
+    out = capsys.readouterr().out
+    assert "sudo nixos-rebuild switch" in out
+    assert self_._pending_relaunch is None
+    assert not result
+
+
+# ---------------------------------------------------------------------------
+# Confirmation proceeds only on recognised affirmative responses
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("answer", ["y", "Y", "yes", "YES", "1", "ok"])
+def test_affirmative_answer_sets_pending_relaunch_and_returns_true(answer, capsys):
+    """Recognised affirmative answers ("y", "yes", "1", "ok") set
+    ``_pending_relaunch = ["update"]`` and return ``True`` so the caller
+    (process_command) can trigger the main-thread app-exit path."""
+    self_ = _make_self(modal_response=answer)
+    with patch("hermes_cli.config.is_managed", return_value=False):
+        result = _call(self_)
+
+    assert self_._pending_relaunch == ["update"]
+    assert result is True
+    assert "Launching update" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Cancellation paths — _pending_relaunch must stay None
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("answer", ["n", "N", "no", "NO", " no "])
+def test_negative_answer_cancels(answer, capsys):
+    """Any "no"-shaped answer cancels without setting ``_pending_relaunch``."""
+    self_ = _make_self(modal_response=answer)
+    with patch("hermes_cli.config.is_managed", return_value=False):
+        result = _call(self_)
+
+    assert self_._pending_relaunch is None
+    assert not result
+    assert "Launching update" not in capsys.readouterr().out
+
+
+def test_none_response_cancels(capsys):
+    """``None`` from the modal (timeout or dismiss) cancels cleanly."""
+    self_ = _make_self(modal_response=None)
+    with patch("hermes_cli.config.is_managed", return_value=False):
+        result = _call(self_)
+
+    assert self_._pending_relaunch is None
+    assert not result
+
+
+@pytest.mark.parametrize("answer", ["nope", "cancel", "sure", "2", "3", "abort", ""])
+def test_unrecognized_or_cancel_input_cancels(answer, capsys):
+    """Unrecognised input and explicit "cancel" do not proceed.
+
+    Previously the implementation treated any non-"n/no" answer as approval,
+    which meant typos like "nope" or "cancel" would launch the update.
+    Now only confirmed affirmative aliases ("y", "yes", "1", "ok") proceed;
+    everything else (including empty string, "cancel", typos) cancels.
+    """
+    self_ = _make_self(modal_response=answer)
+    with patch("hermes_cli.config.is_managed", return_value=False):
+        result = _call(self_)
+
+    assert self_._pending_relaunch is None
+    assert not result
+

@@ -1,0 +1,243 @@
+
+
+=== ARCHIVO: .\hermes-agent\tui_gateway\event_publisher.py ===
+"""Best-effort WebSocket publisher transport for the PTY-side gateway.
+
+The dashboard's `/api/pty` spawns `hermes --tui`, which spawns ``tui_gateway.entry`` — three
+processes from the dashboard server. To surface events in the sidebar (`/api/events`), that gateway
+opens a back-WS to the dashboard at startup and mirrors every emit through this transport as
+newline-framed JSON (no JSON-RPC envelope; ``/api/pub`` rebroadcasts bytes verbatim). Failure mode:
+silent — the agent loop must never block on the sidecar: ``send`` runs on a daemon thread, ``write``
+returns after enqueueing (drop when full), a dead WS short-circuits all later writes.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import queue
+import threading
+from typing import Optional
+
+try:
+    from websockets.sync.client import connect as ws_connect
+except ImportError:  # pragma: no cover - websockets is a required install path
+    ws_connect = None  # type: ignore[assignment]
+
+_log = logging.getLogger(__name__)
+
+_DRAIN_STOP = object()
+_QUEUE_MAX = 256
+
+
+class WsPublisherTransport:
+    __slots__ = ("_url", "_lock", "_ws", "_dead", "_q", "_worker")
+
+    def __init__(self, url: str, *, connect_timeout: float = 2.0) -> None:
+        self._url = url
+        self._lock = threading.Lock()
+        self._ws: Optional[object] = None
+        self._dead = ws_connect is None
+        self._q: queue.Queue[object] = queue.Queue(maxsize=_QUEUE_MAX)
+        self._worker: Optional[threading.Thread] = None
+        if self._dead:
+            return
+        try:
+            self._ws = ws_connect(url, open_timeout=connect_timeout, max_size=None)
+        except Exception as exc:
+            _log.debug("event publisher connect failed: %s", exc)
+            self._dead = True
+            return
+        self._worker = threading.Thread(target=self._drain, name="hermes-ws-pub", daemon=True)
+        self._worker.start()
+
+    def _drain(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is _DRAIN_STOP:
+                return
+            if not isinstance(item, str) or self._ws is None:
+                continue
+            try:
+                with self._lock:
+                    if self._ws is not None:
+                        self._ws.send(item)  # type: ignore[union-attr]
+            except Exception as exc:
+                _log.debug("event publisher write failed: %s", exc)
+                self._dead = True
+                self._ws = None
+
+    def write(self, obj: dict) -> bool:
+        if self._dead or self._ws is None or self._worker is None:
+            return False
+        try:
+            self._q.put_nowait(json.dumps(obj, ensure_ascii=False))
+            return True
+        except queue.Full:
+            return False
+
+    def close(self) -> None:
+        self._dead = True
+        w = self._worker
+        if w is not None and w.is_alive():
+            # Best-effort: if the queue is wedged, the daemon thread dies with the process.
+            with contextlib.suppress(queue.Full):
+                self._q.put_nowait(_DRAIN_STOP)
+            w.join(timeout=3.0)
+        self._worker = None
+        if self._ws is None:
+            return
+        with contextlib.suppress(Exception), self._lock:
+            if self._ws is not None:
+                self._ws.close()  # type: ignore[union-attr]
+        self._ws = None
+
+
+
+=== ARCHIVO: .\hermes-agent\tui_gateway\event_replay.py ===
+"""Per-session event sequencing + bounded replay for WS reconnects.
+
+Every event frame through :func:`server.write_json` (hence ``_emit``) gets a per-session monotonic
+``seq`` and lands in a small ring per session; a reconnecting client calls ``session.events.since``
+with its last seen seq and gets everything newer. Invariants: stdio TUI unaffected (``seq`` only on
+event frames; Ink ignores unknown keys); one lock guards counters + buffers, and write_json already
+serializes per-transport writes so stamping cannot reorder frames; memory bound =
+_REPLAY_BUFFER_MAX events AND _REPLAY_BUFFER_BYTES_MAX serialized bytes per session,
+_REPLAY_PROCESS_BYTES_MAX bytes across at most _REPLAY_SESSIONS_MAX sessions, oldest evicted
+FIFO. Evicted or never-retained (oversized) frames leave a truncation watermark so a
+reconnecting client refetches instead of trusting a replay with holes.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import uuid
+from collections import OrderedDict, deque
+
+# Seq counters live in-process, so a restart resets them to 1 while clients hold high
+# watermarks — events_since(sid, 97) would return [] with truncated=False forever. The
+# epoch lets clients detect the restart and reset their watermarks.
+_REPLAY_EPOCH = uuid.uuid4().hex
+
+# A long turn emits ~hundreds of token events; 512 covers minutes of streaming plus
+# all control events. Desktop users rarely exceed a dozen live chats.
+_REPLAY_BUFFER_MAX = 512
+_REPLAY_SESSIONS_MAX = 64
+# A ring may legitimately hold many bounded 64 KiB tool results (512 of them ≈ 32 MiB per
+# session, ×64 sessions before any cap); bound the serialized bytes so replay memory cannot
+# scale with payload size without limit.
+_REPLAY_BUFFER_BYTES_MAX = 4 * 1024 * 1024
+_REPLAY_PROCESS_BYTES_MAX = 64 * 1024 * 1024
+
+_replay_lock = threading.Lock()
+# sid -> deque of (seq, params dict, serialized bytes).
+_replay_buffers: "OrderedDict[str, deque]" = OrderedDict()
+_replay_buffer_bytes: dict[str, int] = {}
+_replay_evicted_through: dict[str, int] = {}
+_replay_total_bytes = 0
+_replay_next_seq: dict[str, int] = {}
+
+
+def replay_epoch() -> str:
+    """Opaque token identifying this server process's seq numbering."""
+    return _REPLAY_EPOCH
+
+
+def _stamp_event(obj: dict) -> None:
+    """Stamp one outgoing event frame (mutates obj in place) and record it."""
+    if obj.get("method") != "event":
+        return
+    params = obj.get("params")
+    if not isinstance(params, dict):
+        return
+    sid = params.get("session_id") or ""
+    if not sid:
+        # Session-less global events (skin.changed etc.) are re-fetchable via their own RPCs.
+        return
+    # Sizing stays OUTSIDE the lock (same rule as transport.write) so one large payload cannot
+    # stall other threads' frames; ``seq`` is not stamped yet, a few bytes off a MiB budget.
+    size = len(json.dumps(params, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8", errors="surrogatepass"))
+    with _replay_lock:
+        global _replay_total_bytes
+        seq = _replay_next_seq.get(sid, 0) + 1
+        _replay_next_seq[sid] = seq
+        params["seq"] = seq
+        buf = _replay_buffers.get(sid)
+        if buf is None:
+            buf = _replay_buffers[sid] = deque()
+            _replay_buffer_bytes[sid] = 0
+            while len(_replay_buffers) > _REPLAY_SESSIONS_MAX:
+                oldest_sid, oldest_buf = _replay_buffers.popitem(last=False)
+                _replay_total_bytes -= _replay_buffer_bytes.pop(oldest_sid, 0)
+                _replay_next_seq.pop(oldest_sid, None)
+                _replay_evicted_through.pop(oldest_sid, None)
+        if size > _REPLAY_BUFFER_BYTES_MAX or size > _REPLAY_PROCESS_BYTES_MAX:
+            _replay_evicted_through[sid] = seq
+            return
+        buf.append((seq, params, size))
+        _replay_buffer_bytes[sid] += size
+        _replay_total_bytes += size
+        while len(buf) > _REPLAY_BUFFER_MAX or _replay_buffer_bytes[sid] > _REPLAY_BUFFER_BYTES_MAX:
+            evicted_seq, _event, evicted_size = buf.popleft()
+            _replay_buffer_bytes[sid] -= evicted_size
+            _replay_total_bytes -= evicted_size
+            _replay_evicted_through[sid] = max(_replay_evicted_through.get(sid, 0), evicted_seq)
+        while _replay_total_bytes > _REPLAY_PROCESS_BYTES_MAX:
+            for evict_sid, evict_buf in _replay_buffers.items():
+                if evict_buf:
+                    evicted_seq, _event, evicted_size = evict_buf.popleft()
+                    _replay_buffer_bytes[evict_sid] -= evicted_size
+                    _replay_total_bytes -= evicted_size
+                    _replay_evicted_through[evict_sid] = max(_replay_evicted_through.get(evict_sid, 0), evicted_seq)
+                    break
+
+
+def events_since(sid: str, last_seen: int) -> list[dict]:
+    """Recorded EVENT OBJECTS (each frame's ``params`` dict) with seq > last_seen for *sid*.
+
+    Returning the full JSON-RPC envelope would make every replayed event fail the
+    client's ``event.type`` gate and be silently dropped.
+    """
+    with _replay_lock:
+        buf = _replay_buffers.get(sid or "")
+        return [event for seq, event, _size in buf if seq > last_seen] if buf else []
+
+
+def is_truncated(sid: str, last_seen: int) -> bool:
+    """True when events between *last_seen* and the ring's oldest retained seq were
+    evicted — the client must refetch history instead of trusting the replay."""
+    with _replay_lock:
+        return last_seen < _replay_evicted_through.get(sid or "", 0)
+
+
+def latest_seq(sid: str) -> int:
+    """Current highest stamped seq for *sid* (0 when unknown)."""
+    with _replay_lock:
+        return _replay_next_seq.get(sid or "", 0)
+
+
+def reset_replay_state() -> None:
+    """Test hook."""
+    with _replay_lock:
+        global _replay_total_bytes
+        _replay_buffers.clear()
+        _replay_buffer_bytes.clear()
+        _replay_evicted_through.clear()
+        _replay_next_seq.clear()
+        _replay_total_bytes = 0
+
+
+def replay_stats() -> dict:
+    """Telemetry: buffer occupancy for the ops/debug surface."""
+    with _replay_lock:
+        return {
+            "sessions": len(_replay_buffers),
+            "events": sum(len(buffer) for buffer in _replay_buffers.values()),
+            "bytes": _replay_total_bytes,
+            "max_per_session": _REPLAY_BUFFER_MAX,
+            "max_bytes_per_session": _REPLAY_BUFFER_BYTES_MAX,
+            "max_bytes_process": _REPLAY_PROCESS_BYTES_MAX}
+

@@ -1,0 +1,231 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\scripts\crypto.py ===
+"""At-rest encryption for sensitive files via the `age` binary (optional).
+
+Engaged ONLY when config `encryption: age` AND an age identity key exists AND the
+`age`/`age-keygen` binaries are available. When engaged, JSON docs under
+`subjects/` (dossier, ledger) are written as `<file>.age` ciphertext; the audit
+log (field NAMES + states only, no raw PII values), `config.json`, and the broker
+cache stay plaintext so the engine can read them.
+
+Threat model (be honest): this protects against casual disk inspection, accidental
+`git add`/commits, screen-shares, and backup/cloud-sync leakage. The identity key
+defaults to living beside the data at `$PDD_DATA_DIR/age-identity.txt` (0600); set
+`PDD_AGE_IDENTITY` to a separate volume/token for true key separation. It does NOT
+protect against an attacker who can already read your whole HERMES_HOME (they get
+key + data together).
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from shutil import which
+
+import paths
+
+
+def age_available() -> bool:
+    return which("age") is not None and which("age-keygen") is not None
+
+
+def encryption_setting() -> str:
+    """Read `encryption` straight from config.json (no config/storage import => no cycle)."""
+    cfg = paths.config_path()
+    if not cfg.exists():
+        return "none"
+    try:
+        return (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("encryption", "none")
+    except (ValueError, OSError):
+        return "none"
+
+
+def identity_path() -> Path:
+    return paths.age_identity_path()
+
+
+def ensure_identity() -> Path:
+    """Generate an age identity (X25519 keypair) if missing; return its path."""
+    if not age_available():
+        raise RuntimeError("`age`/`age-keygen` not found; cannot enable encryption")
+    p = identity_path()
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.parent.chmod(0o700)
+        except OSError:
+            pass
+        subprocess.run(["age-keygen", "-o", str(p)], check=True, capture_output=True)
+        try:
+            p.chmod(0o600)
+        except OSError:
+            pass
+    return p
+
+
+def recipient() -> str:
+    """The age public key (recipient) for the identity, parsed from its header."""
+    p = ensure_identity()
+    for line in p.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.lower().startswith("# public key:"):
+            return s.split(":", 1)[1].strip()
+        if s.startswith("age1"):
+            return s
+    raise RuntimeError(f"no public key found in {p}")
+
+
+def is_engaged() -> bool:
+    """True only when encryption is actually active (configured + available + key present)."""
+    return encryption_setting() == "age" and age_available() and identity_path().exists()
+
+
+def encrypt(data: bytes) -> bytes:
+    out = subprocess.run(["age", "-r", recipient()], input=data, capture_output=True, check=True)
+    return out.stdout
+
+
+def decrypt(data: bytes) -> bytes:
+    out = subprocess.run(["age", "-d", "-i", str(identity_path())], input=data, capture_output=True, check=True)
+    return out.stdout
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\scripts\dossier.py ===
+"""Subject dossier management + consent gate + least-disclosure field selection."""
+from __future__ import annotations
+
+import datetime as _dt
+import hashlib
+import os
+from pathlib import Path
+
+import paths
+import storage
+
+# Identifiers we never volunteer in an opt-out (would expand exposure, not reduce it).
+NEVER_VOLUNTEER = {"ssn", "social_security_number", "passport", "drivers_license"}
+
+VALID_CONSENT_METHODS = {"self", "written_authorization", "poa"}
+
+
+def now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def new_subject_id(full_name: str = "") -> str:
+    # Opaque id: derives NOTHING from the name, so PII never leaks into directory names,
+    # case ids, drafts, or the audit log. full_name kept only for call compatibility.
+    return "sub_" + hashlib.sha1(os.urandom(8)).hexdigest()[:10]
+
+
+def create(identity: dict, consent: dict, residency: str = "US", prefs: dict | None = None) -> dict:
+    dossier = {
+        "subject_id": new_subject_id(identity.get("full_name", "subject")),
+        "consent": consent,
+        "identity": identity,
+        "residency_jurisdiction": residency,
+        "preferences": prefs or {"email_mode": "draft_only", "rescan_interval_days": 120},
+        "created_at": now(),
+    }
+    save(dossier)
+    return dossier
+
+
+def load(subject_id: str) -> dict | None:
+    return storage.read_json(paths.dossier_path(subject_id), None)
+
+
+def save(dossier: dict) -> Path:
+    return storage.write_json(paths.dossier_path(dossier["subject_id"]), dossier)
+
+
+def is_authorized(dossier: dict) -> bool:
+    c = dossier.get("consent") or {}
+    return bool(c.get("authorized")) and c.get("method") in VALID_CONSENT_METHODS
+
+
+def require_authorized(dossier: dict) -> None:
+    if not is_authorized(dossier):
+        raise PermissionError(
+            f"subject {dossier.get('subject_id')!r} has no recorded authorization; refusing to act"
+        )
+
+
+def all_names(dossier: dict) -> list[str]:
+    """Primary name + aliases (maiden/married/nicknames), deduped, in priority order."""
+    ident = dossier.get("identity", {})
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in [ident.get("full_name"), *(ident.get("also_known_as") or [])]:
+        if n and n.lower() not in seen:
+            seen.add(n.lower())
+            out.append(n)
+    return out
+
+
+def all_addresses(dossier: dict) -> list[dict]:
+    """Current + prior addresses, each tagged with `kind` (current|prior)."""
+    ident = dossier.get("identity", {})
+    out: list[dict] = []
+    cur = ident.get("current_address")
+    if cur:
+        out.append({**cur, "kind": cur.get("kind", "current")})
+    for a in ident.get("prior_addresses") or []:
+        out.append({**a, "kind": a.get("kind", "prior")})
+    return out
+
+
+def all_locations(dossier: dict) -> list[dict]:
+    """Distinct city/state pairs across all addresses (the vectors for name searches)."""
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for a in all_addresses(dossier):
+        city = a.get("city")
+        key = ((city or "").lower(), (a.get("state") or "").lower())
+        if city and key not in seen:
+            seen.add(key)
+            out.append({"city": city, "state": a.get("state")})
+    return out
+
+
+def contact_email(dossier: dict) -> str | None:
+    """The single email used for opt-out correspondence (designated, else the first)."""
+    ident = dossier.get("identity", {})
+    prefs = dossier.get("preferences", {})
+    emails = ident.get("emails") or []
+    return prefs.get("contact_email_for_optouts") or (emails[0] if emails else None)
+
+
+def select_disclosure(dossier: dict, inputs: list[str], override_email: str | None = None) -> dict:
+    """Return ONLY the dossier fields a broker's opt-out actually requires.
+
+    Enforces least-disclosure: skips anything in NEVER_VOLUNTEER, and skips
+    `profile_url` (that is captured per-listing at submit time, not from the dossier).
+    A single contact email is used for correspondence even when the subject has several
+    (see all_names / all_addresses / search vectors for using every alternate to *find* listings).
+    """
+    ident = dossier.get("identity", {})
+    addr = ident.get("current_address") or {}
+    phones = ident.get("phones") or []
+    available = {
+        "full_name": ident.get("full_name"),
+        "first_name": (ident.get("full_name") or "").split(" ")[0] or None,
+        "contact_email": override_email or contact_email(dossier),
+        "current_address": addr or None,
+        "street": addr.get("line1"),
+        "city": addr.get("city"),
+        "state": addr.get("state"),
+        "postal": addr.get("postal"),
+        "date_of_birth": ident.get("date_of_birth"),
+        "phone": phones[0] if phones else None,
+    }
+    out: dict = {}
+    for key in inputs:
+        if key in NEVER_VOLUNTEER or key == "profile_url":
+            continue
+        if available.get(key) is not None:
+            out[key] = available[key]
+    return out
+

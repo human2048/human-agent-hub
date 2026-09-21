@@ -1,0 +1,348 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_codex_multimodal_tool_result.py ===
+"""Tests for codex_responses_adapter multimodal tool-result handling.
+
+Tool messages can contain a list of OpenAI-style content parts
+(``[{type:"text"...}, {type:"image_url"...}]``) when the
+``vision_analyze`` native fast path returns image bytes for the main model.
+This file verifies the Codex Responses adapter:
+
+  1. Converts that list into ``function_call_output.output`` as an array of
+     ``input_text``/``input_image`` items (not a stringified blob).
+  2. Preserves array-shaped output through the preflight validator.
+"""
+
+from __future__ import annotations
+
+from agent.codex_responses_adapter import (
+    _chat_messages_to_responses_input,
+    _preflight_codex_input_items,
+)
+
+
+def _build_messages_with_multimodal_tool_result():
+    return [
+        {"role": "user", "content": "What's in /tmp/foo.png?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "vision_analyze",
+                    "arguments": '{"image_url": "/tmp/foo.png", "question": "describe"}',
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "name": "vision_analyze",
+            "tool_call_id": "call_abc",
+            "content": [
+                {"type": "text", "text": "Image loaded."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,XYZ"}},
+            ],
+        },
+    ]
+
+
+class TestMultimodalToolResultConversion:
+    def test_list_content_becomes_output_array(self):
+        items = _chat_messages_to_responses_input(
+            _build_messages_with_multimodal_tool_result()
+        )
+        # Find the function_call_output item
+        outputs = [it for it in items if it.get("type") == "function_call_output"]
+        assert len(outputs) == 1
+        out = outputs[0]
+        assert out["call_id"] == "call_abc"
+        # Output should be a LIST (array form), not a string
+        assert isinstance(out["output"], list), \
+            f"Expected array output for multimodal tool result, got {type(out['output']).__name__}: {out['output']!r}"
+        types = [p.get("type") for p in out["output"]]
+        assert "input_text" in types
+        assert "input_image" in types
+
+    def test_input_image_preserves_data_url(self):
+        items = _chat_messages_to_responses_input(
+            _build_messages_with_multimodal_tool_result()
+        )
+        out = next(it for it in items if it.get("type") == "function_call_output")
+        image_parts = [p for p in out["output"] if p.get("type") == "input_image"]
+        assert len(image_parts) == 1
+        assert image_parts[0]["image_url"] == "data:image/png;base64,XYZ"
+
+    def test_string_tool_content_still_string_output(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant", "content": "",
+                "tool_calls": [{
+                    "id": "call_x", "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool", "name": "terminal", "tool_call_id": "call_x",
+                "content": "ls output here",
+            },
+        ]
+        items = _chat_messages_to_responses_input(msgs)
+        out = next(it for it in items if it.get("type") == "function_call_output")
+        assert isinstance(out["output"], str)
+        assert out["output"] == "ls output here"
+
+
+class TestPreflightAcceptsArrayOutput:
+    def test_preflight_passes_array_through(self):
+        raw = [
+            {
+                "type": "function_call",
+                "call_id": "call_abc",
+                "name": "vision_analyze",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "Image loaded."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,ABC"},
+                ],
+            },
+        ]
+        normalized = _preflight_codex_input_items(raw)
+        out = [it for it in normalized if it.get("type") == "function_call_output"][0]
+        assert isinstance(out["output"], list)
+        assert len(out["output"]) == 2
+        assert out["output"][1]["type"] == "input_image"
+        assert out["output"][1]["image_url"] == "data:image/png;base64,ABC"
+
+    def test_preflight_drops_unknown_part_types(self):
+        raw = [
+            {
+                "type": "function_call",
+                "call_id": "call_abc", "name": "vision_analyze", "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "ok"},
+                    {"type": "garbage", "data": "nope"},  # unknown — should be dropped
+                    {"type": "input_image", "image_url": "data:image/png;base64,ZZ"},
+                ],
+            },
+        ]
+        normalized = _preflight_codex_input_items(raw)
+        out = [it for it in normalized if it.get("type") == "function_call_output"][0]
+        # The "garbage" part is dropped; valid parts remain
+        types = [p.get("type") for p in out["output"]]
+        assert types == ["input_text", "input_image"]
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_codex_no_tools_nonetype.py ===
+"""Regression coverage for #32892.
+
+The openai SDK's ``responses.stream()`` / ``responses.parse()`` eagerly
+call ``_make_tools(tools)``, which iterates ``tools`` *without* a None
+guard.  Passing ``tools=None`` therefore raises::
+
+    TypeError: 'NoneType' object is not iterable
+
+…before any HTTP request is issued.  This trips the
+``openai-codex`` / ``gpt-5.5`` combo on ``chatgpt.com/backend-api/codex``
+whenever the user runs Hermes without external tools registered: the
+agent loop catches the TypeError, sees no HTTP status, classifies it as
+non-retryable, and aborts (#32892).
+
+These tests pin the defence:
+:func:`agent.transports.codex.ResponsesApiTransport.build_kwargs` must
+never emit ``tools=None`` — only add the ``tools`` key when there are
+function tools to expose.  When there are no tools, the entire ``tools``
+key (plus ``tool_choice`` and ``parallel_tool_calls`` which are
+meaningless without it) is omitted from the kwargs.
+
+Note: #33042 separately removed the SDK's ``responses.stream()`` helper
+from our own Codex call paths, so the specific iteration crash inside
+``_make_tools`` is also structurally avoided in normal operation.  This
+test class additionally pins the SDK's ``_make_tools(None)`` contract so
+we notice if upstream ever changes it.
+"""
+from __future__ import annotations
+
+import sys
+import types
+from typing import Any, Dict, List
+
+import pytest
+
+
+# Stub optional deps the parent module imports at top level — keeps this
+# test file runnable in the same environment as the existing Codex tests.
+sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
+sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
+sys.modules.setdefault("fal_client", types.SimpleNamespace())
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def transport():
+    """Fresh ``ResponsesApiTransport`` per test (it is stateless but
+    the import has side-effects on a global transport registry)."""
+    from agent.transports.codex import ResponsesApiTransport
+
+    return ResponsesApiTransport()
+
+
+@pytest.fixture
+def codex_messages() -> List[Dict[str, Any]]:
+    """Minimal Codex-shaped chat history mirroring the #32892 reproducer:
+    one system + one short user message, with no tool calls in history."""
+    return [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "Hey! What can I help you with?"},
+    ]
+
+
+def _build_kwargs_no_tools(transport, messages) -> Dict[str, Any]:
+    """Exercise the real ``build_kwargs`` for the codex backend with no tools."""
+    return transport.build_kwargs(
+        model="gpt-5.5",
+        messages=messages,
+        tools=None,
+        is_codex_backend=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# build_kwargs: the "tools=None" key must never appear
+# ---------------------------------------------------------------------------
+
+
+def test_build_kwargs_omits_tools_key_when_no_tools(transport, codex_messages):
+    """``build_kwargs`` must not place ``tools=None`` in the outgoing dict.
+
+    Putting ``tools=None`` reaches ``responses.stream()`` which calls
+    ``_make_tools(None)`` and crashes with the #32892 TypeError before any
+    request is sent.
+    """
+    kwargs = _build_kwargs_no_tools(transport, codex_messages)
+
+    assert "tools" not in kwargs, (
+        f"tools key must be omitted entirely when no tools are registered, "
+        f"got kwargs={sorted(kwargs)}"
+    )
+
+
+
+
+def test_build_kwargs_keeps_required_codex_fields_without_tools(transport, codex_messages):
+    """The toolless build must still emit the non-negotiable Codex fields
+    (model / instructions / input / store) — otherwise we'd just be moving
+    the bug from the SDK to preflight."""
+    kwargs = _build_kwargs_no_tools(transport, codex_messages)
+
+    assert kwargs["model"] == "gpt-5.5"
+    assert kwargs["instructions"] == "You are Hermes."
+    assert kwargs["store"] is False
+    assert isinstance(kwargs["input"], list)
+    assert kwargs["input"] and kwargs["input"][0]["role"] == "user"
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+
+def test_openai_sdk_raises_typeerror_on_tools_none():
+    """Document the upstream behaviour the two defences guard against.
+
+    If the SDK ever fixes ``_make_tools(None)`` to return ``omit``
+    gracefully, this test will start failing — at which point the agent
+    defences become belt-only and this test should be flipped to an
+    ``xfail`` so we notice the upstream change.
+    """
+    from openai.resources.responses.responses import _make_tools
+
+    with pytest.raises(TypeError, match="NoneType.*not iterable"):
+        _make_tools(None)
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_codex_request_transport_diagnostics.py ===
+"""Diagnostics for Codex Responses transport failures."""
+
+from __future__ import annotations
+
+import logging
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from openai import APIConnectionError
+
+from agent.codex_runtime import _codex_request_failure_details, run_codex_stream
+
+
+def test_transport_failure_without_attached_request_reports_unknown_size():
+    error = httpx.RemoteProtocolError("connection closed")
+
+    request_body_bytes, exception_chain = _codex_request_failure_details(error)
+
+    assert request_body_bytes is None
+    assert exception_chain == "RemoteProtocolError"
+
+
+def test_transport_failure_logs_exact_request_bytes_and_class_chain(caplog):
+    request_content = b'{"input":"payload"}'
+    request = httpx.Request(
+        "POST",
+        "https://example.invalid/responses",
+        content=request_content,
+    )
+    transport_error = httpx.RemoteProtocolError(
+        "server disconnected without sending a response",
+        request=request,
+    )
+    connection_error = APIConnectionError(request=request)
+    connection_error.__cause__ = transport_error
+
+    class FailingResponses:
+        def create(self, **_kwargs):
+            raise connection_error
+
+    client = SimpleNamespace(responses=FailingResponses())
+    agent = SimpleNamespace(
+        _interrupt_requested=False,
+        _current_api_request_id="request-id",
+        _fallback_index=0,
+        is_subagent=False,
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        session_id="",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="agent.codex_runtime"):
+        with pytest.raises(APIConnectionError):
+            run_codex_stream(agent, {"model": "gpt-5.6-sol"}, client=client)
+
+    message = caplog.messages[-1]
+    assert f"serialized_request_body_bytes={len(request_content)}" in message
+    assert "stream_opened=false" in message
+    assert "exception_chain=APIConnectionError <- RemoteProtocolError" in message
+    assert "payload" not in message
+    assert request_content.decode() not in message
+    assert "example.invalid" not in message
+

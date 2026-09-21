@@ -1,0 +1,342 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_email_charset_fallback.py ===
+"""Email charset robustness: unknown/malformed charsets must never drop mail.
+
+Regression tests for #35901 (QQ Mail ``unknown-8bit`` charset raising
+``LookupError`` and aborting the IMAP fetch), #55381 (malformed RFC 2047
+header crashing ``_decode_header_value``), and #55383 (unknown Content-Type
+charset crashing ``_extract_text_body``). UIDs are marked seen before the
+fetch, so any exception in per-message decoding permanently loses messages —
+decoding must degrade, never raise.
+"""
+
+import email as email_lib
+from email.message import EmailMessage
+
+from plugins.platforms.email.adapter import (
+    _decode_header_value,
+    _extract_text_body,
+    _safe_decode,
+)
+
+
+class TestSafeDecode:
+    def test_unknown_8bit_charset_falls_back(self):
+        # QQ Mail emits the RFC 1428 "unknown-8bit" placeholder (#35901).
+        assert _safe_decode("你好".encode("utf-8"), "unknown-8bit") == "你好"
+
+    def test_garbage_charset_label_never_raises(self):
+        assert _safe_decode(b"Hello", "charset") == "Hello"
+        assert _safe_decode(b"Hello", "not-a-codec-!!") == "Hello"
+
+    def test_none_charset_defaults_to_utf8(self):
+        assert _safe_decode("héllo".encode("utf-8"), None) == "héllo"
+
+    def test_gb2312_label_decodes_gbk_extensions(self):
+        # gb2312-labelled mail routinely contains GBK-only characters.
+        assert _safe_decode("镕".encode("gb18030"), "gb2312") == "镕"
+
+    def test_invalid_bytes_replace_not_raise(self):
+        out = _safe_decode(b"ok \xff\xfe bad", "utf-8")
+        assert "ok" in out and "bad" in out
+
+    def test_latin1_last_resort(self):
+        # A charset whose codec exists but whose bytes are invalid UTF-8
+        # still returns text via errors="replace" — never an exception.
+        assert _safe_decode(b"\x96\x97", "unknown-8bit") != ""
+
+
+class TestDecodeHeaderValue:
+    def test_unknown_8bit_encoded_word(self):
+        assert _decode_header_value("=?unknown-8bit?B?SGVsbG8=?=") == "Hello"
+
+    def test_malformed_charset_in_encoded_word(self):
+        # decode_header parses this fine but "charset" is not a codec —
+        # previously a LookupError aborted the whole fetch batch (#55381).
+        out = _decode_header_value("=?charset?B?SGVsbG8=?=")
+        assert isinstance(out, str)
+        assert out  # degrades, never raises/empties
+
+    def test_plain_header_passthrough(self):
+        assert _decode_header_value("Just a subject") == "Just a subject"
+
+    def test_qq_mail_gbk_subject(self):
+        # =?gbk?B?...?= with GBK bytes; gbk→gb18030 alias covers extensions.
+        import base64
+        encoded = base64.b64encode("你好".encode("gbk")).decode()
+        assert _decode_header_value(f"=?gbk?B?{encoded}?=") == "你好"
+
+
+class TestExtractTextBodyCharsets:
+    def _msg(self, body_bytes: bytes, charset_label: str):
+        raw = (
+            b"From: a@b.c\r\n"
+            b"Subject: t\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: text/plain; charset="' + charset_label.encode() + b'"\r\n'
+            b"Content-Transfer-Encoding: 8bit\r\n"
+            b"\r\n" + body_bytes
+        )
+        return email_lib.message_from_bytes(raw)
+
+    def test_unknown_charset_body_does_not_raise(self):
+        # LookupError from an unknown Content-Type charset aborted the
+        # fetch and dropped the message (#55383).
+        msg = self._msg("正文内容".encode("utf-8"), "unknown-8bit")
+        assert "正文内容" in _extract_text_body(msg)
+
+    def test_bogus_charset_body_does_not_raise(self):
+        msg = self._msg(b"plain ascii body", "x-mac-cyrillic-fake")
+        assert "plain ascii body" in _extract_text_body(msg)
+
+    def test_multipart_unknown_charset_part(self):
+        outer = EmailMessage()
+        outer["From"] = "a@b.c"
+        outer["Subject"] = "t"
+        outer.make_mixed()
+        raw_part = (
+            b'Content-Type: text/plain; charset="unknown-8bit"\r\n'
+            b"Content-Transfer-Encoding: 8bit\r\n"
+            b"\r\n"
+            b"part body here"
+        )
+        part = email_lib.message_from_bytes(raw_part)
+        outer.attach(part)
+        assert "part body here" in _extract_text_body(outer)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_email_imap_id_protocol.py ===
+"""Exercise IMAP ID negotiation with real imaplib and a local protocol peer.
+
+No external mail service or credentials are used. Unsupported ID gets BAD
+followed by BYE: swallowing the ID error still leaves SELECT unable to proceed.
+"""
+
+import imaplib
+import socketserver
+import threading
+from contextlib import contextmanager
+from unittest.mock import MagicMock
+
+import pytest
+
+
+@contextmanager
+def imap_peer(id_mode):
+    commands = []
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            self.connection.settimeout(5)
+            try:
+                self.exchange()
+            except (TimeoutError, ConnectionError):
+                # Bound cleanup even if the client fails before LOGOUT.
+                return
+
+        def exchange(self):
+            self.wfile.write(b"* OK test IMAP ready\r\n")
+            while raw := self.rfile.readline():
+                tag, command, *_ = raw.decode("ascii").strip().split()
+                command = command.upper()
+                commands.append(command)
+                prefix = tag.encode("ascii")
+                if command == "CAPABILITY":
+                    caps = b"IMAP4rev1" + (b" ID" if id_mode != "absent" else b"")
+                    self.wfile.write(b"* CAPABILITY " + caps + b"\r\n")
+                elif command == "ID":
+                    if id_mode == "absent":
+                        self.wfile.write(
+                            prefix
+                            + b" BAD ID unsupported\r\n* BYE Unknown command.\r\n"
+                        )
+                        return
+                    if id_mode == "reject":
+                        self.wfile.write(prefix + b" BAD ID rejected\r\n")
+                        continue
+                    self.wfile.write(b"* ID NIL\r\n")
+                elif command == "SELECT":
+                    self.wfile.write(b"* 0 EXISTS\r\n")
+                elif command == "UID":
+                    self.wfile.write(b"* SEARCH\r\n")
+                elif command == "LOGOUT":
+                    self.wfile.write(
+                        b"* BYE logging out\r\n" + prefix + b" OK LOGOUT\r\n"
+                    )
+                    return
+                elif command != "LOGIN":
+                    self.wfile.write(prefix + b" BAD unexpected command\r\n")
+                    continue
+                self.wfile.write(prefix + b" OK completed\r\n")
+
+    # Non-daemon handler threads are joined by server_close on context exit;
+    # socket timeouts also bound teardown when the client fails prematurely.
+    with socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield ("127.0.0.1", int(server.server_address[1])), commands
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("id_mode", ["absent", "accept", "reject"])
+def test_id_negotiation_preserves_inbox_connection(monkeypatch, id_mode):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.email.adapter import EmailAdapter
+
+    for key, value in {
+        "EMAIL_ADDRESS": "agent@example.test",
+        "EMAIL_PASSWORD": "test-only",
+        "EMAIL_IMAP_HOST": "imap.example.test",
+        "EMAIL_SMTP_HOST": "smtp.example.test",
+    }.items():
+        monkeypatch.setenv(key, value)
+    adapter = EmailAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_connect_smtp", MagicMock(return_value=MagicMock()))
+
+    with imap_peer(id_mode) as (address, commands):
+        # TLS is out of scope: replace only the transport with real imaplib on
+        # loopback, keeping the actual IMAP parser and command API under test.
+        monkeypatch.setattr(
+            imaplib,
+            "IMAP4_SSL",
+            lambda *args, **kwargs: imaplib.IMAP4(*address, timeout=5),
+        )
+
+        assert adapter._fetch_new_messages() == []
+        assert adapter._last_fetch_failed is False
+
+    assert commands.count("ID") == (0 if id_mode == "absent" else 1)
+    assert commands.index("LOGIN") < commands.index("SELECT") < commands.index("UID")
+    if id_mode != "absent":
+        assert commands.index("LOGIN") < commands.index("ID") < commands.index("SELECT")
+    assert commands[-1] == "LOGOUT"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_email_robustness.py ===
+"""Email adapter robustness against malformed IMAP responses (salvage of #2794).
+
+Validates that:
+- Malformed IMAP fetch responses are skipped instead of aborting the batch
+  (UIDs are marked seen before fetch, so an abort permanently loses messages)
+- Message-ID generation handles a missing '@' in EMAIL_ADDRESS
+"""
+
+import os
+import unittest
+import uuid
+from email.mime.text import MIMEText
+from unittest.mock import MagicMock, patch
+
+
+def _make_adapter(address="hermes@test.com"):
+    from gateway.config import PlatformConfig
+
+    with patch.dict(os.environ, {
+        "EMAIL_ADDRESS": address,
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_IMAP_HOST": "imap.test.com",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+    }):
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        adapter = EmailAdapter(PlatformConfig(enabled=True))
+    return adapter
+
+
+def _raw_email(sender="user@test.com", subject="Hello"):
+    msg = MIMEText("Test body", "plain", "utf-8")
+    msg["From"] = sender
+    msg["Subject"] = subject
+    msg["Message-ID"] = f"<{uuid.uuid4().hex[:8]}@test.com>"
+    return msg.as_bytes()
+
+
+class TestImapResponseGuard(unittest.TestCase):
+    """_fetch_new_messages skips messages with unexpected IMAP structure."""
+
+    def _fetch_with(self, fetch_responses):
+        adapter = _make_adapter()
+        uids = b" ".join(
+            str(i + 1).encode() for i in range(len(fetch_responses))
+        )
+        fetch_iter = iter(fetch_responses)
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [uids])
+            if command == "fetch":
+                return next(fetch_iter)
+            return ("NO", [])
+
+        mock_imap = MagicMock()
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            return adapter._fetch_new_messages()
+
+    def test_normal_response_parses(self):
+        results = self._fetch_with([("OK", [(b"1 (RFC822 {123}", _raw_email())])])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["sender_addr"], "user@test.com")
+
+    def test_none_element_skipped(self):
+        results = self._fetch_with([("OK", [None])])
+        self.assertEqual(results, [])
+
+
+class TestMessageIdDomain(unittest.TestCase):
+    """Message-ID generation tolerates EMAIL_ADDRESS without '@'."""
+
+
+    def test_address_without_at(self):
+        adapter = _make_adapter("not-an-email")
+        self.assertEqual(adapter._message_id_domain(), "localhost")
+
+
+class TestTransportSecurity(unittest.TestCase):
+    """platforms.email.extra.imap_security / smtp_security select the transport (#99641)."""
+
+    def _adapter(self, **extra):
+        from gateway.config import PlatformConfig
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com", "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "127.0.0.1", "EMAIL_IMAP_PORT": "1143",
+            "EMAIL_SMTP_HOST": "127.0.0.1", "EMAIL_SMTP_PORT": "1025",
+        }, clear=True):
+            from plugins.platforms.email.adapter import EmailAdapter
+
+            return EmailAdapter(PlatformConfig(enabled=True, extra=extra))
+
+    def test_starttls_builds_plain_imap_then_upgrades(self):
+        adapter = self._adapter(imap_security="starttls", imap_tls_verify=False)
+        imap = MagicMock()
+        with patch("imaplib.IMAP4", return_value=imap) as imap_cls, \
+             patch("imaplib.IMAP4_SSL") as imap_ssl_cls:
+            self.assertIs(adapter._connect_imap(), imap)
+        imap_cls.assert_called_once_with("127.0.0.1", 1143, timeout=30)
+        imap_ssl_cls.assert_not_called()
+        imap.starttls.assert_called_once()
+
+    def test_unknown_mode_falls_back_to_secure_default(self):
+        adapter = self._adapter(imap_security="bogus", smtp_security="bogus")
+        self.assertEqual(adapter._imap_security, "tls")
+        self.assertEqual(adapter._smtp_security, "starttls")  # port 1025 != 465
+        # verification stays ON unless explicitly opted out
+        self.assertTrue(adapter._imap_tls_verify)
+        self.assertTrue(adapter._smtp_tls_verify)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -1,0 +1,354 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_notification_persistence.py ===
+"""A muted wake keeps durable evidence while hiding only its new presentation rows."""
+from types import SimpleNamespace
+
+from agent.notification_presentation import notification_turn
+from agent.session_persistence import _db_flush_collect
+from hermes_state import SessionDB
+from tui_gateway.server import _history_to_messages
+
+
+def test_muted_wake_preserves_history_and_new_evidence(tmp_path):
+    old = {"role": "user", "content": "human request"}
+    diagnostic = {"role": "user", "content": "worker failed"}
+    reply = {"role": "assistant", "content": "model diagnostic echo"}
+    messages = [old, diagnostic, reply]
+    agent = SimpleNamespace(session_id="session", _last_flushed_db_idx=0)
+    with notification_turn(agent, muted=True):
+        rows, _ = _db_flush_collect(agent, messages, [old])
+    assert "display_kind" not in old
+    assert [row["content"] for row in rows] == ["worker failed", "model diagnostic echo"]
+    assert all(row["display_kind"] == "hidden" for row in rows)
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("session", source="tui")
+        db.append_messages_batch("session", rows)
+        stored = db.get_messages("session")
+    assert [row["content"] for row in stored] == ["worker failed", "model diagnostic echo"]
+    assert _history_to_messages(stored) == []
+    next_result = {"role": "assistant", "content": "requested result"}
+    rows, _ = _db_flush_collect(agent, [next_result], [])
+    assert rows[0]["display_kind"] is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nous_429_fallback_reentry.py ===
+"""Regression guard: a genuine Nous 429 must re-enter the retry loop so the
+top-of-loop Nous rate-limit guard can activate the fallback chain.
+
+Bug (found in the #44061 audit): the genuine-rate-limit branch in
+``agent/conversation_loop.py`` set ``retry_count = max_retries`` then
+``continue``-d, intending the top-of-loop guard to "handle fallback or bail
+cleanly".  But the loop condition is ``while retry_count < max_retries`` —
+setting retry_count equal to max_retries makes the condition False
+immediately, so the guard NEVER runs.  No fallback activation, no clean
+rate-limit message: the turn dies with the generic retry-exhaustion error.
+
+The fix sets ``retry_count = max(0, max_retries - 1)`` so the loop body runs
+exactly once more: the guard sees the breaker state recorded by
+``record_nous_rate_limit()`` moments earlier and either activates a fallback
+provider (resetting retry_count) or returns the explicit rate-limit failure.
+"""
+from __future__ import annotations
+
+import inspect
+import re
+
+
+def _loop_reenters(retry_count: int, max_retries: int) -> bool:
+    """Mirror of the ``while retry_count < max_retries`` loop condition."""
+    return retry_count < max_retries
+
+
+class TestGenuineNous429ReentersLoop:
+    """The assignment used by the genuine-429 branch must leave the loop
+    condition True so the top-of-loop guard gets a chance to run."""
+
+    def test_fixed_assignment_reenters_for_typical_max_retries(self):
+        for max_retries in (1, 2, 3, 5, 10):
+            retry_count = max(0, max_retries - 1)
+            assert _loop_reenters(retry_count, max_retries), (
+                f"max_retries={max_retries}: guard would never run"
+            )
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nous_credits_gauge.py ===
+"""Tests for the Nous-credits subscription % gauge in build_nous_credits_snapshot.
+
+Covers the monthly_credits denominator path added when the portal /api/oauth/account
+subscription block began carrying `monthly_credits`. Magnitudes-only fallback, clamp,
+and the non-finite / rollover guards (surfaced by adversarial review) are all asserted.
+"""
+from hermes_cli.nous_account import (
+    NousPortalAccountInfo,
+    NousPaidServiceAccessInfo,
+    NousPortalSubscriptionInfo,
+    _subscription_from_payload,
+)
+from agent.account_usage import build_nous_credits_snapshot, render_account_usage_lines
+
+
+def _acct(**kwargs):
+    kwargs.setdefault("logged_in", True)
+    kwargs.setdefault("source", "account_api")
+    kwargs.setdefault("fresh", True)
+    kwargs.setdefault("portal_base_url", "https://portal.nousresearch.com")
+    return NousPortalAccountInfo(**kwargs)
+
+
+def _window(snap):
+    return snap.windows[0] if (snap and snap.windows) else None
+
+
+def test_parser_captures_monthly_credits():
+    sub = _subscription_from_payload({
+        "plan": "Ultra", "tier": 14, "monthly_charge": 200, "monthly_credits": 220,
+        "current_period_end": "2026-06-28T05:21:54.000Z",
+        "credits_remaining": 219.27341839, "rollover_credits": 0,
+    })
+    assert sub.monthly_credits == 220
+    assert abs(sub.credits_remaining - 219.27341839) < 1e-6
+
+
+
+
+def test_gauge_present_with_monthly_credits():
+    snap = build_nous_credits_snapshot(_acct(
+        paid_service_access=True,
+        subscription=NousPortalSubscriptionInfo(
+            plan="Ultra", monthly_credits=220, credits_remaining=219.27341839,
+            current_period_end="2026-06-28"),
+        paid_service_access_info=NousPaidServiceAccessInfo(
+            subscription_credits_remaining=219.27, total_usable_credits=219.27),
+    ))
+    w = _window(snap)
+    assert w is not None and w.label == "Subscription"
+    assert abs(w.used_percent - (220 - 219.27341839) / 220 * 100) < 1e-9
+    blob = "\n".join(render_account_usage_lines(snap))
+    assert "% used" in blob or "% remaining" in blob
+    assert "of $220.00 left" in blob
+
+
+
+
+
+
+
+
+
+
+def test_nan_remaining_no_window_no_nan_string():
+    """json.loads parses bare NaN by default; isinstance(nan, float) is True.
+    The gauge must reject it rather than render '$nan' + a false 100% used."""
+    snap = build_nous_credits_snapshot(_acct(
+        paid_service_access=True,
+        subscription=NousPortalSubscriptionInfo(monthly_credits=220, credits_remaining=float("nan")),
+        paid_service_access_info=NousPaidServiceAccessInfo(purchased_credits_remaining=5.0),
+    ))
+    assert _window(snap) is None
+    assert "$nan" not in "\n".join(render_account_usage_lines(snap)).lower()
+
+
+
+
+
+
+
+
+
+
+def test_failopen_none_and_logged_out():
+    assert build_nous_credits_snapshot(None) is None
+    assert build_nous_credits_snapshot(_acct(logged_in=False)) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nous_credits_snapshot.py ===
+"""Tests for build_nous_credits_snapshot (L6-A, magnitudes-only)."""
+
+from __future__ import annotations
+
+from agent.account_usage import build_nous_credits_snapshot
+from hermes_cli.nous_account import (
+    NousPaidServiceAccessInfo,
+    NousPortalAccountInfo,
+    NousPortalSubscriptionInfo,
+)
+
+
+def _account(**kwargs) -> NousPortalAccountInfo:
+    kwargs.setdefault("logged_in", True)
+    kwargs.setdefault("source", "account_api")
+    kwargs.setdefault("fresh", True)
+    return NousPortalAccountInfo(**kwargs)
+
+
+def _all_lines(snapshot) -> list[str]:
+    return list(snapshot.details)
+
+
+def test_healthy():
+    info = _account(
+        paid_service_access=True,
+        paid_service_access_info=NousPaidServiceAccessInfo(
+            subscription_credits_remaining=18.0,
+            purchased_credits_remaining=12.34,
+            total_usable_credits=30.34,
+        ),
+        subscription=NousPortalSubscriptionInfo(
+            plan="Pro",
+            current_period_end="2026-07-01",
+        ),
+    )
+    snap = build_nous_credits_snapshot(info)
+    assert snap is not None
+    assert snap.available is True
+    assert snap.plan == "Pro"
+    assert snap.provider == "nous"
+    assert snap.title == "Nous credits"
+    blob = "\n".join(_all_lines(snap))
+    assert "$18.00" in blob
+    assert "$12.34" in blob
+    assert "$30.34" in blob
+    assert "Renews: 2026-07-01" in blob
+    assert "/billing" in blob
+    # money-rule: magnitudes-only, never a percentage
+    assert "%" not in blob
+
+
+
+
+
+
+
+
+def test_logged_out():
+    info = _account(
+        logged_in=False,
+        paid_service_access=True,
+        paid_service_access_info=NousPaidServiceAccessInfo(
+            total_usable_credits=10.0,
+        ),
+    )
+    assert build_nous_credits_snapshot(info) is None
+
+
+def test_none():
+    assert build_nous_credits_snapshot(None) is None
+
+
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_nous_fallback_unavailable.py ===
+"""Tests for Nous fallback local-availability suppression.
+
+Blocker if Nous token material is missing locally: the fallback chain
+should not repeatedly attempt Nous resolution; it must skip and continue
+to the next provider.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from run_agent import AIAgent
+
+
+def _make_agent(fallback_model=None):
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=fallback_model,
+        )
+        agent.client = None
+        return agent
+
+
+def _mock_client(base_url="https://chatgpt.com/backend-api/codex", api_key="fb-key"):
+    mock = type("Client", (), {})()
+    mock.base_url = base_url
+    mock.api_key = api_key
+    mock.chat = type("Chat", (), {})()
+    mock.chat.completions = type("Completions", (), {})()
+    mock.chat.completions.create = lambda *args, **kwargs: None
+    return mock
+
+
+class TestNousFallbackLocalAvailability:
+    def test_missing_nous_token_is_skipped_once(self):
+        """Nous fallback is skipped when no access/refresh token is stored."""
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "nous", "model": "anthropic/claude-sonnet-4.6"},
+                {"provider": "openai-codex", "model": "gpt-5.5"},
+            ]
+        )
+        with patch(
+            "hermes_cli.auth.get_provider_auth_state",
+            return_value={},
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(api_key="fb"), "gpt-5.5"),
+        ):
+            activated = agent._try_activate_fallback(None)
+        assert activated is True
+        assert agent.model == "gpt-5.5"
+
+    def test_nous_unavailable_not_retried_in_same_session(self):
+        """After Nous is skipped once, subsequent activations continue further."""
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "nous", "model": "anthropic/claude-sonnet-4.6"},
+                {"provider": "openai-codex", "model": "gpt-5.5"},
+            ]
+        )
+        with patch(
+            "hermes_cli.auth.get_provider_auth_state",
+            return_value={},
+        ):
+            agent._try_activate_fallback(None)
+        key = (
+            "nous",
+            "anthropic/claude-sonnet-4.6",
+            "",
+        )
+        assert key in getattr(agent, "_unavailable_fallback_keys", set())
+
+    def test_present_nous_token_allows_activation(self):
+        """Nous is considered when token material exists."""
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "nous", "model": "anthropic/claude-sonnet-4.6"},
+                {"provider": "openai-codex", "model": "gpt-5.5"},
+            ]
+        )
+        with patch(
+            "hermes_cli.auth.get_provider_auth_state",
+            return_value={"access_token": "abc", "refresh_token": "xyz"},
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(api_key="fb"), "anthropic/claude-sonnet-4.6"),
+        ):
+            activated = agent._try_activate_fallback(None)
+        assert activated is True
+        assert agent.provider == "nous"
+

@@ -1,0 +1,395 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\mcp_picker.py ===
+"""MCP picker — interactive `hermes mcp picker` (also the default `hermes mcp`)."""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from typing import List, Optional
+
+from hermes_cli.colors import Colors
+from hermes_cli.cli_output import prompt_yes_no
+from hermes_cli.curses_ui import curses_single_select
+from hermes_cli.mcp_catalog import (
+    CatalogEntry, CatalogError, catalog_diagnostics, install_entry, is_enabled, is_installed,
+    list_catalog, installed_servers, remove_server, server_enabled, uninstall_entry, _say,
+)
+from hermes_cli.config import load_config, save_config
+
+_STATUS_NOT_INSTALLED = "available"
+_STATUS_DISABLED = "installed (disabled)"
+_STATUS_ENABLED = "enabled"
+_STATUS_CUSTOM_ENABLED = "custom — enabled"
+_STATUS_CUSTOM_DISABLED = "custom — disabled"
+
+
+@dataclass
+class _Row:
+    """A picker row. ``entry`` is set for catalog rows; custom MCPs carry only name/description/status."""
+
+    name: str
+    description: str
+    status: str
+    entry: Optional[CatalogEntry] = None  # None for non-catalog (custom) rows
+
+    @property
+    def is_custom(self) -> bool:
+        return self.entry is None
+
+
+def _build_rows() -> List[_Row]:
+    """Return catalog rows + any custom (non-catalog) MCPs found in config."""
+    catalog_entries = list_catalog()
+    catalog_names = {e.name for e in catalog_entries}
+    servers = installed_servers()
+
+    rows: List[_Row] = []
+    for entry in catalog_entries:
+        cfg = servers.get(entry.name)
+        if entry.name not in servers:
+            status = _STATUS_NOT_INSTALLED
+        elif cfg and server_enabled(cfg):
+            status = _STATUS_ENABLED
+        else:
+            status = _STATUS_DISABLED
+        rows.append(_Row(entry.name, entry.description, status, entry))
+    # Custom (non-catalog) MCPs: the transport URL/command doubles as the description.
+    for name, cfg in sorted(servers.items()):
+        if name in catalog_names:
+            continue
+        status = _STATUS_CUSTOM_ENABLED if server_enabled(cfg) else _STATUS_CUSTOM_DISABLED
+        rows.append(_Row(name, str(cfg.get("url") or cfg.get("command") or "(no transport)"), status))
+    return rows
+
+
+def _format_row(row: _Row) -> str:
+    return f"{row.name:<18} {row.status:<24} {row.description}"
+
+
+
+def _enable_disable(name: str, *, enable: bool) -> None:
+    cfg = load_config()
+    servers = cfg.get("mcp_servers") or {}
+    server = servers.get(name)
+    if not server:
+        _say(f"  '{name}' is not installed.", Colors.RED)
+        return
+    server["enabled"] = enable
+    cfg["mcp_servers"] = servers
+    save_config(cfg)
+    _say(
+        f"  ✓ '{name}' {'enabled' if enable else 'disabled'}. "
+        "Start a new Hermes session for changes to take effect."
+    )
+
+
+def _configure_tools(name: str) -> None:
+    """Open the tool selection checklist for an already-installed MCP."""
+    from argparse import Namespace
+    from hermes_cli.mcp_config import cmd_mcp_configure
+
+    cmd_mcp_configure(Namespace(name=name))
+
+
+def _remove_custom(name: str) -> None:
+    """Remove a non-catalog MCP entry from config.yaml."""
+    if not is_installed(name):
+        _say(f"  '{name}' is not configured.", Colors.RED)
+        return
+    if not prompt_yes_no(f"Remove '{name}' from mcp_servers?", default=False):
+        return
+    remove_server(name)
+    _say(f"  ✓ Removed '{name}'")
+
+
+def _install(entry: CatalogEntry, verb: str) -> bool:
+    """Install *entry*, printing (not raising) a CatalogError. True on success."""
+    try:
+        install_entry(entry, enable=True)
+    except CatalogError as exc:
+        _say(f"  ✗ {verb} failed: {exc}", Colors.RED)
+        return False
+    return True
+
+
+def _uninstall(name: str) -> None:
+    if not prompt_yes_no(f"Uninstall '{name}'?", default=False):
+        return
+    if uninstall_entry(name):
+        _say(
+            f"  ✓ Uninstalled '{name}'. "
+            "Credentials in .env preserved — delete manually if no longer needed."
+        )
+    else:
+        _say(f"  '{name}' was not installed", Colors.DIM)
+
+
+def _run_submenu(title: str, actions: list) -> None:
+    """Show a single-select of ``(label, callback)`` pairs and run the picked callback."""
+    choice = curses_single_select(title, [label for label, _ in actions])
+    if choice is not None:
+        actions[choice][1]()
+
+
+def _handle_row(row: _Row) -> None:
+    """Act on the picked row based on its current status."""
+    if row.entry and not is_installed(row.name):
+        _install(row.entry, "install")
+        return
+    if row.entry and not is_enabled(row.name):
+        _enable_disable(row.name, enable=True)
+        return
+    if row.is_custom:
+        enabled = is_enabled(row.name)
+        _run_submenu(f"Action for '{row.name}' (custom)", [
+            ("Configure tools (probe server + re-pick)", lambda: _configure_tools(row.name)),
+            ("Enable" if not enabled else "Disable",
+             lambda: _enable_disable(row.name, enable=not is_enabled(row.name))),
+            ("Remove from config", lambda: _remove_custom(row.name))])
+        return
+    # Catalog row, installed + enabled
+    print()
+    _say(f"  '{row.name}' is already enabled.", Colors.DIM)
+    _run_submenu(f"Action for '{row.name}'", [
+        ("Configure tools (probe server + re-pick)", lambda: _configure_tools(row.name)),
+        ("Disable (keep config, stop loading on next session)",
+         lambda: _enable_disable(row.name, enable=False)),
+        ("Uninstall (remove config and any cloned files)", lambda: _uninstall(row.name)),
+        ("Reinstall (re-clone, re-prompt for credentials)",
+         lambda: _install(row.entry, "reinstall"))])
+
+
+def _print_rows_text(rows: List[_Row]) -> None:
+    """Plain-text catalog dump: `hermes mcp catalog` output and the non-curses fallback."""
+    print()
+    if not rows:
+        _say("  No MCPs in the catalog or configured.", Colors.DIM)
+        print()
+        return
+
+    _say("  MCP Catalog + configured servers:", Colors.CYAN + Colors.BOLD)
+    print()
+    print(f"  {'Name':<18} {'Status':<24} Description")
+    print(f"  {'-' * 18} {'-' * 24} {'-' * 11}")
+    for row in rows:
+        print(f"  {_format_row(row)}")
+    print()
+    _say("  Install: hermes mcp install <name>    Picker: hermes mcp", Colors.DIM)
+    # Manifest-version warnings: the user's Hermes is too old to install everything listed.
+    future = [d for d in catalog_diagnostics() if d[1] == "future_manifest"]
+    if future:
+        print()
+        for name, _, _msg in future:
+            _say(f"  ⚠ '{name}' requires a newer Hermes — run `hermes update` to install this entry.", Colors.YELLOW)
+        print()
+    print()
+
+
+def show_catalog() -> None:
+    """`hermes mcp catalog` — print the curated list + custom servers, no interaction."""
+    _print_rows_text(_build_rows())
+
+
+def run_picker() -> None:
+    """`hermes mcp picker` (and default `hermes mcp`) — interactive selector; re-renders after each
+    action until ESC/q."""
+    while True:
+        rows = _build_rows()
+        if not rows or not sys.stdin.isatty():
+            _print_rows_text(rows)  # non-interactive: degrade to the text dump
+            return
+        idx = curses_single_select(
+            "MCP Catalog  —  ↑↓ navigate  ENTER act on entry  ESC/q quit",
+            [_format_row(r) for r in rows],
+        )
+        if idx is None:
+            return
+        _handle_row(rows[idx])
+
+
+def install_by_name(identifier: str) -> int:
+    """`hermes mcp install <name>` — non-interactive entry-point."""
+    from hermes_cli.mcp_catalog import get_entry
+
+    entry = get_entry(identifier)
+    if entry is None:
+        _say(
+            f"  ✗ '{identifier}' is not in the catalog. Run `hermes mcp catalog` to see available entries.",
+            Colors.RED,
+        )
+        return 1
+    return 0 if _install(entry, "install") else 1
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'color': ('hermes_cli.colors', 'color'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\mcp_security.py ===
+"""Security checks for user-configured MCP server entries.
+
+Blocks three narrow shapes (see ``validate_mcp_server_entry``), including a hardcoded IOC blocklist
+for the June 2026 hermes-0day campaign. Runs BOTH at save time (``_save_mcp_server`` — dashboard API +
+CLI) and at spawn time (``tools.mcp_tool._filter_suspicious_mcp_servers``), so a hand-edited or
+pre-planted ``config.yaml`` entry is caught before it can execute.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shlex
+from typing import Any
+
+_SHELL_INTERPRETERS = frozenset({
+    "bash", "sh", "zsh", "dash", "fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+})
+
+_EGRESS_PATTERN = re.compile(
+    r"(?<![\w.-])(?:curl|wget|nc|ncat|socat)(?![\w.-])"
+    r"|/dev/tcp/"
+    r"|\bInvoke-WebRequest\b"
+    r"|\bInvoke-RestMethod\b"
+    r"|\bSystem\.Net\.WebClient\b",
+    re.IGNORECASE,
+)
+
+_EXFIL_HINT_PATTERN = re.compile(
+    r"\.env\b|--data-binary|--data-raw|\b-X\s+POST\b|\bPOST\b|<\s*[^\s]+",
+    re.IGNORECASE,
+)
+
+# OS persistence surfaces an MCP server has no legitimate reason to write to (the hermes-0day
+# SSH-key/PAM/sudoers/cron shape). Matched anywhere in the inline script.
+_PERSISTENCE_PATTERN = re.compile(
+    r"authorized_keys"               # SSH key persistence (the campaign's payload)
+    r"|\.ssh/"                       # any write under ~/.ssh
+    r"|/etc/ssh\b"                   # sshd_config / AuthorizedKeysCommand backdoor
+    r"|/etc/pam\.d\b|pam_[\w-]+\.so" # PAM credential logger
+    r"|/etc/sudoers"                 # sudoers escalation
+    r"|/etc/cron|crontab\b"          # cron persistence
+    r"|/etc/rc\.local|/etc/systemd"  # init / unit persistence
+    r"|\.bashrc\b|\.bash_profile\b|\.profile\b|\.zshrc\b",  # shell rc backdoor
+    re.IGNORECASE,
+)
+
+# Indicators of compromise, June 2026 hermes-0day campaign: exact attacker artifacts observed on
+# multiple compromised public instances. Hardcoded so a pre-planted config.yaml is refused.
+_IOC_SUBSTRINGS = (
+    "AAAAC3NzaC1lZDI1NTE5AAAAICBoh1oDC4DnsO1m5mJ4yfEKrQebaFh",  # attacker SSH public key
+    "hermes-0day",
+    # Attacker source IPs seen authenticating with the key.
+    "60.165.167.",
+    "118.182.244.156",
+    "61.178.123.196",
+)
+
+
+def _command_basename(command: Any) -> str:
+    text = str(command or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = shlex.split(text, posix=(os.name != "nt"))
+    except ValueError:
+        parts = text.split()
+    first = parts[0] if parts else text
+    return os.path.basename(first).lower()
+
+
+def _inline_script(args: Any) -> str:
+    if args is None:
+        return ""
+    if isinstance(args, (list, tuple)):
+        return " ".join(str(item) for item in args)
+    return str(args)
+
+
+def _entry_text(entry: dict[str, Any]) -> str:
+    """Flatten command + args + env values into one string for IOC scanning."""
+    parts: list[str] = [str(entry.get("command") or "")]
+    parts.append(_inline_script(entry.get("args")))
+    env = entry.get("env")
+    if isinstance(env, dict):
+        parts.extend(str(v) for v in env.values())
+    return " ".join(parts)
+
+
+def validate_mcp_server_entry(name: str, entry: dict[str, Any]) -> list[str]:
+    """Return security warnings for an MCP server entry (empty = not suspicious).
+
+    Intentionally not a whitelist — custom commands, Python scripts, npx, uvx stay legal. Only three
+    narrow shapes are blocked: (1) a known IOC anywhere in command/args/env, (2) a shell interpreter
+    with network egress in its inline script, (3) a shell interpreter writing an OS persistence surface.
+
+    * a shell interpreter whose inline script writes to an OS persistence surface (June 2026 hermes-0day
+    SSH/PAM/sudoers/cron shape). See #45620.
+    """
+    if not isinstance(entry, dict):
+        return []
+
+    issues: list[str] = []
+    flat = _entry_text(entry)
+    for ioc in _IOC_SUBSTRINGS:
+        if ioc in flat:
+            # One IOC is enough to refuse; don't leak the full match list.
+            issues.append(
+                f"MCP server '{name}' contains a known hermes-0day "
+                f"indicator-of-compromise ('{ioc}')"
+            )
+            return issues
+
+    command = entry.get("command")
+    if _command_basename(command) not in _SHELL_INTERPRETERS:
+        return issues
+    script = _inline_script(entry.get("args"))
+    if not script:
+        return issues
+
+    if _EGRESS_PATTERN.search(script):
+        issue = (
+            f"MCP server '{name}' uses shell interpreter '{command}' with "
+            f"network egress in args"
+        )
+        if _EXFIL_HINT_PATTERN.search(script):
+            issue += " and exfiltration-shaped arguments"
+        issues.append(issue)
+    if _PERSISTENCE_PATTERN.search(script):
+        issues.append(
+            f"MCP server '{name}' uses shell interpreter '{command}' to write "
+            f"to an OS persistence surface (SSH keys / PAM / sudoers / cron / "
+            f"shell rc) — this is the hermes-0day backdoor shape, not a real "
+            f"MCP server"
+        )
+    return issues
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+def is_mcp_server_entry_suspicious(name: str, entry: dict[str, Any]) -> bool:
+    return bool(validate_mcp_server_entry(name, entry))
+# ---- END PLUGIN-COMPAT ----
+

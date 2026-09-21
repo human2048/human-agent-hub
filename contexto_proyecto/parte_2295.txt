@@ -1,0 +1,235 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_token_estimator_shared.py ===
+"""Invariant: every rough token estimate in the tree derives from ``estimate_tokens_rough`` /
+``CHARS_PER_TOKEN`` in ``agent/model_metadata.py``, so the ``/context`` breakdown's static
+categories, the conversation slice and native-compaction retention agree on non-Latin text.
+"""
+
+from agent.context_breakdown import _bytes_to_tokens, _chars_to_tokens
+from agent.model_metadata import CHARS_PER_TOKEN, estimate_tokens_rough
+from agent.native_compaction import _approx_tokens
+
+
+CYRILLIC = "Привет мир, это проверка оценки токенов. " * 40
+CJK = "これは日本語のテキストです。" * 40
+
+
+def test_breakdown_and_retention_use_the_canonical_estimator():
+    for text in (CYRILLIC, CJK, "plain ascii text " * 40):
+        canonical = estimate_tokens_rough(text)
+        assert _chars_to_tokens(text) == canonical
+        assert _approx_tokens(text) == canonical
+    # The old chars//4 shape under-counted these by ~2x; the canonical must not.
+    assert _chars_to_tokens(CYRILLIC) > (len(CYRILLIC) + 3) // 4 * 1.5
+    assert _chars_to_tokens(CJK) >= len(CJK)
+
+
+def test_byte_and_ratio_consumers_share_one_constant():
+    from agent.context_compressor import _CHARS_PER_TOKEN as compressor_ratio
+    from tools.budget_config import _CHARS_PER_TOKEN as budget_ratio
+    from tools.transcription_command import _PROMPT_CHARS_PER_TOKEN as whisper_ratio
+
+    assert compressor_ratio is budget_ratio is whisper_ratio is CHARS_PER_TOKEN
+    assert _bytes_to_tokens(CHARS_PER_TOKEN * 10) == 10
+    assert _bytes_to_tokens(None) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_token_guard_session_source.py ===
+"""The token-accounting guard never mints an anonymous session row (#111999).
+
+When every row create of a turn loses to the SQLite lock, the queued token delta's
+"ensure the row exists" guard becomes the session's first writer. It must stamp the agent's
+real surface: the turn lease treats an existing row as proof the create happened, so the
+creator never returns to repair a ``source='unknown'`` placeholder.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from hermes_state import SessionDB
+from run_agent import AIAgent
+
+SID = "20260913_210721_c89ac8"
+
+
+def _response():
+    msg = SimpleNamespace(content="partial answer", tool_calls=None, reasoning=None, reasoning_content=None)
+    choice = SimpleNamespace(message=msg, finish_reason="stop")
+    usage = SimpleNamespace(prompt_tokens=120, completion_tokens=30, total_tokens=150,
+                            prompt_tokens_details=None, completion_tokens_details=None)
+    return SimpleNamespace(choices=[choice], usage=usage, model="grok-4.6", id="x")
+
+
+def test_guard_first_writer_carries_the_agent_source(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
+            skip_context_files=True, skip_memory=True, session_id=SID, session_db=db, platform="desktop",
+        )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _response()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+
+    # The whole first turn runs under contention: every create_session attempt is refused.
+    def locked(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+    db.create_session = locked
+    try:
+        agent.run_conversation("first prompt")
+        assert db.flush_token_counts()
+        row = db.get_session(SID)
+        assert row is not None, "the queued token delta must materialize the row"
+        assert row["source"] == "desktop"
+        assert db.list_sessions_rich(source="unknown", limit=50) == []
+    finally:
+        agent.close()
+        db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_token_persistence_non_cli.py ===
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
+import json
+import sys
+
+from run_agent import AIAgent
+
+
+def _mock_response(*, usage: dict, content: str = "done"):
+    msg = SimpleNamespace(content=content, tool_calls=None)
+    choice = SimpleNamespace(message=msg, finish_reason="stop")
+    return SimpleNamespace(
+        choices=[choice],
+        model="test/model",
+        usage=SimpleNamespace(**usage),
+    )
+
+
+def _make_agent(session_db, *, platform: str):
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=session_db,
+            session_id=f"{platform}-session",
+            platform=platform,
+        )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _mock_response(
+        usage={
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18,
+        }
+    )
+    return agent
+
+
+def test_run_conversation_persists_tokens_for_telegram_sessions():
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="telegram")
+
+    result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "done"
+    # Per-call deltas are enqueued for the SessionDB background writer
+    # (queue_token_counts) rather than written inline on the turn thread.
+    session_db.queue_token_counts.assert_called_once()
+    assert session_db.queue_token_counts.call_args.args[0] == "telegram-session"
+
+
+
+
+def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):
+    sentinel_db = object()
+    captured = {}
+
+    class FakeSessionDB:
+        def __new__(cls):
+            return sentinel_db
+
+    hermes_state = ModuleType("hermes_state")
+    hermes_state.SessionDB = FakeSessionDB
+    monkeypatch.setitem(sys.modules, "hermes_state", hermes_state)
+    hermes_state_registry = ModuleType("hermes_state_registry")
+    hermes_state_registry.acquire = lambda db_path=None: sentinel_db
+    monkeypatch.setitem(sys.modules, "hermes_state_registry", hermes_state_registry)
+
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "results": []})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(None, platform="acp")
+    result = json.loads(agent._invoke_tool(
+        "session_search",
+        {"query": "Hermes", "detail": "full"},
+        "task-id",
+    ))
+
+    assert result["success"] is True
+    assert captured["db"] is sentinel_db
+    assert captured["query"] == "Hermes"
+    assert captured["detail"] == "full"
+    assert agent._session_db is sentinel_db
+
+
+def test_sequential_session_search_forwards_detail(monkeypatch):
+    session_db = MagicMock()
+    captured = {}
+
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "results": []})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(session_db, platform="acp")
+    tool_call = SimpleNamespace(
+        id="search-1",
+        function=SimpleNamespace(
+            name="session_search",
+            arguments=json.dumps({"query": "Hermes", "detail": "full"}),
+        ),
+    )
+    assistant_message = SimpleNamespace(tool_calls=[tool_call])
+    messages = []
+
+    agent._execute_tool_calls_sequential(
+        assistant_message,
+        messages,
+        "task-id",
+    )
+
+    assert captured["db"] is session_db
+    assert captured["query"] == "Hermes"
+    assert captured["detail"] == "full"
+

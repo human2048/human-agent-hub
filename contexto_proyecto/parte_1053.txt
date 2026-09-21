@@ -1,0 +1,228 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\analogy-and-blending.md ===
+# Analogy and Blending
+
+Three traditions of "import structure from a remote frame":
+- **Synectics** — William J. J. Gordon, 1961. Practical training in operative analogy.
+- **Bisociation** — Arthur Koestler, *The Act of Creation*, 1964. Creativity as collision of two unrelated frames.
+- **Conceptual Blending** — Fauconnier & Turner, 1998. Formal cognitive theory: meaning emerges from selective integration of multiple input spaces.
+
+## When to use
+
+- Stuck inside one frame; all candidate ideas come from the same neighborhood
+- The problem has a "shape" but no obvious solution in its native domain
+- A long-established field has run out of native ideas
+- Producing work that depends on metaphor (writing, marketing, theoretical work)
+
+## Don't use when
+
+- You need disciplined development inside a single frame
+- The remote frame shares no generic-space structure with your home frame (no overlap → no blend, just noise)
+- You're using analogy as decoration on shallow understanding
+
+## Synectics: four kinds of analogy
+
+**Direct analogy.** Find an organism or system that solves an analogous problem. *How does a tree handle wind? Flexibility distributed across many small members.*
+
+**Personal analogy.** Imagine being a component. *I am the molecule in this reactor; what is happening to me?* (Counter-intuitive but unusually generative.)
+
+**Symbolic analogy.** Describe in metaphorical / compressed terms. *"The problem is a shy bridegroom"* (a problem that needs to be approached but resists approach).
+
+**Fantasy analogy.** What would the ideal magical solution look like, if all constraints were lifted? (Compare TRIZ's IFR.)
+
+Usually applied in sequence: symbolic / fantasy as starting points → direct as concrete grounding.
+
+## Bisociation: the two-frame frame
+
+Koestler: creativity is the simultaneous holding of two normally-incompatible frames of reference. A joke = a sentence completed in one frame and abruptly reframed in another. A scientific discovery = a phenomenon in domain A seen as instance of structure from domain B (Kekulé's snake-biting-tail → benzene ring).
+
+Operative move: when stuck, find a remote frame and force the mapping. Hold both frames at once; resist collapsing the remote into the home.
+
+## Conceptual blending: four-space architecture
+
+For careful work, F&T's structure:
+1. **Input space 1** — the home problem.
+2. **Input space 2** — the remote domain you're importing from.
+3. **Generic space** — what they share at an abstract level. (If nothing, the blend won't work.)
+4. **Blended space** — selective projection from each input. *Not all* of input 1, *not all* of input 2.
+
+The interesting properties live in the **emergent structure** of the blend — properties that aren't in either input.
+
+## Procedure
+
+1. State the home problem in one sentence.
+2. Pick a remote domain you actually know something about. Effective: biology, geology, theology, medicine, military strategy, dance, agriculture, archaeology, cooking, etymology, monastic life, mountaineering. *Avoid* "AI" and "the brain" — slop magnets.
+3. Find one specific structure in the remote domain. Not the whole domain — one mechanism, relationship, or constraint.
+4. Force the mapping. Be explicit about which elements project and which don't.
+5. Look for emergent structure — properties of the blend that weren't in either input.
+6. Hold the doubleness for a few minutes. Don't immediately collapse the remote into home-frame terms.
+7. State the resulting idea in home-frame terms only at the end.
+
+## Worked example
+
+**Home space**: how should a small open-source project handle contributor onboarding?
+
+**Remote space**: monastic novitiate (medieval Christian process for admitting new members).
+
+**Generic space**: a community admits new members through a graduated process designed to test commitment and transmit values.
+
+**Selective projection**:
+- From novitiate: defined trial period, explicit "rule," senior mentor, public moment of full membership.
+- From open source: technical work, contribution flow, maintainer relationship.
+
+**Blended space**: a contributor passes through a defined "novitiate" — a public 3–6 month period with a maintainer mentor, a documented "rule" of project values, and a recognized moment of becoming a "professed" contributor.
+
+**Emergent structure**: monastic novitiate is *not transactional*. Novice doesn't earn membership through volume of work; they earn it through demonstrated commitment to the rule. Very different from open-source default (volume of merged PRs). The blend produces *commitment to values, not work output, as the criterion*. Not in either input alone.
+
+## Anti-slop notes
+
+- "X is like Y" without specificity = cliché, not analogy. Real analogies have *specific* mapped structure.
+- Avoid analogies to currently-trendy frames ("like AI", "like a network", "like a marketplace") — overused, low transfer.
+- Test: can you name three specific things that map and three that don't? If not, the analogy is decorative.
+- Resist mixed-metaphor accumulation. One careful analogy beats five sloppy ones.
+- Don't pick "the brain" or "AI" as remote frame. Pre-cooked.
+
+Sources: Gordon, *Synectics* (Harper, 1961); Koestler, *The Act of Creation* (Hutchinson, 1964); Fauconnier & Turner, *The Way We Think* (Basic Books, 2002).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\biomimicry.md ===
+# Biomimicry
+
+Janine Benyus, *Biomimicry* (1997). Evolution has 3.8 billion years of R&D on most physical design problems. Use biological strategies as a library of mechanisms — adapt the *operative principle*, not the metaphor.
+
+## When to use
+
+- Physical design problems with parallels in evolved organisms (locomotion, sensing, adhesion, structure, energy capture, water management, thermal regulation, distribution)
+- Materials science problems
+- Distributed-systems problems with biological precedents (slime molds, ant colonies, immune systems)
+- Sustainability or material-efficiency constraints
+
+## Don't use when
+
+- Software, social, or expressive problems where biological analogy = decoration. "Like a colony" applied to a startup is slop.
+- Looking for "natural" answers to normative questions (nature is amoral)
+- The biological mechanism isn't actually understood (you need the mechanism, not the headline)
+- Manufacturing context can't match biology's ambient-temperature water-based assembly
+
+## Catalog of strong precedents
+
+**Velcro** ← burrs (*Arctium*). Many small barbed mechanical hooks. *Operative principle: many small interlocks, not one strong glue.*
+
+**Shinkansen 500-series train nose** ← kingfisher beak. Tapered shape allows dive from air to water with minimal splash. *Operative principle: gradient-density transition reduces shock at medium-to-fluid interfaces.*
+
+**Lotus effect** ← *Nelumbo* leaves. Self-cleaning via micro-structured wax. *Operative principle: hierarchical micro/nanostructure + low-energy surface = superhydrophobicity.*
+
+**Gecko adhesive** ← gecko foot pads. Millions of setae adhering via van der Waals forces. *Operative principle: many small contact points + flexible substrate = strong reversible adhesion.*
+
+**Termite mound HVAC** ← *Macrotermes* mounds maintain near-constant interior temperature in fluctuating Sahel conditions via passive convection. Mick Pearce's Eastgate Centre, Harare, 1996. *Operative principle: passive convection through engineered geometry.*
+
+**Whale-fin tubercles** ← humpback flipper bumpy leading edges delay stall, reduce drag. Wind-turbine blades, WhalePower. *Operative principle: leading-edge perturbation alters boundary-layer behavior.*
+
+**Slime-mold pathfinding** ← *Physarum polycephalum* solves shortest-path. Tero et al., *Science* 2010, recreated Tokyo rail network. *Operative principle: distributed reinforcement of high-flux paths, dissolution of unused ones.*
+
+**Sharkskin antimicrobial** ← microscopic ribbed denticles prevent bacterial colonization. Sharklet hospital surfaces. *Operative principle: surface microtopology disrupts colonization.*
+
+**Spider silk** ← *Nephila*, *Araneus*. Specific strength higher than steel; toughness higher than Kevlar. Spiber, Bolt Threads. *Operative principle: hierarchical protein assembly under shear-flow control.*
+
+**Mussel adhesive** ← *Mytilus* DOPA-rich proteins stick to wet rocks. Surgical adhesives. *Operative principle: catechol chemistry remains effective in water.*
+
+**Mycelial structure** ← fungus binds particles into rigid forms. Ecovative MycoComposite packaging. *Operative principle: cellulose-bonding via biological agents → biodegradable rigid structure.*
+
+## Procedure
+
+1. **State the problem as a function.** "I need to attach this reversibly, holding 50 kg." "I need to extract water from desert air." "I need to route packets without central coordination."
+2. **Look up biological strategies.** AskNature.org is the curated database, indexed by function.
+3. **Identify the operative principle.** Compress the strategy to its mechanism. Not "geckos can stick to walls" — "many small van der Waals contacts via flexible setae provide strong reversible adhesion."
+4. **Match to your problem.** Be honest about what's missing — biological systems often work because of context (water, ambient temperature) your engineering context lacks.
+5. **Prototype with the principle, not the metaphor.** Don't build a "robot gecko." Build something that uses the operative principle in your form factor and material set.
+
+## Anti-slop notes
+
+- "[X] inspired by nature" without specifics = marketing. Real biomimicry names the organism, the mechanism, and the operative principle.
+- Avoid "like a colony / swarm / ecosystem" for non-physical problems. Slop magnet.
+- Don't assume "natural" = "good". Parasitism, deception, exploitation are well-engineered.
+- Resist the spiritual register. Biomimicry is engineering; the slop variant is greeting-card.
+
+Source: Benyus, *Biomimicry* (Morrow, 1997). AskNature.org.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\chance-and-remix.md ===
+# Chance and Remix
+
+Four traditions of surrendering authorial control to procedure:
+- **Surrealist exquisite corpse** — Breton et al., 1925. Folded-paper collaborative writing/drawing.
+- **John Cage's chance operations** — *Music of Changes* (1951). Composed via *I Ching* coin tosses.
+- **Burroughs–Gysin cut-up** — *Minutes to Go* (1960). Cut existing text, rearrange.
+- **Situationist détournement** — Debord & Wolman, 1956. Re-edit existing media to subvert original meaning.
+
+## When to use
+
+- Existing material feels exhausted; need new structure from same material
+- Stuck inside an authorial voice
+- Want to interrupt your own taste (Cage: your taste is what limits the work)
+- Producing experimental work
+- Subverting source material (détournement)
+
+## Don't use when
+
+- You need linear coherence and argument
+- Audience requires polish (cut-edges and discontinuities are usually visible)
+- Source material has copyright issues you can't navigate
+- Using "chance" as alibi for sloppiness (real chance procedures are *strict*)
+
+## Exquisite corpse
+
+Surrealists, 1925, rue du Château apartment. The name comes from the first sentence: *"Le cadavre exquis boira le vin nouveau"*.
+
+**Procedure**: 3+ participants. First writes a sentence fragment, folds the paper to hide it, passes. Second sees only the last few words and continues. Repeat. Unfold at end.
+
+Variants: drawings (head/torso/legs in three folds), single-author asynchronous (write, hide for a day, write next), distributed by chat or mail.
+
+## Cage chance operations
+
+**Procedure**:
+1. Define what gets randomized (pitch, duration, dynamics, tempo).
+2. Pick a chance device (coin tosses, dice, RNG, *I Ching*).
+3. Let the device determine the parameters.
+4. Notate / build / perform the result.
+5. **Use what comes out.** Overriding for taste defeats the operation.
+
+Variants: time-bracket scores (Cage's late practice — windows within which sounds occur). Algorithmic chance (script-driven). Generative systems (Eno's *Music for Airports*, *Reflection*).
+
+## Cut-up technique
+
+Gysin, Beat Hotel Paris, 1959. Bowie used it for *Diamond Dogs*, *Heroes*, *Outside*. Thom Yorke for *Kid A*.
+
+**Procedure**:
+1. Take a page of existing text — your own draft, a newspaper, a manual, anything.
+2. Cut into fragments — by line, phrase, or word.
+3. Shuffle.
+4. Reassemble. Don't force coherence; use the new juxtapositions.
+5. Use the strongest combinations as starting points.
+
+Variants: fold-in (Burroughs — fold one page over another). Voice cut-ups (tape splice). Algorithmic cut-up (script).
+
+## Détournement
+
+Debord & Wolman, 1956. Take an existing piece of media and re-edit / re-caption / re-purpose to invert its meaning. The political stakes are explicit: dominant-culture critique using its own materials.
+
+**Procedure**:
+1. Select source material whose meaning you want to invert.
+2. Identify the *minimum* modification that produces the subversion. (Power comes from recognizability of the source.)
+3. Apply: re-caption, re-edit, re-frame, re-context.
+4. Distribute.
+
+Examples: Debord's *La Société du spectacle* film (1973) is largely détourned feature footage with new voiceover. May 1968 Paris graffiti détourned advertising copy. Adbusters subvertising tradition.
+
+## Anti-slop notes
+
+- "Generate randomly" without a specified procedure is slop. State *what* is randomized, by *what* mechanism.
+- Don't generate cut-up text by guessing what cut-up sounds like. Run the actual procedure on real text.
+- Don't romanticize. The procedures are specific.
+- Détournement requires a target. Generic "subversive remixes" without specific source-and-target are vibe.
+
+Sources: Cage, *Silence* (Wesleyan, 1961); Burroughs & Gysin, *The Third Mind* (Viking, 1978); Debord & Wolman, "Mode d'emploi du détournement" (*Les Lèvres Nues* 8, 1956).
+

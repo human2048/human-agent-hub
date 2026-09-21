@@ -1,0 +1,408 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_shared_session_delivery.py ===
+"""Session observers retain output across attachment and disconnect."""
+import threading
+
+from tui_gateway import server
+
+
+class Peer:
+    def __init__(self):
+        self.frames = []
+        self.received = threading.Event()
+        self._closed = False
+
+    def write(self, frame):
+        self.frames.append(frame)
+        self.received.set()
+        return not self._closed
+
+    def close(self):
+        self._closed = True
+
+
+def test_reattach_preserves_terminal_delivery(monkeypatch):
+    first, second = Peer(), Peer()
+    session = {"transport": first, "history_lock": threading.Lock(), "running": True}
+    monkeypatch.setitem(server._sessions, "shared", session)
+    with session["history_lock"]:
+        server._rebind_live_transport("shared", session, second)
+    server._emit("message.complete", "shared", {"text": "finished"})
+    assert first.received.wait(timeout=5)
+    assert second.received.wait(timeout=5)
+    assert first.frames == second.frames
+    assert len(first.frames) == 1
+    second.close()
+    assert server._close_sessions_for_transport(second) == (0, 0)
+    assert second not in session.get("viewers", {})
+    first.received.clear()
+    server._emit("message.complete", "shared", {"text": "still attached"})
+    assert first.received.wait(timeout=5)
+    assert len(first.frames) == 2
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_slash_fuzzy.py ===
+"""Tests for the description-aware slash fuzzy scorer (grok-cli port).
+
+Covers ``tui_gateway.slash_fuzzy`` (scoring tiers, catalog merge, stable
+ordering) and how ``_rank_slash_completions`` consumes the ``score_of``
+lookup: skill rows sort by fuzzy score first, then usage, then name.
+"""
+
+import math
+
+from tui_gateway.server import _rank_slash_completions
+from tui_gateway.slash_fuzzy import (
+    fuzzy_rank_slash_items,
+    normalize_slash_search_query,
+    score_slash_completion_item,
+    tokenize_search_text,
+)
+
+
+def _item(text, meta="", kind="command"):
+    return {"text": text, "display": text, "meta": meta, "kind": kind}
+
+
+def test_normalize_slash_search_query():
+    assert normalize_slash_search_query(" /Model ") == "model"
+    assert normalize_slash_search_query("//help") == "help"
+    assert normalize_slash_search_query("plain") == "plain"
+
+
+def test_tokenize_search_text_includes_full_value_and_words():
+    assert tokenize_search_text("Commit & Push") == ["commit & push", "commit", "push"]
+
+
+def test_score_tiers_name_before_description():
+    item = _item("/recaps ", "Turn session recaps on/off")
+    assert score_slash_completion_item(item, "recaps") == 0
+    assert score_slash_completion_item(item, "rec") == 1
+    assert score_slash_completion_item(item, "caps") == 2
+    assert score_slash_completion_item(item, "session") == 3
+    assert score_slash_completion_item(item, "sess") == 4
+    assert score_slash_completion_item(item, "essio") == 5
+    assert math.isinf(score_slash_completion_item(item, "zzz"))
+
+
+def test_name_match_beats_description_match():
+    # "recap" hits the description too, but the name tier must win.
+    item = _item("/recap", "Turn session recaps on/off")
+    assert score_slash_completion_item(item, "recap") == 0
+
+
+def test_fuzzy_rank_merges_description_matches_from_catalog():
+    prefix_hits = [_item("/summon")]
+    catalog = [
+        _item("/summon"),
+        _item("/recaps", "Show a summary of the session"),
+        _item("/help", "Show available commands"),
+    ]
+    ranked, score_of = fuzzy_rank_slash_items(prefix_hits, catalog, "summ")
+
+    texts = [item["text"] for item in ranked]
+    assert texts == ["/summon", "/recaps"]  # name prefix (1) before description (4)
+    assert score_of(ranked[0]) == 1
+    assert score_of(ranked[1]) == 4
+    assert math.isinf(score_of(_item("/help", "Show available commands")))
+
+
+def test_fuzzy_rank_is_stable_within_a_tier():
+    items = [_item("/mod-b"), _item("/mod-a")]
+    ranked, _ = fuzzy_rank_slash_items(items, [], "mod")
+    assert [item["text"] for item in ranked] == ["/mod-b", "/mod-a"]
+
+
+def test_fuzzy_rank_drops_non_matching_prefix_rows():
+    ranked, _ = fuzzy_rank_slash_items([_item("/other")], [], "model")
+    assert ranked == []
+
+
+def test_rank_slash_completions_uses_score_before_usage():
+    # Without a scorer, usage sorts skills; with one, score leads and usage
+    # only breaks ties within a tier.
+    name_hit = _item("/summarize", "Condense text", kind="skill")
+    desc_hit = _item("/notes", "Write a summary of a meeting", kind="skill")
+    items = [desc_hit, name_hit]
+
+    usage = {"notes": 50, "summarize": 1}.get
+
+    def usage_of(name):
+        return usage(name, 0)
+
+    def origin_of(_name):
+        return "user"
+
+    scores = {id(name_hit): 1.0, id(desc_hit): 4.0}
+
+    ranked = _rank_slash_completions(
+        items,
+        usage_of,
+        origin_of,
+        browsing=False,
+        score_of=lambda item: scores.get(id(item), math.inf),
+    )
+    assert [item["text"] for item in ranked] == ["/summarize", "/notes"]
+
+    # Sanity: without score_of the heavier-used skill leads.
+    ranked_plain = _rank_slash_completions(items, usage_of, origin_of, browsing=False)
+    assert [item["text"] for item in ranked_plain] == ["/notes", "/summarize"]
+
+
+def test_rank_slash_completions_ties_break_on_usage_then_name():
+    a = _item("/beta", kind="skill")
+    b = _item("/alpha", kind="skill")
+    items = [a, b]
+
+    ranked = _rank_slash_completions(
+        items,
+        lambda name: {"alpha": 3, "beta": 3}.get(name, 0),
+        lambda _name: "user",
+        browsing=False,
+        score_of=lambda item: 1.0,
+    )
+    assert [item["text"] for item in ranked] == ["/alpha", "/beta"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_slash_review_owner.py ===
+"""/review from slash.exec runs on the RPC pool, outside any turn. The reviewer it dispatches must
+still be registered under the parent Desktop/TUI session (HERMES_UI_SESSION_ID + exact steer
+authority), or `subagent.list` hides it and the Desktop status stack shows nothing for /review."""
+
+from __future__ import annotations
+
+import threading
+from unittest.mock import patch
+
+from tui_gateway import server
+from tui_gateway.transport import StdioTransport
+
+
+def _live_session(agent):
+    return {
+        "agent": agent, "session_key": "review-key", "history": [{"role": "user", "content": "hi"}],
+        "history_lock": threading.Lock(), "running": False, "transport": StdioTransport(lambda: None, threading.Lock()),
+        "cwd": "", "source": "desktop",
+    }
+
+
+def test_slash_review_dispatches_under_the_parent_session_identity(monkeypatch):
+    sid = "review-sid"
+    session = _live_session(object())
+    server._sessions[sid] = session
+    seen = {}
+
+    def fake_start_review(agent, snapshot, prompt):
+        from gateway.session_context import get_session_env
+        seen["ui_session_id"] = get_session_env("HERMES_UI_SESSION_ID", "")
+        seen["authority"] = server._current_session_steer_authority(sid)
+        return {"status": "dispatched", "delegation_id": "deleg_x"}
+
+    token = server.bind_transport(session["transport"])
+    try:
+        with (
+            patch.object(server, "_session_uses_compute_host", return_value=False),
+            patch("agent.review_engine.start_review", fake_start_review),
+        ):
+            out = server._live_slash_command_output(sid, session, "review", "")
+        from gateway.session_context import get_session_env
+        assert get_session_env("HERMES_UI_SESSION_ID", "") == ""  # scope cleared after dispatch
+        assert server._current_runtime_session_record.get() is None
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop(sid, None)
+
+    assert out == "Review started. Results will return here."
+    assert seen["ui_session_id"] == sid
+    assert seen["authority"] == (session["transport"], session)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_slash_worker_ansi.py ===
+"""The slash worker feeds desktop chat bubbles, which render plain text — so
+any ANSI a worker-routed command emits (e.g. /journey's own Rich Console) must
+be stripped from the worker's return value."""
+
+from __future__ import annotations
+
+
+class _FakeCLI:
+    console = None
+
+    def process_command(self, cmd: str) -> None:
+        import sys
+
+        sys.stdout.write("\x1b[38;2;1;2;3mcolored\x1b[0m plain")
+
+
+def test_run_strips_ansi_from_output():
+    from tui_gateway import slash_worker
+
+    out = slash_worker._run(_FakeCLI(), "/anything")
+
+    assert "\x1b[" not in out
+    assert out == "colored plain"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_slash_worker_mcp_discovery.py ===
+"""Integration coverage for profile-local MCP discovery in slash workers."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import queue
+import subprocess
+import sys
+import textwrap
+import threading
+
+import pytest
+import yaml
+
+_mcp_server_mod = pytest.importorskip("mcp.server")
+
+if not hasattr(_mcp_server_mod, "MCPServer"):
+    # `mcp.server.MCPServer` replaced `mcp.server.fastmcp.FastMCP` in mcp 2.0.
+    # Skip rather than fail on a FastMCP-era SDK: the probe below is written
+    # against the 2.x API, and the pinned version provides it.
+    pytest.skip(
+        "profile-local MCP discovery probe requires mcp >= 2.0 (MCPServer)",
+        allow_module_level=True,
+    )
+
+
+def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    marker = "profile-local-61922"
+    server = tmp_path / "mcp_probe.py"
+    server.write_text(
+        textwrap.dedent(
+            f"""
+            from mcp.server import MCPServer
+
+            mcp = MCPServer("profileprobe")
+
+            @mcp.tool()
+            def hermes_61922_profile_probe() -> str:
+                return {marker!r}
+
+            if __name__ == "__main__":
+                mcp.run(transport="stdio")
+            """
+        ),
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mcp_servers": {
+                    "profileprobe": {
+                        "enabled": True,
+                        "command": sys.executable,
+                        "args": [str(server)],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    for key in list(env):
+        if key.endswith("_API_KEY") or key.endswith("_TOKEN"):
+            env.pop(key)
+    env["HERMES_HOME"] = str(profile_home)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    env["HERMES_SLASH_WATCHDOG_GRACE_S"] = "0"
+    env["HERMES_SLASH_WATCHDOG_POLL_S"] = "0.05"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-m",
+            "tui_gateway.slash_worker",
+            "--session-key",
+            "agent:main:tui:dm:mcp-profile-test",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+    )
+    output: queue.Queue[str] = queue.Queue()
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        stdout = proc.stdout
+        threading.Thread(
+            target=lambda: output.put(stdout.readline()),
+            daemon=True,
+        ).start()
+        proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
+        proc.stdin.flush()
+        try:
+            line = output.get(timeout=10)
+        except queue.Empty:
+            pytest.fail("slash worker produced no /tools response within 10 seconds")
+        response = json.loads(line)
+        assert response["ok"] is True
+        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_slash_worker_profile_home.py ===
+"""Tests for TUI gateway slash_worker profile_home propagation (#40677)."""
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+
+def test_slash_worker_accepts_profile_home():
+    """_SlashWorker.__init__ accepts profile_home parameter."""
+    # hermes_state evaluates get_hermes_home() / "state.db" at import time, so
+    # the mock must return a Path (a bare str raises TypeError under per-file
+    # subprocess isolation).
+    with patch.dict("sys.modules", {
+        "hermes_constants": MagicMock(
+            get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test")),
+        ),
+    }):
+        with patch("subprocess.Popen") as mock_popen:
+            mock_popen.return_value.stdout = MagicMock()
+            mock_popen.return_value.stderr = MagicMock()
+
+            from tui_gateway.server import _SlashWorker
+
+            # Test initialization with profile_home
+            worker = _SlashWorker(
+                session_key="test_key",
+                model="test-model",
+                profile_home="/home/luke/.hermes/profiles/work"
+            )
+
+            # Verify Popen was called
+            assert mock_popen.called
+
+            # Check that HERMES_HOME was set in the environment
+            call_kwargs = mock_popen.call_args[1]
+            assert "env" in call_kwargs
+            assert call_kwargs["env"]["HERMES_HOME"] == "/home/luke/.hermes/profiles/work"
+
+
+

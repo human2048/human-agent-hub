@@ -1,0 +1,364 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_api_max_retries_config.py ===
+"""Tests for agent.api_max_retries config surface.
+
+Closes #11616 — make the hardcoded ``max_retries = 3`` in the agent's API
+retry loop user-configurable so fallback-provider setups can fail over
+faster on flaky primaries instead of burning ~3x180s on the same stall.
+"""
+from unittest.mock import patch
+
+from run_agent import AIAgent
+
+
+def _make_agent(api_max_retries=None):
+    """Build an AIAgent with a mocked config.load_config that returns a
+    config tree containing the given agent.api_max_retries (or default)."""
+    cfg = {"agent": {}}
+    if api_max_retries is not None:
+        cfg["agent"]["api_max_retries"] = api_max_retries
+
+    with patch("agent.process_bootstrap.OpenAI"), \
+         patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        return AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+
+def test_default_api_max_retries_is_three():
+    """No config override → legacy default of 3 retries preserved."""
+    agent = _make_agent()
+    assert agent._api_max_retries == 3
+
+
+def test_api_max_retries_honors_config_override():
+    """Setting agent.api_max_retries in config propagates to the agent."""
+    agent = _make_agent(api_max_retries=1)
+    assert agent._api_max_retries == 1
+
+    agent2 = _make_agent(api_max_retries=5)
+    assert agent2._api_max_retries == 5
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_arcee_trinity_overrides.py ===
+"""Tests for Arcee Trinity Large Thinking per-model overrides.
+
+Arcee Trinity Large Thinking is a reasoning model that wants:
+- Fixed temperature=0.5 (vs the global default)
+- Compression threshold=0.75 (delay compression to preserve reasoning context)
+
+The helpers must match the bare model name, including when it arrives via
+OpenRouter as ``arcee-ai/trinity-large-thinking``, but must NOT hit sibling
+Arcee models like trinity-large-preview or trinity-mini.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agent.agent_init import _resolve_compression_threshold
+from agent.auxiliary_client import (
+    _compression_threshold_for_model,
+    _fixed_temperature_for_model,
+    _is_arcee_trinity_thinking,
+    _is_codex_gpt54_or_gpt55,
+    _is_codex_spark,
+)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "trinity-large-thinking",
+        "arcee-ai/trinity-large-thinking",
+        "Arcee-AI/Trinity-Large-Thinking",  # case-insensitive
+        "  trinity-large-thinking  ",  # whitespace tolerant
+    ],
+)
+def test_is_arcee_trinity_thinking_matches(model: str) -> None:
+    assert _is_arcee_trinity_thinking(model) is True
+
+
+
+
+def test_fixed_temperature_for_trinity_thinking() -> None:
+    assert _fixed_temperature_for_model("trinity-large-thinking") == 0.5
+    assert _fixed_temperature_for_model("arcee-ai/trinity-large-thinking") == 0.5
+
+
+
+
+
+
+def test_compression_threshold_default_none_for_other_models() -> None:
+    # None means "leave the user's config value unchanged".
+    assert _compression_threshold_for_model(None) is None
+    assert _compression_threshold_for_model("") is None
+    assert _compression_threshold_for_model("trinity-large-preview") is None
+    assert _compression_threshold_for_model("claude-sonnet-4.6") is None
+    assert _compression_threshold_for_model("kimi-k2") is None
+
+
+# ---------------------------------------------------------------------------
+# Codex gpt-5.4 / gpt-5.5 compaction-threshold autoraise
+#
+# ChatGPT's Codex OAuth backend caps both families at a 272K window (verified
+# live via the Codex /models resolver and per-slug fallback table). The default
+# 50% compaction trigger would fire at ~136K — half the usable window — so this
+# route raises the trigger to 85%. Only the Codex OAuth route is affected; the
+# same slugs on OpenAI direct / OpenRouter / Copilot expose a larger window and
+# keep the user's global threshold.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5", "gpt-5.55", "gpt-5.50", "gpt-5.45", "gpt-5.40",
+        "gpt-daybreak-blue-latest-mini", "", None,
+    ],
+)
+def test_is_codex_gpt54_or_gpt55_rejects_non_54_55_models(model) -> None:
+    # Close numeric neighbours must NOT match — the prefix guards require a
+    # separator after "5.4" / "5.5" so e.g. gpt-5.45 and gpt-5.55 stay out.
+    assert _is_codex_gpt54_or_gpt55(model, "openai-codex") is False
+
+
+def test_compression_threshold_for_codex_gpt55() -> None:
+    assert _compression_threshold_for_model("gpt-5.4", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("gpt-5.4-pro", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("openai/gpt-5.4", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("gpt-5.5", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("gpt-5.5-pro", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("openai/gpt-5.5", "openai-codex") == 0.85
+    assert _is_codex_gpt54_or_gpt55("gpt-daybreak-blue-latest", "openai-codex") is True
+    assert _compression_threshold_for_model("gpt-daybreak-blue-latest", "openai-codex") == 0.85
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.6-sol-900k",
+        "gpt-5.6-terra-900k",
+        "gpt-5.6-luna-900k",
+        "gpt-5.4-900k",
+        "gpt-daybreak-blue-latest-900k",
+        "openai/gpt-5.6-sol-900k",
+    ],
+)
+def test_900k_variants_keep_global_threshold(model) -> None:
+    """The 85% autoraise compensates for the small 272K window; ``-900k``
+    opt-in variants run at ~900K, so they keep the user's global
+    ``compression.threshold`` (default 50%) — no override returned."""
+    assert _is_codex_gpt54_or_gpt55(model, "openai-codex") is False
+    assert _compression_threshold_for_model(model, "openai-codex") is None
+
+
+def test_base_slugs_still_autoraised_alongside_900k_variants() -> None:
+    """Sanity pair: the base slug autoraises while its variant does not."""
+    assert _compression_threshold_for_model("gpt-5.6-sol", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("gpt-5.6-sol-900k", "openai-codex") is None
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Codex gpt-5.3-codex-spark compaction-threshold autoraise
+#
+# gpt-5.3-codex-spark is Codex-OAuth-only (ChatGPT Pro entitlement) with a
+# native 128K context window.  The default 50% compaction trigger would fire
+# at ~64K — wasting half the usable window, often before the session has
+# accumulated enough turns to summarize meaningfully.  This route raises the
+# trigger to 70% (~90K) to preserve more raw context while leaving ~38K
+# headroom before the 128K hard limit.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.5",  # different family
+        "gpt-5.3-codex",  # sibling, not spark
+        "gpt-5.3",  # bare 5.3, not spark
+        "gpt-5.3-codex-spark-mini",  # hypothetical variant — not matched yet
+        "", None,
+    ],
+)
+def test_is_codex_spark_rejects_non_spark_models(model) -> None:
+    assert _is_codex_spark(model, "openai-codex") is False
+
+
+
+
+
+
+
+
+# ── _resolve_compression_threshold (init_agent application logic) ────────────
+#
+# The Codex overrides are *autoraises*: they raise the trigger (0.85 for the
+# gpt-5.4/5.5 272K family, 0.70 for spark) but must never LOWER a higher
+# user-configured global threshold.
+
+
+
+
+
+
+
+
+
+
+def test_resolve_no_override_keeps_global() -> None:
+    # No per-model override (model_cthresh is None) → global threshold, no notice.
+    effective, notice = _resolve_compression_threshold(
+        0.50, None, is_codex_autoraise=False
+    )
+    assert effective == 0.50
+    assert notice is None
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_astra_baseline_runtime.py ===
+"""Focused real-path coverage for the GPT-6 Astra baseline contract."""
+
+from types import SimpleNamespace
+
+import pytest
+
+
+def test_explicit_astra_resolves_and_uses_official_responses(monkeypatch, tmp_path):
+    """A fresh profile resolves metadata and routes the official endpoint without live I/O."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda *args, **kwargs: {})
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda *args, **kwargs: [])
+
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        model="gpt-6-astra",
+        provider="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        platform="cli",
+        max_iterations=2,
+        quiet_mode=True,
+        skip_memory=True,
+    )
+
+    assert agent.api_mode == "codex_responses"
+    assert agent.context_compressor.context_length == 1_050_000
+    kwargs = agent._get_transport().build_kwargs(
+        model=agent.model,
+        messages=[{"role": "user", "content": "Hi"}],
+        tools=[],
+        provider=agent.provider,
+        base_url=agent.base_url,
+        reasoning_config={"enabled": True, "effort": "none"},
+    )
+    assert kwargs["reasoning"]["effort"] == "low"  # Astra has no ``none`` wire level
+
+
+def test_astra_codex_oauth_fallback_uses_backend_context_limit():
+    """OAuth keeps the Codex backend's 272K fallback; direct API metadata remains 1.05M."""
+    from agent.model_metadata import (
+        DEFAULT_CONTEXT_LENGTHS,
+        _resolve_codex_oauth_context_length_with_source,
+    )
+
+    codex_ctx, source = _resolve_codex_oauth_context_length_with_source("gpt-6-astra")
+    assert source == "fallback"
+    assert codex_ctx < DEFAULT_CONTEXT_LENGTHS["gpt-6-astra"]  # Codex caps below the direct API window
+
+
+@pytest.mark.parametrize("advertised,expected", [(272_000, 900_000), (200_000, 200_000), (1_050_000, 1_050_000)])
+def test_astra_900k_opt_in_preserves_live_limits_and_wire_contract(monkeypatch, tmp_path, advertised, expected):
+    """Only the known stale advertisement is lifted; the alias never reaches the wire."""
+    from agent import model_metadata as metadata
+    from agent.reasoning_effort import CODEX_ASTRA_EFFORTS, codex_supported_efforts
+    from agent.transports.codex import ResponsesApiTransport
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(metadata, "_codex_oauth_context_cache", {})
+    monkeypatch.setattr(metadata.requests, "get", lambda *args, **kwargs: SimpleNamespace(
+        status_code=200,
+        json=lambda: {"models": [{"slug": "gpt-6-astra", "context_window": advertised}]},
+    ))
+    route = {"base_url": "https://chatgpt.com/backend-api/codex", "provider": "openai-codex"}
+    assert metadata.get_model_context_length("gpt-6-astra-900k", api_key="test-token", **route) == expected
+    assert metadata.get_model_context_length("gpt-6-astra", api_key="test-token", **route) == advertised
+    assert codex_supported_efforts("gpt-6-astra-900k") == CODEX_ASTRA_EFFORTS
+
+    for config in ({"effort": "max"}, {"enabled": False}):
+        params = dict(
+            messages=[{"role": "user", "content": "Hi"}], tools=[],
+            is_codex_backend=True, reasoning_config=config,
+            request_overrides={"temperature": 0.5, "logprobs": True}, **route,
+        )
+        kwargs = ResponsesApiTransport().build_kwargs(model="gpt-6-astra-900k", **params)
+        assert kwargs["model"] == "gpt-6-astra"
+        assert kwargs == ResponsesApiTransport().build_kwargs(model="gpt-6-astra", **params)
+
+
+@pytest.mark.parametrize("provider,model", [
+    ("openai-codex", "gpt-6-astra"), ("openai-codex", "gpt-6-astra-900k"), ("openai-api", "gpt-6-astra"),
+])
+def test_picker_revalidates_cached_astra_and_never_injects_saved_entitlement(monkeypatch, tmp_path, provider, model):
+    from hermes_cli import models
+    from hermes_cli.inventory import ConfigContext, _append_unconfigured_rows
+    from hermes_cli.model_switch_providers import _finalize_picker_rows
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(models, "_credential_fingerprint", lambda _: "synthetic-account")
+    models.update_provider_cache_entry(provider, ["gpt-5.6-sol", model])
+    live = []
+    calls = []
+
+    def discover(slug, **kwargs):
+        calls.append(slug)
+        return list(live)
+
+    monkeypatch.setattr(models, "provider_model_ids", discover)
+    # Only live discovery writes Astra into a same-credential entry, so a fresh entry IS the
+    # entitlement record: served without a round-trip (a per-open revalidation defeated the cache).
+    assert model in models.cached_provider_model_ids(provider)
+    assert calls == []
+    # After the entry ages past the fresh window, a failed refresh must not resurrect Astra from it.
+    monkeypatch.setattr(models, "_PROVIDER_MODELS_STALE_SERVE_MAX", 0)
+    assert models.cached_provider_model_ids(provider, ttl_seconds=0) == ["gpt-5.6-sol"]
+    assert calls == [provider]
+    row = {"slug": provider, "is_current": True, "models": ["gpt-5.6-sol"], "total_models": 1}
+    assert model not in _finalize_picker_rows([row], {}, model)[0]["models"]
+    ctx = ConfigContext(provider, model, "", {}, [])
+    assert _append_unconfigured_rows([], ctx, current_only=True)[0]["models"] == []
+
+    live[:] = ["gpt-5.6-sol", model]
+    assert model in models.cached_provider_model_ids(provider)
+

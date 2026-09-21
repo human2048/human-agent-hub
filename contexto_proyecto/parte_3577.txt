@@ -1,0 +1,379 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_startup_plugin_gating.py ===
+"""Guards for CLI startup performance regression.
+
+``hermes_cli.main`` skips eager plugin discovery at argparse-setup time
+when the invocation is clearly targeting a known built-in subcommand.
+This saves 500-650ms on ``hermes --help``, ``hermes --version``,
+``hermes logs``, etc., by not importing ``google.cloud.pubsub_v1``,
+``aiohttp``, ``grpc``, and friends.
+
+Two invariants:
+
+1. ``_BUILTIN_SUBCOMMANDS`` must contain every subcommand that is actually
+   registered by ``main()``.  If an entry is missing, plugin discovery
+   runs unnecessarily for that command (correctness-safe, just slow).
+   If an entry is PRESENT but the subcommand doesn't exist, a plugin
+   could shadow the name — also bad.
+
+2. ``_plugin_cli_discovery_needed()`` returns the right answer for the
+   flag/positional parsing cases it's meant to handle.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+import sys
+from contextlib import redirect_stdout
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli._parser import build_top_level_parser, top_level_value_flag_sets
+from hermes_cli.main import (
+    _BUILTIN_SUBCOMMANDS,
+    _first_positional_argv,
+    _plugin_cli_discovery_needed,
+    _resolve_deferred_platform_cli_command,
+)
+
+
+# ── helper: grab the live set of top-level subcommands from argparse ───────
+
+
+def _live_subcommand_names() -> set[str]:
+    """Run ``hermes --help`` in-process and parse the subcommand block.
+
+    We patch ``_plugin_cli_discovery_needed`` to always return False so
+    plugin-registered commands aren't included — we're validating the
+    built-in-only set.
+    """
+    from hermes_cli import main as _main
+
+    argv_backup = sys.argv[:]
+    sys.argv = ["hermes", "--help"]
+    buf = io.StringIO()
+    try:
+        with patch.object(_main, "_plugin_cli_discovery_needed", return_value=False):
+            with redirect_stdout(buf):
+                with pytest.raises(SystemExit):
+                    _main.main()
+    finally:
+        sys.argv = argv_backup
+
+    text = buf.getvalue()
+    # argparse prints "{chat,model,...}" somewhere in the help output
+    m = re.search(r"\{([a-zA-Z0-9_,\-]+)\}", text)
+    assert m, f"Could not find subcommand group in --help output:\n{text[:500]}"
+    return set(m.group(1).split(","))
+
+
+# ── _first_positional_argv ─────────────────────────────────────────────────
+
+
+def test_value_flag_sets_match_top_level_parser():
+    required, optional = top_level_value_flag_sets()
+
+    for action in build_top_level_parser()[0]._actions:
+        if not action.option_strings or action.nargs == 0:
+            continue
+        expected = optional if action.nargs == "?" else required
+        assert set(action.option_strings) <= expected
+
+
+def test_reasoning_value_is_not_misclassified_as_subcommand(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "--reasoning", "high", "chat", "hello"],
+    )
+
+    assert _first_positional_argv() == "chat"
+    assert _plugin_cli_discovery_needed() is False
+
+
+
+
+# ── _plugin_cli_discovery_needed ───────────────────────────────────────────
+
+
+# ── _BUILTIN_SUBCOMMANDS ↔ argparse registration parity ────────────────────
+
+
+
+
+# ── _resolve_deferred_platform_cli_command (issue #54678) ──────────────────
+
+
+def test_deferred_platform_cli_resolution_targets_matching_platform():
+    """The slow path must import the deferred platform whose name matches the
+    invoked command, so its register_cli_command side effect fires.
+
+    Photon registers ``hermes photon`` only when its adapter module is
+    imported; on the unknown-command slow path the platform is still a
+    deferred entry, so without this resolution step the CLI command stays
+    absent and argparse rejects ``photon`` (issue #54678).
+    """
+    from hermes_cli import main as _main
+
+    class _FakeRegistry:
+        def __init__(self):
+            self.resolved: list[str] = []
+
+        def get(self, name):
+            self.resolved.append(name)
+            return None
+
+    fake = _FakeRegistry()
+    fake_module = type(sys)("gateway.platform_registry")
+    fake_module.platform_registry = fake
+    with patch.dict(sys.modules, {"gateway.platform_registry": fake_module}):
+        _resolve_deferred_platform_cli_command("photon")
+
+    assert fake.resolved == ["photon"]
+
+
+def test_deferred_platform_loader_registers_cli_command_before_parser_table():
+    """Fake deferred loader must resolve through real registry + register CLI
+    before argparse builds plugin command subparsers (issue #54678 review).
+
+    Existing unit tests mock ``platform_registry.get`` and only assert the
+    helper calls it. This regression exercises the full chain hermes-sweeper
+    asked for:
+
+    1. a deferred platform loader is pending on a real ``PlatformRegistry``
+    2. that loader materializes a ``register_cli_command`` side effect on the
+       plugin manager (no Photon SDK import)
+    3. ``_resolve_deferred_platform_cli_command`` runs the pending loader
+    4. the registered command is present on the manager *and* visible as an
+       argparse subparser/choice after the same construction path ``main()``
+       uses for plugin CLI commands
+    """
+    import argparse
+
+    from gateway.platform_registry import PlatformRegistry
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    mgr = PluginManager()
+    manifest = PluginManifest(name="fake-photon-platform")
+    command_name = "fakephoton"
+
+    def _fake_loader():
+        # Mirrors what a real platform adapter does on import: register its
+        # top-level hermes <name> CLI command via PluginContext.
+        ctx = PluginContext(manifest, mgr)
+        ctx.register_cli_command(
+            name=command_name,
+            help="Fake deferred platform CLI (test-only)",
+            setup_fn=lambda p: None,
+            description="Hermetic stand-in for deferred platform CLI registration",
+        )
+
+    registry = PlatformRegistry()
+    registry.register_deferred(command_name, _fake_loader)
+
+    # Precondition: deferred is known, but CLI command is not yet registered.
+    assert registry.is_registered(command_name)
+    assert command_name not in mgr._cli_commands
+    assert command_name in registry._deferred
+
+    fake_module = type(sys)("gateway.platform_registry")
+    fake_module.platform_registry = registry
+    with patch.dict(sys.modules, {"gateway.platform_registry": fake_module}):
+        _resolve_deferred_platform_cli_command(command_name)
+
+    # Loader resolution must promote deferred -> concrete and fire CLI register.
+    assert command_name not in registry._deferred
+    assert command_name in mgr._cli_commands
+    cmd_info = mgr._cli_commands[command_name]
+    assert cmd_info["name"] == command_name
+    assert cmd_info["plugin"] == "fake-photon-platform"
+
+    # Same parser-table assembly main() uses after reading _cli_commands.
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    for info in mgr._cli_commands.values():
+        plugin_parser = subparsers.add_parser(
+            info["name"],
+            help=info["help"],
+            description=info.get("description", ""),
+        )
+        info["setup_fn"](plugin_parser)
+        if info.get("handler_fn") is not None:
+            plugin_parser.set_defaults(func=info["handler_fn"])
+
+    # argparse surface: choices + parse success.
+    choices = getattr(subparsers, "choices", None) or {}
+    assert command_name in choices
+    parsed = parser.parse_args([command_name])
+    assert parsed.command == command_name
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_state_db_guard.py ===
+"""Tests for the state.db integrity guard used by the update flow (#68474).
+
+Exercises ``verify_sqlite_integrity`` against REAL
+SQLite files (valid, zeroed, truncated) — the exact corruption signature from
+issue #68474 (file kept at original size, 100% null bytes, header gone).
+"""
+
+import sqlite3
+
+import pytest
+
+from hermes_cli.backup import verify_sqlite_integrity
+
+
+@pytest.fixture()
+def valid_db(tmp_path):
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.executemany(
+        "INSERT INTO sessions (name) VALUES (?)", [(f"s{i}",) for i in range(50)]
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+
+
+
+
+
+
+
+
+def test_oversized_db_probe_catches_malformed_schema(tmp_path):
+    """Skipping the pragma must not mean skipping corruption detection.
+
+    A file with a valid header whose schema cannot be parsed has to fail
+    the oversized path via the cheap structural probe.
+    """
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE t (a INTEGER)")
+    conn.commit()
+    conn.close()
+
+    raw = bytearray(path.read_bytes())
+    # Corrupt the schema b-tree page (page 2 onward) while leaving the
+    # 16-byte header magic intact, so only the probe can catch it.
+    for i in range(100, min(len(raw), 4096)):
+        raw[i] = 0xFF
+    path.write_bytes(bytes(raw))
+
+    res = verify_sqlite_integrity(path, max_bytes=1)
+    assert res["valid"] is False
+    assert "probe" in res["message"]
+
+
+
+
+
+
+def test_restore_flow_end_to_end(valid_db, tmp_path):
+    """Simulate the #68474 recovery path: live db zeroed, snapshot valid →
+    restore snapshot over live file → verify restored copy."""
+    import shutil
+
+    snap = tmp_path / "state-snapshots" / "20260721-pre-update" / "state.db"
+    snap.parent.mkdir(parents=True)
+    shutil.copy2(valid_db, snap)
+
+    # Zero the live db (the bug).
+    size = valid_db.stat().st_size
+    valid_db.write_bytes(b"\x00" * size)
+    assert verify_sqlite_integrity(valid_db)["valid"] is False
+    assert verify_sqlite_integrity(snap)["valid"] is True
+
+    # The guard's restore step.
+    shutil.copy2(snap, valid_db)
+    restored = verify_sqlite_integrity(valid_db)
+    assert restored["valid"] is True
+    conn = sqlite3.connect(valid_db)
+    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 50
+    conn.close()
+
+
+class TestPreUpdateBackupIntegrityGuard:
+    """E2E: run the real ``_run_pre_update_backup`` against a temp
+    HERMES_HOME whose state.db is corrupted mid-flight (#68474)."""
+
+    @pytest.fixture()
+    def hermes_home(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        import sys
+
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        (root / "config.yaml").write_text("model:\n  provider: openrouter\n")
+        db = root / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
+                del sys.modules[mod]
+        return root
+
+    def test_healthy_db_stays_quiet(self, hermes_home, capsys):
+        from argparse import Namespace
+
+        from hermes_cli.update_cmd import _run_pre_update_backup
+
+        snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
+        out = capsys.readouterr().out
+        assert snap_id is not None
+        assert "Pre-update snapshot" in out
+        assert "integrity check FAILED" not in out
+
+    def test_zeroed_db_after_snapshot_is_loud(self, hermes_home, capsys, monkeypatch):
+        """If state.db is zeroed right after the snapshot completes, the
+        guard must warn loudly instead of proceeding silently (exit-0 mask)."""
+        from argparse import Namespace
+
+        import hermes_cli.backup as backup_mod
+        from hermes_cli.update_cmd import _run_pre_update_backup
+
+        real_create = backup_mod.create_quick_snapshot
+
+        def create_then_zero(**kwargs):
+            snap_id = real_create(**kwargs)
+            live = hermes_home / "state.db"
+            live.write_bytes(b"\x00" * live.stat().st_size)
+            return snap_id
+
+        monkeypatch.setattr(backup_mod, "create_quick_snapshot", create_then_zero)
+        snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
+        out = capsys.readouterr().out
+        assert snap_id is not None
+        assert "integrity check FAILED" in out
+        assert "Snapshot copy is valid" in out
+
+    def test_failed_snapshot_is_loud_and_update_continues(self, hermes_home, capsys, monkeypatch):
+        """Best-effort by design, but never silent: a snapshot helper that raises (or captures
+        nothing) prints a stdout warning and returns None so the receipt records a failed step."""
+        from argparse import Namespace
+
+        import hermes_cli.backup as backup_mod
+        from hermes_cli.update_cmd import _run_pre_update_backup
+
+        def boom(**kwargs):
+            raise PermissionError("state-snapshots is read-only")
+
+        monkeypatch.setattr(backup_mod, "create_quick_snapshot", boom)
+        snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
+        out = capsys.readouterr().out
+        assert snap_id is None
+        assert "Pre-update snapshot FAILED" in out
+        assert "state-snapshots is read-only" in out
+        assert "Continuing with update" in out
+

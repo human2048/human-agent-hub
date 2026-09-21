@@ -1,0 +1,448 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\nature.md ===
+# nature
+
+Organic, earthy illustration style for environmental and wellness content
+
+## Design Aesthetic
+
+Natural and organic visual approach inspired by the outdoors. Earth tones and natural textures that evoke calm and connection to nature. Flowing lines and organic shapes. Creates a sense of tranquility and environmental awareness.
+
+## Background
+
+- Color: Sand Beige (#F5E6D3) or Sky Blue wash (#E0F2FE)
+- Texture: Natural paper texture with organic feel
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Sand Beige | #F5E6D3 | Primary background |
+| Alt Background | Sky Blue | #E0F2FE | Alternative canvas |
+| Primary | Forest Green | #276749 | Main natural color |
+| Secondary | Sage | #9AE6B4 | Supporting green |
+| Tertiary | Earth Brown | #744210 | Grounding element |
+| Accent 1 | Sunset Orange | #ED8936 | Warm accent |
+| Accent 2 | Water Blue | #63B3ED | Cool accent |
+| Text | Deep Brown | #5D4E3C | Text elements |
+
+## Visual Elements
+
+- Leaf and plant motifs
+- Tree and branch silhouettes
+- Mountain and landscape shapes
+- Organic flowing lines
+- Natural textures (wood grain, stone)
+- Water and wave patterns
+- Animal silhouettes
+- Sun and moon symbols
+
+## Style Rules
+
+### Do
+
+- Use earth-inspired colors
+- Create organic, flowing shapes
+- Include nature elements
+- Evoke outdoor atmosphere
+- Maintain calm and balance
+
+### Don't
+
+- Use synthetic or neon colors
+- Create rigid geometric shapes
+- Add tech or digital elements
+- Use stark contrasts
+- Overcomplicate compositions
+
+## Best For
+
+Sustainability articles, wellness content, outdoor topics, slow living, environmental issues, health and fitness, gardening, travel nature pieces
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\notion.md ===
+# notion
+
+Minimalist hand-drawn line art style for knowledge content (Default)
+
+## Design Aesthetic
+
+Clean, minimalist hand-drawn line art with intellectual feel. Simple doodle-style illustrations with intentional wobble. Maximum whitespace with single concept focus. Notion-like aesthetic that feels thoughtful and organized.
+
+## Background
+
+- Color: Pure White (#FFFFFF) or Off-White (#FAFAFA)
+- Texture: None - clean solid backgrounds
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | White | #FFFFFF | Primary background |
+| Alt Background | Off-White | #FAFAFA | Subtle variation |
+| Primary | Black | #1A1A1A | Main outlines |
+| Secondary | Dark Gray | #4A4A4A | Supporting lines |
+| Accent 1 | Pastel Blue | #A8D4F0 | Soft highlight |
+| Accent 2 | Pastel Yellow | #F9E79F | Warm highlight |
+| Accent 3 | Pastel Pink | #FADBD8 | Gentle accent |
+| Text | Near Black | #1A1A1A | Text elements |
+
+## Visual Elements
+
+- Simple line doodles
+- Hand-drawn wobble effect
+- Basic geometric shapes
+- Stick figures for people
+- Conceptual icons
+- Clean hand-drawn lettering
+- Minimal decorative elements
+- Single-weight line work
+
+## Style Rules
+
+### Do
+
+- Use maximum whitespace
+- Keep illustrations simple
+- Add slight hand-drawn wobble
+- Focus on single concepts
+- Use pastel accents sparingly
+
+### Don't
+
+- Create complex illustrations
+- Use many colors at once
+- Add detailed textures
+- Make precise geometric shapes
+- Overcrowd the composition
+
+## Best For
+
+Knowledge sharing, concept explanations, SaaS content, productivity articles, educational posts, how-to guides, professional blogs
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\pixel-art.md ===
+# pixel-art
+
+Retro 8-bit pixel art aesthetic with nostalgic gaming style
+
+## Design Aesthetic
+
+Pixelated retro aesthetic reminiscent of classic 8-bit and 16-bit era games. Chunky pixels, limited color palettes, and nostalgic gaming references. Simple geometric shapes rendered in blocky pixel form. Fun, playful, and immediately recognizable retro tech aesthetic.
+
+## Background
+
+- Color: Light Blue (#87CEEB) or Soft Lavender (#E6E6FA)
+- Texture: Subtle pixel grid pattern, optional CRT scanline effect
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Light Blue | #87CEEB | Primary background |
+| Alt Background | Soft Lavender | #E6E6FA | Secondary backgrounds |
+| Primary Text | Dark Navy | #1A1A2E | Main elements |
+| Accent 1 | Pixel Green | #00FF00 | Success, highlights |
+| Accent 2 | Pixel Red | #FF0000 | Alerts, emphasis |
+| Accent 3 | Pixel Yellow | #FFFF00 | Warnings, energy |
+| Accent 4 | Pixel Cyan | #00FFFF | Info, tech elements |
+| Accent 5 | Pixel Magenta | #FF00FF | Special elements |
+
+## Visual Elements
+
+- All elements rendered with visible pixel structure
+- Simple iconography: notepad, checkboxes, gears, rockets
+- Text bubbles with pixel borders
+- 8-bit decorations: stars, hearts, arrows
+- Progress bars with chunky pixel segments
+- Dithering patterns for color transitions
+- Limited 16-32 color palette
+
+## Style Rules
+
+### Do
+
+- Maintain consistent pixel grid throughout
+- Use limited color palette (16-32 colors max)
+- Create blocky, geometric shapes
+- Add nostalgic gaming references
+- Use dithering for color transitions
+
+### Don't
+
+- Use smooth gradients or anti-aliasing
+- Create photorealistic elements
+- Use thin lines or fine details
+- Add modern glossy effects
+- Break the pixel grid alignment
+
+## Best For
+
+Gaming articles, tech tutorials, nostalgic content, developer topics, retro-themed pieces, creative tech content
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\playful.md ===
+# playful
+
+Fun, creative illustration style for casual and educational content
+
+## Design Aesthetic
+
+Whimsical and entertaining visual approach that sparks joy. Pastel colors with bright pops of energy. Doodle-like quality that feels approachable and fun. Creates a sense of play and discovery. Encourages engagement through visual delight.
+
+## Background
+
+- Color: Light Cream (#FFFBEB) or Soft White (#FFF)
+- Texture: Subtle, playful pattern or clean
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Light Cream | #FFFBEB | Primary background |
+| Primary | Pastel Pink | #FED7E2 | Soft warmth |
+| Secondary | Mint | #C6F6D5 | Fresh energy |
+| Tertiary | Lavender | #E9D8FD | Dreamy touch |
+| Accent 1 | Sky Blue | #BEE3F8 | Calm brightness |
+| Accent 2 | Bright Yellow | #FBBF24 | Energy pop |
+| Accent 3 | Coral | #F6AD55 | Warm pop |
+| Accent 4 | Turquoise | #38B2AC | Cool pop |
+| Text | Soft Charcoal | #4A4A4A | Text elements |
+
+## Visual Elements
+
+- Doodles and sketchy lines
+- Star and sparkle decorations
+- Swirls and curvy elements
+- Cute character illustrations
+- Speech bubbles and callouts
+- Emoji-style icons
+- Confetti and celebration marks
+- Playful hand-lettering
+
+## Style Rules
+
+### Do
+
+- Use varied pastel palette
+- Add whimsical decorations
+- Create friendly characters
+- Include playful details
+- Keep energy high and positive
+
+### Don't
+
+- Use dark or moody colors
+- Create serious compositions
+- Add corporate elements
+- Use rigid geometric shapes
+- Make it feel professional
+
+## Best For
+
+Tutorials and guides, beginner-friendly content, casual articles, fun topics, children's content, hobby-related posts, entertaining explanations
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\retro.md ===
+# retro
+
+80s/90s nostalgic aesthetic with vibrant colors and geometric patterns
+
+## Design Aesthetic
+
+Nostalgic retro aesthetic inspired by 80s and 90s design trends. Vibrant neon colors, geometric patterns, and Memphis design influence. Energetic, fun, and unapologetically bold. Perfect for content that embraces nostalgia or playful energy.
+
+## Background
+
+- Color: Deep Purple (#2D1B4E) or Dark Teal (#0F4C5C)
+- Texture: Subtle grid patterns or geometric shapes
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Deep Purple | #2D1B4E | Primary background |
+| Alt Background | Dark Teal | #0F4C5C | Alternative |
+| Primary | Hot Pink | #FF1493 | Main accent |
+| Secondary | Electric Cyan | #00FFFF | Supporting |
+| Tertiary | Neon Yellow | #FFFF00 | Highlights |
+| Accent 1 | Lime Green | #32CD32 | Energy |
+| Accent 2 | Orange | #FF6B35 | Warmth |
+| Text | White | #FFFFFF | Text elements |
+| Grid | Light Purple | #9D8EC0 | Grid lines |
+
+## Visual Elements
+
+- Geometric patterns (triangles, circles)
+- Grid backgrounds and lines
+- Neon glow effects
+- Memphis design shapes
+- Zigzag and wavy patterns
+- Retro computer graphics
+- Bold outline strokes
+- Gradient sunsets
+
+## Style Rules
+
+### Do
+
+- Use bold neon colors
+- Create geometric patterns
+- Add retro typography
+- Include Memphis-style shapes
+- Embrace maximalism
+
+### Don't
+
+- Use muted or subtle colors
+- Create minimal compositions
+- Add modern flat design
+- Make it look contemporary
+- Use understated elements
+
+## Best For
+
+Pop culture articles, gaming content, music and entertainment, nostalgia pieces, youth-focused content, creative industry, party and event content
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\scientific.md ===
+# scientific
+
+Academic scientific illustration style for technical diagrams and processes
+
+## Design Aesthetic
+
+Academic scientific illustration aesthetic for biological, chemical, and technical diagrams. Clean, precise diagrams with proper labeling and clear visual flow. Educational clarity with professional polish. Textbook quality illustrations.
+
+## Background
+
+- Color: Off-White (#FAFAFA) or Light Blue-Gray (#F0F4F8)
+- Texture: None or subtle paper grain
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Off-White | #FAFAFA | Primary background |
+| Primary Text | Dark Slate | #1E293B | Labels, headers |
+| Label Text | Medium Gray | #475569 | Annotations |
+| Pathway 1 | Teal | #0D9488 | Primary pathway |
+| Pathway 2 | Blue | #3B82F6 | Secondary pathway |
+| Pathway 3 | Purple | #8B5CF6 | Tertiary pathway |
+| Structure | Amber | #F59E0B | Membranes, structures |
+| Alert | Red | #EF4444 | Key elements |
+| Positive | Green | #22C55E | Products, outputs |
+
+## Visual Elements
+
+- Precise labeled diagrams
+- Flow arrows showing direction
+- Modular components with colors
+- Chemical formulas and notation
+- Cross-section views
+- Numbered step sequences
+- Molecule and cell representations
+- Process summary boxes
+
+## Style Rules
+
+### Do
+
+- Use precise consistent lines
+- Label all components clearly
+- Show directional flow
+- Include technical notation
+- Create clear numbered sequences
+
+### Don't
+
+- Use decorative elements
+- Create imprecise diagrams
+- Omit important labels
+- Use inconsistent styling
+- Add artistic flourishes
+
+## Best For
+
+Biology articles, chemistry explanations, medical content, research summaries, academic writing, technical documentation, process explanations
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\baoyu-article-illustrator\references\styles\screen-print.md ===
+# screen-print
+
+Bold poster art with limited colors, halftone textures, and symbolic storytelling
+
+## Design Aesthetic
+
+Screen print / silkscreen aesthetic inspired by Mondo limited-edition posters and vintage concert prints. Flat color blocks, halftone dot patterns, bold silhouettes, and deliberate print imperfections. Conceptual and symbolic rather than literal — one iconic image tells the whole story. Perfect for opinion pieces, cultural commentary, and editorial content.
+
+## Background
+
+- Color: Off-Black (#121212) or Warm Cream (#F5E6D0)
+- Texture: Paper grain with subtle halftone dot overlay
+
+## Color Palette
+
+| Role | Color | Hex | Usage |
+|------|-------|-----|-------|
+| Background | Off-Black | #121212 | Dark compositions |
+| Background Alt | Warm Cream | #F5E6D0 | Light compositions |
+| Primary | Burnt Orange | #E8751A | Main accent |
+| Secondary | Deep Teal | #0A6E6E | Contrast accent |
+| Tertiary | Crimson | #C0392B | Bold emphasis |
+| Highlight | Amber | #F4A623 | Small accents |
+| Text | Cream White | #FAF3E0 | On dark backgrounds |
+
+**Duotone Pairs** (choose ONE pair for high-impact compositions):
+
+| Pair | Color A | Color B | Feel |
+|------|---------|---------|------|
+| Orange + Teal | #E8751A | #0A6E6E | Cinematic, action |
+| Red + Cream | #C0392B | #F5E6D0 | Bold, classic |
+| Blue + Gold | #1A3A5C | #D4A843 | Prestigious, premium |
+| Crimson + Navy | #DC143C | #0D1B2A | Dramatic, noir |
+
+**Rule**: Use 2-5 colors maximum. Fewer colors = stronger impact.
+
+## Visual Elements
+
+- Bold silhouettes and symbolic shapes
+- Halftone dot patterns within color fills
+- Slight color layer misregistration (print offset effect)
+- Geometric framing (circles, arches, triangles)
+- Figure-ground inversion (negative space forms secondary image)
+- Stencil-cut edges, no outlines — shapes defined by color boundaries
+- Typography integrated as design element, not overlay
+- Vintage poster border treatments
+
+## Style Rules
+
+### Do
+
+- Limit to 2-5 flat colors
+- Use bold silhouettes over detailed rendering
+- Let negative space tell part of the story
+- Add halftone texture for authenticity
+- Use geometric composition (centered, symmetrical)
+- Reference vintage decades (60s/70s/80s) for era feel
+
+### Don't
+
+- Use photorealistic rendering or gradients
+- Add complex facial details (silhouettes preferred)
+- Mix too many visual elements (one focal point)
+- Use modern digital aesthetic
+- Create busy or cluttered compositions
+- Use more than 5 colors
+
+## Best For
+
+Opinion/editorial articles, cultural commentary, philosophy and strategy, dramatic narratives, cinematic storytelling, music and entertainment, event announcements, bold branding content
+

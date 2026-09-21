@@ -1,0 +1,302 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_search_slow_query_log.py ===
+"""Tests for the session-search slow-query log (salvaged from PR #65544)."""
+
+import logging
+
+import pytest
+
+from hermes_state import SessionDB
+
+
+@pytest.fixture()
+def db(tmp_path):
+    d = SessionDB(db_path=tmp_path / "state.db")
+    d.create_session(session_id="s1", source="cli", model="m")
+    d.append_message("s1", role="user", content="hello graphiti 일본 MCP 정리")
+    yield d
+    d.close()
+
+
+def test_slow_log_emitted_at_zero_threshold(db, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_SEARCH_SLOW_MS", "0")
+    with caplog.at_level(logging.INFO, logger="hermes_state"):
+        rows = db.search_messages("graphiti", limit=5)
+    assert rows
+    slow = [r for r in caplog.records if "slow session search" in r.getMessage()]
+    assert slow, "threshold 0 must log every search"
+    msg = slow[0].getMessage()
+    assert "path=" in msg and "rows=1" in msg
+
+
+def test_no_log_under_threshold(db, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_SEARCH_SLOW_MS", "60000")
+    with caplog.at_level(logging.INFO, logger="hermes_state"):
+        db.search_messages("graphiti", limit=5)
+    assert not [r for r in caplog.records if "slow session search" in r.getMessage()]
+
+
+def test_path_attribution(db):
+    # Without the cjk tokenizer loaded, routing matches the pre-cjk shape.
+    assert db._describe_search_path("graphiti OR neo4j") == "fts5"
+    assert db._describe_search_path("우선순위 캘린더") == "trigram"
+    assert db._describe_search_path("일본 MCP") == "like_scan"
+
+
+def test_path_attribution_cjk_available(db):
+    # With the bigram index available, CJK queries (including 2-char terms)
+    # route to fts_cjk; lone 1-char CJK runs keep the LIKE route.
+    db._fts_cjk_available = True
+    try:
+        assert db._describe_search_path("일본 MCP") == "fts_cjk"
+        assert db._describe_search_path("우선순위 캘린더") == "fts_cjk"
+        assert db._describe_search_path("가 alone") == "like_scan"
+        assert db._describe_search_path("graphiti OR neo4j") == "fts5"
+    finally:
+        db._fts_cjk_available = False
+
+
+def test_results_unchanged_by_wrapper(db, monkeypatch):
+    monkeypatch.setenv("HERMES_SEARCH_SLOW_MS", "0")
+    rows = db.search_messages("graphiti", limit=5)
+    assert rows and rows[0]["session_id"] == "s1"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_session_archiving.py ===
+import time
+
+import pytest
+
+from hermes_state import SessionDB
+
+
+@pytest.fixture
+def db(tmp_path):
+    database = SessionDB(tmp_path / "state.db")
+    try:
+        yield database
+    finally:
+        database.close()
+
+
+def _compression_pair(db: SessionDB):
+    base = time.time() - 100
+    db.create_session("root", source="cli")
+    db.create_session("tip", source="cli", parent_session_id="root")
+    db._conn.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = 'compression', message_count = 1 WHERE id = 'root'",
+        (base, base + 10),
+    )
+    db._conn.execute(
+        "UPDATE sessions SET started_at = ?, message_count = 1 WHERE id = 'tip'",
+        (base + 20,),
+    )
+    db._conn.commit()
+
+
+def test_archiving_compression_tip_archives_projected_root(db):
+    _compression_pair(db)
+
+    assert db.set_session_archived("tip", True) is True
+
+    assert db.get_session("root")["archived"] == 1
+    assert db.get_session("tip")["archived"] == 1
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == []
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True, archived_only=True)] == ["tip"]
+
+
+def test_unarchiving_compression_tip_unarchives_projected_root(db):
+    _compression_pair(db)
+    db.set_session_archived("tip", True)
+
+    assert db.set_session_archived("tip", False) is True
+
+    assert db.get_session("root")["archived"] == 0
+    assert db.get_session("tip")["archived"] == 0
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["tip"]
+
+
+def test_archived_only_view_includes_hidden_archived_sessions(db):
+    """The archived-only view is the recovery surface: a session that is both
+    archived and hidden (Bot Mode marks its sessions hidden) must appear
+    there, otherwise it is unreachable from every UI list (#90946)."""
+    db.create_session("plain", source="cli")
+    db.create_session("both", source="cli")
+    assert db.set_session_hidden("both", True) is True
+    assert db.set_session_archived("both", True) is True
+
+    # Default list: hidden rows stay excluded (unchanged behaviour)...
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["plain"]
+    # ...and the archived-only view must surface the archived+hidden row.
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True, archived_only=True)] == ["both"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_session_db_context_manager.py ===
+"""``SessionDB`` must support ``with``, so an owning scope releases its fds.
+
+Historically a SessionDB handle could not be released by dropping the last
+reference: once its background token writer started, the instance pinned
+ITSELF two ways (the writer thread's bound-method target, and a strong
+``atexit`` drain hook that only ``close()`` unregistered), so ``__del__``
+never ran for exactly the instances that leaked ``state.db``/``-wal``/
+``-shm`` descriptors (#88033). The writer now retires after an idle window
+and the atexit hook is a weak reference, so abandoned handles are eventually
+GC-collectible -- but eventual collection is not deterministic release.
+
+Owning call sites are still expected to close explicitly; the ownership
+comments in ``run_agent.py`` and ``tui_gateway/methods_session.py`` say so in
+those words. This module pins the ergonomic half of that contract: an owner can
+scope a handle with ``with`` and be exception-safe by construction, instead of
+hand-writing a ``try/finally`` at each of the ~59 instantiation sites (#88033).
+
+Following ``test_session_db_read_conn_pool.py``, these assert on the
+``sqlite_safe_read`` tracking registry rather than on raw descriptor counts:
+SQLite's unix VFS parks a closed descriptor on a per-inode reuse list while any
+connection still holds POSIX locks on that inode, so descriptor counts lag the
+real connection count and make such assertions flaky.
+"""
+
+import pytest
+
+from hermes_state import SessionDB
+
+
+def _live_count(path) -> int:
+    """Live-connection count the tracking registry holds for *path*."""
+    import hermes_cli.sqlite_safe_read as mod
+
+    with mod._live_lock:
+        return mod._live_connections.get(mod._key(path), 0)
+
+
+def test_with_block_closes_the_handle(tmp_path):
+    """The whole point: leaving the scope releases the connection."""
+    path = tmp_path / "state.db"
+
+    with SessionDB(db_path=path) as db:
+        db.create_session(session_id="s1", source="cli", model="m")
+        db.append_message("s1", role="user", content="hello")
+        assert db._conn is not None
+        assert _live_count(path) > 0
+
+    assert db._conn is None
+    assert _live_count(path) == 0
+
+
+def test_enter_returns_the_same_handle(tmp_path):
+    """``with SessionDB(...) as db`` must bind the instance, not a wrapper.
+
+    Returning anything else would silently break every attribute access in the
+    body, so this is cheap insurance on the one line that is easy to get wrong.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    with db as entered:
+        assert entered is db
+
+    assert db._conn is None
+
+
+def test_exception_inside_the_block_still_closes_and_propagates(tmp_path):
+    """Exception safety is the reason to prefer ``with`` over a bare close().
+
+    The handle must be released on the failure path (the path that leaked
+    hardest, since it is the one callers forget), and ``__exit__`` must NOT
+    suppress: swallowing a caller's error to release a descriptor would trade
+    one bug for a worse one.
+    """
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+
+    with pytest.raises(ValueError, match="boom"):
+        with db:
+            db.create_session(session_id="s1", source="cli", model="m")
+            raise ValueError("boom")
+
+    assert db._conn is None
+    assert _live_count(path) == 0
+
+
+def test_closing_inside_the_block_leaves_the_exit_clean(tmp_path):
+    """``close()`` is documented idempotent; the scope must not fight a caller.
+
+    A call site converted to ``with`` may still hold an explicit ``close()``
+    (or hit one on an internal error path). The second close from ``__exit__``
+    must be a no-op rather than an error.
+    """
+    path = tmp_path / "state.db"
+
+    with SessionDB(db_path=path) as db:
+        db.create_session(session_id="s1", source="cli", model="m")
+        db.close()
+        assert db._conn is None
+
+    assert _live_count(path) == 0
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_state\test_session_db_leak_sweep.py ===
+"""Suite-wide SessionDB leak-closing contract (OOM incident 20260816).
+
+A raw single-process ``pytest tests/hermes_cli/`` used to accumulate every
+SessionDB a test constructed and forgot to close — writer connection,
+pooled read connections, and (once token accounting ran) an ``atexit``
+registration pinning the instance alive — ballooning to 16-25 GB RSS.
+
+The fix is two-sided:
+
+* ``hermes_state_guard._register_test_instance`` adds every successfully
+  constructed SessionDB to a WeakSet registry when the
+  ``HERMES_TEST_ISOLATION`` marker is set (test-isolation runs only).
+* the autouse ``_close_leaked_session_dbs`` fixture in ``tests/conftest.py``
+  closes everything in the registry at each test's teardown.
+
+These tests pin the *behavior contract*: instances register under pytest,
+close() empties them idempotently, and a leaked instance from an earlier
+test is actually closed by the suite-level sweep.
+"""
+
+from __future__ import annotations
+
+import hermes_state_guard
+from hermes_state import SessionDB
+
+# Deliberate cross-test handoff: test_leaked_instance_* leaks an instance;
+# the later test (pytest runs file order deterministically without a
+# randomizer plugin, and the sanctioned runner executes whole files in one
+# process) asserts the autouse teardown sweep closed it.
+_leaked: list[SessionDB] = []
+
+
+def test_constructed_sessiondb_is_registered(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        assert db in hermes_state_guard._test_instance_registry
+    finally:
+        db.close()
+    # close() must fully release the writer connection…
+    assert db._conn is None
+    # …and be idempotent: a second close (the suite sweep will call it
+    # again at teardown) must not raise.
+    db.close()
+
+
+def test_leaked_instance_stays_open_within_the_test(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id="leak-probe", source="cli", model="m")
+    # Intentionally NOT closed — the suite-level sweep owns cleanup.
+    assert db._conn is not None
+    _leaked.append(db)
+
+
+def test_previously_leaked_instance_was_closed_by_the_sweep():
+    assert _leaked, "expected the previous test to have leaked an instance"
+    db = _leaked.pop()
+    # The autouse _close_leaked_session_dbs teardown between the two tests
+    # must have closed the leaked instance (writer conn released), which is
+    # what bounds fd/RSS growth in single-process runs.
+    assert db._conn is None
+

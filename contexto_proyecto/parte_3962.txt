@@ -1,0 +1,439 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_har_derived_api_client_skill.py ===
+"""Tests for the har-derived-api-client optional skill.
+
+Two layers, both stdlib + pytest, no network:
+  1. Structural / frontmatter contract on SKILL.md (matches the maintainer
+     review checklist for optional skills).
+  2. Behavioral: run the real har_to_client.py logic against a synthetic HAR
+     fixture and assert it derives the endpoint, collapses id path segments,
+     filters static assets, and surfaces the User-Agent replay hint.
+"""
+
+import importlib.util
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+SKILL_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "optional-skills"
+    / "web-development"
+    / "har-derived-api-client"
+)
+SKILL_MD = SKILL_DIR / "SKILL.md"
+CAPTURE = SKILL_DIR / "scripts" / "har_capture.py"
+CAPTURE_CDP = SKILL_DIR / "scripts" / "har_capture_cdp.py"
+DERIVE = SKILL_DIR / "scripts" / "har_to_client.py"
+
+
+@pytest.fixture(scope="module")
+def skill_text() -> str:
+    return SKILL_MD.read_text(encoding="utf-8")
+
+
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --- structural contract ---------------------------------------------------
+
+
+def test_skill_files_exist():
+    assert SKILL_MD.is_file()
+    assert CAPTURE.is_file()
+    assert CAPTURE_CDP.is_file()
+    assert DERIVE.is_file()
+
+
+def test_frontmatter_present(skill_text: str):
+    assert skill_text.startswith("---\n")
+    assert skill_text.count("---") >= 2
+
+
+def test_description_under_sixty_chars(skill_text: str):
+    m = re.search(r"^description: (.*)$", skill_text, re.MULTILINE)
+    assert m, "no description field"
+    desc = m.group(1).strip()
+    assert len(desc) <= 60, f"description is {len(desc)} chars (>60): {desc!r}"
+    assert desc.endswith("."), "description should end with a period"
+
+
+def test_required_sections_present(skill_text: str):
+    for heading in (
+        "## When to Use",
+        "## Prerequisites",
+        "## How to Run",
+        "## Quick Reference",
+        "## Procedure",
+        "## Pitfalls",
+        "## Verification",
+    ):
+        assert heading in skill_text, f"missing section: {heading}"
+
+
+# --- behavioral: derivation logic -----------------------------------------
+
+
+def _make_har() -> dict:
+    return {
+        "log": {
+            "entries": [
+                {  # a JSON API call we want derived, with an id path segment
+                    "_resourceType": "fetch",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://api.example.com/v1/items/12345/reviews?limit=5",
+                        "queryString": [{"name": "limit", "value": "5"}],
+                        "headers": [
+                            {"name": "User-Agent", "value": "Mozilla/5.0 TestBrowser/1.0"},
+                            {"name": "accept", "value": "application/json"},
+                            {"name": "referer", "value": "https://example.com/"},
+                        ],
+                    },
+                    "response": {
+                        "status": 200,
+                        "content": {
+                            "mimeType": "application/json",
+                            "text": '{"reviews":[{"id":1}]}',
+                        },
+                    },
+                },
+                {  # a static asset we must filter out by default
+                    "_resourceType": "script",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://cdn.example.com/app.js",
+                        "queryString": [],
+                        "headers": [{"name": "User-Agent", "value": "Mozilla/5.0 TestBrowser/1.0"}],
+                    },
+                    "response": {"status": 200, "content": {"mimeType": "application/javascript"}},
+                },
+            ]
+        }
+    }
+
+
+def test_derives_endpoint_and_filters_static(tmp_path, capsys):
+    mod = _load_module(DERIVE, "har_to_client_undertest")
+    har = tmp_path / "t.har"
+    har.write_text(json.dumps(_make_har()), encoding="utf-8")
+
+    import sys
+
+    argv = sys.argv
+    try:
+        sys.argv = ["har_to_client.py", str(har), "--host", "example.com"]
+        rc = mod.main()
+    finally:
+        sys.argv = argv
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    # id path segment collapsed to {id}
+    assert "GET https://api.example.com/v1/items/{id}/reviews" in out
+    # query param surfaced
+    assert "limit = 5" in out
+    # static JS filtered out
+    assert "app.js" not in out
+    # boring header dropped, useful one absent from list but UA promoted to hints
+    assert "referer" not in out
+    # replay hint carries the browser UA
+    assert "User-Agent (send this): Mozilla/5.0 TestBrowser/1.0" in out
+
+
+def test_path_template_collapses_ids():
+    mod = _load_module(DERIVE, "har_to_client_undertest2")
+    assert mod.path_template("/v1/items/12345/x") == "/v1/items/{id}/x"
+    assert mod.path_template("/v1/items/abc/x") == "/v1/items/abc/x"
+
+
+def test_capture_actions_parse_ok():
+    # har_capture imports playwright at module top; only assert the file is
+    # syntactically valid and exposes run_action without importing playwright.
+    src = CAPTURE.read_text(encoding="utf-8")
+    compile(src, str(CAPTURE), "exec")
+    assert "def run_action(" in src
+    assert 'record_har_content="embed"' in src
+
+
+def test_cdp_capture_is_valid_and_attaches_not_launches():
+    # Covers the CDP pathway (cloud backends / /browser connect). Syntax-check
+    # without importing playwright, and assert it attaches (connect_over_cdp)
+    # and does NOT close a browser it doesn't own.
+    src = CAPTURE_CDP.read_text(encoding="utf-8")
+    compile(src, str(CAPTURE_CDP), "exec")
+    assert "connect_over_cdp(" in src
+    assert 'page.on("request"' in src and 'page.on("response"' in src
+    # must not tear down a browser it merely attached to
+    assert "browser.close()" not in src
+
+
+def test_skill_documents_all_browser_pathways(skill_text: str):
+    # The skill must route every Hermes browser backend to the right capturer.
+    for token in ("Browserbase", "Browser-Use", "Firecrawl", "browser connect",
+                  "har_capture_cdp.py", "connect_over_cdp"):
+        assert token in skill_text, f"pathway coverage missing: {token}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_hermes_agent_skill.py ===
+"""The `hermes-agent` skill is what a running Hermes knows about itself.
+
+`website/` is never packaged, so an installed Hermes has no local copy of the
+user guide; skills ARE synced into `$HERMES_HOME/skills/`. The skill therefore
+does not try to restate the product — it routes to the published `llms.txt`,
+which is generated from the docs tree on every build and so can never be behind
+the feature set. These tests keep that routing honest: the index has to be where
+the skill says it is, and every reference has to be reachable, otherwise a
+shipped feature is invisible and the agent answers "Hermes can't do that."
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+SKILL_DIR = REPO / "skills" / "autonomous-ai-agents" / "hermes-agent"
+SKILL_MD = SKILL_DIR / "SKILL.md"
+GENERATOR = REPO / "website" / "scripts" / "generate-llms-txt.py"
+
+
+@pytest.fixture(scope="module")
+def skill_text() -> str:
+    return SKILL_MD.read_text(encoding="utf-8")
+
+
+def test_every_referenced_file_exists(skill_text):
+    """Routing a question to a file that isn't there is a dead end."""
+    targets = set(re.findall(r"`((?:references|templates)/[^`]+)`", skill_text))
+
+    assert targets, "the skill's routing table no longer references any files"
+    for target in sorted(targets):
+        assert (SKILL_DIR / target).exists(), f"SKILL.md routes to missing {target}"
+
+
+def test_every_reference_is_reachable_from_the_skill(skill_text):
+    """An unrouted reference is one the agent will never think to open.
+
+    This is the failure that produced the original complaint: content can exist
+    and still be invisible because nothing points at it.
+    """
+    on_disk = {f"references/{path.name}" for path in (SKILL_DIR / "references").glob("*.md")}
+    routed = set(re.findall(r"`(references/[^`]+)`", skill_text))
+
+    assert not (on_disk - routed), (
+        f"reference files no reader will ever reach: {sorted(on_disk - routed)} — "
+        "add a routing-table row in SKILL.md"
+    )
+
+
+def test_unknown_features_route_to_the_published_index(skill_text):
+    """The catch-all is what makes coverage of the whole product possible."""
+    assert "/docs/llms.txt" in skill_text
+    # web_extract can be disabled; terminal never is.
+    assert "curl" in skill_text, "no way to reach the index without web tools"
+
+
+def test_the_index_is_published_where_the_skill_says_it_is(skill_text):
+    """A skill pointing at a URL nobody generates is worse than no routing."""
+    spec = importlib.util.spec_from_file_location("generate_llms_txt", GENERATOR)
+    assert spec is not None and spec.loader is not None
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+
+    assert f"{gen.SITE_BASE}/llms.txt" in skill_text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_hyperliquid_skill.py ===
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+
+SCRIPT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "optional-skills"
+    / "blockchain"
+    / "hyperliquid"
+    / "scripts"
+    / "hyperliquid_client.py"
+)
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("hyperliquid_skill", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_normalize_perp_markets_extracts_change_and_volume():
+    mod = load_module()
+
+    payload = [
+        {
+            "universe": [
+                {"name": "BTC", "szDecimals": 5, "maxLeverage": 50},
+                {"name": "ETH", "szDecimals": 4, "maxLeverage": 25, "isDelisted": True},
+            ]
+        },
+        [
+            {
+                "markPx": "100000",
+                "prevDayPx": "95000",
+                "funding": "0.0001",
+                "openInterest": "123456789",
+                "dayNtlVlm": "999999999",
+            },
+            {
+                "markPx": "2500",
+                "prevDayPx": "2600",
+                "funding": "-0.0002",
+                "openInterest": "20000000",
+                "dayNtlVlm": "11111111",
+            },
+        ],
+    ]
+
+    rows = mod._normalize_perp_markets(payload)
+
+    assert len(rows) == 2
+    assert rows[0]["coin"] == "BTC"
+    assert round(rows[0]["change_pct"], 2) == 5.26
+    assert rows[0]["day_ntl_vlm"] == "999999999"
+    assert rows[1]["is_delisted"] is True
+
+
+
+
+def test_main_markets_json_prints_normalized_payload(capsys):
+    mod = load_module()
+
+    payload = [
+        {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]},
+        [{"markPx": "101000", "prevDayPx": "100000", "dayNtlVlm": "10"}],
+    ]
+
+    with patch.object(mod, "_post_info", return_value=payload):
+        exit_code = mod.main(["markets", "--limit", "1", "--json"])
+
+    stdout = capsys.readouterr().out
+    rendered = json.loads(stdout)
+
+    assert exit_code == 0
+    assert rendered["count"] == 1
+    assert rendered["markets"][0]["coin"] == "BTC"
+    assert round(rendered["markets"][0]["change_pct"], 2) == 1.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_env_lookup_reads_hermes_dotenv(tmp_path, monkeypatch):
+    mod = load_module()
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / ".env").write_text(
+        "HYPERLIQUID_USER_ADDRESS=0xdotenv123\nHYPERLIQUID_API_URL=https://api.hyperliquid-testnet.xyz\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HYPERLIQUID_USER_ADDRESS", raising=False)
+    monkeypatch.delenv("HYPERLIQUID_API_URL", raising=False)
+
+    assert mod._env_lookup("HYPERLIQUID_USER_ADDRESS") == "0xdotenv123"
+    assert mod._resolve_user("") == "0xdotenv123"
+    assert mod._info_url() == "https://api.hyperliquid-testnet.xyz/info"
+
+
+def test_user_dotenv_overrides_project_dotenv(tmp_path, monkeypatch):
+    mod = load_module()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / ".env").write_text("HYPERLIQUID_USER_ADDRESS=0xproject\n", encoding="utf-8")
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text("HYPERLIQUID_USER_ADDRESS=0xuserhome\n", encoding="utf-8")
+
+    monkeypatch.chdir(project_dir)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HYPERLIQUID_USER_ADDRESS", raising=False)
+
+    assert mod._env_lookup("HYPERLIQUID_USER_ADDRESS") == "0xuserhome"
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_ip_as_logo_skill.py ===
+"""Tests for the ip-as-logo optional skill."""
+
+import re
+from pathlib import Path
+
+import yaml
+
+SKILL_PATH = (
+    Path(__file__).resolve().parents[2] / "optional-skills" / "creative" / "ip-as-logo" / "SKILL.md"
+)
+
+
+def _frontmatter_and_body():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert content.startswith("---")
+    m = re.search(r"\n---\s*\n", content[3:])
+    assert m, "frontmatter must close with ---"
+    return yaml.safe_load(content[3 : m.start() + 3]), content[m.end() + 3 :]
+
+
+def test_frontmatter_fields_and_section_order():
+    fm, body = _frontmatter_and_body()
+    for field in ("name", "description", "version", "author", "license", "platforms"):
+        assert field in fm, f"missing frontmatter field: {field}"
+    assert fm["name"] == "ip-as-logo"
+    assert fm["metadata"]["hermes"]["category"] == "creative"
+    headings = re.findall(r"^## (.+)$", body, re.MULTILINE)
+    expected = ["When to Use", "Prerequisites", "Procedure"]
+    assert [h for h in headings if h in expected] == expected, headings
+    assert headings[-1] == "Verification"
+
+
+def test_generation_routes_through_native_tool():
+    """The upstream skill targeted another agent's image pipeline; the port must
+    route through Hermes' `image_generate` and carry no residue of that harness."""
+    _, body = _frontmatter_and_body()
+    assert "`image_generate`" in body
+    assert 'aspect_ratio="square"' in body
+    assert not re.search(r"\bImageGen\b|\bCodex\b|\bClaude\b", body)
+

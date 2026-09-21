@@ -1,0 +1,311 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\nous\__init__.py ===
+"""Nous Portal provider profile."""
+
+from typing import Any
+
+from agent.portal_tags import get_affinity_scope, get_conversation_context, nous_portal_tags
+from agent.transports.codex import _cache_scope_from_session_id
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class NousProfile(ProviderProfile):
+    """Nous Portal — product tags, reasoning with Nous-specific omission."""
+
+    def resolve_aux_model(self, *, vision: bool = False) -> str:
+        """Portal's tier-aware ``/api/nous/recommended-models`` pick (cached, offline-safe)."""
+        try:
+            from hermes_cli.models import get_nous_recommended_aux_model
+
+            return get_nous_recommended_aux_model(vision=vision) or ""
+        except Exception:
+            return ""
+
+    def build_extra_body(self, *, session_id: str | None = None, **context) -> dict[str, Any]:
+        body: dict[str, Any] = {"tags": nous_portal_tags(session_id=session_id)}
+        # Top-level session_id = sticky routing key, so Anthropic-style cache
+        # breakpoints stay warm on one upstream instance. Resolved like the
+        # ``conversation=`` tag: declared scope, then the ambient lineage ROOT
+        # (covers aux call sites that pass no session_id), then the explicit argument.
+        sticky_key = _cache_scope_from_session_id(get_affinity_scope() or get_conversation_context() or session_id)
+        if sticky_key:
+            body["session_id"] = sticky_key
+        # Nous Portal inference rejects caller-supplied provider routing prefs
+        # (only/ignore/order/sort/data_collection/zdr/require_parameters) with
+        # HTTP 400 — routing is decided centrally per model. provider_routing
+        # from config.yaml is OpenRouter-only, so it is not forwarded here.
+        return body
+
+    @staticmethod
+    def _cannot_disable_reasoning(model: str | None) -> bool:
+        """True when ``reasoning: {enabled: false}`` would 400 on *model*. Cache-only catalog
+        lookup; unknown/cold (warmer kicked) and no-reasoning routes both answer True (omit > 400)."""
+        try:
+            from hermes_cli.models_reasoning_caps import nous_model_reasoning_capabilities, warm_nous_reasoning_caps_async
+
+            caps = nous_model_reasoning_capabilities(model)
+            if caps is None:
+                warm_nous_reasoning_caps_async()
+                return True
+        except Exception:
+            return True
+        return not caps.get("supports_reasoning") or bool(caps.get("mandatory"))
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, supports_reasoning: bool = False,
+        model: str | None = None, **context,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Pass the full reasoning_config, disable included (the Portal honors it;
+        omitting it means the upstream default, thinking ON for V4-class models)."""
+        if not supports_reasoning:
+            return {}, {}
+        if reasoning_config is None:
+            return {"reasoning": {"enabled": True, "effort": "medium"}}, {}
+        rc = dict(reasoning_config)
+        if rc.get("enabled") is False and self._cannot_disable_reasoning(model):
+            return {}, {}
+        return {"reasoning": rc}, {}
+
+
+nous = NousProfile(
+    name="nous", aliases=("nous-portal", "nousresearch"), env_vars=("NOUS_API_KEY",),
+    display_name="Nous Research", description="Nous Research — Hermes model family",
+    signup_url="https://nousresearch.com/", fallback_models=("hermes-3-405b", "hermes-3-70b"),
+    base_url="https://inference-api.nousresearch.com/v1", auth_type="oauth_device_code",
+)
+
+register_provider(nous)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\novita\__init__.py ===
+"""NovitaAI provider profile."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+novita = ProviderProfile(
+    name="novita", aliases=("novita-ai", "novitaai"), display_name="NovitaAI",
+    description="NovitaAI — AI-native cloud for builders and agents",
+    signup_url="https://novita.ai/settings/key-management", env_vars=("NOVITA_API_KEY", "NOVITA_BASE_URL"),
+    base_url="https://api.novita.ai/openai/v1", auth_type="api_key",
+    default_aux_model="deepseek/deepseek-v3-0324",
+    fallback_models=(
+        "moonshotai/kimi-k2.5", "minimax/minimax-m2.7", "zai-org/glm-5", "deepseek/deepseek-v3-0324",
+        "deepseek/deepseek-r1-0528", "qwen/qwen3-235b-a22b-fp8",
+    ),
+)
+
+register_provider(novita)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\nvidia\__init__.py ===
+"""NVIDIA NIM provider profile."""
+
+from typing import Any
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class NvidiaProviderProfile(ProviderProfile):
+    """NVIDIA NIM accepts a stricter ToolMessage schema than most OpenAI-compatible APIs."""
+
+    @staticmethod
+    def _needs_strip(msg: Any) -> bool:
+        return isinstance(msg, dict) and msg.get("role") == "tool" and ("name" in msg or "tool_name" in msg)
+
+    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Copy-on-write: only tool messages that lose a field are copied
+        (no deep copy of large tool outputs); untouched input returned as-is."""
+        if not any(self._needs_strip(msg) for msg in messages):
+            return messages
+        return [
+            {k: v for k, v in msg.items() if k not in ("name", "tool_name")} if self._needs_strip(msg) else msg
+            for msg in messages
+        ]
+
+
+nvidia = NvidiaProviderProfile(
+    name="nvidia", aliases=("nvidia-nim", "nim", "build-nvidia", "nemotron"), env_vars=("NVIDIA_API_KEY",), display_name="NVIDIA NIM",
+    description="NVIDIA NIM — accelerated inference", signup_url="https://build.nvidia.com/",
+    fallback_models=("nvidia/llama-3.1-nemotron-70b-instruct", "nvidia/llama-3.3-70b-instruct"),
+    base_url="https://integrate.api.nvidia.com/v1", default_max_tokens=16384,
+)
+
+register_provider(nvidia)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\ollama-cloud\__init__.py ===
+"""Ollama Cloud provider profile.
+
+Top-level ``reasoning_effort`` on /v1/chat/completions accepts none|low|medium|
+high|max (``max`` is undocumented but real — ~2.5x more thinking tokens on
+DeepSeek V4); Hermes' ``xhigh`` maps to ``max``.
+"""
+
+from typing import Any
+
+from agent.reasoning_effort import OLLAMA_CLOUD_EFFORTS, OLLAMA_CLOUD_OVERRIDES, clamp_effort
+from providers import register_provider
+from providers.base import ProviderProfile
+
+
+class OllamaCloudProfile(ProviderProfile):
+    """Ollama Cloud — maps xhigh→max via top-level reasoning_effort."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, supports_reasoning: bool = False, **ctx: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Gated on ``supports_reasoning`` (resolved from the model's /api/show
+        ``thinking`` capability) so non-thinking models get no meaningless field."""
+        if not supports_reasoning or not reasoning_config or not isinstance(reasoning_config, dict):
+            return {}, {}
+        # Ollama Cloud defaults to thinking ON and ignores extra_body.thinking
+        # (verified live); top-level reasoning_effort:"none" is the ONLY off switch.
+        effort = (reasoning_config.get("effort") or "").strip().lower()
+        if reasoning_config.get("enabled", True) is False or effort == "none":
+            return {}, {"reasoning_effort": "none"}
+        if not effort:
+            return {}, {}  # let the server default (thinking ON) apply
+        # "minimal" 400s -> clamps to low; xhigh rounds up to max. Bespoke
+        # levels outside the ladder are omitted rather than risking a 400.
+        clamped = clamp_effort(effort, OLLAMA_CLOUD_EFFORTS, OLLAMA_CLOUD_OVERRIDES)
+        return {}, {"reasoning_effort": clamped} if clamped in OLLAMA_CLOUD_EFFORTS else {}
+
+
+ollama_cloud = OllamaCloudProfile(
+    name="ollama-cloud", aliases=("ollama_cloud",), default_aux_model="nemotron-3-nano:30b",
+    env_vars=("OLLAMA_API_KEY",), base_url="https://ollama.com/v1",
+)
+
+register_provider(ollama_cloud)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\openai-codex\__init__.py ===
+"""OpenAI Codex (Responses API) provider profile."""
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+openai_codex = ProviderProfile(
+    name="openai-codex", aliases=("codex", "openai_codex"), api_mode="codex_responses",
+    env_vars=(),  # OAuth external — no API key
+    base_url="https://chatgpt.com/backend-api/codex", auth_type="oauth_external",
+)
+
+register_provider(openai_codex)
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\model-providers\opencode-zen\__init__.py ===
+"""OpenCode provider profiles (Zen + Go).
+
+Both route api_mode per model in core; these profiles carry the
+chat_completions reasoning translations (GLM-5.2, Kimi K2, DeepSeek, Ox Alpha).
+"""
+
+from typing import Any
+
+from agent import reasoning_effort as re_
+from hermes_cli import __version__ as _HERMES_VERSION
+from providers import register_provider
+from providers.base import ProviderProfile
+
+# Attribution headers (same values as OpenRouter / Vercel / Fireworks); via
+# default_headers so they survive model switches and credential rotation.
+_ATTRIBUTION_HEADERS = {
+    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+    "X-Title": "Hermes Agent",
+    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+}
+
+
+def _flat_model_name(model: str | None) -> str:
+    """Bare OpenCode model ID, tolerating aggregator prefixes."""
+    return (model or "").strip().rsplit("/", 1)[-1].lower()
+
+
+# Version-less DeepSeek ids that still carry the thinking/effort knobs on this wire: the retired
+# ``deepseek-reasoner`` alias and the canonical ``deepseek-flash`` (2026-09 Flash refresh), for
+# which the Go relay honours the same top-level ``reasoning_effort``/``thinking`` contract.
+_THINKING_CAPABLE_IDS: frozenset[str] = frozenset({"deepseek-reasoner", "deepseek-flash"})
+
+
+def _is_deepseek_thinking_model(model: str | None) -> bool:
+    m = _flat_model_name(model)
+    return (m.startswith("deepseek-v") and not m.startswith("deepseek-v3")) or m in _THINKING_CAPABLE_IDS
+
+
+def _is_glm_5_2_model(model: str | None) -> bool:
+    """GLM-5.2 across alias spellings (glm-5.2 / glm-5-2 / glm-5p2)."""
+    m = _flat_model_name(model)
+    return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
+
+
+class OpenCodeGoProfile(ProviderProfile):
+    """OpenCode Go - model-specific reasoning controls."""
+
+    # The relay's default max_tokens (262144) exceeds what Xiaomi accepts for
+    # mimo-v2.5-pro and 400s; keys are normalized via _flat_model_name().
+    _MODEL_MAX_TOKENS: dict[str, int] = {"mimo-v2.5-pro": 131072}
+
+    def get_max_tokens(self, model: str | None) -> int | None:
+        cap = self._MODEL_MAX_TOKENS.get(_flat_model_name(model))
+        return self.default_max_tokens if cap is None else cap
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if _is_glm_5_2_model(model):
+            # Native reasoning_effort knob (high/max); server default when unset/disabled.
+            effort = re_.requested_effort(reasoning_config)
+            if effort is None or effort == "none":
+                return {}, {}
+            clamped = re_.clamp_effort(effort, re_.GLM52_EFFORTS, re_.GLM52_OVERRIDES)
+            return {}, {"reasoning_effort": clamped if clamped in re_.GLM52_EFFORTS else "high"}
+        if _flat_model_name(model).startswith("kimi-k2"):
+            if not isinstance(reasoning_config, dict):
+                return {}, {}
+            return re_.thinking_toggle_extras(reasoning_config, re_.KIMI_K2_EFFORTS)
+        if _is_deepseek_thinking_model(model):
+            return re_.thinking_toggle_extras(reasoning_config, re_.DEEPSEEK_V4_EFFORTS, re_.DEEPSEEK_V4_OVERRIDES)
+        return {}, {}
+
+
+class OpenCodeZenProfile(ProviderProfile):
+    """OpenCode Zen - model-specific reasoning controls."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return re_.ox_alpha_reasoning_extras(reasoning_config, model)
+
+
+opencode_zen = OpenCodeZenProfile(
+    name="opencode-zen", aliases=("opencode", "opencode_zen", "zen"), env_vars=("OPENCODE_ZEN_API_KEY",),
+    base_url="https://opencode.ai/zen/v1", default_headers=dict(_ATTRIBUTION_HEADERS),
+    default_aux_model="gemini-3-flash",
+)
+
+opencode_go = OpenCodeGoProfile(
+    name="opencode-go", aliases=("opencode_go", "go", "opencode-go-sub"), env_vars=("OPENCODE_GO_API_KEY",),
+    base_url="https://opencode.ai/zen/go/v1", default_headers=dict(_ATTRIBUTION_HEADERS),
+    default_aux_model="glm-5",
+    # The Go relay's upstream validates tool content as a strict string: list-type tool
+    # content (native vision embeds) 422s with ``messages.N.tool.content.str Input should
+    # be a valid string`` (Console Go, #104731) or 400s ``text is not set`` (MiMo, #47026),
+    # and the rejected row stays in history so every later call dies too. Images in user
+    # messages are fine, so vision itself keeps working via the text-summary downgrade.
+    supports_vision_tool_messages=False,
+)
+
+register_provider(opencode_zen)
+register_provider(opencode_go)
+

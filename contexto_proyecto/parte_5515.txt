@@ -1,0 +1,586 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\optional\research\research-scrapling.md ===
+---
+title: "Scrapling"
+sidebar_label: "Scrapling"
+description: "使用 Scrapling 进行网页抓取——HTTP 获取、隐身浏览器自动化、Cloudflare 绕过及通过 CLI 和 Python 进行爬虫抓取"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Scrapling
+
+使用 Scrapling 进行网页抓取——HTTP 获取、隐身浏览器自动化、Cloudflare 绕过及通过 CLI 和 Python 进行爬虫抓取。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 可选——使用 `hermes skills install official/research/scrapling` 安装 |
+| 路径 | `optional-skills/research/scrapling` |
+| 版本 | `1.0.0` |
+| 作者 | FEUAZUR |
+| 许可证 | MIT |
+| 平台 | linux, macos, windows |
+| 标签 | `Web Scraping`, `Browser`, `Cloudflare`, `Stealth`, `Crawling`, `Spider` |
+| 相关 skill | [`duckduckgo-search`](/user-guide/skills/optional/research/research-duckduckgo-search), [`domain-intel`](/user-guide/skills/optional/research/research-domain-intel) |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时所看到的指令内容。
+:::
+
+# Scrapling
+
+[Scrapling](https://github.com/D4Vinci/Scrapling) 是一个具备反机器人绕过、隐身浏览器自动化和爬虫框架的网页抓取框架。它提供三种获取策略（HTTP、动态 JS、隐身/Cloudflare）以及完整的 CLI。
+
+**本 skill 仅供教育和研究目的使用。** 用户必须遵守当地及国际数据抓取法律，并尊重网站服务条款。
+
+## 使用场景
+
+- 抓取静态 HTML 页面（比浏览器工具更快）
+- 抓取需要真实浏览器的 JS 渲染页面
+- 绕过 Cloudflare Turnstile 或机器人检测
+- 使用爬虫抓取多个页面
+- 当内置 `web_extract` 工具无法返回所需数据时
+
+## 安装
+
+```bash
+pip install "scrapling[all]"
+scrapling install
+```
+
+最小安装（仅 HTTP，无浏览器）：
+```bash
+pip install scrapling
+```
+
+仅含浏览器自动化：
+```bash
+pip install "scrapling[fetchers]"
+scrapling install
+```
+
+## 快速参考
+
+| 方式 | 类 | 使用场景 |
+|----------|-------|----------|
+| HTTP | `Fetcher` / `FetcherSession` | 静态页面、API、快速批量请求 |
+| 动态 | `DynamicFetcher` / `DynamicSession` | JS 渲染内容、SPA |
+| 隐身 | `StealthyFetcher` / `StealthySession` | Cloudflare、反机器人保护站点 |
+| 爬虫 | `Spider` | 跟随链接的多页面抓取 |
+
+## CLI 用法
+
+### 提取静态页面
+
+```bash
+scrapling extract get 'https://example.com' output.md
+```
+
+使用 CSS 选择器和浏览器模拟：
+
+```bash
+scrapling extract get 'https://example.com' output.md \
+  --css-selector '.content' \
+  --impersonate 'chrome'
+```
+
+### 提取 JS 渲染页面
+
+```bash
+scrapling extract fetch 'https://example.com' output.md \
+  --css-selector '.dynamic-content' \
+  --disable-resources \
+  --network-idle
+```
+
+### 提取 Cloudflare 保护页面
+
+```bash
+scrapling extract stealthy-fetch 'https://protected-site.com' output.html \
+  --solve-cloudflare \
+  --block-webrtc \
+  --hide-canvas
+```
+
+### POST 请求
+
+```bash
+scrapling extract post 'https://example.com/api' output.json \
+  --json '{"query": "search term"}'
+```
+
+### 输出格式
+
+输出格式由文件扩展名决定：
+- `.html` —— 原始 HTML
+- `.md` —— 转换为 Markdown
+- `.txt` —— 纯文本
+- `.json` / `.jsonl` —— JSON
+
+## Python：HTTP 抓取
+
+### 单次请求
+
+```python
+from scrapling.fetchers import Fetcher
+
+page = Fetcher.get('https://quotes.toscrape.com/')
+quotes = page.css('.quote .text::text').getall()
+for q in quotes:
+    print(q)
+```
+
+### Session（持久化 Cookie）
+
+```python
+from scrapling.fetchers import FetcherSession
+
+with FetcherSession(impersonate='chrome') as session:
+    page = session.get('https://example.com/', stealthy_headers=True)
+    links = page.css('a::attr(href)').getall()
+    for link in links[:5]:
+        sub = session.get(link)
+        print(sub.css('h1::text').get())
+```
+
+### POST / PUT / DELETE
+
+```python
+page = Fetcher.post('https://api.example.com/data', json={"key": "value"})
+page = Fetcher.put('https://api.example.com/item/1', data={"name": "updated"})
+page = Fetcher.delete('https://api.example.com/item/1')
+```
+
+### 使用代理
+
+```python
+page = Fetcher.get('https://example.com', proxy='http://user:pass@proxy:8080')
+```
+
+## Python：动态页面（JS 渲染）
+
+适用于需要执行 JavaScript 的页面（SPA、懒加载内容）：
+
+```python
+from scrapling.fetchers import DynamicFetcher
+
+page = DynamicFetcher.fetch('https://example.com', headless=True)
+data = page.css('.js-loaded-content::text').getall()
+```
+
+### 等待特定元素
+
+```python
+page = DynamicFetcher.fetch(
+    'https://example.com',
+    wait_selector=('.results', 'visible'),
+    network_idle=True,
+)
+```
+
+### 禁用资源以提升速度
+
+阻止字体、图片、媒体、样式表（速度提升约 25%）：
+
+```python
+from scrapling.fetchers import DynamicSession
+
+with DynamicSession(headless=True, disable_resources=True, network_idle=True) as session:
+    page = session.fetch('https://example.com')
+    items = page.css('.item::text').getall()
+```
+
+### 自定义页面自动化
+
+```python
+from playwright.sync_api import Page
+from scrapling.fetchers import DynamicFetcher
+
+def scroll_and_click(page: Page):
+    page.mouse.wheel(0, 3000)
+    page.wait_for_timeout(1000)
+    page.click('button.load-more')
+    page.wait_for_selector('.extra-results')
+
+page = DynamicFetcher.fetch('https://example.com', page_action=scroll_and_click)
+results = page.css('.extra-results .item::text').getall()
+```
+
+## Python：隐身模式（反机器人绕过）
+
+适用于 Cloudflare 保护或高度指纹识别的站点：
+
+```python
+from scrapling.fetchers import StealthyFetcher
+
+page = StealthyFetcher.fetch(
+    'https://protected-site.com',
+    headless=True,
+    solve_cloudflare=True,
+    block_webrtc=True,
+    hide_canvas=True,
+)
+content = page.css('.protected-content::text').getall()
+```
+
+### 隐身 Session
+
+```python
+from scrapling.fetchers import StealthySession
+
+with StealthySession(headless=True, solve_cloudflare=True) as session:
+    page1 = session.fetch('https://protected-site.com/page1')
+    page2 = session.fetch('https://protected-site.com/page2')
+```
+
+## 元素选择
+
+所有 fetcher 均返回一个 `Selector` 对象，包含以下方法：
+
+### CSS 选择器
+
+```python
+page.css('h1::text').get()              # 第一个 h1 文本
+page.css('a::attr(href)').getall()      # 所有链接 href
+page.css('.quote .text::text').getall() # 嵌套选择
+```
+
+### XPath
+
+```python
+page.xpath('//div[@class="content"]/text()').getall()
+page.xpath('//a/@href').getall()
+```
+
+### Find 方法
+
+```python
+page.find_all('div', class_='quote')       # 按标签 + 属性查找
+page.find_by_text('Read more', tag='a')    # 按文本内容查找
+page.find_by_regex(r'\$\d+\.\d{2}')       # 按正则表达式查找
+```
+
+### 相似元素
+
+查找具有相似结构的元素（适用于商品列表等）：
+
+```python
+first_product = page.css('.product')[0]
+all_similar = first_product.find_similar()
+```
+
+### 导航
+
+```python
+el = page.css('.target')[0]
+el.parent                # 父元素
+el.children              # 子元素
+el.next_sibling          # 下一个兄弟元素
+el.prev_sibling          # 上一个兄弟元素
+```
+
+## Python：爬虫框架
+
+适用于跟随链接的多页面抓取：
+
+```python
+from scrapling.spiders import Spider, Request, Response
+
+class QuotesSpider(Spider):
+    name = "quotes"
+    start_urls = ["https://quotes.toscrape.com/"]
+    concurrent_requests = 10
+    download_delay = 1
+
+    async def parse(self, response: Response):
+        for quote in response.css('.quote'):
+            yield {
+                "text": quote.css('.text::text').get(),
+                "author": quote.css('.author::text').get(),
+                "tags": quote.css('.tag::text').getall(),
+            }
+
+        next_page = response.css('.next a::attr(href)').get()
+        if next_page:
+            yield response.follow(next_page)
+
+result = QuotesSpider().start()
+print(f"Scraped {len(result.items)} quotes")
+result.items.to_json("quotes.json")
+```
+
+### 多 Session 爬虫
+
+将请求路由到不同的 fetcher 类型：
+
+```python
+from scrapling.fetchers import FetcherSession, AsyncStealthySession
+
+class SmartSpider(Spider):
+    name = "smart"
+    start_urls = ["https://example.com/"]
+
+    def configure_sessions(self, manager):
+        manager.add("fast", FetcherSession(impersonate="chrome"))
+        manager.add("stealth", AsyncStealthySession(headless=True), lazy=True)
+
+    async def parse(self, response: Response):
+        for link in response.css('a::attr(href)').getall():
+            if "protected" in link:
+                yield Request(link, sid="stealth")
+            else:
+                yield Request(link, sid="fast", callback=self.parse)
+```
+
+### 暂停/恢复抓取
+
+```python
+spider = QuotesSpider(crawldir="./crawl_checkpoint")
+spider.start()  # 按 Ctrl+C 暂停，重新运行以从检查点恢复
+```
+
+## 注意事项
+
+- **需要安装浏览器**：pip 安装后运行 `scrapling install`——否则 `DynamicFetcher` 和 `StealthyFetcher` 将无法使用
+- **超时**：DynamicFetcher/StealthyFetcher 的超时单位为**毫秒**（默认 30000），Fetcher 的超时单位为**秒**
+- **Cloudflare 绕过**：`solve_cloudflare=True` 会增加 5-15 秒的获取时间——仅在必要时启用
+- **资源占用**：StealthyFetcher 运行真实浏览器——限制并发使用量
+- **法律合规**：抓取前务必检查 robots.txt 和网站服务条款。本库仅供教育和研究目的使用
+- **Python 版本**：需要 Python 3.10+
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\skills\optional\research\research-searxng-search.md ===
+---
+title: "Searxng Search — 通过 SearXNG 免费元搜索 — 聚合 70+ 搜索引擎的结果"
+sidebar_label: "Searxng Search"
+description: "通过 SearXNG 免费元搜索 — 聚合 70+ 搜索引擎的结果"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Searxng Search
+
+通过 SearXNG 免费元搜索（meta-search）——聚合 70+ 搜索引擎的结果。可自托管或使用公共实例。无需 API 密钥。当 web 搜索工具集不可用时自动回退。
+
+## Skill 元数据
+
+| | |
+|---|---|
+| 来源 | 可选 — 使用 `hermes skills install official/research/searxng-search` 安装 |
+| 路径 | `optional-skills/research/searxng-search` |
+| 版本 | `1.0.0` |
+| 作者 | hermes-agent |
+| 许可证 | MIT |
+| 平台 | linux, macos |
+| 标签 | `search`, `searxng`, `meta-search`, `self-hosted`, `free`, `fallback` |
+| 相关 skill | [`duckduckgo-search`](/user-guide/skills/optional/research/research-duckduckgo-search), [`domain-intel`](/user-guide/skills/optional/research/research-domain-intel) |
+
+## 参考：完整 SKILL.md
+
+:::info
+以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+:::
+
+# SearXNG Search
+
+使用 [SearXNG](https://searxng.org/) 进行免费元搜索——这是一个注重隐私的自托管搜索聚合器，可同时查询 70+ 搜索引擎。
+
+使用公共实例时**无需 API 密钥**。也可自托管以获得完全控制权。当主 web 搜索工具集（`FIRECRAWL_API_KEY`）未配置时，自动作为回退方案出现。
+
+## 配置
+
+SearXNG 需要一个 `SEARXNG_URL` 环境变量，指向你的 SearXNG 实例：
+
+```bash
+# 公共实例（无需任何设置）
+SEARXNG_URL=https://searxng.example.com
+
+# 自托管 SearXNG
+SEARXNG_URL=http://localhost:8888
+```
+
+如果未配置实例，此 skill 不可用，agent 将回退到其他搜索选项。
+
+## 检测流程
+
+在选择方案之前，先检查实际可用的内容：
+
+```bash
+# 检查 SEARXNG_URL 是否已设置且实例可访问
+curl -s --max-time 5 "${SEARXNG_URL}/search?q=test&format=json" | head -c 200
+```
+
+决策树：
+1. 如果 `SEARXNG_URL` 已设置且实例响应，则使用 SearXNG
+2. 如果 `SEARXNG_URL` 未设置或不可访问，则回退到其他可用搜索工具
+3. 如果用户明确需要 SearXNG，帮助他们搭建实例或找到公共实例
+
+## 方法一：通过 curl 使用 CLI（推荐）
+
+通过 `terminal` 使用 `curl` 调用 SearXNG JSON API。这样可以避免假设安装了特定的 Python 包。
+
+```bash
+# 文本搜索（JSON 输出）
+curl -s --max-time 10 \
+  "${SEARXNG_URL}/search?q=python+async+programming&format=json&engines=google,bing&limit=10"
+
+# 关闭安全搜索
+curl -s --max-time 10 \
+  "${SEARXNG_URL}/search?q=example&format=json&safesearch=0"
+
+# 指定分类（general、news、science 等）
+curl -s --max-time 10 \
+  "${SEARXNG_URL}/search?q=AI+news&format=json&categories=news"
+```
+
+### 常用 CLI 参数
+
+| 参数 | 说明 | 示例 |
+|------|-------------|---------|
+| `q` | 查询字符串（URL 编码） | `q=python+async` |
+| `format` | 输出格式：`json`、`csv`、`rss` | `format=json` |
+| `engines` | 逗号分隔的引擎名称 | `engines=google,bing,ddg` |
+| `limit` | 每个引擎的最大结果数（默认 10） | `limit=5` |
+| `categories` | 按分类过滤 | `categories=news,science` |
+| `safesearch` | 0=无，1=适中，2=严格 | `safesearch=0` |
+| `time_range` | 过滤：`day`、`week`、`month`、`year` | `time_range=week` |
+
+### 解析 JSON 结果
+
+```bash
+# 从 JSON 中提取标题和 URL
+curl -s --max-time 10 "${SEARXNG_URL}/search?q=fastapi&format=json&limit=5" \
+  | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for r in data.get('results', []):
+    print(r.get('title',''))
+    print(r.get('url',''))
+    print(r.get('content','')[:200])
+    print()
+"
+```
+
+每条结果返回：`title`、`url`、`content`（摘要）、`engine`、`parsed_url`、`img_src`、`thumbnail`、`author`、`published_date`
+
+## 方法二：通过 `requests` 使用 Python API
+
+直接从 Python 使用 `requests` 库调用 SearXNG REST API：
+
+```python
+import os, requests, urllib.parse
+
+base_url = os.environ.get("SEARXNG_URL", "")
+if not base_url:
+    raise RuntimeError("SEARXNG_URL is not set")
+
+query = "fastapi deployment guide"
+params = {
+    "q": query,
+    "format": "json",
+    "limit": 5,
+    "engines": "google,bing",
+}
+
+resp = requests.get(f"{base_url}/search", params=params, timeout=10)
+resp.raise_for_status()
+data = resp.json()
+
+for r in data.get("results", []):
+    print(r["title"])
+    print(r["url"])
+    print(r.get("content", "")[:200])
+    print()
+```
+
+## 方法三：searxng-data Python 包
+
+如需更结构化的访问，安装 `searxng-data` 包：
+
+```bash
+pip install searxng-data
+```
+
+```python
+from searxng_data import engines
+
+# 列出可用引擎
+print(engines.list_engines())
+```
+
+注意：此包仅提供引擎元数据，不提供搜索 API 本身。
+
+## 自托管 SearXNG
+
+运行你自己的 SearXNG 实例：
+
+```bash
+# 使用 Docker
+docker run -d -p 8888:8080 \
+  -v $(pwd)/searxng:/etc/searxng \
+  searxng/searxng:latest
+
+# 然后设置
+SEARXNG_URL=http://localhost:8888
+```
+
+或通过 pip 安装：
+```bash
+pip install searxng
+# 编辑 /etc/searxng/settings.yml
+searxng-run
+```
+
+公共 SearXNG 实例可在以下地址找到：
+- `https://searxng.example.com`（替换为任意公共实例）
+
+## 工作流：先搜索后提取
+
+SearXNG 返回标题、URL 和摘要——而非完整页面内容。要获取完整页面内容，先搜索，然后使用 `web_extract`、浏览器工具或 `curl` 提取最相关的 URL。
+
+```bash
+# 搜索相关页面
+curl -s "${SEARXNG_URL}/search?q=fastapi+deployment&format=json&limit=3"
+# 输出：包含标题和 URL 的结果列表
+
+# 然后使用 web_extract 提取最佳 URL
+```
+
+## 限制
+
+- **实例可用性**：如果 SearXNG 实例宕机或不可访问，搜索将失败。始终检查 `SEARXNG_URL` 已设置且实例可访问。
+- **无内容提取**：SearXNG 返回摘要，而非完整页面内容。使用 `web_extract`、浏览器工具或 `curl` 获取完整文章。
+- **速率限制**：部分公共实例会限制请求。自托管可避免此问题。
+- **引擎覆盖范围**：可用引擎取决于 SearXNG 实例的配置，部分引擎可能被禁用。
+- **结果时效性**：元搜索聚合外部引擎——结果时效性取决于这些引擎。
+
+## 故障排查
+
+| 问题 | 可能原因 | 处理方式 |
+|---------|--------------|------------|
+| `SEARXNG_URL` 未设置 | 未配置实例 | 使用公共 SearXNG 实例或自行搭建 |
+| 连接被拒绝 | 实例未运行或 URL 错误 | 检查 URL 是否正确且实例正在运行 |
+| 结果为空 | 实例屏蔽了该查询 | 尝试其他实例或自托管 |
+| 响应缓慢 | 公共实例负载过高 | 自托管或使用负载较低的公共实例 |
+| 不支持 `json` 格式 | SearXNG 版本过旧 | 尝试 `format=rss` 或升级 SearXNG |
+
+## 注意事项
+
+- **务必设置 `SEARXNG_URL`**：没有它，此 skill 无法运行。
+- **对查询进行 URL 编码**：curl 中的空格和特殊字符必须进行 URL 编码，或在 Python 中使用 `urllib.parse.quote()`。
+- **使用 `format=json`**：默认格式可能不是机器可读的。始终明确请求 JSON。
+- **设置超时**：始终使用 `--max-time` 或 `timeout=`，以避免在实例不可访问时挂起。
+- **自托管最佳**：公共实例可能宕机、限速或屏蔽请求。自托管实例更可靠。
+
+## 实例发现
+
+如果 `SEARXNG_URL` 未设置且用户询问 SearXNG，帮助他们：
+1. 找到公共 SearXNG 实例（搜索"public searxng instance"）
+2. 使用 Docker 或 pip 搭建自己的实例
+
+公共实例列表：https://searxng.org/

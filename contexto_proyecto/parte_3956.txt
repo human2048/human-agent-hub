@@ -1,0 +1,402 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_comfyui_skill.py ===
+"""Invariant tests for the bundled comfyui skill.
+
+Covers optional-skills/creative/comfyui — the diffusion workflow runner. Tests assert
+contracts (locale-independent file reads), not snapshots of skill content.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parent.parent.parent
+SCRIPTS = REPO / "optional-skills" / "creative" / "comfyui" / "scripts"
+
+# Text reads that must not depend on the host locale. The workflow and schema
+# JSON are user-authored files (exported by ComfyUI or hand-edited), so they
+# are read BOM-tolerantly: Notepad prepends U+FEFF, which makes json.load
+# raise JSONDecodeError. See the jobs.json regression in #66607. The /proc
+# reads are Linux-gated and never carry a BOM, so they pin plain utf-8.
+_ENCODING_SENSITIVE_READS = [
+    ("hardware_check.py", 'with open("/proc/version", "r", encoding="utf-8") as fh:'),
+    ("hardware_check.py", 'with open("/proc/meminfo", "r", encoding="utf-8") as fh:'),
+    ("run_workflow.py", 'with open(schema_path, encoding="utf-8-sig") as f:'),
+    ("run_workflow.py", 'with wf_path.open(encoding="utf-8-sig") as f:'),
+    # Sibling call paths: every other script that parses a user-authored
+    # workflow JSON reads it the same BOM-tolerant way (same bug class).
+    ("auto_fix_deps.py", 'wf_path.open(encoding="utf-8-sig")'),
+    ("check_deps.py", 'wf_path.open(encoding="utf-8-sig")'),
+    ("extract_schema.py", 'wf_path.open(encoding="utf-8-sig")'),
+    ("health_check.py", 'wf_path.open(encoding="utf-8-sig")'),
+    ("run_batch.py", 'wf_path.open(encoding="utf-8-sig")'),
+]
+
+
+@pytest.mark.parametrize("rel_path,expected", _ENCODING_SENSITIVE_READS)
+def test_readers_are_locale_independent(rel_path, expected):
+    """Every text read of a user-supplied or system file pins its codec."""
+    source = (SCRIPTS / rel_path).read_text(encoding="utf-8")
+    assert expected in source, f"{rel_path}: locale-dependent read of a UTF-8 payload"
+
+
+def _run_under_c_locale(snippet: str) -> subprocess.CompletedProcess:
+    """Execute a snippet in a child interpreter forced to a non-UTF-8 locale.
+
+    The default text codec is resolved at interpreter startup, so the locale
+    has to be set on the child's environment. Patching os.environ in-process
+    would not change locale.getpreferredencoding(). PYTHONUTF8=0 disables
+    PEP 540 UTF-8 mode, which would otherwise mask the bug entirely.
+    """
+    env = dict(os.environ)
+    env.update({
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONUTF8": "0",
+        "PYTHONIOENCODING": "utf-8",
+    })
+    return subprocess.run(
+        [sys.executable, "-c", snippet],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+def test_load_schema_reads_non_ascii_under_non_utf8_locale(tmp_path):
+    """A schema with non-ASCII labels loads under the C locale.
+
+    Without the explicit encoding the C-locale default codec is ASCII, so
+    json.load crashes with UnicodeDecodeError on any CJK/Cyrillic label.
+    """
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_bytes(
+        json.dumps(
+            {"prompt": {"label": "プロンプト", "type": "string"}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+
+    result = _run_under_c_locale(
+        textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(SCRIPTS)!r})
+            from run_workflow import load_schema
+
+            schema = load_schema({str(schema_path)!r}, {{}})
+            assert schema["prompt"]["label"] == "\\u30d7\\u30ed\\u30f3\\u30d7\\u30c8", schema
+            print("SUCCESS")
+            """
+        )
+    )
+    assert result.returncode == 0, (
+        f"load_schema failed under non-UTF-8 locale:\n{result.stderr}"
+    )
+    assert "SUCCESS" in result.stdout
+
+
+def test_load_schema_tolerates_utf8_bom(tmp_path):
+    """A schema saved by a Windows GUI editor (UTF-8 BOM) still parses.
+
+    json.load rejects a leading U+FEFF with JSONDecodeError, so a BOM-blind
+    read turns "user edited the file in Notepad" into a hard failure.
+    """
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_bytes(
+        b"\xef\xbb\xbf" + json.dumps({"prompt": {"type": "string"}}).encode("utf-8")
+    )
+
+    result = _run_under_c_locale(
+        textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(SCRIPTS)!r})
+            from run_workflow import load_schema
+
+            schema = load_schema({str(schema_path)!r}, {{}})
+            assert schema["prompt"]["type"] == "string", schema
+            print("SUCCESS")
+            """
+        )
+    )
+    assert result.returncode == 0, (
+        f"load_schema rejected a BOM-prefixed schema:\n{result.stderr}"
+    )
+    assert "SUCCESS" in result.stdout
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_competitor_news_monitor_skill.py ===
+"""Tests for the competitor-news-monitor skill and competitor-watch blueprint."""
+import re
+from pathlib import Path
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SKILL_PATH = (
+    REPO_ROOT / "skills" / "research" / "competitor-news-monitor" / "SKILL.md"
+)
+
+
+def _frontmatter_and_body():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert content.startswith("---")
+    m = re.search(r"\n---\s*\n", content[3:])
+    assert m, "frontmatter must close with ---"
+    fm = yaml.safe_load(content[3 : m.start() + 3])
+    body = content[m.end() + 3 :]
+    return fm, body
+
+
+def test_skill_file_exists():
+    assert SKILL_PATH.is_file()
+
+
+def test_frontmatter_required_fields():
+    fm, _ = _frontmatter_and_body()
+    for field in ("name", "description", "version", "author", "license", "platforms"):
+        assert field in fm, f"missing frontmatter field: {field}"
+    assert fm["name"] == "competitor-news-monitor"
+
+
+def test_description_hardline():
+    fm, _ = _frontmatter_and_body()
+    desc = fm["description"]
+    assert len(desc) <= 60, f"description is {len(desc)} chars; hardline is 60"
+    assert desc.endswith(".")
+
+
+def test_author_credits_human_first():
+    fm, _ = _frontmatter_and_body()
+    assert not fm["author"].startswith("Hermes Agent")
+    assert "benbarclay" in fm["author"]
+
+
+def test_related_skills_resolve_in_repo():
+    fm, _ = _frontmatter_and_body()
+    for name in fm["metadata"]["hermes"]["related_skills"]:
+        hits = (
+            list(REPO_ROOT.glob(f"skills/*/{name}/SKILL.md"))
+            + list(REPO_ROOT.glob(f"optional-skills/*/{name}/SKILL.md"))
+            + list(REPO_ROOT.glob(f"skills/*/*/{name}/SKILL.md"))
+        )
+        assert hits, f"related_skills entry does not resolve in-repo: {name}"
+
+
+def test_no_phantom_skill_references():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert "change-monitor-and-notify" not in content, "phantom skill ref must be gone"
+
+
+def test_setup_tick_split():
+    _, body = _frontmatter_and_body()
+    assert "Setup (foreground, once)" in body
+    assert "Tick (each scheduled run)" in body
+    assert "cronjob(action=" in body, "must wire scheduling through the cronjob tool"
+
+
+def test_coverage_honesty_discipline():
+    _, body = _frontmatter_and_body()
+    assert "unknown coverage" in body, "source failure != no news"
+    assert "cutoff advance" in body.replace("advances", "advance").replace(
+        "advanced", "advance"
+    ), "cutoff must only advance on success"
+
+
+def test_steps_have_completion_criteria():
+    _, body = _frontmatter_and_body()
+    steps = re.findall(r"^### \d+\..*?(?=^### \d+\.|^## )", body, re.MULTILINE | re.DOTALL)
+    assert len(steps) >= 5
+    for step in steps:
+        assert "Done when" in step, f"step missing completion criterion: {step[:60]!r}"
+
+
+def test_no_machine_local_paths():
+    content = SKILL_PATH.read_text(encoding="utf-8")
+    assert "/home/" not in content
+
+
+def test_competitor_watch_blueprint_registered():
+    from cron.blueprint_catalog import CATALOG
+
+    bp = next((b for b in CATALOG if b.key == "competitor-watch"), None)
+    assert bp is not None, "competitor-watch blueprint missing from catalog"
+    assert "competitor-news-monitor" in bp.skills
+    slot_names = {s.name for s in bp.slots}
+    assert {"companies", "categories", "time", "recurrence", "deliver"} <= slot_names
+    assert "[SILENT]" in bp.prompt_template
+    assert "{companies}" in bp.prompt_template and "{categories}" in bp.prompt_template
+
+
+def test_every_blueprint_skill_resolves_in_repo():
+    from cron.blueprint_catalog import CATALOG
+
+    for bp in CATALOG:
+        for skill_name in bp.skills:
+            hits = list(REPO_ROOT.glob(f"skills/*/{skill_name}/SKILL.md")) + list(
+                REPO_ROOT.glob(f"skills/*/*/{skill_name}/SKILL.md")
+            )
+            assert hits, f"blueprint {bp.key!r} loads nonexistent skill {skill_name!r}"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_darwinian_evolver_skill.py ===
+"""
+Smoke tests for the darwinian-evolver optional skill.
+
+We can't actually run the evolution loop in CI (it needs network + a paid LLM),
+so these tests verify:
+  - SKILL.md frontmatter conforms to the hardline format
+  - shipped scripts parse as valid Python
+  - the scripts reference the right env var / module paths
+"""
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+import pytest
+import yaml
+
+SKILL_DIR = Path(__file__).resolve().parents[2] / "optional-skills" / "research" / "darwinian-evolver"
+
+
+@pytest.fixture(scope="module")
+def frontmatter() -> dict:
+    src = (SKILL_DIR / "SKILL.md").read_text()
+    m = re.search(r"^---\n(.*?)\n---", src, re.DOTALL)
+    assert m, "SKILL.md missing YAML frontmatter"
+    return yaml.safe_load(m.group(1))
+
+
+def test_skill_dir_exists() -> None:
+    assert SKILL_DIR.is_dir(), f"missing skill dir: {SKILL_DIR}"
+
+
+
+
+def test_description_under_60_chars(frontmatter) -> None:
+    desc = frontmatter["description"]
+    assert len(desc) <= 60, f"description is {len(desc)} chars (hardline ≤60): {desc!r}"
+
+
+
+
+def test_platforms_excludes_windows(frontmatter) -> None:
+    # Upstream uses func_timeout (POSIX signals) and uv subprocess pipelines; the
+    # skill is gated [linux, macos]. If we ever port to Windows, update this test
+    # to assert ["linux", "macos", "windows"].
+    assert "windows" not in frontmatter["platforms"]
+    assert set(frontmatter["platforms"]) >= {"linux", "macos"}
+
+
+def test_author_credits_contributor(frontmatter) -> None:
+    author = frontmatter["author"]
+    assert "Bihruze" in author, f"author should credit the original contributor: {author!r}"
+
+
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/parrot_openrouter.py",
+        "scripts/show_snapshot.py",
+        "templates/custom_problem_template.py",
+    ],
+)
+def test_shipped_scripts_parse(path: str) -> None:
+    src = (SKILL_DIR / path).read_text()
+    ast.parse(src)  # raises SyntaxError on broken Python
+
+
+def test_parrot_script_uses_openrouter() -> None:
+    src = (SKILL_DIR / "scripts" / "parrot_openrouter.py").read_text()
+    assert "OPENROUTER_API_KEY" in src, "parrot driver should read OPENROUTER_API_KEY"
+    assert "openrouter.ai/api/v1" in src, "parrot driver should target OpenRouter"
+    assert "EVOLVER_MODEL" in src, "model should be overridable via EVOLVER_MODEL"
+
+
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\skills\test_decision_questionnaire_skill.py ===
+"""Tests for optional-skills/productivity/decision-questionnaire."""
+
+import re
+from pathlib import Path
+
+import pytest
+import yaml
+
+SKILL_MD = (
+    Path(__file__).resolve().parents[2]
+    / "optional-skills"
+    / "productivity"
+    / "decision-questionnaire"
+    / "SKILL.md"
+)
+
+
+def _frontmatter():
+    text = SKILL_MD.read_text(encoding="utf-8")
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+    assert m, "SKILL.md missing YAML frontmatter"
+    return yaml.safe_load(m.group(1))
+
+
+class TestFrontmatter:
+    def test_name_matches_directory(self):
+        assert _frontmatter()["name"] == "decision-questionnaire"
+
+    def test_description_length_and_period(self):
+        desc = _frontmatter()["description"]
+        assert len(desc) <= 60
+        assert desc.endswith(".")
+
+    def test_license_and_platforms(self):
+        fm = _frontmatter()
+        assert fm["license"] == "MIT"
+        assert set(fm["platforms"]) == {"linux", "macos", "windows"}
+
+
+class TestBody:
+    def _body(self):
+        return SKILL_MD.read_text(encoding="utf-8")
+
+    def test_template_sections_present(self):
+        body = self._body()
+        for section in ("## Context", "## How to answer", "## Anything else?"):
+            assert section in body, f"template missing {section}"
+
+    def test_output_filename_convention(self):
+        assert "decision-questionnaire-<slug>.md" in self._body()
+
+    def test_interview_the_send_principle(self):
+        assert "Interview the Send" in self._body()
+
+    def test_no_upstream_harness_residue(self):
+        lower = self._body().lower()
+        for token in ("claude", "slash command", "disable-model-invocation"):
+            assert token not in lower, f"upstream residue: {token}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
+

@@ -1,0 +1,270 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_goal_judge_timeout_config.py ===
+"""`auxiliary.goal_judge.timeout` must actually reach the judge (#91022).
+
+The key is declared in DEFAULT_CONFIG (60s) and surfaces in the auxiliary
+config UI, but the judge path hardcoded `DEFAULT_JUDGE_TIMEOUT = 30.0` and
+never read it — a user raising the timeout for a slow-but-healthy reasoning
+endpoint got no effect, and the loop auto-paused on misleading transport
+failures pointing at provider/key. The reader mirrors `_goal_judge_max_tokens`
+(max_tokens is wired, timeout was not).
+"""
+
+import pytest
+
+import hermes_cli.goals as goals
+from hermes_cli.goals import DEFAULT_JUDGE_TIMEOUT, _goal_judge_timeout
+
+
+def _patch_config(monkeypatch, cfg):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+
+
+def test_reader_returns_configured_timeout(monkeypatch):
+    _patch_config(monkeypatch, {"auxiliary": {"goal_judge": {"timeout": 120}}})
+    assert _goal_judge_timeout() == 120.0
+
+
+def test_reader_falls_back_when_key_absent(monkeypatch):
+    _patch_config(monkeypatch, {"auxiliary": {"goal_judge": {"max_tokens": 512}}})
+    assert _goal_judge_timeout() == DEFAULT_JUDGE_TIMEOUT
+
+
+def test_reader_falls_back_on_non_positive_or_garbage(monkeypatch):
+    for bad in (0, -5, "fast", None):
+        _patch_config(monkeypatch, {"auxiliary": {"goal_judge": {"timeout": bad}}})
+        assert _goal_judge_timeout() == DEFAULT_JUDGE_TIMEOUT
+
+
+def test_judge_goal_resolves_timeout_from_config(monkeypatch):
+    """The wiring that matters: a caller that passes no timeout (all four
+    production call sites) must have the configured value reach call_llm."""
+    captured = {}
+
+    class _FakeAux:
+        @staticmethod
+        def call_llm(*args, **kwargs):
+            captured.update(kwargs)
+            raise TimeoutError("simulated transport timeout")
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", _FakeAux)
+    _patch_config(monkeypatch, {"auxiliary": {"goal_judge": {"timeout": 120}}})
+
+    verdict, _, _, _, transport_failed = goals.judge_goal(
+        "do the thing", "here is a substantive response to evaluate"
+    )
+
+    assert captured.get("timeout") == 120.0
+    # Fail-open contract preserved: a timeout is still a transport failure.
+    assert verdict == "continue"
+    assert transport_failed is True
+
+
+def test_judge_goal_explicit_timeout_wins(monkeypatch):
+    captured = {}
+
+    class _FakeAux:
+        @staticmethod
+        def call_llm(*args, **kwargs):
+            captured.update(kwargs)
+            raise TimeoutError("simulated transport timeout")
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", _FakeAux)
+    _patch_config(monkeypatch, {"auxiliary": {"goal_judge": {"timeout": 120}}})
+
+    goals.judge_goal("g", "r", timeout=7.5)
+    assert captured.get("timeout") == 7.5
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_gpt56_registration.py ===
+"""Behavior contracts for the GPT-5.6 (Sol/Terra/Luna) registration.
+
+Invariant tests only — no list snapshots (per the no-change-detector-tests
+policy). These pin the two behaviors that would silently regress:
+
+1. Version/tier sorting: the flagship Sol must outrank Terra/Luna and the
+   whole 5.6 series must outrank 5.5, so `/model gpt` resolves to the
+   flagship rather than an alphabetical-first cheap tier.
+2. Pricing reachability: the ("openai", <model>) official-docs pricing keys
+   must be reachable from BOTH the bare "openai" provider and the
+   "openai-api" picker slug (resolve_billing_route normalizes the latter).
+"""
+
+from decimal import Decimal
+
+from agent.usage_pricing import (
+    _OFFICIAL_DOCS_PRICING,
+    _lookup_official_docs_pricing,
+    resolve_billing_route,
+)
+from hermes_cli.model_switch import _model_sort_key
+
+
+class TestGpt56SortInvariants:
+    def test_sol_outranks_terra_and_luna(self):
+        models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+        models.sort(key=lambda m: _model_sort_key(m, "gpt"))
+        assert models[0] == "gpt-5.6-sol"
+
+
+    def test_base_sol_outranks_sol_pro_for_alias_default(self):
+        # "-pro" high-effort variants parse as suffix "sol-pro" (rank 1), so
+        # `/model gpt` defaults to base Sol rather than the high-effort mode.
+        models = ["gpt-5.6-sol-pro", "gpt-5.6-sol"]
+        models.sort(key=lambda m: _model_sort_key(m, "gpt"))
+        assert models[0] == "gpt-5.6-sol"
+
+
+class TestGpt56PricingRoute:
+    def test_official_pricing_reachable_from_openai(self):
+        route = resolve_billing_route("gpt-5.6-sol", provider="openai")
+        entry = _lookup_official_docs_pricing(route)
+        assert entry is not None
+        assert entry.input_cost_per_million == Decimal("5.00")
+
+
+    def test_cache_write_is_1_25x_input_for_56_series(self):
+        for slug in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            entry = _OFFICIAL_DOCS_PRICING[("openai", slug)]
+            assert entry.input_cost_per_million is not None, slug
+            assert entry.cache_write_cost_per_million == (
+                entry.input_cost_per_million * Decimal("1.25")
+            ), slug
+            assert entry.cache_read_cost_per_million == (
+                entry.input_cost_per_million * Decimal("0.10")
+            ), slug
+
+    def test_pro_variants_alias_to_base_tier_pricing(self):
+        # -pro high-effort modes bill at the same per-token rates as their
+        # base tiers; the snapshot aliases them rather than duplicating rows.
+        for base in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            assert (
+                _OFFICIAL_DOCS_PRICING[("openai", f"{base}-pro")]
+                is _OFFICIAL_DOCS_PRICING[("openai", base)]
+            ), base
+
+
+class TestGpt56CodexCompaction:
+    """Codex OAuth caps the whole gpt-5.6 family at 272K, same as 5.4/5.5, so
+    the compaction auto-raise (0.85) must fire for every 5.6 variant on the
+    openai-codex route and NOT on the direct-API/OpenRouter routes."""
+
+    def test_autoraise_applies_to_all_56_on_codex(self):
+        from agent.auxiliary_client import _compression_threshold_for_model
+
+        for slug in (
+            "gpt-5.6-sol",
+            "gpt-5.6-sol-pro",
+            "gpt-5.6-terra",
+            "gpt-5.6-terra-pro",
+            "gpt-5.6-luna",
+            "gpt-5.6-luna-pro",
+        ):
+            assert (
+                _compression_threshold_for_model(slug, provider="openai-codex")
+                == 0.85
+            ), slug
+
+    def test_no_autoraise_on_direct_api_route(self):
+        from agent.auxiliary_client import _compression_threshold_for_model
+
+        # Direct OpenAI API / OpenRouter expose the full 1.05M window, so the
+        # 272K-cap override must NOT apply there.
+        assert (
+            _compression_threshold_for_model("gpt-5.6-sol", provider="openai")
+            is None
+        )
+        assert (
+            _compression_threshold_for_model(
+                "openai/gpt-5.6-sol", provider="openrouter"
+            )
+            is None
+        )
+
+    def test_astra_autoraise_on_codex_unless_900k(self):
+        """Astra is 272K-capped on Codex OAuth like 5.6; the -900k opt-in variants are not."""
+        from agent.auxiliary_client import _compression_threshold_for_model
+
+        for slug in ("gpt-6-astra", "openai/gpt-6-astra-pro", "gpt-6-astra-2026-09-01"):
+            assert _compression_threshold_for_model(slug, provider="openai-codex") == 0.85, slug
+            assert _compression_threshold_for_model(slug, provider="openrouter") is None, slug
+        assert _compression_threshold_for_model("gpt-6-astra-900k", provider="openai-codex") is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_graphical_browser_detection.py ===
+"""Tests for `_can_open_graphical_browser()` in hermes_cli.auth.
+
+Guards the fix for the May 2026 report where `hermes auth add xai-oauth`
+launched a text-mode browser (w3m) INSIDE the terminal on a headless Linux
+box — `_is_remote_session()` only checked SSH/cloud-shell env vars, so a plain
+local box with no GUI browser still called `webbrowser.open()`, which resolved
+to a console browser and hijacked the TTY.
+
+The helper distinguishes "a real windowed browser will pop up" from "a console
+browser will hijack the terminal" so OAuth callsites can fall back to printing
+the URL / manual paste instead of auto-opening.
+"""
+
+from __future__ import annotations
+
+import webbrowser
+
+import pytest
+
+from hermes_cli.auth import _can_open_graphical_browser
+
+
+class _FakeController:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def open(self, *_a, **_kw):  # pragma: no cover - never invoked
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _clean_browser_env(monkeypatch):
+    """Each test controls DISPLAY / WAYLAND_DISPLAY / BROWSER explicitly."""
+    for var in ("DISPLAY", "WAYLAND_DISPLAY", "BROWSER"):
+        monkeypatch.delenv(var, raising=False)
+    yield
+
+
+def _force_resolved_browser(monkeypatch, name: str):
+    monkeypatch.setattr(webbrowser, "get", lambda *_a, **_kw: _FakeController(name))
+
+
+@pytest.mark.linux_only
+def test_headless_linux_no_display_refuses(monkeypatch):
+    """The reported bug: headless Linux, no display server → don't auto-open.
+
+    Gated rather than faked: the display-server requirement is the Linux arm
+    of the helper, and the autouse fixture already strips DISPLAY /
+    WAYLAND_DISPLAY so a real Linux host reaches it headless.
+    """
+    # Even if a GUI browser somehow resolved, no display means no GUI.
+    _force_resolved_browser(monkeypatch, "google-chrome")
+    assert _can_open_graphical_browser() is False
+
+
+def test_browser_env_pointing_at_console_browser_refuses(monkeypatch):
+    """$BROWSER=w3m must refuse even with a display server present.
+
+    Host-independent: the $BROWSER console check runs before the helper's
+    per-platform branch, so this holds on every lane.
+    """
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setenv("BROWSER", "/usr/bin/w3m")
+    assert _can_open_graphical_browser() is False
+
+
+

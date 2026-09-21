@@ -1,0 +1,357 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_iteration_budget_race.py ===
+"""Tests for IterationBudget thread safety.
+
+The `used` property must acquire the lock before reading `_used` to prevent
+data races with concurrent `consume()` / `refund()` calls.
+"""
+from concurrent.futures import ThreadPoolExecutor
+
+
+
+def test_iteration_budget_used_is_thread_safe():
+    """Iterating `used` while other threads consume/refund must not crash.
+
+    Before the fix, `used` returned `_used` directly without holding the lock,
+    so a concurrent `consume()` could observe a partially-updated value or
+    cause the C-level `list.append` to raise a ValueError ("list size changed").
+    """
+    from agent.iteration_budget import IterationBudget
+
+    budget = IterationBudget(max_total=1000)
+    num_threads = 10
+    operations_per_thread = 200
+
+    errors = []
+
+    def worker(consume: bool):
+        try:
+            for _ in range(operations_per_thread):
+                if consume:
+                    budget.consume()
+                else:
+                    budget.refund()
+                # Also read `used` to exercise the property
+                _ = budget.used
+        except Exception as exc:
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=num_threads * 2) as executor:
+        # Half the threads consume, half refund
+        futures = []
+        for i in range(num_threads):
+            consume = i < num_threads // 2
+            futures.append(executor.submit(worker, consume))
+            futures.append(executor.submit(worker, consume))
+
+        for f in futures:
+            f.result()
+
+    assert not errors, f"Thread safety violation: {errors}"
+    # Final value should be within expected bounds
+    assert 0 <= budget.used <= budget.max_total
+
+
+def test_iteration_budget_consume_returns_false_when_exhausted():
+    """consume() must return False once the budget is exhausted."""
+    from agent.iteration_budget import IterationBudget
+
+    budget = IterationBudget(max_total=3)
+    assert budget.consume() is True
+    assert budget.consume() is True
+    assert budget.consume() is True
+    assert budget.consume() is False
+
+
+def test_iteration_budget_refund_restores_consume():
+    """refund() after consume() must allow one more consume()."""
+    from agent.iteration_budget import IterationBudget
+
+    budget = IterationBudget(max_total=2)
+    assert budget.consume() is True
+    assert budget.consume() is True
+    assert budget.consume() is False  # exhausted
+    budget.refund()
+    assert budget.consume() is True
+
+
+def test_iteration_budget_used_reflects_consume_and_refund():
+    """used property must accurately reflect consume() and refund() calls."""
+    from agent.iteration_budget import IterationBudget
+
+    budget = IterationBudget(max_total=10)
+
+    assert budget.used == 0
+    budget.consume()
+    assert budget.used == 1
+    budget.consume()
+    assert budget.used == 2
+    budget.refund()
+    assert budget.used == 1
+    budget.refund()
+    assert budget.used == 0
+
+
+def test_iteration_budget_remaining():
+    """remaining property must equal max_total - used."""
+    from agent.iteration_budget import IterationBudget
+
+    budget = IterationBudget(max_total=5)
+
+    assert budget.remaining == 5
+    budget.consume()
+    assert budget.remaining == 4
+    budget.consume()
+    budget.consume()
+    assert budget.remaining == 2
+    budget.refund()
+    assert budget.remaining == 3
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_iteration_budget_warning.py ===
+"""Iteration checkpoints preserve the transcript and the hard budget."""
+from copy import deepcopy
+
+import pytest
+
+
+def _agent(tmp_path, monkeypatch, ratio):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"agent:\n  budget_warning_ratio: {ratio}\n", encoding="utf-8"
+    )
+    from run_agent import AIAgent
+    from hermes_state import SessionDB
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    # Cases model separate worker processes; their availability caches must not
+    # survive a change from ordinary to dispatcher-owned construction.
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    return AIAgent(session_db=SessionDB(db_path=tmp_path / "proof.db"),
+                   model="test-model", provider="openai-compat", api_key="test",
+                   base_url="http://127.0.0.1:1/v1", max_iterations=4,
+                   quiet_mode=True, skip_context_files=True, skip_memory=True)
+
+
+@pytest.mark.parametrize("content", ["result", [{"type": "text", "text": "result"}]])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_checkpoint_rearms_per_turn_without_changing_budget_or_durable_rows(
+    tmp_path, monkeypatch, content, interrupted
+):
+    from agent.turn_context import _reset_per_turn_agent_state
+    from agent.turn_iteration_prep import prepare_iteration
+    from agent.tool_executor import _flush_session_db_after_tool_progress
+
+    agent = _agent(tmp_path, monkeypatch, "0.75")
+    try:
+        for turn in range(2):
+            _reset_per_turn_agent_state(agent)
+            agent._interrupt_requested = interrupted
+            for _ in range(3):
+                agent.iteration_budget.consume()
+            messages = [{"role": "user", "content": f"work {turn}"},
+                        {"role": "assistant", "tool_calls": [{"id": f"t{turn}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+                        {"role": "tool", "tool_call_id": f"t{turn}", "content": deepcopy(content)}]
+            assert _flush_session_db_after_tool_progress(agent, messages, stage="checkpoint")
+            persisted = agent._session_db.get_messages(agent.session_id)
+            notices = sum("iteration budget checkpoint" in str(row["content"]) for row in persisted)
+            assert notices == (0 if interrupted else turn + 1)
+            assert ("3 of 4" in str(messages[-1]["content"])) is not interrupted
+            snapshot = deepcopy(messages)
+            # A durable result is never rewritten, even after interruption clears
+            # and a new turn has rearmed the notice latch.
+            agent._interrupt_requested = False
+            prepare_iteration(agent, messages=messages, api_call_count=3)
+            assert messages == snapshot
+            assert agent.iteration_budget.consume()
+            assert not agent.iteration_budget.consume()
+    finally:
+        agent._session_db.close()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_jiter_preload.py ===
+from __future__ import annotations
+
+import importlib
+import sys
+
+from agent import jiter_preload
+
+
+def test_preload_jiter_native_extension_loads_sdk_parser_dependency():
+    assert jiter_preload.preload_jiter_native_extension() is True
+    assert "jiter.jiter" in sys.modules
+
+
+def test_preload_jiter_native_extension_is_best_effort(monkeypatch):
+    monkeypatch.setattr(jiter_preload, "_JITER_PRELOADED", False)
+
+    def _raise_missing(name: str):
+        assert name == "jiter.jiter"
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(importlib, "import_module", _raise_missing)
+
+    assert jiter_preload.preload_jiter_native_extension() is False
+    assert jiter_preload._JITER_PRELOADED is False
+    assert isinstance(jiter_preload._JITER_PRELOAD_ERROR, ModuleNotFoundError)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_jsondecodeerror_retryable.py ===
+"""Regression guard for #14782: json.JSONDecodeError must not be classified
+as a local validation error by the main agent loop.
+
+`json.JSONDecodeError` inherits from `ValueError`. The agent loop's
+non-retryable classifier at run_agent.py treats `ValueError` / `TypeError`
+as local programming bugs and skips retry. Without an explicit carve-out,
+a transient provider hiccup (malformed response body, truncated stream,
+routing-layer corruption) that surfaces as a JSONDecodeError would bypass
+the retry path and fail the turn immediately.
+
+This test mirrors the exact predicate shape used in run_agent.py so that
+any future refactor of that predicate must preserve the invariant:
+
+    JSONDecodeError     → NOT local validation error (retryable)
+    UnicodeEncodeError  → NOT local validation error (surrogate path)
+    bare ValueError     → IS local validation error (programming bug)
+    bare TypeError      → IS local validation error (programming bug)
+"""
+from __future__ import annotations
+
+import json
+
+
+def _mirror_agent_predicate(err: BaseException) -> bool:
+    """Exact shape of run_agent.py's is_local_validation_error check.
+
+    Kept in lock-step with the source. If you change one, change both —
+    or, better, refactor the check into a shared helper and have both
+    sites import it.
+    """
+    import ssl
+
+    return (
+        isinstance(err, (ValueError, TypeError))
+        and not isinstance(err, (UnicodeEncodeError, json.JSONDecodeError))
+        and not isinstance(err, ssl.SSLError)
+        # NoneType-is-not-iterable shape errors come from upstream SDK /
+        # provider response mismatches, not local programming bugs. See
+        # the agent/conversation_loop.py inline comment for #33136.
+        and not (
+            isinstance(err, TypeError)
+            and "nonetype" in str(err).lower()
+            and "not iterable" in str(err).lower()
+        )
+    )
+
+
+class TestJSONDecodeErrorIsRetryable:
+
+    def test_json_decode_error_is_not_local_validation(self):
+        """Provider returning malformed JSON surfaces as JSONDecodeError —
+        must be treated as transient so the retry path runs."""
+        try:
+            json.loads("{not valid json")
+        except json.JSONDecodeError as exc:
+            assert not _mirror_agent_predicate(exc), (
+                "json.JSONDecodeError must be excluded from the "
+                "ValueError/TypeError local-validation classification."
+            )
+        else:
+            raise AssertionError("json.loads should have raised")
+
+
+    def test_bare_value_error_is_local_validation(self):
+        """Programming bugs that raise bare ValueError must still be
+        classified as local validation errors (non-retryable)."""
+        assert _mirror_agent_predicate(ValueError("bad arg"))
+
+
+
+
+
+
+class TestNoneTypeNotIterableIsRetryable:
+    """Regression for #33136 / closes lingering Telegram \"Non-retryable error (HTTP None)\".
+
+    The chatgpt.com Codex backend (and any other upstream SDK / provider shim)
+    can surface ``TypeError: 'NoneType' object is not iterable`` as a wire-shape
+    mismatch, not a local programming bug. Even after #33042 made our own
+    consumer immune, third-party paths and mocked clients can still produce
+    this shape. The classifier should treat it as retryable so the normal
+    retry/fallback chain runs.
+    """
+
+    def test_nonetype_not_iterable_is_retryable(self):
+        err = TypeError("'NoneType' object is not iterable")
+        assert not _mirror_agent_predicate(err), (
+            "TypeError('NoneType ... not iterable') must be excluded from "
+            "is_local_validation_error — it is a provider/SDK shape mismatch, "
+            "not a local bug. See #33136."
+        )
+
+
+    def test_unrelated_type_error_remains_local_validation(self):
+        """TypeError without the NoneType-not-iterable pattern still aborts (programming bug)."""
+        assert _mirror_agent_predicate(TypeError("tools must be a list"))
+        assert _mirror_agent_predicate(TypeError("expected str, got int"))
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_kanban_budget_checkpoint.py ===
+"""Checkpoint eligibility follows explicit opt-in or dispatcher ownership."""
+from contextlib import nullcontext
+from copy import deepcopy
+
+import pytest
+from tests.agent.test_iteration_budget_warning import _agent
+
+
+@pytest.mark.parametrize("ratio,scope,expected,kanban_notice", [
+    *[(ratio, "ordinary", False, False) for ratio in ("null", "true", "0", "1", ".nan", "junk")],
+    ("0.75", "ordinary", True, False),
+    ("null", "owner", True, True),
+    ("null", "non-owner", False, False),
+    ("null", "child", False, False),
+    ("0.75", "child", True, False),
+    ("null", "no-completion-tool", False, False),
+])
+def test_checkpoint_requires_opt_in_or_dispatcher_completion_scope(
+    tmp_path, monkeypatch, ratio, scope, expected, kanban_notice
+):
+    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+    from agent.turn_iteration_prep import prepare_iteration
+
+    if scope != "ordinary":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_checkpoint")
+    contexts = {"non-owner": non_dispatcher_owned_context, "child": delegated_child_context}
+    with contexts.get(scope, nullcontext)():
+        agent = _agent(tmp_path, monkeypatch, ratio)
+        try:
+            if scope == "no-completion-tool":
+                agent.valid_tool_names.discard("kanban_complete")
+            for _ in range(3):
+                agent.iteration_budget.consume()
+            messages = [{"role": "user", "content": "work"},
+                        {"role": "assistant", "tool_calls": [{"id": "t", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+                        {"role": "tool", "tool_call_id": "t", "content": "verified artifact"}]
+            original = deepcopy(messages)
+            prepare_iteration(agent, messages=messages, api_call_count=3)
+            assert messages[:-1] == original[:-1]
+            assert (messages[-1]["content"] != "verified artifact") is expected
+            assert ("kanban_complete" in messages[-1]["content"]) is kanban_notice
+            snapshot = deepcopy(messages)
+            prepare_iteration(agent, messages=messages, api_call_count=3)
+            assert messages == snapshot
+            assert agent.iteration_budget.remaining == 1
+        finally:
+            agent._session_db.close()
+

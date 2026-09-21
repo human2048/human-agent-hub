@@ -1,0 +1,286 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_provider_base_urls.py ===
+"""Class-level base_url parity: every cloud TTS provider honors config base_url.
+
+xAI, MiniMax, Gemini, OpenAI and DeepInfra already read
+``tts.<provider>.base_url`` from config.yaml. This locks in the same
+contract for the ElevenLabs and Mistral sections (the two that used to
+hardcode the SDK default endpoint).
+"""
+from __future__ import annotations
+
+import sys
+import types
+from unittest.mock import patch
+
+import tools.tts_tool as tts
+
+
+# ── ElevenLabs: base_url/wss_url → ElevenLabsEnvironment ──────────────────
+
+
+def _fake_elevenlabs_environment_module(captured: dict):
+    mod = types.ModuleType("elevenlabs.environment")
+
+    class ElevenLabsEnvironment:
+        def __init__(self, base, wss):
+            captured["base"] = base
+            captured["wss"] = wss
+
+    mod.ElevenLabsEnvironment = ElevenLabsEnvironment
+    pkg = types.ModuleType("elevenlabs")
+    pkg.environment = mod
+    return pkg, mod
+
+
+def test_elevenlabs_no_base_url_uses_sdk_default_environment():
+    from tools.tts_tool_providers import _elevenlabs_environment_kwargs
+
+    assert _elevenlabs_environment_kwargs({}) == {}
+    assert _elevenlabs_environment_kwargs({"base_url": ""}) == {}
+
+
+# ── Mistral: tts.mistral.base_url → SDK server_url ────────────────────────
+
+
+def test_mistral_no_base_url_omits_server_url(tmp_path):
+    captured: dict = {}
+
+    class _FakeMistral:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        class audio:  # noqa: N801
+            class speech:  # noqa: N801
+                @staticmethod
+                def complete(**kwargs):
+                    return types.SimpleNamespace(audio_data="aGVsbG8=")
+
+    out = tmp_path / "out.mp3"
+    with patch.object(tts, "_import_mistral_client", return_value=_FakeMistral), \
+         patch("hermes_cli.config.get_env_value", lambda k, *a: "key" if k == "MISTRAL_API_KEY" else None):
+        tts._generate_mistral_tts("hi", str(out), {"mistral": {}})
+
+    assert "server_url" not in captured
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_pythonpath_fallback.py ===
+"""Regression tests for #53259.
+
+When TTS/STT packages (edge-tts, elevenlabs, mistralai) installed outside
+the venv but importable on sys.path (e.g. via PYTHONPATH, Docker layered
+filesystems), the lazy-import helpers must fall through to the raw import
+instead of re-raising lazy_deps.ensure() failures as ImportError.
+
+Uses sys.modules fixtures so builtins.__import__ stays intact — patching
+__import__ replaces the helper's own ``from tools.lazy_deps import ...``
+and defeats the purpose of the test.
+"""
+
+import sys
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from tools.lazy_deps import FeatureUnavailable
+
+
+@pytest.fixture(autouse=True)
+def _clean_tts_modules():
+    """Remove TTS packages from sys.modules so each test starts fresh."""
+    removed = {}
+    for name in ("edge_tts", "elevenlabs", "elevenlabs.client",
+                 "mistralai", "mistralai.client"):
+        if name in sys.modules:
+            removed[name] = sys.modules.pop(name)
+    yield
+    for name in ("edge_tts", "elevenlabs", "elevenlabs.client",
+                 "mistralai", "mistralai.client"):
+        sys.modules.pop(name, None)
+    sys.modules.update(removed)
+
+
+class TestEdgeTtsPythonpathFallback:
+    def test_falls_through_on_lazy_deps_failure(self):
+        """FeatureUnavailable from ensure() must not prevent raw import."""
+        mock_edge_tts = MagicMock()
+        with patch.dict(sys.modules, {"edge_tts": mock_edge_tts}), \
+             patch("tools.lazy_deps.ensure",
+                   side_effect=FeatureUnavailable("tts.edge", (), "test")):
+            from tools.tts_tool import _import_edge_tts
+            result = _import_edge_tts()
+        assert result is mock_edge_tts
+
+    def test_raises_when_package_truly_missing(self):
+        """When the package is truly absent, ImportError must propagate."""
+        with patch("tools.lazy_deps.ensure"), \
+             patch.dict(sys.modules, {"edge_tts": None}):
+            from tools.tts_tool import _import_edge_tts
+            with pytest.raises(ImportError):
+                _import_edge_tts()
+
+
+class TestElevenLabsPythonpathFallback:
+    def test_falls_through_on_lazy_deps_failure(self):
+        """FeatureUnavailable from ensure() must not prevent raw import."""
+        mock_cls = MagicMock()
+        mock_client_pkg = MagicMock()
+        mock_client_pkg.ElevenLabs = mock_cls
+        with patch.dict(sys.modules, {
+            "elevenlabs": mock_client_pkg,
+            "elevenlabs.client": mock_client_pkg,
+        }), patch("tools.lazy_deps.ensure",
+                  side_effect=FeatureUnavailable("tts.elevenlabs", (), "test")):
+            from tools.tts_tool import _import_elevenlabs
+            result = _import_elevenlabs()
+        assert result is mock_cls
+
+    def test_raises_when_package_truly_missing(self):
+        """When the package is truly absent, ImportError must propagate."""
+        with patch("tools.lazy_deps.ensure"), \
+             patch.dict(sys.modules, {"elevenlabs": None,
+                                      "elevenlabs.client": None}):
+            from tools.tts_tool import _import_elevenlabs
+            with pytest.raises(ImportError):
+                _import_elevenlabs()
+
+
+class TestMistralPythonpathFallback:
+    def test_falls_through_on_lazy_deps_failure(self):
+        """FeatureUnavailable from ensure() must not prevent raw import."""
+        mock_cls = MagicMock()
+        mock_mistralai = MagicMock()
+        mock_mistralai.Mistral = mock_cls
+        with patch.dict(sys.modules, {
+            "mistralai": mock_mistralai,
+            "mistralai.client": mock_mistralai,
+        }), patch("tools.lazy_deps.ensure",
+                  side_effect=FeatureUnavailable("tts.mistral", (), "test")):
+            from tools.tts_tool import _import_mistral_client
+            result = _import_mistral_client()
+        assert result is mock_cls
+
+    def test_raises_when_package_truly_missing(self):
+        """When the package is truly absent, ImportError must propagate."""
+        with patch("tools.lazy_deps.ensure"), \
+             patch.dict(sys.modules, {"mistralai": None,
+                                      "mistralai.client": None}):
+            from tools.tts_tool import _import_mistral_client
+            with pytest.raises(ImportError):
+                _import_mistral_client()
+
+
+# ── STT: _transcribe_mistral fallthrough ───────────────────────────────────
+
+
+class TestMistralSttPythonpathFallback:
+    def test_transcribe_mistral_falls_through_on_lazy_deps_failure(
+        self, tmp_path,
+    ):
+        """FeatureUnavailable from ensure('stt.mistral') must not block
+        transcription when mistralai is importable via PYTHONPATH."""
+        from tools.transcription_tools import _transcribe_mistral
+
+        audio_file = tmp_path / "audio.wav"
+        audio_file.write_bytes(b"fake-audio")
+
+        mock_client_cls = MagicMock()
+        mock_result = MagicMock()
+        mock_result.text = "hello world"
+        mock_client_cls.return_value.__enter__ = MagicMock(
+            return_value=MagicMock(
+                audio=MagicMock(
+                    transcriptions=MagicMock(
+                        complete=MagicMock(return_value=mock_result),
+                    ),
+                ),
+            ),
+        )
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_mistralai = MagicMock()
+        mock_mistralai.Mistral = mock_client_cls
+
+        with patch.dict(sys.modules, {
+            "mistralai": mock_mistralai,
+            "mistralai.client": mock_mistralai,
+        }), patch("tools.lazy_deps.ensure",
+                  side_effect=FeatureUnavailable("stt.mistral", (), "test")), \
+             patch("hermes_cli.config.get_env_value",
+                   return_value="test-key"):
+            result = _transcribe_mistral(str(audio_file), "mistral-large-latest")
+
+        assert result["success"] is True
+        assert result["transcript"] == "hello world"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_tts_response_body_cap.py ===
+"""Regression tests for bounded upstream TTS response reads."""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+from tools import tts_tool
+
+
+class StreamingResponse:
+    def __init__(self, chunks, *, status_code=200, headers=None):
+        self._chunks = list(chunks)
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.closed = False
+
+    def iter_content(self, chunk_size=65536):
+        del chunk_size
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+@pytest.fixture(autouse=True)
+def small_tts_body_cap(monkeypatch):
+    monkeypatch.setattr("tools.tts_tool_providers.TTS_RESPONSE_BODY_LIMIT_BYTES", 8)
+
+
+def test_xai_tts_rejects_oversized_audio_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "test-xai-key")
+    response = StreamingResponse([b"12345", b"6789"], headers={"Content-Type": "audio/mpeg"})
+    output_path = tmp_path / "out.mp3"
+
+    with patch("requests.post", return_value=response) as post:
+        with pytest.raises(RuntimeError, match="xAI TTS response exceeds 8 bytes"):
+            tts_tool._generate_xai_tts("hello", str(output_path), {})
+
+    assert post.call_args.kwargs["stream"] is True
+    assert response.closed is True
+    assert not output_path.exists()
+
+
+def test_gemini_tts_rejects_oversized_json_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    response = StreamingResponse([b'{"candidates":', b"[{}]}"], headers={"Content-Type": "application/json"})
+
+    with patch("requests.post", return_value=response) as post:
+        with pytest.raises(RuntimeError, match="Gemini TTS response exceeds 8 bytes"):
+            tts_tool._generate_gemini_tts("hello", str(tmp_path / "out.wav"), {})
+
+    assert post.call_args.kwargs["stream"] is True
+    assert response.closed is True
+

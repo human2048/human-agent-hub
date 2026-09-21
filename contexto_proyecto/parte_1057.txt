@@ -1,0 +1,229 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\oulipo.md ===
+# OuLiPo
+
+*Ouvroir de Littérature Potentielle*, founded 1960 by Raymond Queneau and François Le Lionnais. Members: Perec, Calvino, Roubaud, Mathews, Garréta. "Rats who construct the labyrinth from which they plan to escape" (Queneau). Constraint as generative engine.
+
+## When to use
+
+- Writing — fiction, poetry, copy, lyrics, anything text
+- Writing feels samey; constraint suppresses your default sentence shape
+- Generating titles, names, taglines (short forms benefit most)
+- Software constraint by analogy (code golf, no-dependency, single-file)
+
+## Don't use when
+
+- You want the prose invisible (constraints are usually visible in the result)
+- Blocked because you don't know what to say (constraint gives you *how*, not *what*)
+- The constraint will compensate for not having a subject (Perec's *La Disparition* works because the missing E is the subject)
+
+## The constraints
+
+### Lipogram
+Exclude one or more letters. Perec's *La Disparition* (1969): 300 pages without E. The previous sentence is a lipogram in B, F, J, K, Q, V, Y, Z.
+
+### Univocalism
+Only one vowel letter. (Letter, not phoneme — "born" and "cot" both qualify in English.)
+
+### Snowball / Rhopalism
+Each line one word; each word one letter longer than the previous.
+
+### S+7 (or N+7)
+Replace every noun with the 7th noun after it in a dictionary. "Call me Ishmael. Some years ago..." → "Call me Ishmael. Some yes-men ago..."
+
+Generalizes: V+7, Adj+7, N+k for any k.
+
+### Stile
+Each new sentence stems from the last word/phrase of the previous: "I descend the long ladder brings me to the ground floor is spacious..."
+
+### Palindrome
+Sonnets, paragraphs, or longer constructed palindromically. Perec wrote a 5,566-letter palindrome.
+
+### Prisoner's constraint (Macao)
+Lipogram excluding letters with ascenders or descenders (b, d, f, g, h, j, k, l, p, q, t, y).
+
+### Pilish
+Word lengths follow the digits of π: "How I want a drink, alcoholic of course, after the heavy lectures involving quantum mechanics."
+
+### Sonnet machine (Queneau)
+Fixed structure with interchangeable line-strips. Queneau's *Cent Mille Milliards de Poèmes* (1961): 10 sonnets cut into 14 strips each → 10^14 combinations.
+
+### Antonymy
+Replace each word with its antonym. Reveals what the text is *about* by what it would mean if reversed.
+
+## Procedure
+
+### For openings
+1. Pick a constraint that fits your domain.
+2. Write 200 words under it.
+3. Note what the constraint forced you to say.
+4. Decide: keep the constraint for the whole piece, or use the opening then unconstrain.
+
+### For unblocking
+Apply S+7 to the stuck paragraph. The dislocation surfaces what the original was about.
+
+### Software analogues
+- Lipogram → no `e` in identifiers
+- N+7 → replace each function with the 7th in a library; describe what the result does
+- Snowball → each commit one line longer
+- Univocalism → variable names use one vowel
+- Pilish → comment word counts follow π
+
+## Anti-slop notes
+
+- Constrained-without-subject = exercise, not work. *La Disparition* works because the missing E *is* the subject.
+- Apply strictly. Half-constrained is worse than unconstrained.
+- Don't fake "Calvino-style" surface qualities. Use the actual constraints.
+- Acrostics are not OuLiPo (centuries older). Use a real constraint or call an acrostic an acrostic.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\pataphysics.md ===
+# Pataphysics
+
+Alfred Jarry, *Gestes et opinions du docteur Faustroll, pataphysicien* (1898/1911). The science of imaginary solutions and particular cases.
+
+Where physics is general laws applied to common cases, **pataphysics studies particular cases and imaginary solutions** — the *one-offs*, the *exceptions*, the *imagined entities whose virtuality* (potential being) can be described as lawfully as actual objects.
+
+The OuLiPo was founded as a sub-committee of the Collège de 'Pataphysique. Marcel Duchamp, Eugène Ionesco, Boris Vian, Italo Calvino, Umberto Eco were members. Borges, Lem, Calvino, Roussel are pataphysical writers in this sense.
+
+## When to use
+
+- Push past plausibility; specify the impossible thing in detail
+- Parodic / satirical work that needs rigorous form
+- Producing fictional artifacts (encyclopedias of non-existent civilizations, manuals for non-existent devices, reviews of non-existent books)
+- Stuck and the realistic solutions feel exhausted — specify the impossible solution
+- Highlighting that a "natural" framing is actually a choice
+
+## Don't use when
+
+- You need an actually-implementable proposal on the first pass
+- Audience requires sincerity (drifts toward irony)
+- Avoiding harder analysis (slop variant: pataphysical-flavored dodge)
+- You don't actually have anything to say (form requires content)
+
+## Operating moves
+
+### Specify an imaginary object
+1. Pick the object. A device, organism, institution, place, work, person — something that cannot exist.
+2. Specify its **lineaments** in concrete material detail. What is it made of? How does it operate? What are its parts?
+3. Identify its laws — internal consistency rules. What can it do? What can't it?
+4. Describe consequences if it existed.
+5. **Stop short of asking whether it could exist.** That question is not pataphysical.
+
+### Exception-finding
+1. State the general rule in your domain.
+2. Find the actually-existing case that doesn't fit.
+3. Describe it on its own terms — not as deviation, but as what it is.
+4. Resist generalizing back into a modified rule.
+5. The particular case is the result.
+
+### Pataphysical fiction
+1. Adopt the form of a serious genre (encyclopedia, manual, technical paper, museum catalog, book review).
+2. Apply the form rigorously to a non-existent subject.
+3. Don't break frame. Don't wink.
+
+## Worked example
+
+**Problem**: file synchronization software. Realistic solutions all involve some compromise on conflict resolution.
+
+**Pataphysical specification**: a file system in which two simultaneous edits to the same file produce a *third* file containing both edits as "ghosts" — versions visible to and editable by readers but not committed until a quorum of readers reads them and chooses one. The file exists in superposition until observation.
+
+**Lineaments**: ghost-files have an "observation count"; below threshold they are interactive but not committed; above, they collapse to chosen version.
+
+**Consequences**: editing a popular file is fast (quorum collapses quickly); editing an obscure file is slow (no quorum). The file system has *audience-dependent commit semantics*.
+
+The specification is impossible. But *audience-dependent commit semantics*, surfaced by the pataphysical move, is in fact a useful concept with plausible implementations.
+
+## Anti-slop notes
+
+- Whimsical incoherence is not pataphysics. "What if cows could fly" without the cow's wing-loading and lift coefficient = sloppy fantasy.
+- Don't generate fake-Borges or fake-Calvino. Their work is grounded in deep specifics. Generated "in the style of" is decorative.
+- The dry, committed register matters. Comedic SF is not pataphysics.
+- Don't walk back to "of course this is just a thought experiment" at the end. That undoes the operation.
+
+Sources: Jarry, *Gestes et opinions du docteur Faustroll, pataphysicien* (Fasquelle, 1911); Borges, *Ficciones* (1944); Lem, *A Perfect Vacuum* (1971).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\pattern-languages.md ===
+# Pattern Languages
+
+Christopher Alexander et al., *A Pattern Language* (1977). 253 patterns for designing buildings, towns, rooms — structured as a generative grammar with explicit cross-references. Spawned the Gang of Four software design patterns (1994) and many domain adaptations.
+
+## Pattern format
+
+A pattern has three parts:
+1. **Context** — the situation in which it applies
+2. **Problem** — a recurring tension in that context
+3. **Solution** — a *generative* principle (not a specific design — capable of many instantiations)
+
+A pattern *language* is a network of patterns at different scales, with explicit links: which patterns *contain* this one, which patterns *complete* it.
+
+## When to use
+
+- Designing physical environments (buildings, rooms, gardens, neighborhoods)
+- Designing interactional environments (UX, software architecture)
+- Building shared design vocabulary with a team
+- Documenting design intuitions for transmission
+- Civic / community design
+
+## Don't use when
+
+- You want to break with tradition (patterns are conservative — they encode what has worked)
+- Domain has no established practice yet (no patterns to extract)
+- Pure conceptual / artistic work
+- You'd be implementing patterns literally (collapses generative → rule)
+
+## Selected patterns from Alexander's 253
+
+For texture. Real use means buying or borrowing the book.
+
+- **8. Mosaic of Subcultures** — a region needs distinct subcultures with their own ecology, separated by zones of disuse, not homogenized.
+- **53. Main Gateways** — mark every entrance with a substantial visible threshold.
+- **60. Accessible Green** — green outdoor space within 3 minutes' walk.
+- **105. South-Facing Outdoors** — most-used outdoor space to the south of the building.
+- **111. Half-Hidden Garden** — garden right at street is too public; behind house is unused. Place it half-hidden.
+- **159. Light on Two Sides of Every Room** — windows on at least two sides. Single-sided rooms are uncomfortable, rarely used.
+- **179. Alcoves** — rooms with no place to retreat are unsettling. Build niches, bays, window seats.
+- **188. Bed Alcove** — bed in the open is exposed. Build at least a partial enclosure.
+- **191. Shape of Indoor Space** — simple, mostly orthogonal; deviate only for clear local reason.
+- **230. Radiant Heat** — radiant heat (fireplace, radiator) is qualitatively different from forced air.
+
+The patterns are arguably true and arguably false; what matters is the *form*.
+
+## Procedure
+
+### Using an existing language
+1. Identify the relevant scale (region / neighborhood / building / room / detail).
+2. Read patterns at and above your scale; note which apply.
+3. Compose: apply higher-scale patterns first; let them constrain lower-scale ones.
+4. Adapt to your specifics. Patterns are generative, not literal.
+
+### Developing your own language (more useful for software, org, pedagogy)
+1. Identify recurring problems in your domain. Look across many cases.
+2. Name each (short, memorable, describes the *solution* shape — "Light on Two Sides", not "Insufficient Daylight").
+3. State each in: context — problem — solution — therefore: [generative principle] — see also: [related patterns].
+4. Map containment relations between patterns.
+5. Test by applying to a fresh problem; revise.
+
+## Worked example (software, in Alexander's form)
+
+**Iterator pattern** (Gang of Four, 1994)
+
+*Context*: a collection of objects must be traversable by client code.
+*Problem*: client shouldn't need to know the internal structure (array vs tree vs linked list); collection shouldn't have traversal logic scattered across clients.
+*Solution*: provide an Iterator object with `next()`, `hasNext()`, `current()` that encapsulates traversal state. Collection produces an Iterator on request.
+*Therefore*: separate "what is being traversed" from "how it is traversed."
+*See also*: Composite (tree traversal), Visitor (operations during traversal), Factory Method (producing the right Iterator).
+
+## Anti-slop notes
+
+- Bullet-list "design tips" are not patterns. A pattern has context, problem, generative solution, and place in a network.
+- Don't generate patterns to seem comprehensive. Real patterns come from many cases.
+- Don't apply Alexander's residential patterns to non-residential domains literally.
+- Patterns are conservative *and* generative. They don't anti-novelty; they shape novelty.
+
+Source: Alexander et al., *A Pattern Language* (Oxford UP, 1977); *The Timeless Way of Building* (Oxford UP, 1979). For software: Gamma et al., *Design Patterns* (Addison-Wesley, 1994).
+

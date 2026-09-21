@@ -1,0 +1,216 @@
+
+
+=== ARCHIVO: .\hermes-agent\plugins\teams_pipeline\runtime.py ===
+"""Gateway runtime wiring for the Teams meeting pipeline plugin."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from gateway.config import Platform
+from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
+from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipeline_store_path
+from plugins.teams_pipeline.subscriptions import build_graph_client
+
+logger = logging.getLogger(__name__)
+
+# Teams platform settings mirrored into the pipeline's teams_delivery config (pipeline keys win).
+_DELIVERY_KEYS = ("incoming_webhook_url", "access_token", "team_id", "channel_id", "chat_id")
+
+
+def _teams_delivery_is_configured(teams_extra: dict[str, Any], teams_delivery: dict[str, Any]) -> bool:
+    def pick(key: str) -> Any:
+        return teams_delivery.get(key) or teams_extra.get(key)
+    delivery_mode = str(teams_delivery.get("mode") or pick("delivery_mode") or "").strip().lower()
+    if delivery_mode == "incoming_webhook":
+        return bool(pick("incoming_webhook_url"))
+    if delivery_mode == "graph":
+        return bool(pick("chat_id") or (pick("team_id") and pick("channel_id")))
+    return False
+
+
+def build_pipeline_runtime_config(gateway_config: Any) -> dict[str, Any]:
+    """Pipeline knobs live under ``teams.extra.meeting_pipeline``; Teams delivery targets are
+    mirrored from the Teams platform config so they are not configured twice."""
+    teams_config = gateway_config.platforms.get(Platform("teams"))
+    teams_extra = dict((teams_config.extra or {}) if teams_config else {})
+    pipeline_config = dict(teams_extra.get("meeting_pipeline") or {})
+    if teams_config and teams_config.enabled:
+        teams_delivery = dict(pipeline_config.get("teams_delivery") or {})
+        if delivery_mode := str(teams_extra.get("delivery_mode") or "").strip():
+            teams_delivery["mode"] = delivery_mode
+        for key in _DELIVERY_KEYS:
+            value = teams_extra.get(key)
+            if value not in {None, ""}:
+                teams_delivery[key] = value
+        if teams_delivery:
+            teams_delivery["enabled"] = _teams_delivery_is_configured(teams_extra, teams_delivery)
+            pipeline_config["teams_delivery"] = teams_delivery
+    return pipeline_config
+
+
+def build_pipeline_runtime(gateway: Any) -> TeamsMeetingPipeline:
+    teams_sender = None
+    teams_config = gateway.config.platforms.get(Platform("teams"))
+    pipeline_config = build_pipeline_runtime_config(gateway.config)
+    if teams_config and teams_config.enabled and (pipeline_config.get("teams_delivery") or {}).get("enabled"):
+        try:
+            from plugins.platforms.teams.summary_writer import TeamsSummaryWriter
+        except ImportError:
+            logger.debug("TeamsSummaryWriter unavailable; Teams outbound delivery remains disabled until the adapter layer is present.")
+        else:
+            teams_sender = TeamsSummaryWriter(platform_config=teams_config)
+    return TeamsMeetingPipeline(
+        graph_client=build_graph_client(), store=TeamsPipelineStore(resolve_teams_pipeline_store_path()),
+        config=pipeline_config, teams_sender=teams_sender,
+    )
+
+
+def bind_gateway_runtime(gateway: Any) -> bool:
+    """Attach the Teams pipeline runtime to the msgraph webhook adapter."""
+    adapter = gateway.adapters.get(Platform.MSGRAPH_WEBHOOK)
+    if adapter is None:
+        return False
+    if getattr(gateway, "_teams_pipeline_runtime", None) is not None:
+        return True
+    try:
+        runtime = build_pipeline_runtime(gateway)
+    except Exception as exc:
+        # Without a runtime, notifications must still be acked (and dropped) so Graph does not retry-storm.
+        gateway._teams_pipeline_runtime_error = str(exc)
+        logger.warning(
+            "Teams pipeline runtime unavailable: %s. Installing a drop-scheduler "
+            "so Graph notifications ack cleanly without piling up unbound.", exc,
+        )
+
+        async def _drop(notification: dict[str, Any], event: Any) -> None:
+            logger.debug("Dropping Graph notification because runtime is unavailable: id=%s resource=%s",
+                         notification.get("id"), notification.get("resource"))
+        adapter.set_notification_scheduler(_drop)
+        return False
+
+    async def _schedule(notification: dict[str, Any], event: Any) -> None:
+        await runtime.run_notification(notification)
+    adapter.set_notification_scheduler(_schedule)
+    gateway._teams_pipeline_runtime = runtime
+    gateway._teams_pipeline_runtime_error = None
+    return True
+
+
+
+=== ARCHIVO: .\hermes-agent\plugins\teams_pipeline\store.py ===
+"""Durable local state for the Teams pipeline plugin."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+from copy import deepcopy
+from datetime import datetime, timezone
+from functools import partialmethod
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any, Dict, Optional
+
+from hermes_constants import get_hermes_home
+
+
+DEFAULT_TEAMS_PIPELINE_STORE_FILENAME = "teams_pipeline_store.json"
+# Persisted top-level buckets; the on-disk JSON shape must stay stable for existing user stores.
+_BUCKETS = ("subscriptions", "notification_receipts", "event_timestamps", "jobs", "sink_records")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_teams_pipeline_store_path(path: str | Path | None = None) -> Path:
+    explicit = str(path).strip() if path is not None else ""
+    env_path = os.getenv("MSGRAPH_WEBHOOK_STORE_PATH", "").strip()
+    return Path(explicit or env_path) if (explicit or env_path) else get_hermes_home() / DEFAULT_TEAMS_PIPELINE_STORE_FILENAME
+
+
+class TeamsPipelineStore:
+    """JSON-backed durable store for Teams pipeline state; every write is an atomic temp-file replace."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._lock = threading.RLock()
+        self._state: Dict[str, Dict[str, Any]] = {bucket: {} for bucket in _BUCKETS}
+        self._load()
+
+    def _load(self) -> None:
+        with self._lock:
+            data = json.loads(self.path.read_text(encoding="utf-8") or "{}") if self.path.exists() else None
+            if isinstance(data, dict):
+                self._state = {bucket: dict(data.get(bucket) or {}) for bucket in _BUCKETS}
+
+    def _persist(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile("w", encoding="utf-8", dir=str(self.path.parent), delete=False) as tmp:
+            json.dump(self._state, tmp, indent=2, sort_keys=True)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(self.path)
+
+    def _list(self, bucket: str) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return deepcopy(self._state[bucket])
+
+    def _get(self, bucket: str, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            record = self._state[bucket].get(key)
+            return deepcopy(record) if isinstance(record, dict) else None
+
+    def _upsert(self, bucket: str, id_field: str, key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge ``payload`` over the existing record, stamping ``id_field`` and created/updated timestamps."""
+        with self._lock:
+            existing = self._state[bucket].get(key, {})
+            merged = {**existing, **deepcopy(payload)}
+            merged[id_field] = key
+            merged.setdefault("created_at", existing.get("created_at") or _utc_now_iso())
+            merged["updated_at"] = _utc_now_iso()
+            self._state[bucket][key] = merged
+            self._persist()
+            return deepcopy(merged)
+
+    list_subscriptions = partialmethod(_list, "subscriptions")
+    get_subscription = partialmethod(_get, "subscriptions")
+    upsert_subscription = partialmethod(_upsert, "subscriptions", "subscription_id")
+    list_jobs = partialmethod(_list, "jobs")
+    get_job = partialmethod(_get, "jobs")
+    upsert_job = partialmethod(_upsert, "jobs", "job_id")
+    get_sink_record = partialmethod(_get, "sink_records")
+    upsert_sink_record = partialmethod(_upsert, "sink_records", "sink_key")
+
+    def delete_subscription(self, subscription_id: str) -> bool:
+        with self._lock:
+            if self._state["subscriptions"].pop(subscription_id, None) is None:
+                return False
+            self._persist()
+            return True
+
+    @classmethod
+    def build_notification_receipt_key(cls, notification: Dict[str, Any]) -> str:
+        if explicit_id := notification.get("id"):
+            return f"id:{explicit_id}"
+        canonical = json.dumps(notification, sort_keys=True, separators=(",", ":"))
+        return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+    def record_notification_receipt(self, receipt_key: str, payload: Optional[Dict[str, Any]] = None, *, received_at: Optional[str] = None) -> bool:
+        """Record a receipt once; returns False when the key was already seen (duplicate delivery)."""
+        with self._lock:
+            if receipt_key in self._state["notification_receipts"]:
+                return False
+            self._state["notification_receipts"][receipt_key] = {"received_at": received_at or _utc_now_iso(),
+                                                                 "payload": deepcopy(payload) if isinstance(payload, dict) else payload}
+            self._persist()
+            return True
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {bucket: len(self._state[bucket]) for bucket in _BUCKETS}
+

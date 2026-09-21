@@ -1,0 +1,295 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\tests\conftest.py ===
+"""Pytest configuration for the comfyui skill test suite.
+
+Adds `scripts/` to sys.path so tests can `from _common import ...`, and
+provides a few common fixtures.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS = ROOT / "scripts"
+WORKFLOWS = ROOT / "workflows"
+
+sys.path.insert(0, str(SCRIPTS))
+
+
+@pytest.fixture
+def sd15_workflow() -> dict:
+    return json.loads((WORKFLOWS / "sd15_txt2img.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def flux_workflow() -> dict:
+    return json.loads((WORKFLOWS / "flux_dev_txt2img.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def video_workflow() -> dict:
+    return json.loads((WORKFLOWS / "wan_video_t2v.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def workflows_dir() -> Path:
+    return WORKFLOWS
+
+
+@pytest.fixture
+def scripts_dir() -> Path:
+    return SCRIPTS
+
+
+@pytest.fixture
+def cloud_key() -> str | None:
+    """Cloud API key if set, otherwise None.
+
+    Tests that need cloud connectivity should skip when this is None.
+    """
+    return os.environ.get("COMFY_CLOUD_API_KEY")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-skip cloud tests when no API key is set."""
+    if os.environ.get("COMFY_CLOUD_API_KEY"):
+        return
+    skip_cloud = pytest.mark.skip(reason="Set COMFY_CLOUD_API_KEY to run cloud tests")
+    for item in items:
+        if "cloud" in item.keywords:
+            item.add_marker(skip_cloud)
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\tests\README.md ===
+# ComfyUI Skill Tests
+
+Pytest suite covering the skill's scripts. Pure-stdlib unit tests run
+without any setup; cloud integration tests need a Comfy Cloud API key.
+
+## Running
+
+```bash
+# Unit tests only (no network required) — runs in <1s
+python3 -m pytest tests/ -c tests/pytest.ini -o addopts="-p no:xdist"
+
+# Including cloud integration tests
+COMFY_CLOUD_API_KEY="comfyui-..." python3 -m pytest tests/ \
+  -c tests/pytest.ini -o addopts="-p no:xdist"
+
+# Just cloud tests
+COMFY_CLOUD_API_KEY="comfyui-..." python3 -m pytest tests/test_cloud_integration.py \
+  -c tests/pytest.ini -o addopts="-p no:xdist" -v
+```
+
+The `-c` and `-o` overrides isolate this suite from any parent
+`pyproject.toml` pytest config (e.g. the `-n auto` from a parent repo).
+
+## Test files
+
+| File | Coverage |
+|------|----------|
+| `test_common.py` | Cloud detection, URL routing, format validation, embeddings, paths, seeds, model-list parsing, folder aliases |
+| `test_extract_schema.py` | Connection tracing, positive/negative prompt detection, dedup logic, embedding deps |
+| `test_run_workflow.py` | Param injection (incl. -1 seed, link refusal), output download walk, runner construction |
+| `test_check_deps.py` | Model-name fuzzy matching, install command suggestions |
+| `test_cloud_integration.py` | Live cloud API contract tests (auto-skipped without API key) |
+
+## Adding tests
+
+When you change a script:
+
+1. Add a unit test if the change is pure logic (cloud detection, parsing, etc.)
+2. Add a cloud integration test if the change depends on cloud API behavior
+   (use `pytestmark = pytest.mark.cloud` so it auto-skips without a key)
+3. Workflow fixtures live in `conftest.py` (`sd15_workflow`, `flux_workflow`,
+   `video_workflow`)
+
+## Why the explicit `-c` / `-o`?
+
+The parent hermes-agent repo used to enable `pytest-xdist` by default
+(`-n auto`); the canonical runner has since moved to per-file subprocess
+isolation via `scripts/run_tests_parallel.py` and no longer uses xdist.
+This suite is small enough that parallelism isn't worth the complexity, and
+pytest-xdist isn't always installed in the user's environment. The
+`-c tests/pytest.ini -o addopts="-p no:xdist"` flags make the suite run
+identically regardless of the parent project's config.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\tests\test_check_deps.py ===
+"""Tests for check_deps.py — focuses on parsing logic that doesn't need a server."""
+
+from __future__ import annotations
+
+from check_deps import (
+    NODE_TO_PACKAGE,
+    model_present,
+    normalize_for_match,
+    suggest_install_command,
+)
+
+
+class TestNormalizeForMatch:
+    def test_basic(self):
+        s = normalize_for_match("model.safetensors")
+        assert "model.safetensors" in s
+        assert "model" in s
+
+    def test_subfolder(self):
+        s = normalize_for_match("subdir/model.pt")
+        assert "subdir/model.pt" in s
+        assert "model.pt" in s
+        assert "model" in s
+
+
+class TestModelPresent:
+    def test_exact_match(self):
+        assert model_present("a.safetensors", {"a.safetensors", "b.safetensors"}) is True
+
+    def test_extension_difference(self):
+        # User said "model" but installed is "model.safetensors"
+        assert model_present("model", {"model.safetensors"}) is True
+        # Reverse direction — also matches
+        assert model_present("model.safetensors", {"model"}) is True
+
+    def test_subfolder_match(self):
+        # Installed list has "subdir/model.safetensors", workflow asks "model.safetensors"
+        assert model_present("model.safetensors", {"subdir/model.safetensors"}) is True
+
+    def test_missing(self):
+        assert model_present("missing.safetensors", {"a.safetensors", "b.safetensors"}) is False
+
+    def test_empty_installed(self):
+        assert model_present("anything.safetensors", set()) is False
+
+
+class TestSuggestInstallCommand:
+    def test_known_node(self):
+        cmd = suggest_install_command("VHS_VideoCombine")
+        assert cmd == "comfy node install comfyui-videohelpersuite"
+
+    def test_unknown_node(self):
+        assert suggest_install_command("SomeRandomNodeName123") is None
+
+
+class TestNodePackageMap:
+    def test_no_duplicates(self):
+        # Each node should map to exactly one package
+        keys = list(NODE_TO_PACKAGE.keys())
+        assert len(keys) == len(set(keys))
+
+    def test_packages_are_safe_for_shell(self):
+        # Registry slugs must be alphanumerics + hyphens/underscores only
+        # (passed straight to `comfy node install <pkg>`).
+        import re
+        safe = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+        for pkg in NODE_TO_PACKAGE.values():
+            assert safe.match(pkg), f"Unsafe package slug: {pkg!r}"
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\comfyui\tests\test_cloud_integration.py ===
+"""Integration tests against the live Comfy Cloud API.
+
+These tests are auto-skipped when COMFY_CLOUD_API_KEY is not set.
+They never SUBMIT workflows (would need a paid subscription) — they only
+verify the read-only endpoints we rely on.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from _common import http_get, parse_model_list, resolve_url
+
+
+pytestmark = pytest.mark.cloud
+
+
+class TestCloudEndpointsLive:
+    def test_system_stats_reachable(self, cloud_key):
+        url = resolve_url("https://cloud.comfy.org", "/system_stats")
+        r = http_get(url, headers={"X-API-Key": cloud_key})
+        assert r.status == 200
+        data = r.json()
+        assert "system" in data
+
+    def test_models_endpoint_routed_to_experiment(self, cloud_key):
+        # We expect the skill to route /models/checkpoints → /api/experiment/models/checkpoints
+        url = resolve_url("https://cloud.comfy.org", "/models/checkpoints")
+        assert "/api/experiment/models/checkpoints" in url
+        r = http_get(url, headers={"X-API-Key": cloud_key})
+        assert r.status == 200
+
+    def test_models_endpoint_returns_dicts(self, cloud_key):
+        url = resolve_url("https://cloud.comfy.org", "/models/checkpoints")
+        r = http_get(url, headers={"X-API-Key": cloud_key})
+        data = r.json()
+        assert isinstance(data, list)
+        if data:
+            # Cloud format: list of dicts with `name`
+            assert isinstance(data[0], dict)
+            assert "name" in data[0]
+            # Our parser normalizes both
+            normalized = parse_model_list(data)
+            assert len(normalized) == len(data)
+
+    def test_history_renamed_to_v2(self, cloud_key):
+        # /history → /api/history_v2 on cloud
+        url = resolve_url("https://cloud.comfy.org", "/history/some-fake-id")
+        assert "/api/history_v2/some-fake-id" in url
+
+    def test_object_info_paid_tier(self, cloud_key):
+        # On free tier, /object_info returns 403 with a recognizable message
+        url = resolve_url("https://cloud.comfy.org", "/object_info")
+        r = http_get(url, headers={"X-API-Key": cloud_key})
+        # Should be either 200 (paid) or 403 (free) — not 404 / 500
+        assert r.status in {200, 403}
+        if r.status == 403:
+            # Body should mention the limitation
+            assert "free tier" in r.text().lower() or "subscription" in r.text().lower()
+
+
+class TestCloudCheckDepsLive:
+    def test_check_deps_against_cloud(self, cloud_key, sd15_workflow):
+        from check_deps import check_deps
+        report = check_deps(sd15_workflow, host="https://cloud.comfy.org", api_key=cloud_key)
+        # Either node check passed OR was skipped (free tier)
+        assert "missing_models" in report
+        assert "is_cloud" in report and report["is_cloud"] is True
+
+    def test_flux_workflow_models_resolved_via_aliases(self, cloud_key, flux_workflow):
+        """Flux uses unet/clip folders; cloud has them in diffusion_models/text_encoders.
+        With folder aliasing, the check should still find them."""
+        from check_deps import check_deps
+        report = check_deps(flux_workflow, host="https://cloud.comfy.org", api_key=cloud_key)
+        # The exact required Flux files (flux1-dev.safetensors, t5xxl_fp16, clip_l, ae)
+        # are present on cloud; with folder aliasing, none should be missing.
+        # If this fails, either the cloud removed the model or the aliasing logic broke.
+        missing_filenames = {m["value"] for m in report["missing_models"]}
+        assert "ae.safetensors" not in missing_filenames, \
+            "ae.safetensors should be on cloud's vae folder"
+        # t5xxl_fp16 / clip_l should be reachable via the clip → text_encoders alias
+        # flux1-dev.safetensors likewise via unet → diffusion_models
+
+
+class TestHealthCheckLive:
+    def test_health_check_passes(self, cloud_key, capsys):
+        from health_check import main as health_main
+        rc = health_main(["--host", "https://cloud.comfy.org", "--api-key", cloud_key])
+        captured = capsys.readouterr()
+        # Should produce JSON
+        import json
+        report = json.loads(captured.out)
+        assert report["server"]["reachable"] is True
+        assert report["checkpoints"]["queryable"] is True
+        assert report["checkpoints"]["count"] > 0
+

@@ -1,0 +1,247 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_diagnostic_turn_end_to_end.py ===
+"""Diagnostic wake exercises the actual TUI turn, event transport, and control callback."""
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+from tui_gateway import server
+from tests.tui_gateway.test_auto_continue import turn_env, marker_home, _session
+
+
+@pytest.mark.parametrize("suppress", [False, True])
+def test_diagnostic_turn_runs_but_never_echoes_on_wire(turn_env, marker_home, monkeypatch, suppress):
+    monkeypatch.setenv("HERMES_HOME", str(marker_home))
+    (marker_home / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(not suppress).lower()}}}")
+    owner = marker_home / "owner"
+    owner.mkdir()
+    (owner / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(suppress).lower()}}}")
+    frames, work, controls = [], [], []
+    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
+    agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
+                            clarify_callback=lambda *a: controls.append(a))
+    def run(message, **kwargs):
+        work.append(message)
+        kwargs["stream_callback"]("technical diagnostic echo")
+        if agent.interim_assistant_callback:
+            agent.interim_assistant_callback("technical interim")
+        agent.clarify_callback("Recovery approval?", ["yes", "no"])
+        return {"final_response": "technical final", "messages": []}
+    agent.run_conversation = run
+    session = _session(agent=agent, running=True)
+    session["profile_home"] = str(owner)
+    server._run_prompt_submit("request", "session", session, "engine failure",
+                              display_metadata={"notification_category": "diagnostic"})
+    assert work == ["engine failure"]
+    assert controls == [("Recovery approval?", ["yes", "no"])]
+    content_frames = [f for f in frames if (f.get("params") or {}).get("type") in {"message.delta", "message.interim", "message.complete", "error"}]
+    assert bool(content_frames) is not suppress
+    assert session["running"] is False
+
+
+def test_restart_preserves_diagnostic_category_through_marker(turn_env, marker_home, monkeypatch):
+    from tui_gateway.turn_marker import read_turn_marker
+    session = _session()
+    server._record_turn_marker(session, "engine diagnostic",
+                               notification_category="diagnostic")
+    marker = read_turn_marker(marker_home, "session-key")
+    assert marker["notification_category"] == "diagnostic"
+    calls = []
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
+    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 3600, 2))
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: calls.append(k))
+    server._maybe_schedule_auto_continue("session", session, "session-key")
+    assert calls[0]["display_metadata"]["notification_category"] == "diagnostic"
+
+
+def test_next_human_followup_is_outside_diagnostic_presentation_scope(turn_env, marker_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(marker_home))
+    (marker_home / "config.yaml").write_text("display: {suppress_warning_notifications: true}")
+    frames = []
+    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
+    agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
+        run_conversation=lambda *a, **k: {"final_response": "diagnostic echo", "messages": []})
+    session = _session(agent=agent, running=True)
+    def followups(*a):
+        server._emit("message.complete", "session", {"text": "next requested result"})
+    monkeypatch.setattr(server, "_run_post_turn_followups", followups)
+    server._run_prompt_submit("request", "session", session, "engine failure",
+                              display_metadata={"notification_category": "diagnostic"})
+    finals = [f["params"]["payload"]["text"] for f in frames if f.get("params", {}).get("type") == "message.complete"]
+    assert finals == ["next requested result"]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_empty_fast_status.py ===
+"""``config.set fast status`` reports "normal" for an explicit-normal pin.
+
+A session pinned to normal carries ``""`` (not ``None``) in ``create_service_tier_override``
+and, once built, in ``agent.service_tier`` — the status branch echoed that ``""`` back.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+import tui_gateway.server as server
+
+
+@pytest.mark.parametrize("tier,expected", [("", "normal"), (None, "normal"), ("priority", "fast")])
+@pytest.mark.parametrize("built", [True, False])
+def test_fast_status_reports_tier_without_writing_config(tier, expected, built):
+    session = ({"agent": SimpleNamespace(service_tier=tier)} if built
+               else {"create_service_tier_override": tier})
+    with patch.dict(server._sessions, {"s-fast": session}, clear=False), \
+            patch.object(server, "_load_service_tier", return_value=tier), \
+            patch.object(server, "_write_config_key") as write_key:
+        res = server._methods["config.set"]("rid", {"session_id": "s-fast", "key": "fast", "value": "status"})
+    assert res["result"]["value"] == expected
+    write_key.assert_not_called()
+    if built:
+        assert session["agent"].service_tier == tier
+    else:
+        assert session["create_service_tier_override"] == tier
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_entry_import_off_main_thread.py ===
+"""Regression test: importing tui_gateway.entry off the main thread must not crash.
+
+Background
+----------
+``entry.py`` installs signal handlers (SIGPIPE, SIGTERM, …) at *import time*.
+``signal.signal`` is only legal in the main thread, so a first import of
+``entry`` from a worker thread raises
+``ValueError: signal only works in main thread of the main interpreter``.
+
+The Desktop/WebSocket agent-build path (``server._build``) runs in a daemon
+thread and does ``from tui_gateway.entry import ensure_mcp_discovery_started``
+(server.py:1866).  On that path ``entry.main()`` is never run, so the worker
+thread performs the *first* import of ``entry`` — which crashed and aborted
+MCP discovery startup (#72667, regression from the 2026-07-26 websocket-MCP
+discovery fix).
+
+Fix: guard the import-time signal installs with a main-thread check.  Handlers
+are process-global, so installing them only when reached in the main thread is
+sufficient; importing from a worker thread becomes a safe no-op.
+
+This test runs the import in a *fresh* subprocess worker thread to guarantee a
+clean first-import (the test process already imported entry in its main
+thread, so an in-process import would not reproduce the bug).
+"""
+
+import subprocess
+import sys
+
+REPO_ROOT = "."
+
+
+def _spawn_worker_import_entry():
+    """Run `import tui_gateway.entry` for the first time inside a worker thread.
+
+    Returns (returncode, stdout, stderr).
+    """
+    code = (
+        "import threading, sys, signal, os\n"
+        "sys.stdout.reconfigure(line_buffering=True)\n"
+        "sys.stderr.reconfigure(line_buffering=True)\n"
+        "errs = []\n"
+        "def _worker():\n"
+        "    try:\n"
+        "        import tui_gateway.entry\n"
+        "    except Exception as e:\n"
+        "        errs.append(repr(e))\n"
+        "t = threading.Thread(target=_worker, daemon=True)\n"
+        "t.start(); t.join(timeout=15)\n"
+        "if errs:\n"
+        "    sys.stdout.write('IMPORT_FAILED: ' + errs[0] + '\\n')\n"
+        "    sys.exit(2)\n"
+        "# main thread of this process still installs SIGPIPE handler\n"
+        "h = signal.getsignal(signal.SIGPIPE)\n"
+        "sys.stdout.write('OK handler_installed=' + str(h is signal.SIG_IGN or callable(h)) + '\\n')\n"
+        "sys.exit(0)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**__import__("os").environ},
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def test_entry_imports_cleanly_from_worker_thread():
+    """First import of tui_gateway.entry from a worker thread must succeed."""
+    rc, out, err = _spawn_worker_import_entry()
+    # entry import may emit to stdout or stderr depending on the runner; check both.
+    combined = out + err
+    assert rc == 0, f"entry import off main thread failed (rc={rc}): {err!r}"
+    assert "OK" in combined, f"unexpected output: {out!r} / {err!r}"
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_entry_inline_handler_error.py ===
+"""Regression coverage for stdio inline-handler failures (#112816).
+
+``entry.main()`` used to call ``dispatch(req)`` bare, so an exception from an
+inline (non-pool) handler unwound the read loop and killed the gateway child,
+losing the in-flight reply and wedging the TUI until a restart.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+
+from tui_gateway import entry
+
+
+def test_main_reports_inline_handler_error_and_keeps_reading(monkeypatch):
+    """A failed inline request must not prevent the next request from replying."""
+    replies: list[dict] = []
+    breadcrumbs: list[str] = []
+    stdin_text = "".join(json.dumps(req) + "\n" for req in (
+        {"jsonrpc": "2.0", "id": "broken", "method": "clipboard.save"},
+        {"jsonrpc": "2.0", "id": "next", "method": "ping"},
+    ))
+
+    monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+    monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
+    monkeypatch.setattr(entry, "resolve_skin", lambda: "default")
+    monkeypatch.setattr(entry.server, "_start_backend_heartbeat_refresher", lambda: None)
+    monkeypatch.setattr(entry.server, "_schedule_startup_orphan_sweep", lambda: None)
+    monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(entry, "handle_spurious_eof", lambda *_args: False)
+    monkeypatch.setattr(entry, "write_json", lambda payload: replies.append(payload) or True)
+    monkeypatch.setattr(entry, "_append_crash_log", lambda header, dump=None: breadcrumbs.append(header))
+    monkeypatch.setattr(entry.sys, "stdin", io.StringIO(stdin_text))
+
+    def dispatch(req):
+        if req["id"] == "broken":
+            raise NameError("clipboard backend is unavailable")
+        return {"jsonrpc": "2.0", "id": req["id"], "result": {"ok": True}}
+
+    monkeypatch.setattr(entry, "dispatch", dispatch)
+
+    entry.main()
+
+    assert replies[1] == {
+        "jsonrpc": "2.0",
+        "id": "broken",
+        "error": {"code": -32000, "message": "handler error: clipboard backend is unavailable"},
+    }
+    assert replies[2] == {"jsonrpc": "2.0", "id": "next", "result": {"ok": True}}
+    # Forensics: the survived crash leaves the same crash-log trail a fatal one would.
+    assert len(breadcrumbs) == 1 and "clipboard.save" in breadcrumbs[0]
+

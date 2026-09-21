@@ -1,0 +1,189 @@
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\live_ab\cache_prefix_live.py ===
+"""Live A/B for the thinking-strip cache miss (F0). Runs a short real tool loop through AIAgent on
+Fable 5.1 via Nous and prints per-call cache hit ratios from agent.log. ~10 calls, well under $1.
+Arm A = current code. Arm B = HERMES_KEEP_ALL_THINKING=1 monkeypatch of _manage_thinking_signatures
+that passes thinking blocks back unchanged for the Nous/Anthropic route."""
+import os, sys, re, time, subprocess, json
+# LIVE: real provider calls (cents). Usage: python cache_prefix_live.py <repo_root> <A|B>
+os.environ.setdefault("HERMES_HOME", os.path.expanduser("~/.hermes"))
+sys.path.insert(0, sys.argv[1])
+arm = sys.argv[2] if len(sys.argv) > 2 else "A"
+import agent.anthropic_message_convert as amc
+if arm == "B":
+    _orig = amc._manage_thinking_signatures
+    def _keep_all(result, base_url, model):
+        # keep-all model on a signature-validating route: pass every thinking block back unchanged,
+        # only drop cache_control on thinking blocks and the internal flag.
+        for idx, m in amc._assistant_block_lists(result):
+            for b in m["content"]:
+                if amc._block_type(b) in amc._THINKING_TYPES:
+                    b.pop("cache_control", None)
+            m.pop("_thinking_signature_invalidated", None)
+    amc._manage_thinking_signatures = _keep_all
+    # the adapter imports the name at call time via module attribute? verify binding
+    import agent.anthropic_adapter as ad
+    if hasattr(ad, "_manage_thinking_signatures"):
+        ad._manage_thinking_signatures = _keep_all
+from run_agent import AIAgent
+from hermes_cli.runtime_provider import resolve_runtime_provider
+rt = resolve_runtime_provider(requested="nous", target_model="anthropic/claude-fable-5.1")
+sid = f"f0ab_{arm}_{int(time.time())}"
+ag = AIAgent(model="anthropic/claude-fable-5.1", provider="nous", base_url=rt.get("base_url"), api_key=rt.get("api_key"),
+             api_mode=rt.get("api_mode"), session_id=sid, quiet_mode=True,
+             enabled_toolsets=["file", "terminal"], platform="cli", max_iterations=12,
+             skip_context_files=True, skip_memory=True, reasoning_config={"enabled": True, "effort": "medium"})
+task = ("In /tmp/f0ab_work (create it), do these steps ONE tool call at a time, no parallel calls: "
+        "1) write a.txt with 'alpha', 2) write b.txt with 'beta', 3) read a.txt, 4) read b.txt, "
+        "5) run `ls -la /tmp/f0ab_work`, 6) run `wc -c /tmp/f0ab_work/*`, 7) run `cat /tmp/f0ab_work/a.txt`, "
+        "then reply with one line: DONE.")
+t0 = time.time()
+r = ag.run_conversation(task)
+print("final:", (r.get("final_response") or "")[:80], "| wall", round(time.time() - t0, 1), "s")
+time.sleep(1)
+log = subprocess.run(f"grep -h '\\[{sid}\\]' ~/.hermes/logs/agent.log | grep 'API call #'", shell=True, capture_output=True).stdout.decode("utf-8", "replace")
+rows = re.findall(r"API call #(\d+): .*in=(\d+) out=(\d+) .*cache=(\d+)/(\d+) \((\d+)%\)", log)
+tot_in = tot_c = 0
+for n, i, o, c, ct, p in rows:
+    i, c = int(i), int(c); tot_in += i; tot_c += c
+    print(f"  call {n:>2} in={i:>7} out={o:>5} cached={c:>7} ({p}%)  uncached={i-c}")
+print(f"ARM {arm}: calls={len(rows)} input={tot_in} cached={tot_c} uncached={tot_in-tot_c} hit={100*tot_c/max(tot_in,1):.1f}%")
+print(json.dumps({"arm": arm, "calls": len(rows), "input": tot_in, "cached": tot_c}))
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\live_ab\cache_prefix_wire.py ===
+"""Definitive F0 test: capture consecutive wire payloads on a real Fable 5.1 tool loop and diff the
+message prefix between call N and N+1. If Hermes strips prior-turn thinking, call N+1's messages[:k]
+will NOT equal call N's messages (prefix divergence) even though the conversation only grew.
+Also reports cache hit per call. Cost: a handful of calls."""
+import os, sys, re, time, json, copy, subprocess
+# LIVE: makes ~6 real calls to the configured provider (a few cents). Usage:
+#   python cache_prefix_wire.py <repo_root> <A|B> [--hermes-home DIR]   (default HERMES_HOME: the real one, for credentials)
+sys.path.insert(0, sys.argv[1])
+os.environ.setdefault("HERMES_HOME", os.path.expanduser("~/.hermes"))
+if "--hermes-home" in sys.argv:
+    os.environ["HERMES_HOME"] = sys.argv[sys.argv.index("--hermes-home") + 1]
+arm = sys.argv[2] if len(sys.argv) > 2 else "A"
+import agent.anthropic_message_convert as amc
+if arm == "B":
+    def _keep_all(result, base_url, model):
+        for idx, m in amc._assistant_block_lists(result):
+            for b in m["content"]:
+                if amc._block_type(b) in amc._THINKING_TYPES: b.pop("cache_control", None)
+            m.pop("_thinking_signature_invalidated", None)
+    amc._manage_thinking_signatures = _keep_all
+# Capture every outbound Anthropic-format payload
+captured = []
+import agent.anthropic_adapter as ad
+_orig_convert = None
+for name in ("convert_messages_to_anthropic", "to_anthropic_messages", "convert_to_anthropic", "build_anthropic_messages"):
+    if hasattr(amc, name): _orig_convert = (name, getattr(amc, name)); break
+if _orig_convert is None:
+    # find the public converter: the function that calls _manage_thinking_signatures at line ~703
+    import inspect
+    for name, fn in inspect.getmembers(amc, inspect.isfunction):
+        try:
+            if "_manage_thinking_signatures(result" in inspect.getsource(fn): _orig_convert = (name, fn); break
+        except Exception: pass
+name, fn = _orig_convert
+def _wrapped(*a, **k):
+    out = fn(*a, **k)
+    try:
+        msgs = out[1] if isinstance(out, tuple) else out   # (system, messages)
+        captured.append(copy.deepcopy(msgs))
+    except Exception: pass
+    return out
+setattr(amc, name, _wrapped)
+if hasattr(ad, name): setattr(ad, name, _wrapped)
+print("hooked converter:", name)
+from run_agent import AIAgent
+from hermes_cli.runtime_provider import resolve_runtime_provider
+rt = resolve_runtime_provider(requested="nous", target_model="anthropic/claude-fable-5.1")
+sid = f"f0wire_{arm}_{int(time.time())}"
+ag = AIAgent(model="anthropic/claude-fable-5.1", provider="nous", base_url=rt.get("base_url"), api_key=rt.get("api_key"),
+             api_mode=rt.get("api_mode"), session_id=sid, quiet_mode=True, enabled_toolsets=["file", "terminal"],
+             platform="cli", max_iterations=10, skip_context_files=True, skip_memory=True,
+             reasoning_config={"enabled": True, "effort": "medium"})
+task = ("Work in /tmp/f0wire (create it). Before EACH tool call, think carefully for a moment about edge cases. "
+        "Steps, one tool call each: 1) write notes.md with a 5-line summary of what a Python context manager is; "
+        "2) read it back; 3) run `wc -l /tmp/f0wire/notes.md`; 4) append one more line to notes.md explaining __exit__ return values; "
+        "5) read it back; then reply DONE.")
+ag.run_conversation(task)
+time.sleep(1)
+log = subprocess.run(f"grep -h '\\[{sid}\\]' ~/.hermes/logs/agent.log | grep 'API call #'", shell=True, capture_output=True).stdout.decode("utf-8", "replace")
+rows = re.findall(r"API call #(\d+): .*in=(\d+) out=(\d+) .*cache=(\d+)/(\d+) \((\d+)%\)", log)
+for r in rows: print(f"  call {r[0]:>2} in={int(r[1]):>6} out={int(r[2]):>5} cached={int(r[3]):>6} ({r[5]}%) uncached={int(r[1])-int(r[3])}")
+print(f"ARM {arm}: captured {len(captured)} payloads")
+# prefix divergence check
+def sig(m):  # message signature: role + block types + text/thinking lengths + signature presence
+    c = m.get("content")
+    if isinstance(c, list):
+        return (m.get("role"), tuple((b.get("type"), len(str(b.get("text", b.get("thinking", b.get("input", ""))))), bool(b.get("signature"))) for b in c))
+    return (m.get("role"), str(c)[:200])
+div = 0
+for i in range(1, len(captured)):
+    prev, cur = captured[i-1], captured[i]
+    k = len(prev)
+    same = [sig(a) == sig(b) for a, b in zip(prev, cur[:k])]
+    if not all(same):
+        j = same.index(False); div += 1
+        print(f"  payload {i}: prefix DIVERGED at message {j}/{k}: prev={sig(prev[j])}  cur={sig(cur[j])}")
+print(f"ARM {arm}: {div} of {len(captured)-1} consecutive payloads had a mutated prefix (thinking blocks in prev assistant msgs: "
+      f"{sum(1 for m in captured[-1] if m.get('role')=='assistant' and isinstance(m.get('content'),list) and any(b.get('type')=='thinking' for b in m['content']))} of "
+      f"{sum(1 for m in captured[-1] if m.get('role')=='assistant')} assistant msgs in final payload)")
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\live_ab\goal_judge_wait.py ===
+"""Live judge A/B on the run's real "waiting" response shape. Usage: python judge_ab.py <repo_root> [n]"""
+import os, sys
+root = sys.argv[1]; n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+sys.path.insert(0, root)
+os.environ.setdefault("HERMES_HOME", os.path.expanduser("~/.hermes"))  # LIVE: real auxiliary judge calls (cents)
+from hermes_cli import goals
+goal = ("Simplify the hermes-agent codebase by >=30% LOC with zero behavior change, decomposing every god file, "
+        "through parallel subagent waves; integrate, run the full test suite, and open one PR.")
+response = ("Round 3 status: 4 worker batches are still running (deleg_9f1a2b, deleg_77c0de, deleg_a1b2c3, deleg_0e9f88; "
+            "8 workers on adapters/gateway god files, median 38 min in). Round-2 integration merged clean; full suite "
+            "green on the integration branch. Nothing else is dispatchable until these return: their summaries decide "
+            "which files round 4 takes. Waiting on the batch-complete notifications; no action needed from me now.")
+kw = {"active_delegations": 4} if "active_delegations" in goals.judge_goal.__code__.co_varnames else {}
+verdicts = []
+for _ in range(n):
+    v, reason, pf, directive, tf = goals.judge_goal(goal, response, **kw)
+    verdicts.append((v, directive.get("seconds") if directive else None))
+    print(v, directive, "|", reason[:90])
+print("SUMMARY", verdicts)
+
+
+
+=== ARCHIVO: .\hermes-agent\evals\postmortem\live_ab\hardline_scanner_matrix.py ===
+import sys; sys.path.insert(0, sys.argv[1] if len(sys.argv) > 1 else ".")  # usage: python hardline_scanner_matrix.py <repo_root>
+from tools.approval_detection import detect_hardline_command as d
+cases = {
+    # the reviewer's witnesses
+    "newline-hidden reboot in quoted $(grep)":  ('echo "$(grep -P \'safe\' /dev/null\nreboot)"', True),
+    "grep with backtick operand":                ("grep -e `echo needle` file", False),
+    # the original class (must stay fixed)
+    "canonical sed/grep/cut":                    ('sed -n "$(grep -n X f | cut -d: -f1),+3p" f', False),
+    "grep -c inside $()":                        ('echo "$(grep -c x f)"', False),
+    # controls: other separators inside the substitution
+    "; hidden reboot":                           ('echo "$(grep x f; reboot)"', True),
+    "&& hidden reboot":                          ('echo "$(grep x f && reboot)"', True),
+    "| hidden shutdown":                         ('echo "$(grep x f | shutdown -h now)"', True),
+    "nested $( ) newline reboot":                ('echo "$(echo $(grep x f)\nreboot)"', True),
+    "backtick newline reboot":                   ('echo "`grep x f\nreboot`"', True),
+    # data that must stay allowed
+    "reboot as quoted grep pattern":             ("grep -F 'sudo reboot' notes.md", False),
+    "commit msg with reboot on a data line":     ('git commit -m "fix\nsudo reboot handling"', False),
+}
+bad = 0
+for name, (cmd, want_block) in cases.items():
+    got, why = d(cmd)
+    ok = got == want_block
+    bad += not ok
+    print(("OK  " if ok else "FAIL") + f" {name}: blocked={got} ({why})")
+print("ALL OK" if not bad else f"{bad} FAILURES")
+

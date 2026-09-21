@@ -1,0 +1,180 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\tts_provider.py ===
+"""Text-to-Speech Provider ABC.
+
+Providers register via ``PluginContext.register_tts_provider()`` and service
+``text_to_speech`` only when ``tts.provider`` names neither a built-in
+(``BUILTIN_TTS_PROVIDERS`` in :mod:`tools.tts_tool`; the registry rejects
+colliding names) nor a ``tts.providers.<name>: type: command`` entry (config is
+more local than a plugin install, so it wins). :meth:`TTSProvider.synthesize`
+should raise on failure — the dispatcher builds the ``{success: False}`` envelope.
+"""
+
+from __future__ import annotations
+
+import abc
+import logging
+from typing import Any, Dict, Iterator, List, Optional
+
+from agent.provider_base import CatalogProviderBase
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_OUTPUT_FORMAT = "mp3"
+VALID_OUTPUT_FORMATS = frozenset({"mp3", "wav", "ogg", "opus", "flac"})
+
+
+class TTSProvider(CatalogProviderBase):
+    """Abstract base class for a text-to-speech backend.
+
+    Subclasses must implement :attr:`name` (rejected at registration if it
+    collides with a built-in TTS provider name) and :meth:`synthesize`.
+    """
+
+    def list_voices(self) -> List[Dict[str, Any]]:
+        """Voice catalog entries: ``{"id"}`` required; ``display`` / ``language``
+        / ``gender`` / ``preview_url`` optional. Default: empty."""
+        return []
+
+    def default_voice(self) -> Optional[str]:
+        """Id of the first voice entry, or None if not applicable."""
+        voices = self.list_voices()
+        return voices[0].get("id") if voices else None
+
+    @abc.abstractmethod
+    def synthesize(
+        self, text: str, output_path: str, *, voice: Optional[str]=None, model: Optional[str]=None,
+        speed: Optional[float]=None, format: str=DEFAULT_OUTPUT_FORMAT, ** extra: Any,
+    ) -> str:
+        """Synthesize ``text`` into ``output_path`` and return the written path.
+
+        ``text`` is already truncated to the provider's max length and the
+        parent directory exists. ``voice`` / ``model`` fall back to
+        :meth:`default_voice` / :meth:`default_model` when None; ``speed`` is a
+        rate multiplier providers may ignore. If ``format`` is unsupported, pick
+        the closest equivalent and make ``output_path`` carry the right
+        extension. Unknown ``extra`` keys must be ignored. Raise on failure.
+        """
+
+    def stream(
+        self, text: str, *, voice: Optional[str] = None, model: Optional[str] = None,
+        format: str = "opus", **extra: Any,
+    ) -> Iterator[bytes]:
+        """Stream synthesized audio bytes (optional).
+
+        Default raises :class:`NotImplementedError`; the dispatcher then falls
+        back to :meth:`synthesize` + read-whole-file. ``format`` defaults to
+        ``opus`` because the primary streaming consumer is voice-bubble
+        delivery (Telegram et al.), which requires Opus.
+        """
+        raise NotImplementedError(
+            f"TTS provider {self.name!r} does not implement streaming "
+            "synthesis. Use synthesize() instead, or implement stream() "
+            "if your backend supports it."
+        )
+
+    def warm(self) -> None:
+        """Speech output was just turned on; pre-load so the first reply is hot.
+        Called from the TTS lease path when this is the configured provider.
+        Best-effort; default no-op."""
+
+    def release(self) -> None:
+        """Last speech-output lease released; free resident resources (counterpart
+        of :meth:`warm`). Best-effort; default no-op."""
+
+    @property
+    def voice_compatible(self) -> bool:
+        """Whether output suits voice-bubble delivery (mirrors
+        ``tts.providers.<name>.voice_compatible``): True → the gateway converts
+        to Opus via ffmpeg if needed; False → regular audio attachment. Default
+        False (opt in).
+
+        See #17843.
+        """
+        return False
+
+
+def resolve_output_format(value: Optional[str]) -> str:
+    """Clamp an output_format to :data:`VALID_OUTPUT_FORMATS`; invalid values
+    coerce to :data:`DEFAULT_OUTPUT_FORMAT` so the tool surface forgives agent
+    mistakes instead of rejecting them."""
+    v = value.strip().lower() if isinstance(value, str) else None
+    return v if v in VALID_OUTPUT_FORMATS else DEFAULT_OUTPUT_FORMAT
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\tts_registry.py ===
+"""TTS Provider Registry.
+
+Registered plugin TTS providers, populated at import-time via
+:meth:`PluginContext.register_tts_provider` and consulted by :mod:`tools.tts_tool`
+only when ``tts.provider`` is neither a built-in nor a command-type provider.
+Built-ins always win: a colliding plugin name is rejected here with a warning
+(re-checked at dispatch). Command-providers-win-over-plugins is enforced by the
+dispatcher (a name in the user's config.yaml is more specific than a plugin).
+"""
+
+from __future__ import annotations
+
+import logging
+
+from agent.provider_registry import ProviderRegistry, lower_key
+from agent.tts_provider import TTSProvider
+
+logger = logging.getLogger(__name__)
+
+
+# Names reserved for native built-in TTS handlers. **Kept in sync with
+# ``BUILTIN_TTS_PROVIDERS`` in :mod:`tools.tts_tool`** (``TestBuiltinSync`` in
+# ``tests/agent/test_tts_registry.py`` fails on drift); importing it directly
+# would be a circular import.
+_BUILTIN_NAMES = frozenset({
+    "edge", "elevenlabs", "openai", "minimax", "xai", "mistral", "gemini", "neutts", "kittentts",
+    "piper", "deepinfra",
+})
+
+
+def _warn_builtin_collision(key: str) -> None:
+    logger.warning(
+        "TTS provider '%s' shadows a built-in name; registration ignored. "
+        "Built-in TTS providers (%s) always win — pick a different name.",
+        key, ", ".join(sorted(_BUILTIN_NAMES)),
+    )
+
+
+# Case-insensitive, whitespace-tolerant keys mirror how
+# ``tools.tts_tool._get_provider`` normalizes the configured ``tts.provider``.
+_registry: ProviderRegistry[TTSProvider] = ProviderRegistry(
+    label="TTS", provider_cls=TTSProvider, logger=logger, normalize=lower_key,
+    builtin_names=_BUILTIN_NAMES, on_builtin_collision=_warn_builtin_collision,
+)
+_registry.export(globals())
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from typing import Dict  # noqa: F401,E402
+from typing import List  # noqa: F401,E402
+from typing import Optional  # noqa: F401,E402
+import threading  # noqa: F401,E402
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'hermes_home_key': ('hermes_constants', 'hermes_home_key'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
+

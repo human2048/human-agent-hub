@@ -1,0 +1,310 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\interrupt_scope.py ===
+"""Host-owned cancellation for agents created deep inside synchronous work.
+
+A host that runs a blocking command on a worker thread (Hermes Console) never sees
+the ``AIAgent`` a CLI subcommand forks inside it, so it cannot call ``interrupt()``
+when the user cancels. The host binds an :class:`InterruptScope` around the work;
+every ``run_conversation()`` under that scope registers its agent, and
+``scope.cancel()`` hard-interrupts them from any thread. Agents registering after
+the cancel are interrupted immediately, so a cancel never loses the race with a
+turn that has not started yet (#106179).
+"""
+
+from __future__ import annotations
+
+import threading
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from typing import Any, Iterator, Optional
+
+from agent.interrupt_compat import request_hard_interrupt
+
+_ACTIVE_SCOPE: ContextVar[Optional["InterruptScope"]] = ContextVar("hermes_interrupt_scope", default=None)
+
+
+_TOOL_REASON_HOST_CANCELLED = "host cancelled the command"
+
+
+class InterruptScope:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._agents: list[Any] = []
+        self.reason: Optional[str] = None
+        self._tool_reason: Optional[str] = _TOOL_REASON_HOST_CANCELLED
+
+    def cancel(self, reason: str, *, tool_reason: Optional[str] = _TOOL_REASON_HOST_CANCELLED) -> None:
+        """Latch ``reason`` and hard-interrupt every agent running under this scope.
+
+        ``tool_reason`` names the system issuer; pass ``None`` for a human stop so the turn is
+        attributed to the user rather than to the host (#112647)."""
+        with self._lock:
+            self.reason = reason
+            self._tool_reason = tool_reason
+            agents = list(self._agents)
+        for agent in agents:
+            request_hard_interrupt(agent, reason, tool_reason=tool_reason)
+
+    @contextmanager
+    def track(self, agent: Any) -> Iterator[None]:
+        with self._lock:
+            self._agents.append(agent)
+            reason, tool_reason = self.reason, self._tool_reason
+        if reason is not None:
+            request_hard_interrupt(agent, reason, tool_reason=tool_reason)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._agents.remove(agent)
+
+
+@contextmanager
+def bind_interrupt_scope(scope: Optional[InterruptScope]) -> Iterator[None]:
+    """Make ``scope`` the owner of every agent turn started in this context."""
+    token = _ACTIVE_SCOPE.set(scope)
+    try:
+        yield
+    finally:
+        _ACTIVE_SCOPE.reset(token)
+
+
+def track_in_interrupt_scope(agent: Any):
+    """Register ``agent`` with the bound scope for the duration of its turn (no-op without one)."""
+    scope = _ACTIVE_SCOPE.get()
+    return nullcontext() if scope is None else scope.track(agent)
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\iteration_budget.py ===
+"""Per-agent iteration budget — thread-safe consume/refund counter.
+
+Each ``AIAgent`` (parent or subagent) holds its own :class:`IterationBudget`: the parent's
+cap is ``max_iterations`` (default 500), each subagent's ``delegation.max_iterations``
+(default 50), so total iterations across parent + subagents can exceed the parent's cap.
+"""
+
+from __future__ import annotations
+
+import math
+import threading
+
+
+def normalize_budget_warning_ratio(value) -> float | None:
+    """A finite ratio strictly between zero and one, or None (feature off)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    return ratio if math.isfinite(ratio) and 0 < ratio < 1 else None
+
+
+class IterationBudget:
+    """Thread-safe iteration counter; ``execute_code`` (programmatic tool calling)
+    iterations are refunded via :meth:`refund` so they don't eat into the budget."""
+
+    def __init__(self, max_total: int):
+        self.max_total = max_total
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def consume(self) -> bool:
+        """Try to consume one iteration.  Returns True if allowed."""
+        with self._lock:
+            if self._used >= self.max_total:
+                return False
+            self._used += 1
+            return True
+
+    def refund(self) -> None:
+        """Give back one iteration (e.g. for execute_code turns)."""
+        with self._lock:
+            if self._used > 0:
+                self._used -= 1
+
+    @property
+    def used(self) -> int:
+        with self._lock:
+            return self._used
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return max(0, self.max_total - self._used)
+
+
+__all__ = ["IterationBudget"]
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\jiter_preload.py ===
+"""Best-effort early import of the OpenAI SDK's native streaming parser: on some
+Windows installs ``jiter``'s native extension imports fine from the venv but fails
+when first imported inside the threaded streaming path. Loading it once at
+agent-package import avoids that while keeping the SDK's normal error path for
+genuinely broken installs."""
+
+from __future__ import annotations
+
+import importlib
+
+_JITER_PRELOADED = False
+_JITER_PRELOAD_ERROR: Exception | None = None
+
+
+def preload_jiter_native_extension() -> bool:
+    global _JITER_PRELOADED, _JITER_PRELOAD_ERROR
+    if _JITER_PRELOADED:
+        return True
+    try:
+        importlib.import_module("jiter.jiter")
+        from jiter import from_json as _from_json  # noqa: F401
+    except Exception as exc:
+        _JITER_PRELOAD_ERROR = exc
+        return False
+    _JITER_PRELOADED, _JITER_PRELOAD_ERROR = True, None
+    return True
+
+
+preload_jiter_native_extension()
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\kanban_stop.py ===
+"""Turn-end guard for kanban workers, which must end with a terminal board tool that hands
+the card to whoever owns it next (``kanban_complete``, ``kanban_block``,
+``kanban_request_review``, ``kanban_request_changes``). Some models narrate the next step
+and stop with no tool calls; Hermes treats that as a clean exit → ``rc=0`` → dispatcher
+``protocol_violation``. Policy-only: return a bounded synthetic nudge so the loop continues
+instead of exiting.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Iterable, Optional
+
+from agent.delegation_context import owned_kanban_task
+
+
+# Every tool that ends this worker's responsibility for the card, not just the two that
+# close it out: ``kanban_request_review`` moves it to ``review`` (goals.py's continuation /
+# finalize prompts tell builders to call it) and ``kanban_request_changes`` returns it to
+# ``ready`` (the sdlc-review skill tells reviewers to). Nudging after either asks a worker
+# that did the right thing to ``kanban_complete`` a card it must not close.
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+})
+
+_DEFAULT_MAX_ATTEMPTS = 2
+
+
+def kanban_stop_nudge_enabled() -> bool:
+    """On when ``HERMES_KANBAN_TASK`` is set for the dispatcher-owned worker, unless
+    ``HERMES_KANBAN_STOP_NUDGE`` disables it. In-process delegate_task children and cron runs
+    inherit the env var but own no board task and carry no kanban toolset."""
+    if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return bool(owned_kanban_task())
+
+
+def _tool_call_name(tc: Any) -> str:
+    """Tool name from a dict or object tool call (``function.name`` first, then ``name``)."""
+    if isinstance(tc, dict):
+        fn = tc.get("function")
+        return str((fn.get("name") if isinstance(fn, dict) else tc.get("name")) or "")
+    fn = getattr(tc, "function", None)
+    return str((getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or "")
+
+
+def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
+    """True if this conversation already invoked a terminal kanban tool."""
+    for msg in filter(lambda m: isinstance(m, dict), messages or ()):
+        role = msg.get("role")
+        if role == "assistant" and any(
+            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
+        ):
+            return True
+        if role == "tool" and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
+            return True
+    return False
+
+
+def build_kanban_stop_nudge(
+    *,
+    messages: Iterable[dict] | None = None,
+    attempts: int = 0,
+    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Synthetic follow-up when a kanban worker exits without a terminal tool; ``None`` when
+    the guard should not fire (not a kanban worker, already completed/blocked, budget exhausted)."""
+    if (
+        not kanban_stop_nudge_enabled()
+        or attempts >= max_attempts
+        or session_called_kanban_terminal(messages)
+    ):
+        return None
+
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    # The transcript is the status source: this text is only reached when the session made no
+    # handoff call, so it never tells a worker to close a card it already sent to review.
+    return (
+        "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
+        "terminal state for the board.\n\n"
+        f"Task `{tid}` has not been handed off: this session made no terminal board "
+        "call (`kanban_complete` / `kanban_request_review` / `kanban_block`). Ending now "
+        "causes a protocol violation (clean exit with the card still `running`).\n\n"
+        "Do this immediately in your next response — do not narrate intent:\n"
+        "1. Finish any remaining deliverable (write the required file(s) now).\n"
+        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is done "
+        "and needs no review, `kanban_request_review(summary=...)` if it is a code "
+        "change that needs same-card review, OR `kanban_block(reason=...)` if you are "
+        "blocked. Reviewers approve with `kanban_complete` or send the card back with "
+        "`kanban_request_changes(reason=...)`.\n\n"
+        "Never end a turn with only a promise of future action. Repeated "
+        "protocol violations will block this task and require manual intervention.]"
+    )
+
+
+__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\lazy_forward.py ===
+"""Lazy forwarding helpers shared by the AIAgent façade and its mixins.
+
+Targets are resolved on every call, so ``patch("<module>.<name>")`` in tests still
+intercepts and the heavy agent modules stay off the ``run_agent`` import path.
+"""
+import importlib
+
+
+def lazy_attr(module: str, name: str):
+    """Resolve ``module.name`` at call time."""
+    return getattr(importlib.import_module(module), name)
+
+
+def forward(module: str, name: str, *, static: bool = False):
+    """Build an AIAgent method that lazily forwards to ``module.name``
+    (``target(self, *args, **kwargs)``; ``static=True`` drops ``self``)."""
+    if static:
+        def forwarder(*args, **kwargs):
+            return lazy_attr(module, name)(*args, **kwargs)
+    else:
+        def forwarder(self, *args, **kwargs):
+            return lazy_attr(module, name)(self, *args, **kwargs)
+    forwarder.__name__ = forwarder.__qualname__ = name
+    forwarder.__doc__ = f"Forwarder — see ``{module}.{name}``."
+    return staticmethod(forwarder) if static else forwarder
+
+
+def forward_static(module: str, name: str):
+    return forward(module, name, static=True)
+

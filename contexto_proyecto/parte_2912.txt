@@ -1,0 +1,338 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_stream_consumer_silence.py ===
+"""Streaming intentional-silence suppression.
+
+When the agent chooses not to reply it emits a bare control marker
+(``NO_REPLY`` / ``[SILENT]`` / …).  The gateway's whole-response filter
+(``gateway/response_filters.is_intentional_silence_agent_result``) suppresses
+this on the non-streaming delivery path, but the *streaming* path
+(``GatewayStreamConsumer``) previously had no silence awareness: it edited the
+raw marker onto the screen delta-by-delta and finalized it *before* the
+whole-response filter could run.  On any streaming-capable adapter (Slack,
+Telegram, Discord, …) users saw a literal ``NO_REPLY`` bubble.
+
+These tests pin the two halves of the fix:
+
+* ``is_partial_silence_marker`` — the mid-stream hold-back predicate.
+* ``GatewayStreamConsumer`` — an exact-marker final buffer is suppressed and
+  any already-shown preview is retracted, while substantive prose that merely
+  mentions a marker is delivered normally.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.response_filters import (
+    is_intentional_silence_response,
+    is_partial_silence_marker,
+)
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+
+# --------------------------------------------------------------------------
+# is_partial_silence_marker — mid-stream hold-back predicate
+# --------------------------------------------------------------------------
+
+# Buffers that could still resolve to a marker → held back while streaming.
+PARTIAL_POSITIVE = [
+    "N",
+    "NO",
+    "NO_",
+    "NO_REP",
+    "NO_REPLY",      # exact marker, not yet terminated by stream-end
+    "NO REPLY",
+    "no reply",      # canonicalized (case/space-insensitive)
+    "  no_reply  ",  # surrounding whitespace stripped
+    "[",
+    "[SIL",
+    "[SILENT]",
+    "SILENT",
+    "sil",
+]
+
+# Buffers that have already diverged from every marker → stream normally.
+PARTIAL_NEGATIVE = [
+    "",
+    "   ",
+    "No reply needed — here is the plan",   # diverged past the marker
+    "NO_REPLYING",                           # superset, not a prefix
+    "Nope",
+    "Hello there",
+    "The NO_REPLY token means silence",      # marker mentioned mid-prose
+    "x" * 65,                                # over the 64-char cap
+    "silence is golden",                     # 'SILENCE...' is not a marker prefix
+]
+
+
+def test_partial_predicate_agrees_with_exact_on_full_markers():
+    """Every exact silence marker is also a (trivial) partial of itself."""
+    from gateway.response_filters import LIVE_GATEWAY_SILENT_MARKERS
+
+    for marker in LIVE_GATEWAY_SILENT_MARKERS:
+        assert is_partial_silence_marker(marker) is True
+        assert is_intentional_silence_response(marker) is True
+
+
+# --------------------------------------------------------------------------
+# GatewayStreamConsumer — end-to-end suppression through run()
+# --------------------------------------------------------------------------
+
+def _make_adapter(*, supports_delete: bool = True) -> MagicMock:
+    """Minimal MagicMock adapter wired for send/edit/delete."""
+    adapter = MagicMock()
+    adapter.REQUIRES_EDIT_FINALIZE = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(return_value=SimpleNamespace(
+        success=True, message_id="preview_1",
+    ))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+        success=True, message_id="preview_1",
+    ))
+    if supports_delete:
+        adapter.delete_message = AsyncMock(return_value=True)
+    else:
+        del adapter.delete_message  # type: ignore[attr-defined]
+    return adapter
+
+
+def _sent_and_edited(adapter):
+    texts = []
+    for call in adapter.send.call_args_list:
+        texts.append(call.kwargs.get("content", ""))
+    if getattr(adapter, "edit_message", None) is not None:
+        for call in adapter.edit_message.call_args_list:
+            texts.append(call.kwargs.get("content", ""))
+    return texts
+
+
+class TestStreamedSilenceSuppression:
+    @pytest.mark.asyncio
+    async def test_no_reply_only_stream_is_fully_suppressed(self):
+        """A stream whose entire content is NO_REPLY sends nothing visible."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta("NO_REPLY")
+        consumer.finish()
+        await consumer.run()
+
+        # No marker text ever reached the platform.
+        for text in _sent_and_edited(adapter):
+            assert "NO_REPLY" not in text, f"marker leaked: {text!r}"
+
+        # Delivery flags stay False so the gateway does not treat the marker
+        # as a delivered reply (its whole-response filter then drops it too).
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_partial_marker_preview_is_retracted(self):
+        """A marker flushed mid-stream as a preview is deleted on completion."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        # Force a mid-stream preview: pretend "NO_REPLY" was already put on
+        # screen (the pre-fix behaviour) before got_done runs.
+        consumer._message_id = "preview_1"
+        consumer._preview_message_ids = {"preview_1"}
+        consumer._already_sent = True
+
+        consumer.on_delta("NO_REPLY")
+        consumer.finish()
+        await consumer.run()
+
+        # The stale preview was best-effort deleted.
+        adapter.delete_message.assert_awaited_once_with("chat_1", "preview_1")
+        assert consumer.final_content_delivered is False
+        assert consumer.already_sent is False
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_stream_consumer_thread_routing.py ===
+"""Regression tests for stream consumer thread/topic routing fix.
+
+Verifies that GatewayStreamConsumer correctly passes reply_to on the first
+message send, ensuring messages land in the correct topic/thread instead of
+the main group chat.
+
+Covers: #6969, #9916, #7355
+"""
+from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.stream_consumer import (
+    GatewayStreamConsumer,
+)
+
+
+def _make_adapter(send_result=None, edit_result=None, max_length=4096):
+    adapter = MagicMock()
+    adapter.send = AsyncMock(
+        return_value=send_result or SimpleNamespace(success=True, message_id="msg_1")
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=edit_result or SimpleNamespace(success=True)
+    )
+    adapter.MAX_MESSAGE_LENGTH = max_length
+    return adapter
+
+
+class TestInitialReplyToId:
+    """Verify initial_reply_to_id is passed as reply_to on first send."""
+
+    @pytest.mark.asyncio
+    async def test_first_send_uses_initial_reply_to_id(self):
+        """When initial_reply_to_id is set, first adapter.send() should
+        include reply_to=initial_reply_to_id."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"thread_id": "omt_topic123"},
+            initial_reply_to_id="om_user_msg_456",
+        )
+        await consumer._send_or_edit("Hello world")
+
+        adapter.send.assert_called_once()
+        call_kwargs = adapter.send.call_args[1]
+        assert call_kwargs["reply_to"] == "om_user_msg_456", (
+            "First send should pass initial_reply_to_id as reply_to"
+        )
+        assert call_kwargs["chat_id"] == "chat_123"
+
+
+    @pytest.mark.asyncio
+    async def test_subsequent_edits_ignore_initial_reply_to_id(self):
+        """After first send, edits should use message_id, not initial_reply_to_id."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"thread_id": "omt_topic123"},
+            initial_reply_to_id="om_user_msg_456",
+        )
+
+        # First send
+        await consumer._send_or_edit("Hello world")
+        assert adapter.send.call_count == 1
+
+        # Second call should edit, not send
+        await consumer._send_or_edit("Hello world updated")
+        assert adapter.send.call_count == 1, "Should edit, not send again"
+        adapter.edit_message.assert_called_once()
+        edit_kwargs = adapter.edit_message.call_args[1]
+        assert edit_kwargs["message_id"] == "msg_1"
+        assert edit_kwargs["chat_id"] == "chat_123"
+
+
+class TestOverflowFirstMessage:
+    """Verify thread routing is preserved when the first message overflows."""
+
+    @pytest.mark.asyncio
+    async def test_overflow_first_send_uses_initial_reply_to_id(self):
+        """When first message exceeds platform limit and is split into chunks,
+        each chunk should be threaded to initial_reply_to_id, not None."""
+        adapter = _make_adapter(max_length=10)
+        adapter.truncate_message = MagicMock(
+            return_value=["chunk_1", "chunk_2"]
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"thread_id": "omt_topic123"},
+            initial_reply_to_id="om_user_msg_789",
+        )
+
+        # Inject oversized accumulated text to trigger overflow path
+        consumer._accumulated = "A" * 100
+        consumer._current_edit_interval = 999
+        await consumer._send_new_chunk("chunk_1", consumer._message_id or consumer._initial_reply_to_id)
+
+        adapter.send.assert_called_once()
+        call_kwargs = adapter.send.call_args[1]
+        assert call_kwargs["reply_to"] == "om_user_msg_789", (
+            "Overflow first chunk should use initial_reply_to_id"
+        )
+
+
+class TestFeishuFallbackThreadRouting:
+    """Verify FeishuAdapter._send_raw_message routes to topic on fallback."""
+
+    @pytest.mark.asyncio
+    async def test_create_uses_thread_id_when_available(self):
+        """When reply_to=None and metadata has thread_id, message.create
+        should use receive_id_type='thread_id'."""
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        # We test the _send_raw_message method directly by mocking the client
+        adapter = MagicMock(spec=FeishuAdapter)
+
+        # Set up the real _send_raw_message logic manually
+        mock_client = MagicMock()
+        mock_create_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="new_msg_1"),
+        )
+        mock_client.im.v1.message.create = MagicMock(return_value=mock_create_response)
+
+        # Use the real implementation path
+        adapter._client = mock_client
+        adapter._build_create_message_body = FeishuAdapter._build_create_message_body
+        adapter._build_create_message_request = FeishuAdapter._build_create_message_request
+        # _send_raw_message routes blocking SDK calls through _run_blocking
+        # (adapter-owned executor). On a MagicMock(spec=...) that method is
+        # auto-mocked and would swallow the real call, so wire a passthrough.
+        async def _run_blocking_passthrough(func, *args):
+            return func(*args)
+        adapter._run_blocking = _run_blocking_passthrough
+
+        # Call _send_raw_message with reply_to=None and thread_id in metadata
+        import json
+        result = await FeishuAdapter._send_raw_message(
+            adapter,
+            chat_id="oc_main_chat",
+            msg_type="text",
+            payload=json.dumps({"text": "hello"}),
+            reply_to=None,
+            metadata={"thread_id": "omt_topic_abc"},
+        )
+
+        # Verify message.create was called (not message.reply)
+        mock_client.im.v1.message.create.assert_called_once()
+
+        # The request should have receive_id_type="thread_id"
+        call_args = mock_client.im.v1.message.create.call_args[0][0]
+        # Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
+        # The contributor's branch had the lark SDK installed, the test environment
+        # may not — handle both shapes.
+        body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
+        assert body is not None, "request has neither .body nor .request_body"
+        # receive_id should be the thread_id, not the chat_id
+        receive_id = getattr(body, "receive_id", None)
+        if receive_id is None and isinstance(body, str):
+            import json as _json
+            receive_id = _json.loads(body).get("receive_id")
+        assert receive_id == "omt_topic_abc", (
+            f"Expected receive_id='omt_topic_abc', got '{receive_id}'"
+        )
+        # And receive_id_type must be 'thread_id', not 'chat_id'
+        receive_id_type = getattr(call_args, "receive_id_type", None)
+        assert receive_id_type == "thread_id", (
+            f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
+        )
+
+

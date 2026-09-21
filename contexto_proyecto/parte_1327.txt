@@ -1,0 +1,341 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\peekyou.json ===
+{
+  "id": "peekyou",
+  "name": "PeekYou",
+  "category": "people_search",
+  "priority": "high",
+  "jurisdictions": [
+    "US"
+  ],
+  "parent": "peekyou",
+  "owns": [],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://www.peekyou.com/",
+    "fetch": "browser",
+    "match_signal": "result",
+    "antibot": "cloudflare",
+    "by": [
+      "name",
+      "phone",
+      "address"
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://www.peekyou.com/about/contact/optout",
+    "requires": {
+      "profile_url": true,
+      "email_verification": true,
+      "captcha": false,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": [
+      "full_name",
+      "contact_email",
+      "profile_url"
+    ],
+    "notes": "Aggregates social/web profiles. Opt-out: paste your PeekYou profile URL(s), pick a reason, provide email, confirm the link.",
+    "quirks": [
+      "Opt-out URL is the documented public endpoint; datacenter IPs get 403 (anti-bot), so confirm the live flow via the operator's residential browser before the first submission, then set last_verified.",
+      "Needs the confirmed PeekYou profile_url.",
+      "Email verification required."
+    ],
+    "est_processing_days": 7,
+    "reappearance_risk": "medium"
+  },
+  "last_verified": null,
+  "source": "curated",
+  "confidence": "documented"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\peoplefinders.json ===
+{
+  "id": "peoplefinders",
+  "name": "PeopleFinders",
+  "category": "people_search",
+  "priority": "high",
+  "jurisdictions": [
+    "US"
+  ],
+  "parent": "peoplefinders",
+  "owns": [],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://www.peoplefinders.com/",
+    "fetch": "browser",
+    "match_signal": "result",
+    "antibot": "cloudflare",
+    "by": [
+      "name",
+      "phone",
+      "address"
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://www.peoplefinders.com/opt-out",
+    "requires": {
+      "profile_url": true,
+      "email_verification": true,
+      "captcha": false,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": [
+      "full_name",
+      "contact_email",
+      "profile_url"
+    ],
+    "notes": "Standalone people-search (Confi-Chek family). Opt-out: find the listing, submit with a contact email, confirm via the emailed link.",
+    "quirks": [
+      "Opt-out URL is the documented public endpoint; datacenter IPs get 403 (anti-bot), so confirm the live flow via the operator's residential browser before the first submission, then set last_verified.",
+      "Needs the confirmed profile_url from evidence.",
+      "Email verification: poll-verification picks up the link; open it in the agent browser."
+    ],
+    "est_processing_days": 7,
+    "reappearance_risk": "medium"
+  },
+  "last_verified": null,
+  "source": "curated",
+  "confidence": "documented"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\radaris.json ===
+{
+  "id": "radaris",
+  "name": "Radaris",
+  "category": "people_search",
+  "priority": "crucial",
+  "jurisdictions": [
+    "US"
+  ],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://radaris.com/",
+    "fetch": "web_extract",
+    "match_signal": "View Profile",
+    "by": [
+      "name",
+      "phone",
+      "address"
+    ],
+    "url_patterns": {
+      "name": "https://radaris.com/p/{First}/{Last}/"
+    },
+    "url_format_quirks": [
+      "Name profile page: /p/{First}/{Last}/ with First/Last Capitalized and a TRAILING slash, e.g. /p/Jane/Public/ . Readable via web_extract (no hard bot gate as of 2026-06-30).",
+      "The page aggregates: a 'phone numbers & home addresses' table (the DIRECT hit for the subject), a relatives/namesakes carousel ('Review the potential relatives'), and resume/CV records. The subject's removable row is in the address table; the carousel entries are OTHER people - disambiguate by address/age before acting.",
+      "Page is noisy with testimonials/reviews boilerplate; the signal blocks are 'phone numbers & home addresses N' and 'resumes & CV records N'."
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://radaris.com/control-privacy",
+    "requires": {
+      "profile_url": true,
+      "email_verification": true,
+      "captcha": true,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": [
+      "profile_url",
+      "contact_email"
+    ],
+    "notes": "Multi-step control-privacy wizard: step 1 NEXT -> step 2 'identify your personal page' (paste the NUMBERED profile URL into the 'Or Enter URL of your page' field; typing reveals a NEXT submit button) -> then user_email + Google reCAPTCHA -> emailed verification link. If there is no View Profile button for the subject, email customer-service@radaris.com and reply to the auto-response until removed.",
+    "email": "customer-service@radaris.com",
+    "quirks": [
+      "CAPTCHA: the form carries a Google reCAPTCHA (hidden field g-recaptcha-response) plus anti-bot fingerprint tokens (jfp, token). Tier is T2 without a captcha-clearing browser backend (T1 with Browserbase). (Record previously mis-declared captcha:false.)",
+      "The /control-privacy form REQUIRES the per-person NUMBERED profile URL. Pasting the aggregate /p/{First}/{Last}/ URL is rejected with the validation error: 'The URL must include unique number at the end'. The real removable URL looks like https://{region}.radaris.com/person/~First-Last/1234567890 (see the field placeholder).",
+      "The subject's own record may appear ONLY as a static row in the 'phone numbers & home addresses' table with NO 'View Profile' link, so no numbered profile URL is exposed for them (the /p/{First}/{Last}/ page deep-links only to relatives/namesakes via JS onclick, not static hrefs). When that happens the /control-privacy form cannot be used -- do NOT fabricate or submit a relative's or namesake's profile URL. Fall back to email: write customer-service@radaris.com with the subject's own listed details and request removal, replying to the auto-response until confirmed.",
+      "Pressing Enter in the URL field reloads the wizard to step 1 (does not submit); type into the field and click the revealed NEXT button instead."
+    ],
+    "est_processing_days": 14,
+    "reappearance_risk": "high"
+  },
+  "last_verified": "2026-06-30",
+  "source": "BADBOOL"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\rehold.json ===
+{
+  "id": "rehold",
+  "name": "Rehold",
+  "category": "property_records",
+  "priority": "long_tail",
+  "jurisdictions": [
+    "US"
+  ],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://rehold.com/",
+    "fetch": "browser",
+    "match_signal": "result",
+    "match_signal_notes": "PROPERTY-RECORD, NOT PII. An address match here shows only PUBLIC PROPERTY RECORDS (build year, beds/baths, last sale price, incident history). Resident/owner NAMES sit behind 'View full report', which leads to a paywall/signup, so no personal PII is publicly exposed. Public property records are NOT removable. Record `found` ONLY if a resident NAME matching the subject is publicly displayed on the free page; an address-only match is `not_found` (nothing to opt out of).",
+    "access": "paywall",
+    "by": [
+      "address"
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://rehold.com/optout",
+    "requires": {
+      "profile_url": true,
+      "email_verification": false,
+      "captcha": false,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": [
+      "profile_url"
+    ],
+    "notes": "Address-anchored property/reverse-address site. Only pursue an opt-out if the scan found a publicly displayed resident NAME for the subject (see match_signal_notes); a bare public property record is not personal PII and is not removable. If the subject's personal profile IS shown, submit the profile URL to the opt-out endpoint and confirm the live flow in a residential browser before the first submission, then set last_verified.",
+    "quirks": [
+      "Distinguish 'address exists in a public property DB' (non-removable) from 'the subject's personal profile is displayed' (removable). Only the latter is an actionable exposure.",
+      "'View full report' is a paywall/signup, not proof of a public listing.",
+      "Opt-out endpoint UNVERIFIED: confirm the live flow before the first submission."
+    ],
+    "est_processing_days": 3,
+    "reappearance_risk": "low"
+  },
+  "last_verified": null,
+  "source": "curated",
+  "confidence": "documented"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\searchpeoplefree.json ===
+{
+  "id": "searchpeoplefree",
+  "name": "SearchPeopleFree",
+  "category": "people_search",
+  "priority": "high",
+  "jurisdictions": [
+    "US"
+  ],
+  "parent": "searchpeoplefree",
+  "owns": [],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://www.searchpeoplefree.com/",
+    "fetch": "browser",
+    "match_signal": "result",
+    "antibot": "cloudflare",
+    "by": [
+      "name",
+      "phone",
+      "address"
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://www.searchpeoplefree.com/opt-out",
+    "requires": {
+      "profile_url": true,
+      "email_verification": true,
+      "captcha": false,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": [
+      "full_name",
+      "contact_email",
+      "profile_url"
+    ],
+    "notes": "Free people-search. Opt-out: find the listing, submit with an email, confirm the link.",
+    "quirks": [
+      "Opt-out URL is the documented public endpoint; datacenter IPs get 403 (anti-bot), so confirm the live flow via the operator's residential browser before the first submission, then set last_verified.",
+      "Needs the confirmed profile_url.",
+      "Email verification required."
+    ],
+    "est_processing_days": 3,
+    "reappearance_risk": "medium"
+  },
+  "last_verified": null,
+  "source": "curated",
+  "confidence": "documented"
+}
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\security\unbroker\references\brokers\socialcatfish.json ===
+{
+  "id": "socialcatfish",
+  "name": "Social Catfish",
+  "category": "people_search",
+  "priority": "standard",
+  "jurisdictions": [
+    "US"
+  ],
+  "search": {
+    "method": "url_pattern",
+    "url": "https://socialcatfish.com/",
+    "fetch": "browser",
+    "match_signal": "result",
+    "by": [
+      "name",
+      "email",
+      "phone",
+      "image"
+    ],
+    "url_format_quirks": [
+      "Reverse-lookup site (name / email / phone / image / username). Subject exposure is usually an INDIRECT one (an email/phone data point), not a full profile -- verify what is actually shown before choosing a lane."
+    ]
+  },
+  "optout": {
+    "tier": "T2",
+    "method": "web_form",
+    "url": "https://socialcatfish.com/opt-out/",
+    "requires": {
+      "profile_url": false,
+      "email_verification": true,
+      "captcha": true,
+      "gov_id": false,
+      "account": false,
+      "phone_callback": false,
+      "payment": false
+    },
+    "inputs": [
+      "full_name",
+      "contact_email"
+    ],
+    "notes": "Automation-HOSTILE opt-out form: in the field the form filled correctly but the submission was automation-defeated, so it lands as a 2-click human task rather than a hands-off submit. Decision order per the blocked-form rule (methods.md): try the in-browser form on the operator's residential browser first; if it will not go through, fall back to the rights-request EMAIL address cited on the Social Catfish privacy policy / opt-out page (confirm the current address before sending -- do NOT use an address sourced from a third-party blog), disclosing name + contact email only. If neither is possible, queue a human_task with the exact end-state.",
+    "quirks": [
+      "Form defeats automation even when fields are filled correctly -> treat as a 2-click human task or use the cited rights-email fallback.",
+      "Confirm the cited rights-request email on the live privacy policy before using it; it is the fallback lane, not the primary."
+    ],
+    "est_processing_days": 7,
+    "reappearance_risk": "medium"
+  },
+  "last_verified": "2026-07-03",
+  "source": "field_verified",
+  "confidence": "documented"
+}
+

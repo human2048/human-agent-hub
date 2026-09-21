@@ -1,0 +1,347 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\relay\test_contract_doc_conformance.py ===
+"""Cross-repo contract conformance: website/docs/developer-guide/relay-connector-contract.md ⟷ Python.
+
+The contract doc is the formal interface the connector repo
+(NousResearch/gateway-gateway) implements against. The connector's TypeScript
+structs are hand-mirrored from the doc, so if the Python source of truth drifts
+from the doc, the two repos silently diverge and the handshake / session-keying
+breaks only at integration time.
+
+These tests make the doc ⟷ code relationship an enforced invariant:
+
+  * Every ``CapabilityDescriptor`` field (§2 table) is documented with the
+    correct required/optional flag, and the doc lists no fields the dataclass
+    lacks.
+  * Every ``SessionSource`` wire key (what ``to_dict()`` actually serializes)
+    is named in the contract doc's §3 discriminator section, and every
+    discriminator the doc calls out as a column header exists on the dataclass.
+
+They are invariants, NOT change-detector snapshots: they assert the *relation*
+between two artifacts that must move together, not a frozen list of names. Add
+a field to the descriptor and the doc, and the test stays green; add it to only
+one, and CI fails — which is exactly the lockstep guarantee the plan's
+Cross-Repo Coordination Checklist calls for.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from gateway.relay.descriptor import CapabilityDescriptor
+from gateway.session import SessionSource
+
+# Repo root: tests/gateway/relay/ -> repo root is parents[3]
+_CONTRACT_DOC = (
+    Path(__file__).resolve().parents[3] / "website" / "docs" / "developer-guide" / "relay-connector-contract.md"
+)
+
+
+def _doc_text() -> str:
+    assert _CONTRACT_DOC.exists(), (
+        f"Contract doc missing at {_CONTRACT_DOC}. It is the formal cross-repo "
+        f"interface (Phase 1, Task 1.5) and must ship with the relay adapter."
+    )
+    return _CONTRACT_DOC.read_text(encoding="utf-8")
+
+
+def _parse_descriptor_table(text: str) -> dict[str, bool]:
+    """Parse §2's markdown table → {field_name: required}.
+
+    Rows look like: ``| `field` | type | yes|no | meaning |``. Returns a map of
+    field name to whether the Required column says "yes".
+    """
+    fields: dict[str, bool] = {}
+    # Restrict to the §2 section so §3/§4 tables don't bleed in.
+    section = text.split("## 2. CapabilityDescriptor", 1)[-1].split("## 3.", 1)[0]
+    row_re = re.compile(r"^\|\s*`([a-z_]+)`\s*\|[^|]*\|\s*(yes|no)\s*\|", re.M)
+    for name, required in row_re.findall(section):
+        fields[name] = required.strip() == "yes"
+    return fields
+
+
+def test_descriptor_fields_match_contract_doc():
+    """§2 table ⟷ CapabilityDescriptor dataclass, names + required/optional."""
+    documented = _parse_descriptor_table(_doc_text())
+    assert documented, "Failed to parse any descriptor fields from the §2 table."
+
+    dc_fields = CapabilityDescriptor.__dataclass_fields__  # type: ignore[attr-defined]
+    # A dataclass field is "required" iff it has no default and no default_factory.
+    import dataclasses
+
+    code_required = {
+        name
+        for name, f in dc_fields.items()
+        if f.default is dataclasses.MISSING
+        and f.default_factory is dataclasses.MISSING  # type: ignore[misc]
+    }
+    code_names = set(dc_fields.keys())
+    doc_names = set(documented.keys())
+
+    missing_from_doc = code_names - doc_names
+    assert not missing_from_doc, (
+        f"CapabilityDescriptor fields missing from the §2 contract-doc table: "
+        f"{sorted(missing_from_doc)}. Document them so the connector mirrors them."
+    )
+    extra_in_doc = doc_names - code_names
+    assert not extra_in_doc, (
+        f"Contract-doc §2 table documents fields the dataclass does not have: "
+        f"{sorted(extra_in_doc)}. Remove them or add them to descriptor.py."
+    )
+
+    # Required/optional must agree, so the connector knows which fields it may omit.
+    for name, doc_required in documented.items():
+        assert doc_required == (name in code_required), (
+            f"Field '{name}': contract doc says required={doc_required}, but the "
+            f"dataclass says required={name in code_required}. Reconcile them."
+        )
+
+
+def _session_source_wire_keys() -> set[str]:
+    """Keys ``SessionSource.to_dict()`` can emit (the actual wire surface).
+
+    Build a maximally-populated source so conditionally-included keys (the
+    ``if self.x:`` branches in ``to_dict``) all appear.
+    """
+    from gateway.config import Platform
+
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="c",
+        chat_name="n",
+        chat_type="channel",
+        user_id="u",
+        user_name="un",
+        thread_id="t",
+        chat_topic="topic",
+        user_id_alt="ua",
+        chat_id_alt="ca",
+        guild_id="g",
+        parent_chat_id="p",
+        message_id="m",
+    )
+    return set(src.to_dict().keys())
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\relay\test_descriptor.py ===
+"""Tests for the experimental CapabilityDescriptor (relay Phase 0, Task 0.2)."""
+
+from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+
+
+def _telegram_descriptor(**overrides) -> CapabilityDescriptor:
+    base = dict(
+        contract_version=CONTRACT_VERSION,
+        platform="telegram",
+        label="Telegram",
+        max_message_length=4096,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=True,
+        markdown_dialect="markdown_v2",
+        len_unit="utf16",
+        emoji="\u2708\ufe0f",
+        platform_hint="You are on Telegram.",
+        pii_safe=False,
+    )
+    base.update(overrides)
+    return CapabilityDescriptor(**base)
+
+
+def test_descriptor_is_frozen():
+    d = _telegram_descriptor()
+    try:
+        d.max_message_length = 1  # type: ignore[misc]
+    except Exception as exc:  # FrozenInstanceError
+        assert "cannot assign" in str(exc) or "frozen" in str(exc).lower()
+    else:  # pragma: no cover
+        raise AssertionError("descriptor should be immutable (frozen)")
+
+
+def test_module_is_marked_experimental():
+    import gateway.relay.descriptor as m
+
+    assert "EXPERIMENTAL" in (m.__doc__ or "")
+
+
+# ─────────────── supported_ops (op-level capability discovery, Phase 1) ───────────────
+
+
+def test_supports_op_legacy_connector_assumes_legacy_set():
+    """An empty supported_ops means the connector predates op discovery: the
+    legacy four ops are assumed supported (old connectors keep working), while
+    NEW ops are not (discovery semantics — never probe by trying)."""
+    d = _telegram_descriptor()  # no supported_ops
+    for op in ("send", "edit", "typing", "follow_up"):
+        assert d.supports_op(op) is True, op
+    assert d.supports_op("get_chat_info") is False
+
+
+def test_from_json_normalizes_malformed_supported_ops():
+    """Non-list shapes and non-string members degrade to the legacy fallback
+    (empty tuple), never raise — malformed input can't break the handshake."""
+    base = (
+        '{"contract_version": 1, "platform": "x", "label": "X", '
+        '"max_message_length": 2000, "supports_draft_streaming": false, '
+        '"supports_edit": true, "supports_threads": false, '
+        '"markdown_dialect": "plain", "len_unit": "chars", '
+    )
+    d = CapabilityDescriptor.from_json(base + '"supported_ops": "send"}')
+    assert d.supported_ops == ()
+    d = CapabilityDescriptor.from_json(base + '"supported_ops": ["send", 7, null, ""]}')
+    assert d.supported_ops == ("send",)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\relay\test_explicit_disable.py ===
+"""``platforms.relay.enabled: false`` beats a deployment-injected relay URL.
+
+Real profile files under a temp HERMES_HOME, the production startup hook and the
+standalone predicate. Only the connector HTTP calls are replaced.
+"""
+from unittest.mock import Mock
+import json
+import os
+
+import pytest
+import yaml
+
+import gateway.relay as relay
+from gateway.config import Platform, load_gateway_config
+from gateway.platform_registry import platform_registry
+from gateway.run_startup import GatewayStartupMixin
+
+URL = "wss://connector.example/relay"
+DISABLE = {"relay": {"enabled": False}}
+
+# Every place the loader accepts a relay block, plus the managed overlay. The verdict must be
+# the same whichever one the operator used.
+SPELLINGS = {
+    "top": {"platforms": DISABLE},
+    "nested": {"gateway": {"platforms": DISABLE}},
+    "string-false": {"platforms": {"relay": {"enabled": "false"}}},
+    "top-beats-nested": {"platforms": DISABLE, "gateway": {"platforms": {"relay": {"enabled": True}}}},
+    "managed": None,  # user YAML absent; disable comes from HERMES_MANAGED_DIR
+}
+
+
+@pytest.fixture
+def profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for key in list(os.environ):
+        if key.startswith("GATEWAY_RELAY_"):
+            monkeypatch.delenv(key)
+    # A deployment stamp: URL + identity provider, no pinned secret, so an
+    # un-vetoed boot would resolve a token and provision credentials.
+    monkeypatch.setenv("GATEWAY_RELAY_URL", URL)
+    monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "slack")
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://identity.example/token")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "native-test-token")
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(GatewayStartupMixin, "_register_config_hooks", lambda *a, **k: None)
+    platform_registry.unregister("relay")
+    yield tmp_path
+    platform_registry.unregister("relay")
+
+
+def write_disable(home, spelling, monkeypatch):
+    doc = SPELLINGS[spelling]
+    if doc is None:
+        managed = home / "managed"
+        managed.mkdir()
+        (managed / "config.yaml").write_text(yaml.safe_dump({"platforms": DISABLE}))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        return
+    (home / "config.yaml").write_text(yaml.safe_dump(doc))
+
+
+@pytest.mark.parametrize("spelling", list(SPELLINGS))
+def test_disabled_relay_startup_hook_has_no_side_effects(profile, monkeypatch, spelling):
+    write_disable(profile, spelling, monkeypatch)
+    http = Mock(side_effect=AssertionError("disabled relay reached the connector"))
+    monkeypatch.setattr("urllib.request.urlopen", http)
+    monkeypatch.setattr(relay, "_resolve_relay_identity_token", http)
+    before = {k: v for k, v in os.environ.items() if k.startswith("GATEWAY_RELAY_")}
+
+    GatewayStartupMixin._start_register_plugins_relay_hooks()
+
+    http.assert_not_called()
+    assert not platform_registry.is_registered("relay")
+    assert {k: v for k, v in os.environ.items() if k.startswith("GATEWAY_RELAY_")} == before
+    # The test seam and an explicit URL do not override the operator either.
+    assert relay.register_relay_adapter(force=True, url=URL) is False
+    # Standalone routing (cron preflight) agrees: nothing is relay-fronted.
+    assert relay.relay_fronted_platforms() == set()
+
+
+def test_url_only_activation_is_unchanged(profile, monkeypatch):
+    """Control: with no ``enabled`` key the injected URL still activates relay."""
+    (profile / "config.yaml").write_text(yaml.safe_dump({"platforms": {"relay": {"extra": {"note": "kept"}}}}))
+    provision = Mock(return_value={"gatewayId": "g", "secret": "b" * 64, "deliveryKey": "d"})
+    monkeypatch.setattr(relay, "_resolve_relay_identity_token", Mock(return_value="identity-token"))
+    monkeypatch.setattr(relay, "_post_provision", provision)
+    monkeypatch.setattr(relay, "_post_policy", Mock(return_value=200))
+
+    GatewayStartupMixin._start_register_plugins_relay_hooks()
+
+    provision.assert_called_once()
+    assert platform_registry.is_registered("relay")
+    assert relay.relay_fronted_platforms() == {"slack"}
+
+
+@pytest.mark.parametrize("spelling", list(SPELLINGS))
+def test_predicate_agrees_with_loader_and_keeps_native_adapters(profile, monkeypatch, spelling):
+    """The standalone predicate and ``load_gateway_config()`` are two readers of one rule, and an
+    opted-out relay does not own the profile's native connections."""
+    write_disable(profile, spelling, monkeypatch)
+    config = load_gateway_config()
+
+    assert relay.relay_explicitly_disabled() is True
+    assert config.platforms[Platform.RELAY].enabled is False
+    # Without the veto GATEWAY_RELAY_URL disables every directly-connected platform.
+    assert config.platforms[Platform.SLACK].enabled is True
+
+    from cron.scheduler_delivery import _resolve_target_transport
+
+    resolved, error = _resolve_target_transport(
+        {"id": "job"}, Platform.SLACK, "slack", {"chat_id": "channel"}, {}, config,
+    )
+    assert error is None
+    assert resolved[1] is config.platforms[Platform.SLACK]
+
+
+def test_legacy_json_disable_is_advisory_like_other_platforms(profile, monkeypatch):
+    (profile / "gateway.json").write_text(json.dumps({"platforms": {
+        "relay": {"enabled": False},
+        "telegram": {"enabled": False},
+    }}))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "native-telegram-test-token")
+    monkeypatch.setenv("GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS", "true")
+    config = load_gateway_config()
+
+    # Only a YAML ``enabled`` key sets ``_enabled_explicit``; env presence (the URL, the token)
+    # re-enables a gateway.json disable for relay exactly as it does for telegram.
+    assert relay.relay_explicitly_disabled() is False
+    assert config.platforms[Platform.RELAY].enabled is True
+    assert config.platforms[Platform.TELEGRAM].enabled is True
+
+
+def test_malformed_user_yaml_drops_the_yaml_layer_for_both_readers(profile, monkeypatch):
+    """The loader falls back to env + gateway.json WITHOUT the managed layer on a malformed user
+    file; the predicate must fall back the same way or startup suppresses native adapters for a
+    relay it then refuses to register."""
+    (profile / "config.yaml").write_text("platforms: [\n")
+    write_disable(profile, "managed", monkeypatch)
+    config = load_gateway_config()
+
+    assert relay.relay_explicitly_disabled() is False
+    assert config.platforms[Platform.RELAY].enabled is True
+    assert relay.relay_url() == URL
+

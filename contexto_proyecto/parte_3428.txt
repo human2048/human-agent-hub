@@ -1,0 +1,369 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_opencode_go_validation_fallback.py ===
+"""Tests for the static-catalog fallback in validate_requested_model.
+
+OpenCode Go and OpenCode Zen publish an OpenAI-compatible API at paths that do
+NOT expose ``/models`` (the path returns the marketing site's HTML 404).  This
+caused ``validate_requested_model`` to return ``accepted=False`` for every
+model on those providers, which in turn made ``switch_model()`` fail and the
+gateway's ``/model <name> --provider opencode-go`` command never write to
+``_session_model_overrides``.
+
+These tests cover the catalog-fallback path: when ``fetch_api_models`` returns
+``None``, the validator must consult ``provider_model_ids()`` for the provider
+(populated from ``_PROVIDER_MODELS``) rather than rejecting outright.
+"""
+
+from unittest.mock import patch
+
+from hermes_cli.models_validate import validate_requested_model
+
+
+_UNREACHABLE_PROBE = {
+    "models": None,
+    "probed_url": "https://opencode.ai/zen/go/v1/models",
+    "resolved_base_url": "https://opencode.ai/zen/go/v1",
+    "suggested_base_url": None,
+    "used_fallback": False,
+}
+
+
+def _patched(func):
+    """Decorator: force fetch_api_models / probe_api_models to simulate an
+    unreachable /models endpoint, proving the catalog path is used."""
+    def wrapper(*args, **kwargs):
+        with patch("hermes_cli.models.fetch_api_models", return_value=None), \
+             patch("hermes_cli.models.probe_api_models", return_value=_UNREACHABLE_PROBE):
+            return func(*args, **kwargs)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# opencode-go: curated catalog in _PROVIDER_MODELS
+# ---------------------------------------------------------------------------
+
+
+@_patched
+def test_opencode_go_known_model_accepted():
+    """A model present in the opencode-go curated catalog must be accepted
+    even when /models is unreachable."""
+    result = validate_requested_model("kimi-k2.6", "opencode-go")
+    assert result["accepted"] is True
+    assert result["persist"] is True
+    assert result["recognized"] is True
+    assert result["message"] is None
+
+
+@_patched
+def test_opencode_go_totally_unknown_model_still_accepted():
+    """A model with zero similarity to the catalog is still accepted (no
+    suggestion line) so the user can try a model that hasn't made it into the
+    curated list yet."""
+    result = validate_requested_model("some-brand-new-model", "opencode-go")
+    assert result["accepted"] is True
+    assert result["persist"] is True
+    assert result["recognized"] is False
+    # No suggestion text (no close matches)
+    assert "Similar models" not in result["message"]
+    assert "opencode" in result["message"].lower() or "opencode go" in result["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# opencode-zen: same pattern as opencode-go
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# Unknown provider with no catalog: soft-accept (honors the comment's intent)
+# ---------------------------------------------------------------------------
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_opencode_zen_model_limit.py ===
+"""Regression tests for OpenCode Zen model picker limits."""
+
+import os
+from unittest.mock import patch
+
+import hermes_cli.providers as providers_mod
+from hermes_cli.model_switch import list_authenticated_providers
+
+
+def test_opencode_zen_lists_all_models_while_other_providers_remain_capped(monkeypatch):
+    """OpenCode Zen is an aggregator product, so the picker must expose its full catalog."""
+    zen_models = [f"zen-model-{i}" for i in range(57)]
+    deepseek_models = [f"deepseek-model-{i}" for i in range(57)]
+
+    monkeypatch.setattr(
+        "agent.models_dev.PROVIDER_TO_MODELS_DEV",
+        {
+            "opencode-zen": "opencode",
+            "deepseek": "deepseek",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.models_dev.fetch_models_dev",
+        lambda: {"opencode": {}, "deepseek": {}},
+    )
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        lambda provider, **_: {
+            "opencode-zen": zen_models,
+            "deepseek": deepseek_models,
+        }.get(provider, []),
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "OPENCODE_ZEN_API_KEY": "test-zen-key",
+            "DEEPSEEK_API_KEY": "test-deepseek-key",
+        },
+        clear=False,
+    ):
+        providers = list_authenticated_providers(max_models=50)
+
+    opencode_zen = next(p for p in providers if p["slug"] == "opencode-zen")
+    deepseek = next(p for p in providers if p["slug"] == "deepseek")
+
+    assert opencode_zen["models"] == zen_models
+    assert opencode_zen["total_models"] == len(zen_models)
+    assert deepseek["models"] == deepseek_models[:50]
+    assert deepseek["total_models"] == len(deepseek_models)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_openrouter_preset_validation.py ===
+"""Regression coverage for OpenRouter preset references (issue #31739)."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli.models_validate import validate_requested_model
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["@preset/email-copywriter", "@preset/Foo_bar.~9"],
+)
+def test_direct_openrouter_preset_reference_skips_model_listing(model_name):
+    """An account-scoped direct preset has no public model row to probe."""
+    with patch(
+        "hermes_cli.models.fetch_api_models",
+        side_effect=AssertionError("direct preset references must not probe /models"),
+    ):
+        result = validate_requested_model(
+            model_name,
+            "openrouter",
+            api_key="key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    assert result == {
+        "accepted": True,
+        "persist": True,
+        "recognized": False,
+        "message": None,
+    }
+
+
+def test_combined_openrouter_preset_reference_validates_base_model():
+    """Combined references validate the base model, not the preset-decorated ID."""
+    with patch(
+        "hermes_cli.models.fetch_api_models",
+        return_value=["openai/gpt-5.4"],
+    ) as mock_fetch:
+        result = validate_requested_model(
+            "openai/gpt-5.4@preset/email-copywriter",
+            "openrouter",
+            api_key="key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    mock_fetch.assert_called_once_with("key", "https://openrouter.ai/api/v1")
+    assert result == {
+        "accepted": True,
+        "persist": True,
+        "recognized": True,
+        "message": None,
+    }
+
+
+def test_combined_openrouter_preset_reference_rejects_unknown_base_model():
+    with patch("hermes_cli.models.fetch_api_models", return_value=["openai/gpt-5.4"]):
+        result = validate_requested_model(
+            "openai/gpt-5.4-preview@preset/email-copywriter",
+            "openrouter",
+            api_key="key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    assert result["accepted"] is False
+    assert result["persist"] is False
+    assert result["recognized"] is False
+    assert "Similar models" in result["message"]
+    assert "openai/gpt-5.4" in result["message"]
+
+
+def test_combined_preset_near_miss_base_is_not_rewritten():
+    """A base model close to a listed id is the user's pick, not a typo — the verdict rejects with a
+    suggestion instead of swapping the model under the preset."""
+    with patch("hermes_cli.models.fetch_api_models", return_value=["openai/gpt-5.4"]):
+        result = validate_requested_model(
+            "openai/gpt-5.44@preset/email-copywriter",
+            "openrouter",
+            api_key="key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    assert result["accepted"] is False
+    assert "corrected_model" not in result
+    assert "openai/gpt-5.4" in result["message"]
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "@preset/",
+        "openai/gpt-5.4@preset/",
+        "@preset/foo/bar",
+        "@preset/foo?bar",
+        "@preset/☃",
+        "@preset/foo@preset/bar",
+        "openai/gpt-5.4@preset/foo/bar",
+    ],
+)
+def test_openrouter_preset_reference_requires_a_url_safe_slug(model_name):
+    """Malformed preset references must fail before model-list probing."""
+    with patch(
+        "hermes_cli.models.fetch_api_models",
+        side_effect=AssertionError("malformed presets must not probe /models"),
+    ):
+        result = validate_requested_model(
+            model_name,
+            "openrouter",
+            api_key="key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    assert result["accepted"] is False
+    assert result["persist"] is False
+    assert result["recognized"] is False
+    assert "URL-safe" in result["message"]
+
+
+def test_preset_reference_does_not_bypass_other_provider_validation():
+    with patch("hermes_cli.models.fetch_api_models", return_value=["gpt-5.4"]):
+        result = validate_requested_model(
+            "@preset/email-copywriter",
+            "openai",
+            api_key="key",
+            base_url="https://api.openai.com/v1",
+        )
+
+    assert result["accepted"] is False
+    assert result["persist"] is False
+
+
+def test_preset_reference_does_not_bypass_custom_endpoint_validation():
+    probe = {
+        "models": ["local-model"],
+        "probed_url": "https://proxy.example/v1/models",
+        "resolved_base_url": "https://proxy.example/v1",
+        "suggested_base_url": None,
+        "used_fallback": False,
+    }
+    with patch("hermes_cli.models.probe_api_models", return_value=probe) as mock_probe:
+        result = validate_requested_model(
+            "@preset/email-copywriter",
+            "openrouter",
+            api_key="key",
+            base_url="https://proxy.example/v1",
+        )
+
+    mock_probe.assert_called_once()
+    assert result["accepted"] is True
+    assert result["recognized"] is False
+    assert "custom endpoint's model listing" in result["message"]
+
+
+def test_configured_alias_switches_preset_through_real_resolution_chain(tmp_path):
+    """Exercise config loading, alias resolution, runtime resolution, and validation."""
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  default: openai/gpt-5.4
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+model_aliases:
+  email-copywriter:
+    model: '@preset/email-copywriter'
+    provider: openrouter
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    script = r"""
+import json
+import hermes_cli.model_switch as model_switch
+import hermes_cli.models as models
+
+
+def fail_model_probe(*args, **kwargs):
+    raise AssertionError("preset references must not probe /models")
+
+
+models.fetch_api_models = fail_model_probe
+model_switch.get_model_capabilities = lambda *args, **kwargs: None
+model_switch.get_model_info = lambda *args, **kwargs: None
+result = model_switch.switch_model(
+    "email-copywriter",
+    current_provider="openrouter",
+    current_model="openai/gpt-5.4",
+    current_base_url="https://openrouter.ai/api/v1",
+    current_api_key="key",
+)
+print(json.dumps(vars(result)))
+"""
+    env = {
+        "HOME": str(tmp_path),
+        "HERMES_HOME": str(tmp_path),
+        "LANG": "C.UTF-8",
+        "OPENROUTER_API_KEY": "key",
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONIOENCODING": "utf-8",
+    }
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, (
+        f"subprocess failed with exit {completed.returncode}\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+    result = json.loads(completed.stdout.splitlines()[-1])
+
+    assert result["success"] is True
+    assert result["new_model"] == "@preset/email-copywriter"
+    assert result["target_provider"] == "openrouter"
+    assert result["resolved_via_alias"] == "email-copywriter"
+    assert result["warning_message"] == ""
+

@@ -1,0 +1,391 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_overlay_slug_resolution.py ===
+"""Test that overlay providers with mismatched models.dev keys resolve correctly.
+
+HERMES_OVERLAYS keys may be models.dev IDs (e.g. "github-copilot") while
+_PROVIDER_MODELS and config.yaml use Hermes IDs ("copilot").  The slug
+resolution in list_authenticated_providers() Section 2 must bridge this gap.
+
+Covers: #5223, #6492
+"""
+
+import os
+from unittest.mock import patch
+
+
+from hermes_cli.model_switch import list_authenticated_providers
+
+
+# -- Copilot slug resolution (env var path) ----------------------------------
+
+@patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "fake-ghu"}, clear=False)
+def test_copilot_uses_hermes_slug():
+    """github-copilot overlay should resolve to slug='copilot' with curated models."""
+    providers = list_authenticated_providers(current_provider="copilot")
+
+    copilot = next((p for p in providers if p["slug"] == "copilot"), None)
+    assert copilot is not None, "copilot should appear when COPILOT_GITHUB_TOKEN is set"
+    assert copilot["total_models"] > 0, "copilot should have curated models"
+    assert copilot["is_current"] is True
+
+    # Must NOT appear under the models.dev key
+    gh_copilot = next((p for p in providers if p["slug"] == "github-copilot"), None)
+    assert gh_copilot is None, "github-copilot slug should not appear (resolved to copilot)"
+
+
+
+
+# -- kimi-for-coding alias in auth.py ----------------------------------------
+
+
+
+# -- Generic slug mismatch providers -----------------------------------------
+
+
+
+
+
+
+def test_mapped_provider_credential_pool_visibility(monkeypatch):
+    """Mapped providers should appear when credentials live only in auth-store credential_pool."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {"google-ai-studio": {"env": ["GEMINI_API_KEY"]}})
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {"gemini": "google-ai-studio"})
+    monkeypatch.setattr(
+        "hermes_cli.auth._load_auth_store",
+        lambda: {"providers": {}, "credential_pool": {"gemini": {"token": "fake"}}},
+    )
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    providers = list_authenticated_providers(current_provider="gemini")
+
+    gemini = next((p for p in providers if p["slug"] == "gemini"), None)
+    assert gemini is not None, "gemini should appear when auth-store credential_pool has creds"
+    assert gemini["is_current"] is True
+    assert gemini["total_models"] > 0
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_pairing.py ===
+from argparse import Namespace
+from unittest.mock import patch
+
+from gateway.pairing import PairingStore
+from hermes_cli.pairing import pairing_command
+
+
+def test_cli_listed_request_id_and_bot_code_can_be_approved(tmp_path, capsys):
+    with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+        store = PairingStore()
+        store.generate_code("telegram", "listed-user", "Listed User")
+
+        with patch("gateway.pairing.PairingStore", return_value=store):
+            pairing_command(Namespace(pairing_action="list"))
+            list_output = capsys.readouterr().out
+            request_id = store.list_pending("telegram")[0]["request_id"]
+
+            assert request_id in list_output
+
+            pairing_command(
+                Namespace(
+                    pairing_action="approve",
+                    platform="telegram",
+                    code=request_id,
+                )
+            )
+            request_approval_output = capsys.readouterr().out
+
+            bot_code = store.generate_code("telegram", "code-user", "Code User")
+            pairing_command(
+                Namespace(
+                    pairing_action="approve",
+                    platform="telegram",
+                    code=bot_code,
+                )
+            )
+            code_approval_output = capsys.readouterr().out
+
+        approved_ids = {entry["user_id"] for entry in store.list_approved("telegram")}
+
+    assert "listed-user" in request_approval_output
+    assert "code-user" in code_approval_output
+    assert approved_ids == {"listed-user", "code-user"}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_parser_epilogue_gateway_profile.py ===
+"""The ``--help`` epilogue must cover the profile-scoped gateway lifecycle.
+
+``-p/--profile`` is consumed before argparse (``main._apply_profile_override``), so it never
+appears among the parser's option rows — the epilogue examples are the only place ``--help``
+can teach the ``hermes -p <profile> gateway <action>`` form that generated service units and
+user-facing copy already rely on. Contract, not snapshot: assert the verbs and the profile flag
+are named in the RENDERED help (the wiring, not just the constant), not the exact wording.
+"""
+
+from hermes_cli._parser import PRE_ARGPARSE_INHERITED_FLAGS, build_top_level_parser
+
+
+def _rendered_help() -> str:
+    return build_top_level_parser()[0].format_help()
+
+
+def test_rendered_help_documents_the_profile_scoped_command_form():
+    help_text = _rendered_help()
+    assert "hermes -p <profile>" in help_text
+    assert "--profile" in help_text
+    assert "hermes -p coder gateway stop" in help_text
+    # The flag stays pre-argparse: documented in the epilogue, never registered as an option.
+    assert ("-p", True) in PRE_ARGPARSE_INHERITED_FLAGS
+    assert "-p PROFILE" not in help_text and "--profile PROFILE" not in help_text
+
+
+def test_rendered_help_documents_the_gateway_service_verbs():
+    help_text = _rendered_help()
+    for verb in ("install", "start", "stop", "status"):
+        assert f"hermes gateway {verb}" in help_text, verb
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_parser_help_home.py ===
+"""The top-level parser's help text must not trip the wrong-profile fallback warning.
+
+``main._apply_profile_override`` builds the parser (``top_level_value_flag_sets``) before it
+re-homes the process to the sticky ``active_profile``; a help string that resolved the home through
+``get_hermes_home()`` printed ``[HERMES_HOME fallback] ... wrong profile`` on every ``hermes``
+command for users of ``hermes profile use`` (#112319, also reported in #112839).
+"""
+
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def sticky_profile_home(monkeypatch, tmp_path):
+    import hermes_constants
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "coder").mkdir(parents=True)
+    (root / "active_profile").write_text("coder\n", encoding="utf-8")
+    monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
+    return root
+
+
+def test_building_the_parser_before_the_profile_override_stays_silent(sticky_profile_home, capsys):
+    from hermes_cli._parser import build_top_level_parser
+
+    build_top_level_parser()
+
+    assert "HERMES_HOME fallback" not in capsys.readouterr().err
+
+
+def test_help_text_names_the_profile_config_once_the_process_is_re_homed(sticky_profile_home, monkeypatch):
+    from hermes_cli._parser import _cfg_path
+
+    monkeypatch.setenv("HERMES_HOME", str(sticky_profile_home / "profiles" / "coder"))
+
+    assert _cfg_path() == "~/.hermes/profiles/coder/config.yaml"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_partial_compress.py ===
+"""Tests for hermes_cli.partial_compress — the pure split/parse helpers
+behind ``/compress here [N]`` (boundary-aware "summarize up to here").
+
+Inspired by Claude Code's Rewind "Summarize up to here" action.
+"""
+
+from hermes_cli.partial_compress import (
+    DEFAULT_KEEP_LAST,
+    MAX_KEEP_LAST,
+    parse_partial_compress_args,
+    rejoin_compressed_head_and_tail,
+    split_history_for_partial_compress,
+)
+
+
+def _history(n_pairs: int) -> list[dict[str, str]]:
+    """Build n_pairs of (user, assistant) exchanges."""
+    h: list[dict[str, str]] = []
+    for i in range(n_pairs):
+        h.append({"role": "user", "content": f"u{i}"})
+        h.append({"role": "assistant", "content": f"a{i}"})
+    return h
+
+
+# ── parse_partial_compress_args ──────────────────────────────────────
+
+
+
+
+
+
+def test_here_with_count():
+    partial, keep, focus = parse_partial_compress_args("here 4")
+    assert partial is True
+    assert keep == 4
+    assert focus is None
+
+
+
+
+def test_keep_flag_forms():
+    for arg in ("--keep 5", "-k 5", "--keep=5"):
+        partial, keep, focus = parse_partial_compress_args(arg)
+        assert partial is True, arg
+        assert keep == 5, arg
+        assert focus is None, arg
+
+
+
+
+def test_here_count_clamped_low_and_high():
+    _, keep_low, _ = parse_partial_compress_args("here 0")
+    assert keep_low == 1
+    _, keep_high, _ = parse_partial_compress_args(f"here {MAX_KEEP_LAST + 50}")
+    assert keep_high == MAX_KEEP_LAST
+
+
+
+
+# ── split_history_for_partial_compress ───────────────────────────────
+
+
+
+
+
+
+def test_split_tail_always_starts_on_user():
+    # Tool messages interleaved — tail must still snap to a user turn.
+    h = [
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "tool", "content": "t1"},
+        {"role": "assistant", "content": "a1b"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    head, tail = split_history_for_partial_compress(h, keep_last=1)
+    assert tail[0]["role"] == "user"
+    assert tail[0]["content"] == "u2"
+    assert head + tail == h
+
+
+
+
+
+
+def test_split_rejoin_preserves_all_messages():
+    h = _history(6)
+    head, tail = split_history_for_partial_compress(h, keep_last=3)
+    assert head + tail == h
+
+
+# ── rejoin_compressed_head_and_tail (seam-alternation guard) ─────────
+
+
+def _roles(msgs):
+    return [m["role"] for m in msgs if m["role"] in ("user", "assistant")]
+
+
+def _no_consecutive_dupes(msgs):
+    r = _roles(msgs)
+    return all(r[i] != r[i + 1] for i in range(len(r) - 1))
+
+
+def test_rejoin_valid_seam_assistant_then_user():
+    # Normal case: head ends on assistant, tail starts on user → valid.
+    head = [{"role": "user", "content": "[summary]"},
+            {"role": "assistant", "content": "ack"}]
+    tail = [{"role": "user", "content": "next"},
+            {"role": "assistant", "content": "reply"}]
+    out = rejoin_compressed_head_and_tail(head, tail)
+    assert out == head + tail
+    assert _no_consecutive_dupes(out)
+
+
+def test_rejoin_user_user_seam_merges():
+    # Degenerate head ending on a user summary; tail starts on user.
+    head = [{"role": "user", "content": "[summary of head]"}]
+    tail = [{"role": "user", "content": "latest question"},
+            {"role": "assistant", "content": "answer"}]
+    out = rejoin_compressed_head_and_tail(head, tail)
+    assert _no_consecutive_dupes(out), out
+    # The two user messages were merged into one.
+    assert out[0]["content"] == "[summary of head]\n\nlatest question"
+    assert out[1] == {"role": "assistant", "content": "answer"}
+
+
+def test_rejoin_assistant_assistant_seam_merges():
+    head = [{"role": "user", "content": "q"},
+            {"role": "assistant", "content": "head end"}]
+    tail = [{"role": "assistant", "content": "tail start"},
+            {"role": "user", "content": "u"}]
+    out = rejoin_compressed_head_and_tail(head, tail)
+    assert _no_consecutive_dupes(out), out
+    assert out[-2]["content"] == "head end\n\ntail start"
+
+
+
+
+def test_rejoin_tool_seam_left_alone():
+    # tool->tool is the one legal repetition; don't merge.
+    head = [{"role": "user", "content": "q"}, {"role": "tool", "content": "t1"}]
+    tail = [{"role": "user", "content": "u"}]
+    out = rejoin_compressed_head_and_tail(head, tail)
+    assert out == head + tail
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_passive_update_opt_out.py ===
+"""Passive opt-out keeps explicit update checks available."""
+import json
+import subprocess
+import time
+
+from hermes_constants import get_hermes_home
+
+
+def test_passive_check_obeys_config_before_using_cached_notice(monkeypatch):
+    from hermes_cli import banner
+
+    home = get_hermes_home()
+    # The cache is keyed on the checkout's HEAD (an update moving HEAD invalidates it).
+    repo_dir = banner._resolve_repo_dir()
+    head = banner._git_stdout(["rev-parse", "HEAD"], cwd=repo_dir) if repo_dir else None
+    (home / ".update_check").write_text(json.dumps({
+        "ts": time.time(), "behind": 17, "rev": None, "ver": banner.VERSION, "head": head,
+    }), encoding="utf-8")
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+    config = home / "config.yaml"
+    config.write_text("updates:\n  check: true\n", encoding="utf-8")
+    assert banner.check_for_updates(passive=True) == 17
+    config.write_text("updates:\n  check: false\n", encoding="utf-8")
+    assert banner.check_for_updates(passive=True) is None
+    assert banner.check_for_updates() == 17
+
+
+def test_explicit_check_fetches_local_origin_despite_passive_opt_out(tmp_path, monkeypatch, capsys):
+    from hermes_cli import main
+    from hermes_cli.update_cmd import _cmd_update_check
+
+    remote = tmp_path / "remote"
+    local = tmp_path / "checkout"
+    def git(*args):
+        return subprocess.run(["git", *map(str, args)], check=True, capture_output=True, text=True)
+    git("init", "-b", "main", remote)
+    git("-C", remote, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "initial")
+    git("clone", remote, local)
+    git("-C", remote, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "next")
+    monkeypatch.setattr(main, "PROJECT_ROOT", local)
+    (get_hermes_home() / "config.yaml").write_text("updates:\n  check: false\n", encoding="utf-8")
+    _cmd_update_check()
+    output = capsys.readouterr().out
+    assert "Fetching from origin" in output
+    assert "1 commit" in output
+

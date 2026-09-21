@@ -1,0 +1,382 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_agent_cache_release_profile_scope.py ===
+"""Multiplex invariant: agent-cache eviction commits end-of-session memory under the OWNING profile.
+
+``_spawn_release_thread`` used to start a bare ``threading.Thread``; threads begin with an EMPTY
+context, so provider ``on_session_end`` (credentials/home read at call time) ran under the launch
+profile — a secondary's transcript was extracted into the default profile's memory namespace, or
+failed closed (``UnscopedSecretError``) and the memories were lost.
+"""
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+from agent import secret_scope
+from gateway.config import GatewayConfig
+from gateway.run import GatewayRunner
+from hermes_constants import get_hermes_home
+
+
+def _runner(profile_homes: dict[str, Path]) -> GatewayRunner:
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.session_store = SimpleNamespace(_profile_home_for_key=lambda key: profile_homes.get(key))
+    return runner
+
+
+def _seen_after_release(runner, key, *, wait_scope=None) -> dict:
+    seen: dict = {}
+    done = threading.Event()
+
+    def target(agent, k):
+        seen["scope"] = secret_scope.current_secret_scope()
+        seen["home"] = get_hermes_home()
+        done.set()
+
+    runner._spawn_release_thread(target, (None, key), f"t-{key}", inline_fallback=False, session_key=key)
+    assert done.wait(5)
+    return seen
+
+
+def test_unscoped_housekeeping_sweep_enters_the_owning_profile_scope(tmp_path, monkeypatch):
+    default_home = tmp_path / ".hermes"
+    prof_b = default_home / "profiles" / "b"
+    prof_b.mkdir(parents=True)
+    (prof_b / ".env").write_text("HINDSIGHT_LLM_API_KEY=key-of-b\n")
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    secret_scope.set_multiplex_active(True)
+    try:
+        # The housekeeping watcher runs with NO scope installed.
+        assert secret_scope.current_secret_scope() is None
+        seen = _seen_after_release(_runner({"agent:b:telegram:dm:1": prof_b}), "agent:b:telegram:dm:1")
+    finally:
+        secret_scope.set_multiplex_active(False)
+    assert seen["home"] == prof_b
+    assert seen["scope"] and seen["scope"].get("HINDSIGHT_LLM_API_KEY") == "key-of-b"
+
+
+def test_in_turn_cap_eviction_keeps_the_callers_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({"MARKER": "turn-scope"})
+    try:
+        seen = _seen_after_release(_runner({}), "agent:main:cli:1")
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+    assert seen["scope"] == {"MARKER": "turn-scope"}
+
+
+def test_in_turn_cap_eviction_of_another_profiles_agent_enters_the_owners_scope(tmp_path, monkeypatch):
+    """The LRU cap is enforced inside the REQUESTING turn (profile A's scope), and the agent it
+    evicts may be profile B's. B's end-of-session commit must run under B, not under A."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    default_home = tmp_path / ".hermes"
+    prof_a, prof_b = default_home / "profiles" / "a", default_home / "profiles" / "b"
+    prof_a.mkdir(parents=True), prof_b.mkdir(parents=True)
+    (prof_b / ".env").write_text("HINDSIGHT_LLM_API_KEY=key-of-b\n")
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    secret_scope.set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(prof_a))
+    scope_token = secret_scope.set_secret_scope({"HINDSIGHT_LLM_API_KEY": "key-of-a"})
+    try:
+        seen = _seen_after_release(_runner({"agent:b:telegram:dm:1": prof_b}), "agent:b:telegram:dm:1")
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+        secret_scope.set_multiplex_active(False)
+    assert seen["home"] == prof_b
+    assert seen["scope"].get("HINDSIGHT_LLM_API_KEY") == "key-of-b"
+
+
+def test_in_turn_cap_eviction_of_a_default_profile_agent_leaves_the_secondarys_scope(tmp_path, monkeypatch):
+    """Inverse: secondary A's turn evicts a default-profile session (``agent:main:`` — no named
+    owner in the key). The commit runs under the default home, not under A."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    default_home = tmp_path / ".hermes"
+    prof_a = default_home / "profiles" / "a"
+    prof_a.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    secret_scope.set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(prof_a))
+    scope_token = secret_scope.set_secret_scope({"MARKER": "profile-a"})
+    try:
+        seen = _seen_after_release(_runner({}), "agent:main:telegram:dm:9")
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+        secret_scope.set_multiplex_active(False)
+    assert seen["home"] == default_home
+    assert seen["scope"] is not None and seen["scope"].get("MARKER") is None
+
+
+def test_default_profile_owner_is_the_root_even_when_launched_under_a_named_profile(tmp_path, monkeypatch):
+    """``hermes -p x gateway`` sets HERMES_HOME to x's home and serves the default profile as a
+    secondary. An ``agent:main:`` session still belongs to the default profile at the ROOT, not to
+    the launch profile x — otherwise x's turn would commit default's transcript under x."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = tmp_path / ".hermes"
+    prof_x = root / "profiles" / "x"
+    prof_x.mkdir(parents=True)
+    (root / ".env").write_text("MARKER=default-root\n")
+    monkeypatch.setenv("HERMES_HOME", str(prof_x))  # launched under x
+    secret_scope.set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(prof_x))
+    scope_token = secret_scope.set_secret_scope({"MARKER": "profile-x"})
+    try:
+        seen = _seen_after_release(_runner({}), "agent:main:telegram:dm:3")
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+        secret_scope.set_multiplex_active(False)
+    assert seen["home"] == root
+    assert seen["scope"].get("MARKER") == "default-root"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_agent_error_reply_401_hint.py ===
+"""The gateway's 401 exception reply names the turn's provider and the failing profile's own
+sign-in (93889b770da: a bare ``hermes auth add <provider>`` from a named profile re-signs the
+ROOT store — the loop #114012 measured)."""
+
+import asyncio
+from types import SimpleNamespace
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+
+
+def _reply_for_401(provider):
+    runner = object.__new__(GatewayRunner)
+
+    async def stop_typing(event, source):
+        return None
+
+    runner._hmwa_stop_typing_for_turn = stop_typing
+    runner._session_state = lambda key: SimpleNamespace(
+        turn=SimpleNamespace(agent=SimpleNamespace(provider=provider) if provider else None))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c", user_id="u")
+    prepared = runner._PreparedTurn([], "", None, None, None, None)
+    err = RuntimeError("HTTP 401: token_revoked")
+    err.status_code = 401
+    return asyncio.run(runner._hmwa_agent_error_reply(
+        err, MessageEvent(text="x", source=source), source, None, "k", prepared,
+    ))
+
+
+def test_gateway_401_reply_names_the_provider_and_the_profile(monkeypatch, tmp_path):
+    profile_home = tmp_path / ".hermes" / "profiles" / "codex"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    known = _reply_for_401("openai-codex")
+    assert "/login" in known
+    assert "`hermes -p codex auth add openai-codex --type oauth`" in known, known
+    assert "<provider>" not in known and "{relogin}" not in known
+
+    # No agent yet (failure before the turn claimed one): keep the placeholder, still profile-pinned.
+    unknown = _reply_for_401(None)
+    assert "`hermes -p codex auth add <provider>`" in unknown, unknown
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_agent_loop_stopped_hook.py ===
+"""Tests that the ``agent_loop_stopped`` plugin hook fires when the gateway
+interrupts a running agent turn — both via ``/stop`` and via the running-agent
+fast-path inside ``/new``.
+
+Mirrors ``test_session_boundary_hooks.py``: we bypass ``GatewayRunner.__init__``
+and stub just enough attributes to drive ``_interrupt_and_clear_session``.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.session import SessionSource, build_session_key
+from hermes_cli.plugins import VALID_HOOKS
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    # SimpleNamespace, not MagicMock — _interrupt_and_clear_session calls
+    # adapter.interrupt_session_activity() only when hasattr(...) is true,
+    # and MagicMock fakes every attribute, which would push us into an
+    # await on a non-awaitable.
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._running_agents = {}
+    runner._pending_messages = {}
+
+    # _invalidate_session_run_generation + _release_running_agent_state are
+    # called downstream; stub to no-op so we exercise the hook emit only.
+    runner._invalidate_session_run_generation = lambda *a, **kw: None
+    runner._release_running_agent_state = lambda *a, **kw: None
+    return runner
+
+
+def test_agent_loop_stopped_in_valid_hooks():
+    """Plugins must be able to subscribe to the new hook without warnings."""
+    assert "agent_loop_stopped" in VALID_HOOKS
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_interrupt_fires_agent_loop_stopped_hook(mock_invoke_hook):
+    """Calling ``_interrupt_and_clear_session`` with a real running agent
+    must interrupt it AND dispatch the hook with the session, platform,
+    and reasons attached."""
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+
+    await runner._interrupt_and_clear_session(
+        session_key,
+        source,
+        interrupt_reason="user_stop",
+        invalidation_reason="stop_command",
+    )
+
+    running_agent.interrupt.assert_called_once_with("user_stop")
+    mock_invoke_hook.assert_any_call(
+        "agent_loop_stopped",
+        session_key=session_key,
+        platform="telegram",
+        reason="user_stop",
+        invalidation_reason="stop_command",
+    )
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_hook_not_fired_for_pending_sentinel_stop(mock_invoke_hook):
+    """The pending-sentinel /stop path (slash_commands.py) has no in-flight
+    work to cancel — the agent loop never started. The hook is gated on a
+    real running agent and must not fire in this case."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+
+    runner._running_agents[session_key] = _AGENT_PENDING_SENTINEL
+
+    await runner._interrupt_and_clear_session(
+        session_key,
+        source,
+        interrupt_reason="user_stop",
+        invalidation_reason="stop_command_pending",
+    )
+
+    agent_loop_stopped_calls = [
+        call for call in mock_invoke_hook.call_args_list
+        if call.args and call.args[0] == "agent_loop_stopped"
+    ]
+    assert agent_loop_stopped_calls == [], (
+        f"agent_loop_stopped must not fire on the pending-sentinel path "
+        f"(saw {len(agent_loop_stopped_calls)} call(s))"
+    )
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_hook_not_fired_when_no_running_agent(mock_invoke_hook):
+    """If there is no agent at all for the session key (already cleared),
+    there is nothing to interrupt and the hook must not fire."""
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+
+    # _running_agents stays empty — no entry for this session_key.
+    await runner._interrupt_and_clear_session(
+        session_key,
+        source,
+        interrupt_reason="user_stop",
+        invalidation_reason="stop_command_no_agent",
+    )
+
+    agent_loop_stopped_calls = [
+        call for call in mock_invoke_hook.call_args_list
+        if call.args and call.args[0] == "agent_loop_stopped"
+    ]
+    assert agent_loop_stopped_calls == []
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_hook_dispatch_failure_does_not_break_interrupt(mock_invoke_hook):
+    """A misbehaving plugin must not prevent the interrupt from completing."""
+    mock_invoke_hook.side_effect = RuntimeError("plugin exploded")
+
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+
+    # Should not raise — the hook block has try/except for exactly this.
+    await runner._interrupt_and_clear_session(
+        session_key,
+        source,
+        interrupt_reason="user_stop",
+        invalidation_reason="stop_command",
+    )
+
+    # The interrupt itself still happened despite the hook blowing up.
+    running_agent.interrupt.assert_called_once_with("user_stop")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_aiohttp_body_caps.py ===
+"""Regression tests: aiohttp servers must set an explicit ``client_max_size``.
+
+Without it, aiohttp falls back to its implicit 1 MiB default and — worse —
+handlers that only check ``Content-Length`` can be bypassed entirely by
+chunked transfer-encoding requests (#58536 webhook, #58902 raft lineage).
+These tests pin the wiring for the three servers fixed in this follow-up:
+bluebubbles, teams, and the ``hermes proxy`` server.
+"""
+
+import inspect
+
+
+def test_bluebubbles_app_sets_client_max_size():
+    import gateway.platforms.bluebubbles as bb
+
+    assert bb._WEBHOOK_MAX_BODY_BYTES > 0
+    src = inspect.getsource(bb.BlueBubblesAdapter.connect)
+    assert "client_max_size=_WEBHOOK_MAX_BODY_BYTES" in src
+
+
+

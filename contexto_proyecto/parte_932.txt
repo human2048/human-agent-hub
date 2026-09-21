@@ -1,0 +1,232 @@
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\slack.py ===
+"""``hermes slack`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_slack_parser(subparsers, *, cmd_slack: Callable) -> None:
+    """Attach the ``slack`` subcommand to ``subparsers``."""
+    slack_parser = subparsers.add_parser(
+        "slack", help="Slack integration helpers (manifest generation, etc.)",
+        description="Slack integration helpers for Hermes.")
+    slack_sub = slack_parser.add_subparsers(dest="slack_command")
+    slack_manifest = slack_sub.add_parser(
+        "manifest",
+        help="Print or write a Slack app manifest with every gateway command "
+        "registered as a native slash (/btw, /stop, /model, ...)",
+        description="Generate a Slack app manifest that registers every gateway "
+            "command in COMMAND_REGISTRY as a first-class Slack slash "
+            "command (matching Discord and Telegram parity). Paste the "
+            "output into Slack app config → Features → App Manifest → "
+            "Edit, then Save. Reinstall the app if Slack prompts for it.")
+    slack_manifest.add_argument(
+        "--write", nargs="?", const=True, default=None, metavar="PATH",
+        help="Write manifest to a file instead of stdout. With no PATH "
+        "writes to $HERMES_HOME/slack-manifest.json.")
+    slack_manifest.add_argument("--name", default=None, help='Bot display name (default: "Hermes")')
+    slack_manifest.add_argument(
+        "--description", default=None, help="Bot description shown in Slack's app directory.")
+    slack_long_description = slack_manifest.add_mutually_exclusive_group()
+    slack_long_description.add_argument(
+        "--long-description", default=None, metavar="TEXT",
+        help="Set Slack's long app description (175-4,000 characters).")
+    slack_long_description.add_argument(
+        "--long-description-file", default=None, metavar="PATH",
+        help=("Read Slack's long app description from a UTF-8 text file (175-4,000 characters)."))
+    slack_manifest.add_argument(
+        "--slashes-only", action="store_true",
+        help="Emit only the features.slash_commands array (for merging "
+        "into an existing manifest manually).")
+    slack_messaging = slack_manifest.add_mutually_exclusive_group()
+    slack_messaging.add_argument(
+        "--no-assistant", action="store_true",
+        help="Omit Slack AI Assistant mode (assistant_view, assistant:write "
+        "scope, assistant_thread_* events). DMs then render as a flat chat "
+        "where bare slash commands (/help, /new) work inline instead of "
+        "Slack's Assistant thread pane.")
+    slack_messaging.add_argument(
+        "--agent-view", action="store_true",
+        help="Emit Slack's Agent messaging experience (agent_view, "
+        "app_home_opened + message.im) instead of the legacy assistant_view "
+        "experience. This changes Slack's app messaging surface and cannot "
+        "be reversed in Slack after applying the manifest.")
+    slack_parser.set_defaults(func=cmd_slack)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\status.py ===
+"""``hermes status`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_status_parser(subparsers, *, cmd_status: Callable) -> None:
+    """Attach the ``status`` subcommand to ``subparsers``."""
+    status_parser = subparsers.add_parser(
+        "status", help="Show status of all components",
+        description="Display status of Hermes Agent components")
+    status_parser.add_argument(
+        "--all", action="store_true", help="Show all details (redacted for sharing)")
+    status_parser.add_argument(
+        "--deep", action="store_true", help="Run deep checks (may take longer)")
+    status_parser.set_defaults(func=cmd_status)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\sync.py ===
+"""``hermes sync`` subcommand parser — Skill Sync.
+
+Personal sync (status/pull/push/now/enable/disable/device) moves your own skills across
+your devices; ``propose`` shares a skill with your organisation. Sync is INERT unless the
+resolved Nous token carries the access-gate claim AND a sync base URL is configured — the
+commands report that state rather than failing opaquely.
+"""
+
+from __future__ import annotations
+
+import argparse
+from typing import Callable
+
+
+def build_sync_parser(subparsers, *, cmd_sync: Callable) -> None:
+    """Attach the ``sync`` subcommand (and its sub-actions) to ``subparsers``."""
+    sync_parser = subparsers.add_parser(
+        "sync", help="Skill Sync — sync your skills across devices and with your team",
+        description="Skill Sync keeps your skills with you. Personal sync moves your "
+            "own skills between your devices; if you belong to an "
+            "organisation, you also get its shared skills and can propose "
+            "your own back to the team.",
+        epilog="Examples:\n"
+            "  hermes sync status            what is synced, and from where\n"
+            "  hermes sync enable my-skill   include a skill in your sync\n"
+            "  hermes sync now               pull, then push\n"
+            "  hermes sync propose my-skill  share a skill with your team\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sync_sub = sync_parser.add_subparsers(dest="sync_command")
+
+    sync_sub.add_parser("status", help="Show what is synced, and from where")
+    sync_sub.add_parser("pull", help="Pull your synced skills (and your organisation's)")
+    sync_sub.add_parser("push", help="Push your opted-in skills")
+    sync_sub.add_parser("now", help="Reconcile now: pull then push")
+
+    enable = sync_sub.add_parser("enable", help="Include a skill in your sync")
+    enable.add_argument("skill", help="Skill name (frontmatter name / directory name)")
+
+    disable = sync_sub.add_parser("disable", help="Exclude a skill from your sync")
+    disable.add_argument("skill", help="Skill name (frontmatter name / directory name)")
+
+    device = sync_sub.add_parser(
+        "device", help="Show or set this device's label (shown in the sync console)")
+    device.add_argument(
+        "--name", dest="device_name", default=None,
+        help="Set a human-friendly label for this device (e.g. \"Ben's Laptop\"). "
+        "Omit to print the current label.")
+
+    # Org-shared skills. A member's submission becomes a proposal an admin
+    # reviews; an admin's merges straight into the shared set. Accounts that
+    # aren't in a shared organisation are told so plainly.
+    propose = sync_sub.add_parser(
+        "propose", help="Share a skill with your organisation",
+        description="Submit one of your skills to your organisation's shared set. If "
+            "you are an admin it is added directly; otherwise it becomes a "
+            "proposal for an admin to review. Accounts that aren't part of a "
+            "shared organisation don't have this workflow.")
+    propose.add_argument("name", help="Skill name to share")
+    propose.add_argument(
+        "-m", "--message", default=None, help="Optional message describing the change")
+
+    sync_parser.set_defaults(func=cmd_sync)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\tools.py ===
+"""``hermes tools`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+
+def build_tools_parser(subparsers, *, cmd_tools: Callable) -> None:
+    """Attach the ``tools`` subcommand to ``subparsers``."""
+    tools_parser = subparsers.add_parser(
+        "tools", help="Configure which tools are enabled per platform",
+        description="Enable, disable, or list tools for CLI, Telegram, Discord, etc.\n\n"
+            "Built-in toolsets use plain names (e.g. web, memory).\n"
+            "MCP tools use server:tool notation (e.g. github:create_issue).\n\n"
+            "Run 'hermes tools' with no subcommand for the interactive configuration UI.")
+    tools_parser.add_argument(
+        "--summary", action="store_true",
+        help="Print a summary of enabled tools per platform and exit")
+    tools_sub = tools_parser.add_subparsers(dest="tools_action")
+
+    tools_list_p = tools_sub.add_parser(
+        "list", help="Show all tools and their enabled/disabled status")
+    tools_list_p.add_argument("--platform", default="cli", help="Platform to show (default: cli)")
+
+    tools_disable_p = tools_sub.add_parser("disable", help="Disable toolsets or MCP tools")
+    tools_disable_p.add_argument(
+        "names", nargs="+", metavar="NAME",
+        help="Toolset name (e.g. web) or MCP tool in server:tool form")
+    tools_disable_p.add_argument(
+        "--platform", default="cli", help="Platform to apply to (default: cli)")
+
+    tools_enable_p = tools_sub.add_parser("enable", help="Enable toolsets or MCP tools")
+    tools_enable_p.add_argument(
+        "names", nargs="+", metavar="NAME", help="Toolset name or MCP tool in server:tool form")
+    tools_enable_p.add_argument(
+        "--platform", default="cli", help="Platform to apply to (default: cli)")
+
+    tools_postsetup_p = tools_sub.add_parser(
+        "post-setup", help="Run a provider's post-setup install hook (npm/pip/binary)",
+        description="Run the install/bootstrap hook a tool backend declares — the\n"
+            "same step `hermes tools` runs after you pick a provider that\n"
+            "needs extra dependencies (browser Chromium, Camofox, cua-driver,\n"
+            "KittenTTS/Piper, ddgs, Spotify, Langfuse, xAI). Stable,\n"
+            "non-interactive target the dashboard spawns to drive backend\n"
+            "setup. Keys: agent_browser, camofox, cua_driver, kittentts,\n"
+            "piper, ddgs, spotify, langfuse, xai_grok.")
+    tools_postsetup_p.add_argument(
+        "post_setup_key", metavar="KEY",
+        help="Post-setup hook key (e.g. agent_browser, camofox, kittentts)")
+    tools_parser.set_defaults(func=cmd_tools)
+
+
+
+=== ARCHIVO: .\hermes-agent\hermes_cli\subcommands\uninstall.py ===
+"""``hermes uninstall`` subcommand parser."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from hermes_cli.subcommands._shared import add_yes_flag
+
+
+def build_uninstall_parser(subparsers, *, cmd_uninstall: Callable) -> None:
+    """Attach the ``uninstall`` subcommand to ``subparsers``."""
+    uninstall_parser = subparsers.add_parser(
+        "uninstall", help="Uninstall Hermes Agent",
+        description="Remove Hermes Agent from your system. Can keep configs/data for reinstall.")
+    uninstall_parser.add_argument(
+        "--full", action="store_true",
+        help="Full uninstall - remove everything including configs and data")
+    uninstall_parser.add_argument(
+        "--gui", action="store_true",
+        help="Uninstall only the desktop Chat GUI, leaving the agent intact")
+    uninstall_parser.add_argument(
+        "--gui-summary", action="store_true",
+        help="Print a JSON summary of installed GUI/agent artifacts and exit "
+        "(used by the desktop app to gate uninstall options)")
+    add_yes_flag(uninstall_parser, "Skip confirmation prompts")
+    uninstall_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what uninstall would remove without changing anything")
+    uninstall_parser.set_defaults(func=cmd_uninstall)
+

@@ -1,0 +1,287 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\email\agentmail\references\core.md ===
+# AgentMail Core
+
+Common CLI path: create inboxes, send mail, read incoming mail, reply in
+threads, label work, and fetch attachments. Need a key first? Use
+[signup.md](signup.md). Need realtime delivery? Use [webhooks.md](webhooks.md)
+or [websockets.md](websockets.md).
+
+## Setup
+
+```bash
+npm install -g agentmail-cli@latest
+export AGENTMAIL_API_KEY="am_..."
+agentmail inboxes list --format json
+```
+
+## Inboxes
+
+```bash
+agentmail inboxes create \
+  --username support \
+  --display-name "Support Agent" \
+  --client-id support-agent-primary \
+  --format json
+
+agentmail inboxes get --inbox-id support@agentmail.to --format json
+```
+
+Omit `domain` to use `@agentmail.to`. Use stable `client_id` values for
+retried create commands.
+
+## Send
+
+```bash
+agentmail inboxes:messages send \
+  --inbox-id support@agentmail.to \
+  --to customer@example.com \
+  --subject "Hello" \
+  --text "Plain-text body." \
+  --html "<p>Plain-text body.</p>" \
+  --label outreach \
+  --format json
+```
+
+Send both `text` and `html` when possible. Recipient limit is 50 total across
+`to`, `cc`, and `bcc`.
+
+## Read and Reply
+
+```bash
+agentmail inboxes:messages list --inbox-id support@agentmail.to --label unread --format json
+agentmail inboxes:messages get --inbox-id support@agentmail.to --message-id <message_id> --format json
+agentmail inboxes:threads get --inbox-id support@agentmail.to --thread-id <thread_id> --format json
+```
+
+For LLM input, prefer `extracted_text` or `extracted_html`. Some email has
+`html` but no `text`.
+
+```bash
+agentmail inboxes:messages reply \
+  --inbox-id support@agentmail.to \
+  --message-id <message_id> \
+  --text "Thanks, I will take a look." \
+  --format json
+
+agentmail inboxes:messages reply-all \
+  --inbox-id support@agentmail.to \
+  --message-id <message_id> \
+  --text "Thanks, everyone." \
+  --format json
+
+agentmail inboxes:messages forward \
+  --inbox-id support@agentmail.to \
+  --message-id <message_id> \
+  --to teammate@example.com \
+  --format json
+```
+
+## Labels
+
+Use labels as lightweight state: `unread`, `handled`, `needs-review`.
+
+```bash
+agentmail inboxes:messages update \
+  --inbox-id support@agentmail.to \
+  --message-id <message_id> \
+  --add-labels handled \
+  --remove-labels unread \
+  --format json
+```
+
+## Attachments
+
+```bash
+agentmail inboxes:messages get-attachment \
+  --inbox-id support@agentmail.to \
+  --message-id <message_id> \
+  --attachment-id <attachment_id> \
+  --format json
+```
+
+Fetch the returned download URL before it expires. Check
+`agentmail inboxes:messages send --help` for attachment-send flags.
+
+## REST Notes
+
+Use REST only when the CLI is unavailable or missing a required operation.
+
+```bash
+curl https://api.agentmail.to/v0/inboxes \
+  -H "Authorization: Bearer $AGENTMAIL_API_KEY"
+```
+
+Base URLs: `https://api.agentmail.to/v0`, `https://api.agentmail.eu/v0`.
+
+Error bodies include `name` and `message`; validation errors include `errors`.
+For `429`, honor `Retry-After` and back off.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\email\agentmail\references\mcp.md ===
+# AgentMail MCP
+
+Use MCP only when the user or harness already wants MCP tools. The CLI remains
+the default path for AgentMail workflows.
+
+Hosted server:
+
+```text
+https://mcp.agentmail.to/mcp
+```
+
+Authentication:
+
+- OAuth in compatible MCP clients.
+- API key in `?apiKey=...`.
+- API key in an `x-api-key` header.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\email\agentmail\references\signup.md ===
+# AgentMail Self-Signup
+
+Use this when the agent does not have an AgentMail API key. A human must receive
+and provide the OTP.
+
+## Sign Up
+
+```bash
+npm install -g agentmail-cli@latest
+agentmail agent sign-up \
+  --human-email you@example.com \
+  --username my-agent \
+  --source agentmail-cli \
+  --referrer hermes-agent \
+  --format json
+```
+
+Export the returned `api_key`:
+
+```bash
+export AGENTMAIL_API_KEY="am_..."
+```
+
+Verify with the OTP:
+
+```bash
+agentmail agent verify --otp-code 123456
+```
+
+## Notes
+
+- Use a real human email address for `--human-email`.
+- `human_email` is the signup idempotency key, but signing up again with the
+  same email rotates the API key.
+- Before verification, the account has one inbox, 10 sends/day, and can only
+  send to the signup human email.
+
+## First Check
+
+```bash
+agentmail inboxes list --format json
+agentmail inboxes:messages send \
+  --inbox-id my-agent@agentmail.to \
+  --to you@example.com \
+  --subject "AgentMail verified" \
+  --text "My AgentMail inbox is verified." \
+  --format json
+```
+
+Continue with [core.md](core.md).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\email\agentmail\references\webhooks.md ===
+# AgentMail Webhooks
+
+Use webhooks when a public HTTPS server should receive AgentMail events. Use
+[websockets.md](websockets.md) for local processes without a public URL.
+
+## Create
+
+```bash
+agentmail webhooks create \
+  --url https://your-app.example.com/webhooks/agentmail \
+  --event-type message.received \
+  --inbox-id support@agentmail.to \
+  --client-id support-agentmail-webhook \
+  --format json
+```
+
+Store the returned `secret` immediately.
+
+## Handle
+
+Headers: `svix-id`, `svix-timestamp`, `svix-signature`.
+
+1. Verify the raw request body with the webhook secret.
+2. Dedupe by `svix-id` or `event_id`.
+3. Return `200` quickly.
+4. Process asynchronously.
+5. For `message.received`, load the thread with the CLI and reply if needed.
+
+Act on `message.received` only. Treating `message.sent` or delivery events as
+inbound work creates loops.
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\email\agentmail\references\websockets.md ===
+# AgentMail WebSockets
+
+Use WebSockets when a local agent process needs realtime inbound mail. After an
+event arrives, use the CLI for inbox, send, reply, label, and attachment work.
+
+## Python
+
+The Python example needs the separate AgentMail Python SDK, not the CLI:
+
+```bash
+pip install agentmail
+```
+
+`AgentMail()` reads `AGENTMAIL_API_KEY` from the environment. If the SDK is
+unavailable, use the `Raw` WebSocket below instead.
+
+```python
+from agentmail import AgentMail, MessageReceivedEvent, Subscribe
+
+client = AgentMail()
+
+with client.websockets.connect() as socket:
+    socket.send_subscribe(Subscribe(
+        inbox_ids=["agent@agentmail.to"],
+        event_types=["message.received"],
+    ))
+    for event in socket:
+        if isinstance(event, MessageReceivedEvent):
+            print(event.message.subject, event.message.from_)
+```
+
+## Raw
+
+```text
+wss://ws.agentmail.to/v0?api_key=$AGENTMAIL_API_KEY
+```
+
+EU region:
+
+```text
+wss://ws.agentmail.eu/v0?api_key=$AGENTMAIL_API_KEY
+```
+
+Subscribe frame:
+
+```json
+{ "type": "subscribe", "event_types": ["message.received"], "inbox_ids": ["agent@agentmail.to"] }
+```
+
+Omit `inbox_ids` and `pod_ids` for the API key scope.
+
+## Loop Rules
+
+- Dedupe every event by `event_id`.
+- Reconnect with backoff and resubscribe after reconnecting.
+

@@ -1,0 +1,436 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_suppress_eio_on_interrupt.py ===
+"""Tests for OSError EIO suppression during interrupt shutdown (#13710).
+
+When the user interrupts a running task, prompt_toolkit tries to flush
+stdout during emergency shutdown.  If stdout is already in a broken state
+(redirected to /dev/null, pipe closed, etc.), the flush raises
+``OSError: [Errno 5] Input/output error``.
+
+The ``_suppress_closed_loop_errors`` asyncio exception handler and the
+outer ``except (KeyError, OSError)`` block must both suppress this error
+to prevent a hard crash.
+"""
+
+from __future__ import annotations
+
+import errno
+from unittest.mock import MagicMock
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# _suppress_closed_loop_errors – asyncio exception handler
+# ---------------------------------------------------------------------------
+
+def _make_suppress_fn():
+    """Build a standalone copy of ``_suppress_closed_loop_errors``.
+
+    The real function is defined as a closure inside
+    ``CLI._run_interactive``; we reconstruct an equivalent here so the
+    unit tests don't need a full CLI instance.
+    """
+    def _suppress_closed_loop_errors(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+            return
+        if isinstance(exc, KeyError) and "is not registered" in str(exc):
+            return
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.EIO:
+            return
+        loop.default_exception_handler(context)
+    return _suppress_closed_loop_errors
+
+
+class TestSuppressClosedLoopErrors:
+    """Verify the asyncio exception handler suppresses expected errors."""
+
+    def test_suppresses_event_loop_closed(self):
+        handler = _make_suppress_fn()
+        loop = MagicMock()
+        handler(loop, {"exception": RuntimeError("Event loop is closed")})
+        loop.default_exception_handler.assert_not_called()
+
+
+    def test_does_not_suppress_oserror_other_errno(self):
+        """OSError with a different errno must still propagate."""
+        handler = _make_suppress_fn()
+        loop = MagicMock()
+        exc = OSError(errno.EACCES, "Permission denied")
+        handler(loop, {"exception": exc})
+        loop.default_exception_handler.assert_called_once()
+
+
+    def test_no_exception_key(self):
+        """Context without 'exception' must propagate to default handler."""
+        handler = _make_suppress_fn()
+        loop = MagicMock()
+        handler(loop, {"message": "some log"})
+        loop.default_exception_handler.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Outer except block – EIO handling
+# ---------------------------------------------------------------------------
+
+class TestOuterExceptEIO:
+    """Verify the outer ``except (KeyError, OSError)`` block logic."""
+
+    def test_eio_does_not_reraise(self):
+        """OSError with errno.EIO should be silently suppressed."""
+        exc = OSError(errno.EIO, "Input/output error")
+        # Simulate the condition check from the outer except block:
+        assert isinstance(exc, OSError)
+        assert getattr(exc, "errno", None) == errno.EIO
+
+
+    def test_other_oserror_reraises(self):
+        """Other OSError variants must not match the EIO guard."""
+        exc = OSError(errno.EACCES, "Permission denied")
+        assert not (getattr(exc, "errno", None) == errno.EIO)
+        assert "is not registered" not in str(exc)
+        assert "Bad file descriptor" not in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal handler – guarded logger.debug (#13710 regression)
+# ---------------------------------------------------------------------------
+#
+# CPython's logging module is not reentrant-safe.  ``Logger.isEnabledFor``
+# caches level results in ``Logger._cache``; under shutdown races the cache
+# can be cleared (``Logger._clear_cache``) or mid-mutation when the signal
+# fires, raising ``KeyError: <level_int>`` (e.g. ``KeyError: 10`` for DEBUG)
+# from inside the handler.  If that KeyError escapes, it bypasses the
+# ``raise KeyboardInterrupt()`` on the next line, which in turn bypasses
+# prompt_toolkit's normal interrupt unwind and surfaces as the EIO cascade
+# from #13710.
+#
+# The fix: wrap the ``logger.debug`` call in the signal handler in a bare
+# ``try/except Exception: pass`` so logging can never raise through it.
+#
+# These tests verify the contract: the handler must raise KeyboardInterrupt
+# (and nothing else) regardless of whether logger.debug succeeds or blows up.
+
+
+def _make_signal_handler(logger, agent_state):
+    """Build a standalone copy of ``_signal_handler``.
+
+    The real handler is defined as a closure inside ``CLI._run_interactive``;
+    we reconstruct an equivalent here so the unit tests don't need a full
+    CLI instance.  Mirrors cli.py:_signal_handler as of #13710 regression
+    fix — guarded logger.debug + agent interrupt + KeyboardInterrupt.
+    """
+    def _signal_handler(signum, frame):
+        # Guarded: logging must never raise through a signal handler.
+        try:
+            logger.debug("Received signal %s, triggering graceful shutdown", signum)
+        except Exception:
+            pass  # never let logging raise from a signal handler (#13710 regression)
+        try:
+            if agent_state.get("agent") and agent_state.get("running"):
+                agent_state["agent"].interrupt(f"received signal {signum}")
+        except Exception:
+            pass  # never block signal handling
+        raise KeyboardInterrupt()
+    return _signal_handler
+
+
+class TestSignalHandlerLoggingRace:
+    """#13710 regression — logger.debug in signal handler must not escape.
+
+    If the DEBUG-level ``logging._cache`` lookup races with a concurrent
+    ``_clear_cache`` (e.g. from another thread reconfiguring logging during
+    shutdown), ``logger.debug`` can raise ``KeyError: 10``.  The signal
+    handler must swallow that and still raise KeyboardInterrupt.
+    """
+
+    def test_keyboard_interrupt_raised_on_normal_path(self):
+        """Sanity: handler raises KeyboardInterrupt when logging works."""
+        logger = MagicMock()
+        handler = _make_signal_handler(logger, {})
+        with pytest.raises(KeyboardInterrupt):
+            handler(15, None)  # SIGTERM
+        logger.debug.assert_called_once()
+
+    def test_keyboard_interrupt_raised_when_logger_raises_keyerror(self):
+        """logger.debug raising KeyError(10) must not escape — KeyboardInterrupt wins.
+
+        This is the exact failure signature from the #13710 regression: the
+        CPython 3.11 ``Logger._cache[level]`` race surfaces as KeyError on
+        the integer level value, and previously propagated out of the
+        signal handler before the ``raise KeyboardInterrupt()`` could fire.
+        """
+        logger = MagicMock()
+        logger.debug.side_effect = KeyError(10)  # DEBUG level int
+        handler = _make_signal_handler(logger, {})
+        # Must still raise KeyboardInterrupt, NOT KeyError.
+        with pytest.raises(KeyboardInterrupt):
+            handler(15, None)
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_systemd_optional_directives.py ===
+"""Tests for systemd optional-directive normalization (issue #41119).
+
+On older systemd versions that don't support RestartMaxDelaySec /
+RestartSteps, the installed unit file has those directives silently
+dropped.  Without normalization, systemd_unit_is_current() would
+perpetually report the unit as outdated because the strict text
+comparison sees a difference.
+
+The fix: _strip_optional_systemd_directives() removes those directives
+from both the installed and expected text before comparison.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# _strip_optional_systemd_directives
+# ---------------------------------------------------------------------------
+
+
+class TestStripOptionalSystemdDirectives:
+    def test_removes_restart_max_delay_sec(self):
+        from hermes_cli.gateway import _strip_optional_systemd_directives
+        text = """[Service]
+Restart=always
+RestartSec=5
+RestartMaxDelaySec=300
+RestartSteps=5
+"""
+        result = _strip_optional_systemd_directives(text)
+        assert "RestartMaxDelaySec" not in result
+        assert "RestartSteps" not in result
+        assert "Restart=always" in result
+        assert "RestartSec=5" in result
+
+
+
+
+
+    def test_full_unit_comparison(self):
+        """Simulate the full stale-check flow with an older systemd unit."""
+        from hermes_cli.gateway import (
+            _normalize_service_definition,
+            _strip_optional_systemd_directives,
+        )
+        # What the installed unit looks like on older systemd (directives stripped)
+        installed = """[Unit]
+Description=Hermes Gateway
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python -m hermes_cli.main gateway run
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
+"""
+        # What generate_systemd_unit produces (with the directives)
+        expected = """[Unit]
+Description=Hermes Gateway
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python -m hermes_cli.main gateway run
+Restart=always
+RestartSec=5
+RestartMaxDelaySec=300
+RestartSteps=5
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
+"""
+        # Without normalization, they differ
+        assert _normalize_service_definition(installed) != _normalize_service_definition(expected)
+
+        # With optional-directive stripping, they match
+        norm_installed = _normalize_service_definition(
+            _strip_optional_systemd_directives(installed)
+        )
+        norm_expected = _normalize_service_definition(
+            _strip_optional_systemd_directives(expected)
+        )
+        assert norm_installed == norm_expected
+
+
+# ---------------------------------------------------------------------------
+# systemd_unit_is_current integration
+# ---------------------------------------------------------------------------
+
+
+class TestSystemdUnitIsCurrent:
+    def test_unit_without_fatal_config_restart_policy_is_not_current(
+        self, tmp_path, monkeypatch,
+    ):
+        from hermes_cli import gateway as gw
+
+        expected = """[Service]
+Restart=always
+RestartForceExitStatus=75
+RestartPreventExitStatus=78
+"""
+        installed = expected.replace("RestartPreventExitStatus=78\n", "")
+        unit_file = tmp_path / "hermes-gateway.service"
+        unit_file.write_text(installed)
+
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
+        monkeypatch.setattr(
+            gw,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: expected,
+        )
+
+        assert gw.systemd_unit_is_current(system=False) is False
+
+    def test_unit_without_optional_directives_is_current(self, tmp_path, monkeypatch):
+        """Installed unit missing RestartMaxDelaySec/RestartSteps should be
+        considered current when the generated unit includes them."""
+        from hermes_cli import gateway as gw
+
+        installed = """[Unit]
+Description=Hermes Gateway
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python gateway run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+        unit_file = tmp_path / "hermes-gateway.service"
+        unit_file.write_text(installed)
+
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
+        monkeypatch.setattr(
+            gw,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: installed + "\nRestartMaxDelaySec=300\nRestartSteps=5\n",
+        )
+
+        assert gw.systemd_unit_is_current(system=False) is True
+
+
+    def test_nonexistent_unit_is_not_current(self, tmp_path, monkeypatch):
+        from hermes_cli import gateway as gw
+        unit_file = tmp_path / "nonexistent.service"
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
+        assert gw.systemd_unit_is_current(system=False) is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_systemd_watchdog_unit.py ===
+"""Generated service behavior for the opt-in systemd watchdog."""
+
+from __future__ import annotations
+
+from gateway.config import GatewayConfig
+from hermes_cli import gateway as gateway_cli
+
+
+
+
+def test_positive_watchdog_config_generates_notify_unit(monkeypatch):
+    monkeypatch.setattr(
+        gateway_cli,
+        "load_gateway_config",
+        lambda: GatewayConfig.from_dict({"systemd_watchdog_seconds": 120}),
+        raising=False,
+    )
+
+    unit = gateway_cli.generate_systemd_unit(system=False)
+
+    assert "Type=notify" in unit
+    assert "NotifyAccess=main" in unit
+    assert "WatchdogSec=120s" in unit
+
+
+
+
+
+
+def test_system_unit_reads_watchdog_from_target_home(tmp_path, monkeypatch):
+    caller_home = tmp_path / "caller"
+    target_home = tmp_path / "target"
+    caller_home.mkdir()
+    target_home.mkdir()
+    (caller_home / "config.yaml").write_text(
+        "gateway:\n  systemd_watchdog_seconds: 0\n",
+        encoding="utf-8",
+    )
+    (target_home / "config.yaml").write_text(
+        "gateway:\n  systemd_watchdog_seconds: 75\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(caller_home))
+    monkeypatch.setattr(
+        gateway_cli,
+        "_system_service_identity",
+        lambda _user: ("service", "service", str(tmp_path / "account"), 1001),
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_hermes_home_for_target_user",
+        lambda _home: str(target_home),
+    )
+
+    unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="service")
+
+    assert "Type=notify" in unit
+    assert "WatchdogSec=75s" in unit
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_system_stats_platform.py ===
+from hermes_cli.web_server_gateway import _display_system_platform
+
+
+def test_windows_11_build_displays_as_windows_11():
+    info = _display_system_platform(
+        system="Windows",
+        release="10",
+        version="10.0.26200",
+        platform_label="Windows-10-10.0.26200-SP0",
+    )
+
+    assert info["os"] == "Windows"
+    assert info["os_release"] == "11"
+    assert info["os_version"] == "10.0.26200"
+    assert info["platform"] == "Windows-11-10.0.26200-SP0"
+
+
+def test_non_windows_platform_unchanged():
+    info = _display_system_platform(
+        system="Linux",
+        release="6.8.0",
+        version="#1 SMP",
+        platform_label="Linux-6.8.0-x86_64-with-glibc2.39",
+    )
+
+    assert info == {
+        "os": "Linux",
+        "os_release": "6.8.0",
+        "os_version": "#1 SMP",
+        "platform": "Linux-6.8.0-x86_64-with-glibc2.39",
+    }
+

@@ -1,0 +1,423 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dashboard_token_auth.py ===
+"""Contract tests for the generic non-interactive (bearer-token) auth seam.
+
+Covers Task 2.0a: the reusable token-auth capability in the dashboard auth
+framework — NOT the drain plugin (that's 2.0b/2.1). Asserts the ABC capability
+flag, the registry filter, bearer extraction, provider stacking (verify_token),
+and the route-agnostic middleware seam's fail-closed / 503 / pass-through
+behaviour.
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Optional
+
+import pytest
+
+from hermes_cli.dashboard_auth import (
+    DashboardAuthProvider,
+    LoginStart,
+    Session,
+    TokenPrincipal,
+    clear_providers,
+    list_providers,
+    list_session_providers,
+    list_token_providers,
+    register_provider,
+)
+from hermes_cli.dashboard_auth.base import ProviderError
+from hermes_cli.dashboard_auth import token_auth
+
+
+# --------------------------------------------------------------------------
+# Test doubles
+# --------------------------------------------------------------------------
+
+
+class _OAuthOnly(DashboardAuthProvider):
+    """A pure interactive provider — never token-authable."""
+
+    name = "oauth-only"
+    display_name = "OAuth Only"
+
+    def start_login(self, *, redirect_uri):
+        return LoginStart(redirect_url="x", cookie_payload={})
+
+    def complete_login(self, *, code, state, code_verifier, redirect_uri):
+        return Session("u", "e", "n", "o", self.name, 0, "a", "r")
+
+    def verify_session(self, *, access_token):
+        return None
+
+    def refresh_session(self, *, refresh_token):
+        return Session("u", "e", "n", "o", self.name, 0, "a", "r")
+
+    def revoke_session(self, *, refresh_token):
+        return None
+
+
+class _TokenProvider(_OAuthOnly):
+    """A token provider that accepts exactly one secret."""
+
+    name = "tok"
+    display_name = "Token Provider"
+    supports_token = True
+
+    def __init__(self, *, secret: str = "good-secret", scopes=("drain",)):
+        self._secret = secret
+        self._scopes = tuple(scopes)
+
+    def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
+        if token == self._secret:
+            return TokenPrincipal(
+                principal=self.name, provider=self.name, scopes=self._scopes
+            )
+        return None
+
+
+class _UnreachableTokenProvider(_OAuthOnly):
+    name = "tok-down"
+    display_name = "Unreachable Token Provider"
+    supports_token = True
+
+    def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
+        raise ProviderError("backing store down")
+
+
+class _BuggyTokenProvider(_OAuthOnly):
+    name = "tok-buggy"
+    display_name = "Buggy Token Provider"
+    supports_token = True
+
+    def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
+        raise RuntimeError("kaboom")
+
+
+# --------------------------------------------------------------------------
+# Fixtures
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state():
+    clear_providers()
+    token_auth.clear_token_routes()
+    yield
+    clear_providers()
+    token_auth.clear_token_routes()
+
+
+class _FakeURL:
+    def __init__(self, path):
+        self.path = path
+
+
+class _FakeClient:
+    host = "1.2.3.4"
+
+
+class _FakeRequest:
+    """Minimal Request stand-in for the seam (no real Starlette needed)."""
+
+    def __init__(self, path="/api/gateway/drain", headers=None):
+        self.url = _FakeURL(path)
+        self.headers = headers or {}
+        self.client = _FakeClient()
+
+        class _State:
+            pass
+
+        self.state = _State()
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+# --------------------------------------------------------------------------
+# ABC + registry
+# --------------------------------------------------------------------------
+
+
+def test_oauth_provider_defaults_supports_token_false():
+    assert _OAuthOnly().supports_token is False
+
+
+
+
+class _NonInteractiveProvider(_TokenProvider):
+    """A token-only credential with no interactive session."""
+
+    name = "svc-cred"
+    display_name = "Service Credential"
+    supports_session = False
+
+
+# --------------------------------------------------------------------------
+# Bearer extraction
+# --------------------------------------------------------------------------
+
+
+
+
+# --------------------------------------------------------------------------
+# authenticate_token (provider stacking)
+# --------------------------------------------------------------------------
+
+
+def test_authenticate_token_accepts_valid():
+    register_provider(_TokenProvider(secret="good-secret"))
+    req = _FakeRequest(headers={"authorization": "Bearer good-secret"})
+    principal, unreachable = token_auth.authenticate_token(req)
+    assert unreachable is None
+    assert principal is not None
+    assert principal.provider == "tok"
+    assert principal.scopes == ("drain",)
+
+
+def test_authenticate_token_rejects_wrong_secret():
+    register_provider(_TokenProvider(secret="good-secret"))
+    req = _FakeRequest(headers={"authorization": "Bearer wrong"})
+    principal, unreachable = token_auth.authenticate_token(req)
+    assert principal is None
+    assert unreachable is None
+
+
+def test_authenticate_token_stacks_first_match_wins():
+    register_provider(_TokenProvider(secret="aaa"))
+    second = _TokenProvider(secret="bbb")
+    second.name = "tok2"
+    register_provider(second)
+    req = _FakeRequest(headers={"authorization": "Bearer bbb"})
+    principal, _ = token_auth.authenticate_token(req)
+    assert principal is not None and principal.provider == "tok2"
+
+
+def test_authenticate_token_unreachable_then_valid_provider_wins():
+    register_provider(_UnreachableTokenProvider())
+    register_provider(_TokenProvider(secret="good"))
+    req = _FakeRequest(headers={"authorization": "Bearer good"})
+    principal, unreachable = token_auth.authenticate_token(req)
+    # A later provider accepting the token beats the earlier outage.
+    assert principal is not None and principal.provider == "tok"
+    assert unreachable is None
+
+
+def test_authenticate_token_buggy_provider_does_not_crash():
+    register_provider(_BuggyTokenProvider())
+    register_provider(_TokenProvider(secret="good"))
+    req = _FakeRequest(headers={"authorization": "Bearer good"})
+    principal, unreachable = token_auth.authenticate_token(req)
+    assert principal is not None and principal.provider == "tok"
+
+
+# --------------------------------------------------------------------------
+# Middleware seam (route-agnostic)
+# --------------------------------------------------------------------------
+
+
+async def _call_next_ok(request):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse({"ok": True}, status_code=200)
+
+
+
+
+
+
+def test_seam_rejects_wrong_token_401():
+    register_provider(_TokenProvider(secret="good"))
+    token_auth.register_token_route("/api/gateway/drain")
+    req = _FakeRequest(
+        path="/api/gateway/drain", headers={"authorization": "Bearer bad"}
+    )
+    resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
+    assert resp.status_code == 401
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dashboard_tui_backcompat.py ===
+"""Regression test: `hermes dashboard --tui` must not hard-crash.
+
+Older Hermes desktop app shells (<= 0.15.x) spawn the backend as::
+
+    hermes dashboard --no-open --tui --host 127.0.0.1 --port <PORT>
+
+The ``--tui`` flag was removed from the ``dashboard`` subcommand in cae6b5486
+(embedded chat is always on now). When a user's CLI updates past that commit
+but their desktop app binary has not, argparse used to reject the unknown flag
+with ``error: unrecognized arguments: --tui`` and ``exit(2)`` — the backend
+died before it became ready and the desktop GUI showed only "Hermes couldn't
+start" with no actionable cause.
+
+The fix adds a hidden, deprecated, accepted-and-ignored ``--tui`` flag to the
+dashboard subparser so an old app shell + new CLI degrades gracefully instead
+of bricking. These tests pin that contract.
+"""
+
+import os
+import subprocess
+import sys
+
+REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+)
+
+
+def _run_cli(args, timeout=60):
+    """Invoke the real hermes_cli.main parser in a subprocess.
+
+    Uses ``--status`` so the dashboard command exits immediately after parsing
+    (it scans the process table and returns) instead of starting a server.
+    Returns the CompletedProcess.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", *args],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def test_dashboard_tui_flag_is_accepted_not_rejected():
+    """The exact argv an old desktop app sends must parse without argparse error."""
+    result = _run_cli(
+        ["dashboard", "--no-open", "--tui", "--host", "127.0.0.1",
+         "--port", "39997", "--status"]
+    )
+    combined = (result.stdout or "") + (result.stderr or "")
+    # The pre-fix failure signature.
+    assert "unrecognized arguments" not in combined, combined
+    assert "--tui" not in (result.stderr or ""), result.stderr
+    # argparse usage errors exit 2; the parse itself must not be that error.
+    assert result.returncode != 2, combined
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_dashboard_unified_launch.py ===
+"""Tests for the unified profile→machine dashboard launch routing.
+
+`<profile> dashboard` routes to ONE machine-level dashboard instead of
+spawning a per-profile server: attach (open browser at ?profile=) when one
+is already listening, else re-exec as the machine dashboard with the
+launching profile preselected. `--isolated` opts out.
+"""
+import sys
+import types
+import pytest
+from hermes_cli import main_dashboard
+
+
+@pytest.fixture
+def main_mod():
+    import hermes_cli.main as main_mod
+    return main_mod
+
+
+def _args(**kw):
+    defaults = dict(
+        status=False, stop=False, host="127.0.0.1", port=9119,
+        no_open=True, insecure=False, skip_build=False,
+        isolated=False, open_profile="",
+    )
+    defaults.update(kw)
+    return types.SimpleNamespace(**defaults)
+
+
+class TestUnifiedDashboardRouting:
+
+
+    def test_profile_launch_reexecs_machine_dashboard(self, main_mod, monkeypatch):
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
+        )
+        monkeypatch.setattr(main_dashboard, "_dashboard_listening", lambda host, port: False)
+        execs = []
+
+        def fake_exec(exe, argv, env):
+            execs.append((exe, argv, env))
+            raise SystemExit(0)  # execvpe never returns
+
+        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+
+        with pytest.raises(SystemExit):
+            main_mod.cmd_dashboard(_args())
+
+        assert len(execs) == 1
+        exe, argv, env = execs[0]
+        assert exe == sys.executable
+        # Pinned to the default profile + launching profile preselected.
+        assert "-p" in argv and argv[argv.index("-p") + 1] == "default"
+        assert "--open-profile" in argv
+        assert argv[argv.index("--open-profile") + 1] == "worker_x"
+        # The child is pinned to the machine ROOT, not the launching profile's
+        # HERMES_HOME.  For a standard install (HERMES_HOME unset) that root is
+        # the platform-native default (~/.hermes), NOT dropped — see the Docker
+        # test below for why we resolve explicitly instead of popping.
+        from hermes_constants import get_default_hermes_root
+        assert env.get("HERMES_HOME") == str(get_default_hermes_root())
+
+
+    def test_desktop_profile_backend_skips_machine_dashboard_reroute(self, main_mod, monkeypatch):
+        """A desktop-spawned named-profile backend (HERMES_DESKTOP=1) must NOT
+        reroute into the machine dashboard. The reroute re-execs as the default
+        profile and exits, so the desktop never sees a ready backend → boot
+        loop. The guard keeps desktop pool backends per-profile."""
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
+        )
+        listening_calls = []
+        monkeypatch.setattr(main_dashboard, "_dashboard_listening",
+            lambda host, port: listening_calls.append(1) or False,
+        )
+        execs = []
+        monkeypatch.setattr(main_mod.os, "execvpe", lambda *a, **k: execs.append(a))
+        monkeypatch.setitem(sys.modules, "fastapi", None)
+
+        with pytest.raises((SystemExit, AttributeError, ImportError, TypeError)):
+            main_mod.cmd_dashboard(_args())
+        assert listening_calls == []
+        assert execs == []
+
+
+class TestInteractiveDashboardAuthSetup:
+
+    def test_loopback_proxy_public_url_offers_auth_setup(
+        self, main_mod, monkeypatch, capsys
+    ):
+        """A TTY operator is prompted when public_url gates a loopback bind."""
+        from hermes_cli.dashboard_auth import clear_providers
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_PUBLIC_URL",
+            "https://dashboard.example.test:9443",
+        )
+        clear_providers()
+        monkeypatch.setattr(main_mod.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(main_mod.sys.stdout, "isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _prompt: "3")
+
+        with pytest.raises(SystemExit) as exc:
+            main_mod._maybe_setup_dashboard_auth_interactively(_args())
+
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+        assert "configured external dashboard.public_url" in output
+
+
+
+
+

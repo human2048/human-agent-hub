@@ -1,0 +1,357 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_profiles_s6_hooks.py ===
+"""Tests for the Phase 4 s6 hooks in hermes_cli.profiles.
+
+Specifically: _maybe_register_gateway_service,
+_maybe_unregister_gateway_service. The integration with
+create_profile and delete_profile is covered indirectly by the
+existing TestCreateProfile and TestDeleteProfile classes in
+tests/hermes_cli/test_profiles.py; here we only exercise the new
+helper surface that doesn't touch the filesystem.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from hermes_cli.profiles import (
+    _maybe_register_gateway_service,
+    _maybe_unregister_gateway_service,
+)
+
+
+# ---------------------------------------------------------------------------
+# _maybe_register_gateway_service / _maybe_unregister_gateway_service
+# ---------------------------------------------------------------------------
+
+
+class _HostManager:
+    """Mimics a host backend that doesn't support runtime registration."""
+    kind = "systemd"
+
+    def supports_runtime_registration(self) -> bool:
+        return False
+
+    def register_profile_gateway(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("host backend register_profile_gateway should not be called")
+
+    def unregister_profile_gateway(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("host backend unregister_profile_gateway should not be called")
+
+
+class _S6Manager:
+    """Mimics S6ServiceManager just enough for the hooks."""
+    kind = "s6"
+
+    def __init__(self) -> None:
+        self.registered: list[str] = []
+        self.unregistered: list[str] = []
+        self.raise_on_register: Exception | None = None
+        self.raise_on_unregister: Exception | None = None
+
+    def supports_runtime_registration(self) -> bool:
+        return True
+
+    def register_profile_gateway(
+        self, profile: str, *,
+        extra_env: dict[str, str] | None = None,
+        start_now: bool = True,
+    ) -> None:
+        if self.raise_on_register is not None:
+            raise self.raise_on_register
+        self.registered.append(profile)
+        self.last_start_now = start_now
+
+    def unregister_profile_gateway(self, profile: str) -> None:
+        if self.raise_on_unregister is not None:
+            raise self.raise_on_unregister
+        self.unregistered.append(profile)
+
+
+def _patch_detect_s6(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend we're inside an s6 container so the host short-circuit
+    in :func:`_maybe_register_gateway_service` /
+    :func:`_maybe_unregister_gateway_service` doesn't fire.
+
+    Without this, ``detect_service_manager()`` runs its real
+    implementation (host Linux/macOS in CI), returns ``"systemd"`` or
+    ``"launchd"``, and the hooks return early before reaching the
+    patched ``get_service_manager``. Each s6-call-through test
+    explicitly opts into this so the host-no-op tests can still
+    exercise the early-return path.
+    """
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.detect_service_manager",
+        lambda: "s6",
+    )
+
+
+def test_register_noop_on_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    # NOTE: deliberately DO NOT patch detect_service_manager — we want
+    # the real host detection to kick in and short-circuit before
+    # get_service_manager is ever called. The lambda below is a
+    # defense-in-depth assertion that get_service_manager is never
+    # reached on host.
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.get_service_manager",
+        lambda: _HostManager(),
+    )
+    # Should NOT raise the AssertionError from _HostManager.register
+    _maybe_register_gateway_service("hostprof")
+
+
+def test_register_passes_start_now_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_maybe_register_gateway_service must register with start_now=False
+    so that profile creation does not auto-start a gateway that may
+    conflict with the main gateway's bot-token lock."""
+    _patch_detect_s6(monkeypatch)
+    mgr = _S6Manager()
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.get_service_manager", lambda: mgr,
+    )
+    _maybe_register_gateway_service("coder")
+    assert mgr.last_start_now is False, (
+        "profile creation must not auto-start the gateway service"
+    )
+
+
+def test_register_silent_when_detect_throws(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If detect_service_manager itself raises (e.g. a partial s6
+    install on a host machine), the hook must stay silent — no
+    confusing s6 warning printed to a user who has never touched a
+    container."""
+    def _broken_detect() -> str:
+        raise RuntimeError("detection blew up")
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.detect_service_manager", _broken_detect,
+    )
+    # If get_service_manager is reached, the test will assert via
+    # _HostManager.register. It must NOT be reached.
+    monkeypatch.setattr(
+        "hermes_cli.service_manager.get_service_manager",
+        lambda: _HostManager(),
+    )
+    _maybe_register_gateway_service("anywhere")
+    captured = capsys.readouterr()
+    assert "Could not register" not in captured.out
+    assert captured.out == ""
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_profiles_sidebar_cache.py ===
+"""Regression tests for dashboard sidebar scan coalescing."""
+
+import inspect
+import tempfile
+import threading
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest import mock
+
+from hermes_cli.web_routers import profiles
+
+
+class SidebarCacheTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 5.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        profiles._sidebar_profile_cache_clear()
+        self.addCleanup(profiles._sidebar_profile_cache_clear)
+
+    def test_profile_cache_uses_db_and_wal_fingerprint_and_defensive_copies(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = Path(root) / "state.db"
+            wal_path = Path(f"{db_path}-wal")
+            db_path.write_bytes(b"db-v1")
+            wal_path.write_bytes(b"wal-v1")
+            first_fingerprint = profiles._sidebar_db_fingerprint(db_path)
+            first_key = (str(db_path), first_fingerprint, False, 0, (), 50, 100, ())
+            payload = {"recents": None, "cron": [{"id": "one"}], "messaging": []}
+
+            profiles._sidebar_profile_cache_put(first_key, payload)
+            cached = profiles._sidebar_profile_cache_get(first_key)
+            cached["cron"][0]["id"] = "mutated"
+            self.assertEqual(
+                profiles._sidebar_profile_cache_get(first_key)["cron"][0]["id"],
+                "one",
+            )
+
+            wal_path.write_bytes(b"wal-v2-is-different")
+            second_fingerprint = profiles._sidebar_db_fingerprint(db_path)
+            second_key = (str(db_path), second_fingerprint, False, 0, (), 50, 100, ())
+            self.assertNotEqual(first_fingerprint, second_fingerprint)
+            self.assertIsNone(profiles._sidebar_profile_cache_get(second_key))
+
+            profiles._sidebar_profile_cache_put(second_key, payload)
+            self.assertIsNone(profiles._sidebar_profile_cache_get(first_key))
+
+    def test_profile_cache_is_lru_bounded(self):
+        with mock.patch.object(profiles, "_SIDEBAR_PROFILE_CACHE_MAX_ENTRIES", 2):
+            for index in range(3):
+                key = (f"/db/{index}", (index, None), False, 0, (), 50, 100, ())
+                profiles._sidebar_profile_cache_put(key, {"index": index})
+            self.assertEqual(len(profiles._SIDEBAR_PROFILE_CACHE), 2)
+
+    def test_applies_defaults_and_returns_defensive_copies(self):
+        calls = 0
+
+        @profiles._sidebar_singleflight_cache
+        def scan(profile="all", limit=20):
+            nonlocal calls
+            calls += 1
+            return {"profile": profile, "rows": [{"limit": limit}]}
+
+        first = scan()
+        first["rows"][0]["limit"] = 999
+        second = scan(profile="all", limit=20)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(second, {"profile": "all", "rows": [{"limit": 20}]})
+
+    def test_coalesces_concurrent_identical_scans(self):
+        workers = 12
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        @profiles._sidebar_singleflight_cache
+        def scan(profile="all"):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return {"profile": profile, "rows": []}
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(scan, "default") for _ in range(workers)]
+            self.assertTrue(entered.wait(timeout=1))
+            time.sleep(0.05)
+            release.set()
+            results = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(results, [{"profile": "default", "rows": []}] * workers)
+
+    def test_expires(self):
+        clock = iter((100.0, 100.0, 100.0, 106.0, 106.0, 106.0))
+        calls = 0
+
+        @profiles._sidebar_singleflight_cache
+        def scan():
+            nonlocal calls
+            calls += 1
+            return {"generation": calls}
+
+        with mock.patch.object(profiles.time, "monotonic", side_effect=clock):
+            self.assertEqual(scan(), {"generation": 1})
+            self.assertEqual(scan(), {"generation": 2})
+        self.assertEqual(calls, 2)
+
+    def test_does_not_cache_failures(self):
+        calls = 0
+
+        @profiles._sidebar_singleflight_cache
+        def scan():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient")
+            return {"ok": True}
+
+        with self.assertRaisesRegex(RuntimeError, "transient"):
+            scan()
+        self.assertEqual(scan(), {"ok": True})
+        self.assertEqual(scan(), {"ok": True})
+        self.assertEqual(calls, 2)
+
+    def test_does_not_cache_payloads_that_carry_profile_errors(self):
+        # A 200 with a non-empty errors[] is how a failed profile scan is
+        # reported. Caching it for the TTL keeps the empty recents page in
+        # front of a store that has already recovered.
+        calls = 0
+
+        @profiles._sidebar_singleflight_cache
+        def scan():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "errors": [{"profile": "default", "error": "disk I/O error"}],
+                    "recents": {"sessions": []},
+                }
+            return {"errors": [], "recents": {"sessions": [{"id": "yesterday"}]}}
+
+        first = scan()
+        second = scan()
+
+        self.assertEqual(first["errors"][0]["error"], "disk I/O error")
+        self.assertEqual(second["recents"]["sessions"], [{"id": "yesterday"}])
+        self.assertEqual(calls, 2)
+
+    def test_can_be_disabled(self):
+        calls = 0
+
+        @profiles._sidebar_singleflight_cache
+        def scan():
+            nonlocal calls
+            calls += 1
+            return calls
+
+        with mock.patch.object(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 0.0):
+            self.assertEqual((scan(), scan()), (1, 2))
+
+    def test_preserves_fastapi_signature(self):
+        def scan(profile: str = "all", limit: int = 20):
+            return profile, limit
+
+        wrapped = profiles._sidebar_singleflight_cache(scan)
+
+        self.assertEqual(inspect.signature(wrapped), inspect.signature(scan))
+
+    def test_projects_tree_coalesces_concurrent_scans_and_returns_copies(self):
+        # /api/profiles/projects/tree fans out over every profile's state.db; desktop
+        # background sync + sidebar refreshes overlap identical requests. One scan must
+        # serve the whole burst, and no two callers may share the same payload object.
+        workers = 8
+        entered = threading.Event()
+        release = threading.Event()
+        scans = 0
+        scans_lock = threading.Lock()
+
+        def fake_read(name, home, errors, fn):
+            nonlocal scans
+            with scans_lock:
+                scans += 1
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return None
+
+        with mock.patch.object(profiles, "_profile_targets", return_value=[("default", Path("/nonexistent"))]), \
+                mock.patch.object(profiles, "_read_profile_db", side_effect=fake_read), \
+                ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(profiles.get_profiles_projects_tree) for _ in range(workers)]
+            self.assertTrue(entered.wait(timeout=1))
+            time.sleep(0.05)
+            release.set()
+            results = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(scans, 1)
+        self.assertEqual(len({id(r) for r in results}), workers)
+        self.assertEqual(results, [results[0]] * workers)
+        self.assertEqual(results[0]["projects"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

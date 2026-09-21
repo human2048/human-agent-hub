@@ -1,0 +1,403 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_fresh_reset_skill_injection.py ===
+"""Regression tests for topic/channel skill auto-injection after /new or /reset.
+
+Covers the fix for issue #6508.
+
+Before the fix:
+    1. User sends ``/new`` — ``reset_session`` creates a fresh SessionEntry
+       with ``created_at == updated_at``.
+    2. User sends the next message.
+    3. ``get_or_create_session`` finds the entry and bumps
+       ``entry.updated_at = now`` (microseconds after ``created_at``).
+    4. ``_handle_message_with_agent`` checks
+       ``_is_new_session = (created_at == updated_at) or was_auto_reset``.
+       Both are False → ``_is_new_session = False`` → topic/channel skills
+       are silently skipped for the first message of a manually reset session.
+
+After the fix:
+    ``reset_session`` stamps the new entry with ``is_fresh_reset=True``.
+    ``_handle_message_with_agent`` ORs this into ``_is_new_session`` and
+    consumes the flag immediately after the check, so subsequent messages
+    are treated as continuing the session and the flag does not leak.
+
+We use ``was_auto_reset`` for surprise resets (idle/daily/suspended) and
+``is_fresh_reset`` for user-initiated resets because the former also drives
+a "Session automatically reset due to inactivity" user-facing notice and
+a context-note prepend into the agent's prompt — both wrong for an explicit
+/new or /reset.
+"""
+
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionEntry, SessionSource, SessionStore
+
+
+def _make_store(tmp_path):
+    return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+
+def _make_source(chat_id="123", user_id="u1"):
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+
+
+def _is_new_session(entry) -> bool:
+    """Mirror of the predicate in ``_handle_message_with_agent``.
+
+    Kept in-sync with the production check so this test fails loudly if the
+    upstream logic regresses.
+    """
+    return (
+        entry.created_at == entry.updated_at
+        or getattr(entry, "was_auto_reset", False)
+        or getattr(entry, "is_fresh_reset", False)
+    )
+
+
+# ---------------------------------------------------------------------------
+# reset_session stamps is_fresh_reset=True
+# ---------------------------------------------------------------------------
+
+class TestResetSessionStampsFreshReset:
+    def test_reset_session_sets_is_fresh_reset_true(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        store.get_or_create_session(source)
+        session_key = store._generate_session_key(source)
+
+        new_entry = store.reset_session(session_key)
+
+        assert new_entry is not None
+        assert new_entry.is_fresh_reset is True
+
+
+# ---------------------------------------------------------------------------
+# Core regression: _is_new_session stays True after updated_at bump
+# ---------------------------------------------------------------------------
+
+class TestIsNewSessionSurvivesUpdatedAtBump:
+    def test_is_new_session_true_after_reset_then_next_message(self, tmp_path):
+        """The actual bug: _is_new_session was False on message after /reset."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        store.get_or_create_session(source)
+        session_key = store._generate_session_key(source)
+
+        # User sends /reset
+        store.reset_session(session_key)
+
+        # Next inbound message — get_or_create_session bumps updated_at
+        entry = store.get_or_create_session(source)
+
+        # Before the fix: created_at != updated_at, was_auto_reset=False → False
+        # After the fix: is_fresh_reset=True carries the signal through the bump
+        assert _is_new_session(entry) is True
+
+
+# ---------------------------------------------------------------------------
+# Vanilla-session behavior is unchanged
+# ---------------------------------------------------------------------------
+
+class TestVanillaBehaviorUnaffected:
+    def test_ongoing_session_not_flagged_as_new(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        store.get_or_create_session(source)
+
+        # Second message on the same session — updated_at bumps,
+        # is_fresh_reset was never set
+        entry = store.get_or_create_session(source)
+        assert entry.is_fresh_reset is False
+        assert _is_new_session(entry) is False
+
+
+# ---------------------------------------------------------------------------
+# Persistence through sessions.json round-trip
+# ---------------------------------------------------------------------------
+
+class TestPersistence:
+    def test_is_fresh_reset_survives_to_dict_from_dict(self, tmp_path):
+        """Protect against the gateway restarting between /reset and the
+        next message — the flag must be persisted in sessions.json.
+        """
+        store = _make_store(tmp_path)
+        source = _make_source()
+        store.get_or_create_session(source)
+        session_key = store._generate_session_key(source)
+        new_entry = store.reset_session(session_key)
+
+        assert new_entry.is_fresh_reset is True
+        restored = SessionEntry.from_dict(new_entry.to_dict())
+        assert restored.is_fresh_reset is True
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_gateway_command_dispatch_minimal.py ===
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionEntry, SessionSource, build_session_key
+
+
+def _make_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_event(text: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=_make_source(),
+        message_id="m1",
+        internal=True,
+    )
+
+
+def _session_entry() -> SessionEntry:
+    return SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+
+
+def _make_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    adapter._pending_messages = {}
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(
+        emit=AsyncMock(),
+        emit_collect=AsyncMock(return_value=[]),
+        loaded_hooks=False,
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = _session_entry()
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._queued_events = {}
+    runner._session_db = MagicMock()
+    runner._session_db.get_session_title.return_value = None
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._show_reasoning = False
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    runner._update_prompt_pending = {}
+    runner._busy_input_mode = "interrupt"
+    runner._draining = False
+    runner._session_run_generation = {}
+    runner._session_sources = {}
+    runner._pending_native_image_paths_by_session = {}
+    runner._background_tasks = {}
+    runner._background_task_counter = 0
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._service_tier = None
+    runner._fast_mode_by_session = {}
+    runner._goal_state_by_session = {}
+    runner._goal_runs_in_progress = set()
+    runner._goal_queued_by_session = set()
+    runner._is_telegram_topic_root_lobby = lambda _source: False
+    runner._should_send_telegram_lobby_reminder = lambda _source: False
+    runner._check_slash_access = lambda _source, _command: None
+    runner._begin_session_run_generation = lambda _key: 1
+    runner._release_running_agent_state = lambda key, run_generation=None: runner._running_agents.pop(key, None)
+    return runner, adapter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_text", ["/queue do this next", "/q do this next"])
+async def test_idle_queue_sends_payload_as_next_turn(command_text):
+    runner, _adapter = _make_runner()
+    captured = {}
+
+    async def fake_handle_message_with_agent(event, source, key, generation):
+        captured["text"] = event.text
+        captured["command"] = event.get_command()
+        captured["source"] = source
+        captured["key"] = key
+        captured["generation"] = generation
+        return {"final_response": "", "messages": []}
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+
+    result = await runner._handle_message(_make_event(command_text))
+
+    assert result == {"final_response": "", "messages": []}
+    assert captured["text"] == "do this next"
+    assert captured["command"] is None
+    assert captured["source"] == _make_source()
+    assert captured["key"] == build_session_key(_make_source())
+    assert captured["generation"] == 1
+    assert runner._running_agents == {}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_gateway_command_help.py ===
+"""Gateway command help rendering tests."""
+
+import pytest
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
+
+
+def _make_event(text: str, platform: Platform) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=SessionSource(
+            platform=platform,
+            chat_id="chat-1",
+            user_id="user-1",
+            user_name="tester",
+            chat_type="dm",
+        ),
+    )
+
+
+def _make_runner():
+    from gateway.run import GatewayRunner
+
+    return object.__new__(GatewayRunner)
+
+
+@pytest.mark.asyncio
+async def test_help_sanitizes_slash_command_mentions_for_telegram(monkeypatch):
+    """Telegram help output must not expose invalid uppercase/hyphenated slashes."""
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands",
+        lambda: {
+            "/Linear": {"description": "Open Linear"},
+            "/Custom-Thing": {"description": "Run a custom thing"},
+        },
+    )
+
+    result = await _make_runner()._handle_help_command(
+        _make_event("/help", Platform.TELEGRAM)
+    )
+
+    assert "`/linear`" in result
+    assert "`/custom_thing`" in result
+    assert "`/Linear`" not in result
+    assert "`/Custom-Thing`" not in result
+
+
+@pytest.mark.asyncio
+async def test_commands_sanitizes_slash_command_mentions_for_telegram(monkeypatch):
+    """Paginated Telegram /commands output uses Telegram-valid slash mentions."""
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands",
+        lambda: {"/Linear": {"description": "Open Linear"}},
+    )
+
+    result = await _make_runner()._handle_commands_command(
+        _make_event("/commands 999", Platform.TELEGRAM)
+    )
+
+    assert "`/linear`" in result
+    assert "`/Linear`" not in result
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_gateway_command_line_matcher.py ===
+"""Tests for the strict gateway command-line matcher.
+
+Regression guard for the Windows ``hermes gateway restart`` silent-outage bug:
+the previous loose substring match (``"... gateway" in cmdline``) false-matched
+``gateway status``/``dashboard`` siblings and unrelated processes such as
+``python -m tui_gateway``, which let ``restart()`` race a still-draining old
+process and ``status``/``start`` report false positives.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gateway.status import (
+    looks_like_gateway_command_line as matches,
+    looks_like_gateway_runtime_command_line as matches_runtime,
+)
+
+
+ACCEPT = [
+    "pythonw.exe -m hermes_cli.main gateway run",
+    r"C:\Users\me\hermes\venv\Scripts\pythonw.exe -m hermes_cli.main gateway run",
+    "python -m hermes_cli.main --profile work gateway run",
+    "python -m hermes_cli.main gateway run --replace",
+    "python -m hermes_cli/main.py gateway run",
+    "python gateway/run.py",
+    "hermes-gateway.exe",
+    "hermes gateway",          # bare `hermes gateway` defaults to run
+    "hermes gateway run",
+    # profile selector AFTER the `gateway` token (argv is profile-position
+    # agnostic — _apply_profile_override strips --profile/-p anywhere)
+    "hermes gateway --profile work run",
+    "python -m hermes_cli.main gateway -p work run",
+    "hermes gateway --profile=work run",
+    # a profile literally NAMED "gateway"
+    "hermes -p gateway gateway run",
+    "python -m hermes_cli.main --profile gateway gateway run",
+    # quoted Windows paths with spaces (shlex-aware tokenization)
+    r'"C:\Program Files\Hermes\hermes-gateway.exe"',
+    r'"C:\Program Files\Hermes\gateway\run.py" run',
+    r'"C:\Program Files\Py\pythonw.exe" -m hermes_cli.main gateway run',
+]
+
+REJECT = [
+    "python -m tui_gateway",                              # unrelated module
+    "python -m hermes_cli.main gateway status",           # other subcommand
+    "python -m hermes_cli.main gateway restart",
+    "python -m hermes_cli.main gateway stop",
+    "python -m hermes_cli.main --profile x dashboard",    # non-gateway subcommand
+    "some random python -m mygateway thing",
+    "",
+    None,
+]
+
+
+@pytest.mark.parametrize("cmd", ACCEPT)
+def test_accepts_real_gateway_run(cmd):
+    assert matches(cmd) is True
+
+
+

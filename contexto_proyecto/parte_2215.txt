@@ -1,0 +1,250 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_repair_tool_call_arguments.py ===
+"""Tests for _repair_tool_call_arguments — malformed JSON repair pipeline."""
+
+import json
+
+from agent.message_sanitization import _repair_tool_call_arguments
+class TestRepairToolCallArguments:
+    """Verify each repair stage in the pipeline."""
+
+    # -- Stage 1: empty / whitespace-only --
+
+    def test_empty_string_returns_empty_object(self):
+        assert _repair_tool_call_arguments("", "t") == "{}"
+
+
+
+    # -- Stage 2: Python None literal --
+
+
+
+    # -- Stage 3: trailing comma repair --
+
+
+    def test_trailing_comma_in_array(self):
+        result = _repair_tool_call_arguments('{"a": [1, 2,]}', "t")
+        parsed = json.loads(result)
+        assert parsed == {"a": [1, 2]}
+
+
+    # -- Stage 4: unclosed brackets --
+
+
+
+    # -- Stage 5: excess closing delimiters --
+
+
+
+    # -- Stage 6: last resort --
+
+
+    def test_unrepairable_partial_returns_empty_object(self):
+        # Truncated in the middle of a string key — bracket closing won't help
+        assert _repair_tool_call_arguments('{"truncated": "val', "t") == "{}"
+
+    # -- Valid JSON passthrough (this path is via except, but still works) --
+
+
+    # -- Combined repairs --
+
+
+
+    # -- Stage 0: strict=False (literal control chars in strings) --
+    # llama.cpp backends sometimes emit literal tabs/newlines inside JSON
+    # string values. strict=False accepts these; we re-serialise to the
+    # canonical wire form (#12068).
+
+
+
+
+    # -- Stage 4: control-char escape fallback --
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_repair_tool_call_name.py ===
+"""Tests for AIAgent._repair_tool_call — tool-name normalization.
+
+Regression guard for #14784: Claude-style models sometimes emit
+class-like tool-call names (``TodoTool_tool``, ``Patch_tool``,
+``BrowserClick_tool``, ``PatchTool``). Before the fix they returned
+"Unknown tool" even though the target tool was registered under a
+snake_case name. The repair routine now normalizes CamelCase,
+strips trailing ``_tool`` / ``-tool`` / ``tool`` suffixes (up to
+twice to handle double-tacked suffixes like ``TodoTool_tool``), and
+falls back to fuzzy match.
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+
+VALID = {
+    "todo",
+    "patch",
+    "browser_click",
+    "browser_navigate",
+    "web_search",
+    "read_file",
+    "write_file",
+    "terminal",
+    "execute_code",
+    "session_search",
+}
+
+
+@pytest.fixture
+def repair():
+    """Return a bound _repair_tool_call built on a minimal shell agent.
+
+    We avoid constructing a real AIAgent (which pulls in credential
+    resolution, session DB, etc.) because the repair routine only
+    reads self.valid_tool_names. A SimpleNamespace stub is enough to
+    bind the unbound function.
+    """
+    from run_agent import AIAgent
+    stub = SimpleNamespace(valid_tool_names=VALID)
+    return AIAgent._repair_tool_call.__get__(stub, AIAgent)
+
+
+class TestExistingBehaviorStillWorks:
+    """Pre-existing repairs must keep working (no regressions)."""
+
+    def test_lowercase_already_matches(self, repair):
+        assert repair("browser_click") == "browser_click"
+
+
+
+
+
+
+
+class TestClassLikeEmissions:
+    """Regression coverage for #14784 — CamelCase + _tool suffix variants."""
+
+    def test_camel_case_no_suffix(self, repair):
+        assert repair("BrowserClick") == "browser_click"
+
+
+
+
+
+
+
+
+
+class TestEdgeCases:
+    """Edge inputs that must not crash or produce surprising results."""
+
+    def test_empty_string(self, repair):
+        assert repair("") is None
+
+
+
+
+
+class TestVolcEngineXmlPollution:
+    """Regression coverage for #33007 — VolcEngine ``api/plan`` endpoint
+    leaks raw XML attribute fragments into ``tool_use.name``.
+
+    Observed in production with the ``anthropic_messages`` API mode:
+
+        terminal" parameter="command" string="true
+        execute_code" parameter="code" string="true
+        session_search" parameter="session_id" string="true
+
+    The fix trims at the first ``"``/``'``/``<``/``>`` so the rest of
+    the repair pipeline can resolve the cleaned name to a real tool.
+    """
+
+    def test_terminal_with_xml_attribute_pollution(self, repair):
+        # Exact pattern from the bug report (terminal call).
+        polluted = 'terminal" parameter="command" string="true'
+        assert repair(polluted) == "terminal"
+
+
+
+
+    def test_tool_name_with_trailing_quote_only(self, repair):
+        # Minimal leak — just a stray trailing quote, no full attribute.
+        assert repair('terminal"') == "terminal"
+
+
+
+    def test_clean_tool_name_unaffected_by_sanitizer(self, repair):
+        # Pure passthrough — no XML/quote chars, no change.
+        assert repair("execute_code") == "execute_code"
+        assert repair("session_search") == "session_search"
+
+    def test_space_separated_name_still_normalizes(self, repair):
+        # Critical: the XML strip must NOT consume whitespace, or the
+        # legitimate ``"write file" -> write_file`` repair path breaks.
+        assert repair("write file") == "write_file"
+
+
+    def test_leading_quote_falls_through_to_fuzzy_match(self, repair):
+        # Sanitizer only trims when the XML char is at idx > 0 — a
+        # name that *starts* with a quote is left untouched so the
+        # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
+        # recover the obvious target.
+        assert repair('"terminal"') == "terminal"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_repetition_guard.py ===
+"""Unit tests for the truncated-response repetition guard (issue #86581)."""
+
+from __future__ import annotations
+
+from agent.repetition_guard import MIN_FRAGMENT_LENGTH, is_repetition_dominated
+
+# The exact sentence from the #86581 incident (echoed hundreds of times by
+# the model before the provider cut it off at finish_reason=length).
+_INCIDENT_ECHO = "好，你幫我更改成 Google Gemini 4 31B。"
+
+
+class TestRepetitionGuard:
+    def test_incident_shape_flags_repetition(self):
+        # Narration + the echoed sentence on its own line, repeated (line path).
+        text = ("We need to verify the model setting.\n" + _INCIDENT_ECHO + "\n") * 800
+        assert is_repetition_dominated(text) is True
+
+    def test_repeated_sentence_without_line_breaks_flags(self):
+        # Repetition loop with no line breaks — exercises the window path.
+        text = _INCIDENT_ECHO * 2000
+        assert len(text) >= MIN_FRAGMENT_LENGTH
+        assert is_repetition_dominated(text) is True
+
+    def test_long_legitimate_text_not_flagged(self):
+        # Long, unique prose — no 60-char window ever repeats.
+        text = " ".join(
+            f"Sentence number {i} describes a distinct topic with unique words "
+            f"such as quasar-{i} and nebula-{i} to keep every window distinct."
+            for i in range(1200)
+        )
+        assert len(text) >= MIN_FRAGMENT_LENGTH
+        assert is_repetition_dominated(text) is False
+
+    def test_short_fragment_never_flagged(self):
+        # Below MIN_FRAGMENT_LENGTH the guard fails open — short truncations
+        # are legitimately continued even if they look repetitive.
+        assert is_repetition_dominated("A. " * 50) is False
+        assert is_repetition_dominated("hello ") is False
+
+    def test_repeat_not_dominant_not_flagged(self):
+        # A repeated sentence scattered through a long unique text: repeated
+        # windows exist but cover far less than half of the fragment.
+        filler = " ".join(f"unique filler token {i}" for i in range(3000))
+        text = filler + ("\n" + _INCIDENT_ECHO + "\n") * 30
+        assert is_repetition_dominated(text) is False
+
+    def test_non_string_inputs(self):
+        assert is_repetition_dominated("") is False
+        assert is_repetition_dominated(None) is False
+        assert is_repetition_dominated(12345) is False
+

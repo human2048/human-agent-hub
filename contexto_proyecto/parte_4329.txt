@@ -1,0 +1,454 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_env_bridge.py ===
+"""Behavioral regressions for the terminal config → env bridge.
+
+``terminal_tool._get_env_config()`` reads TERMINAL_* variables.  The bridge
+must let explicitly configured terminal keys override stale launcher/.env
+values while preserving environment values for terminal keys omitted from
+config.yaml.
+"""
+
+import os
+
+import pytest
+
+import tools.terminal_tool as terminal_tool
+from hermes_constants import get_hermes_home
+
+
+@pytest.fixture(autouse=True)
+def _reset_bridge_state(monkeypatch):
+    """Each test starts with an un-attempted bridge and clean mapped env."""
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    for name in (
+        "TERMINAL_ENV",
+        "TERMINAL_CWD",
+        "TERMINAL_DOCKER_IMAGE",
+        "TERMINAL_SSH_HOST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    yield
+
+
+def _write_config(text: str) -> None:
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(text)
+
+
+def test_unset_terminal_env_backfills_backend_from_config():
+    _write_config(
+        "terminal:\n"
+        "  backend: docker\n"
+        "  docker_image: custom/image:1\n"
+    )
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "docker"
+    assert config["docker_image"] == "custom/image:1"
+    assert os.environ["TERMINAL_ENV"] == "docker"
+
+
+def test_explicit_config_backend_overrides_stale_env(monkeypatch):
+    _write_config("terminal:\n  backend: docker\n")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "docker"
+    assert os.environ["TERMINAL_ENV"] == "docker"
+
+
+def test_partial_terminal_config_preserves_unrelated_env_values(monkeypatch):
+    _write_config("terminal:\n  backend: docker\n")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "env/image:2")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "docker"
+    assert config["docker_image"] == "env/image:2"
+    assert os.environ["TERMINAL_DOCKER_IMAGE"] == "env/image:2"
+
+
+def test_explicit_config_key_overrides_matching_env_value(monkeypatch):
+    _write_config(
+        "terminal:\n"
+        "  backend: docker\n"
+        "  docker_image: config/image:1\n"
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "env/image:2")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "docker"
+    assert config["docker_image"] == "config/image:1"
+
+
+def test_ssh_config_preserves_remote_tilde_cwd(monkeypatch):
+    """SSH ``~`` belongs to the remote user, not the Hermes host/container."""
+    _write_config("terminal:\n  backend: ssh\n  cwd: '~'\n")
+    monkeypatch.setenv("HOME", "/opt/data/home")
+    monkeypatch.setenv("USERPROFILE", r"C:\opt\data\home")
+
+    config = terminal_tool._get_env_config()
+
+    assert os.environ["TERMINAL_CWD"] == "~"
+    assert config["cwd"] == "~"
+
+
+def test_env_is_preserved_when_config_has_no_terminal_section(monkeypatch):
+    _write_config("agent:\n  max_turns: 100\n")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "example.test")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "ssh"
+    assert config["ssh_host"] == "example.test"
+
+
+def test_defaults_backfill_when_neither_config_nor_env_selects_backend():
+    _write_config("{}\n")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "local"
+    assert os.environ["TERMINAL_ENV"] == "local"
+
+
+def test_bridge_only_attempted_once(monkeypatch):
+    calls = []
+
+    import hermes_cli.config as config_mod
+
+    real = config_mod.apply_terminal_config_to_env
+
+    def _counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(config_mod, "apply_terminal_config_to_env", _counting)
+    _write_config("{}\n")
+
+    terminal_tool._get_env_config()
+    terminal_tool._get_env_config()
+
+    assert len(calls) == 1
+
+
+def test_bridge_config_failure_does_not_crash(monkeypatch):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "read_raw_config",
+        lambda: (_ for _ in ()).throw(RuntimeError("config read failed")),
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "example.test")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "ssh"
+    assert config["ssh_host"] == "example.test"
+
+
+def test_secondary_home_override_does_not_latch_ambient_env(tmp_path, monkeypatch):
+    """#107422: first bridge under a secondary profile must not poison os.environ.
+
+    Multiplexed dashboard sets ``set_hermes_home_override`` for profile B. If
+    ``_ensure_terminal_env_bridged`` ran there (no terminal scope yet), the
+    one-shot latch used to write B's docker policy into process-global env and
+    every later unscoped launch-profile tool call inherited it.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch_home = tmp_path / "launch"
+    secondary_home = tmp_path / "profiles" / "docker-bee"
+    launch_home.mkdir(parents=True)
+    secondary_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n", encoding="utf-8"
+    )
+    (secondary_home / "config.yaml").write_text(
+        "terminal:\n"
+        "  backend: docker\n"
+        "  docker_image: bee/local:1\n"
+        '  docker_volumes:\n'
+        '    - /bee/vol:/data\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    # Clean ambient — the dashboard process starts without TERMINAL_ENV.
+    for name in (
+        "TERMINAL_ENV",
+        "TERMINAL_DOCKER_IMAGE",
+        "TERMINAL_DOCKER_VOLUMES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    token = set_hermes_home_override(str(secondary_home))
+    try:
+        # Unscoped call under secondary home (the residual path).
+        terminal_tool._ensure_terminal_env_bridged()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert "TERMINAL_ENV" not in os.environ
+    assert "TERMINAL_DOCKER_IMAGE" not in os.environ
+    assert "TERMINAL_DOCKER_VOLUMES" not in os.environ
+    # Bridge must still be available for the real launch profile afterwards.
+    assert terminal_tool._terminal_config_bridge_attempted is False
+
+    config = terminal_tool._get_env_config()
+    assert config["env_type"] == "local"
+    assert os.environ["TERMINAL_ENV"] == "local"
+    assert "bee/local:1" not in os.environ.get("TERMINAL_DOCKER_IMAGE", "")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_error_redaction.py ===
+"""Terminal tool result errors must not leak credential-shaped strings."""
+
+import json
+from types import SimpleNamespace
+
+import agent.redact as redact
+import tools.terminal_tool as terminal_tool
+
+
+SECRET = "OPENAI_API_KEY=sk-testterminalerrorredaction1234567890"
+
+
+def _minimal_terminal_config(cwd="/tmp"):
+    return {
+        "env_type": "local",
+        "cwd": cwd,
+        "timeout": 1,
+        "host_cwd": None,
+        "modal_mode": "auto",
+        "docker_image": "",
+        "singularity_image": "",
+        "modal_image": "",
+        "daytona_image": "",
+    }
+
+
+def _patch_common(monkeypatch, env):
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 0})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+
+def assert_secret_redacted(payload, field):
+    assert SECRET not in payload[field]
+    assert "sk-testterminalerrorredaction1234567890" not in payload[field]
+    assert "***" in payload[field]
+
+
+def test_foreground_retry_error_redacts_exception_text(monkeypatch):
+    class FailingEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            raise RuntimeError(f"backend failed with {SECRET}")
+
+    _patch_common(monkeypatch, FailingEnv())
+    monkeypatch.setattr(terminal_tool.time, "sleep", lambda seconds: None)
+
+    result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+
+    assert result["exit_code"] == -1
+    assert_secret_redacted(result, "error")
+
+
+def test_successful_output_preserves_redaction_opt_out(monkeypatch):
+    class Env:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": f"{SECRET}\n", "returncode": 0}
+
+    _patch_common(monkeypatch, Env())
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+
+    result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+
+    assert result["exit_code"] == 0
+    assert result["output"] == SECRET
+
+
+def test_successful_output_keeps_command_aware_redactor(monkeypatch):
+    class Env:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": "ordinary output\n", "returncode": 0}
+
+    calls = []
+
+    def fake_redact_terminal_output(output, command):
+        calls.append((output, command))
+        return "command-aware output"
+
+    _patch_common(monkeypatch, Env())
+    monkeypatch.setattr(redact, "redact_terminal_output", fake_redact_terminal_output)
+
+    result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "command-aware output"
+    assert calls == [("ordinary output", "echo ok")]
+
+
+def test_environment_creation_import_error_redacts_exception_text(monkeypatch):
+    _patch_common(monkeypatch, None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+
+    def fail_create_environment(**kwargs):
+        raise ImportError(f"backend import failed with {SECRET}")
+
+    monkeypatch.setattr("tools.terminal_tool_backends._create_environment", fail_create_environment)
+
+    result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+
+    assert result["exit_code"] == -1
+    assert result["status"] == "disabled"
+    assert_secret_redacted(result, "error")
+
+
+def test_background_start_error_redacts_exception_text(monkeypatch):
+    class Env:
+        env = {}
+
+    class FailingRegistry:
+        pending_watchers = []
+
+        def spawn_local(self, **kwargs):
+            raise RuntimeError(f"spawn failed with {SECRET}")
+
+    import tools.process_registry as process_registry_mod
+
+    _patch_common(monkeypatch, Env())
+    monkeypatch.setattr(process_registry_mod, "process_registry", FailingRegistry())
+
+    result = json.loads(terminal_tool.terminal_tool(command="echo ok", background=True))
+
+    assert result["exit_code"] == -1
+    assert_secret_redacted(result, "error")
+
+
+def test_outer_exception_redacts_error_and_traceback(monkeypatch):
+    env = SimpleNamespace(env={})
+    _patch_common(monkeypatch, env)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: (_ for _ in ()).throw(RuntimeError(f"config failed with {SECRET}")),
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+
+    assert result["exit_code"] == -1
+    assert result["status"] == "error"
+    assert_secret_redacted(result, "error")
+    assert_secret_redacted(result, "traceback")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_terminal_exit_semantics.py ===
+"""Tests for terminal command exit code semantic interpretation."""
+
+import pytest
+
+from tools.terminal_tool_result import _interpret_exit_code
+
+
+class TestInterpretExitCode:
+    """Test _interpret_exit_code returns correct notes for known command semantics."""
+
+    # ---- exit code 0 always returns None ----
+
+    def test_success_returns_none(self):
+        assert _interpret_exit_code("grep foo bar", 0) is None
+        assert _interpret_exit_code("diff a b", 0) is None
+        assert _interpret_exit_code("test -f /etc/passwd", 0) is None
+
+    # ---- grep / rg family: exit 1 = no matches ----
+
+    @pytest.mark.parametrize("cmd", [
+        "grep 'pattern' file.txt",
+        "egrep 'pattern' file.txt",
+        "fgrep 'pattern' file.txt",
+        "rg 'foo' .",
+        "ag 'foo' .",
+        "ack 'foo' .",
+    ])
+    def test_grep_family_no_matches(self, cmd):
+        result = _interpret_exit_code(cmd, 1)
+        assert result is not None
+        assert "no matches" in result.lower()
+
+
+    # ---- diff: exit 1 = files differ ----
+
+    def test_diff_files_differ(self):
+        result = _interpret_exit_code("diff file1 file2", 1)
+        assert result is not None
+        assert "differ" in result.lower()
+
+    def test_colordiff_files_differ(self):
+        result = _interpret_exit_code("colordiff file1 file2", 1)
+        assert result is not None
+        assert "differ" in result.lower()
+
+
+    # ---- test / [: exit 1 = condition false ----
+
+    def test_test_condition_false(self):
+        result = _interpret_exit_code("test -f /nonexistent", 1)
+        assert result is not None
+        assert "false" in result.lower()
+
+
+    # ---- find: exit 1 = partial success ----
+
+
+    # ---- curl: various informational codes ----
+
+
+    # ---- git: exit 1 is context-dependent ----
+
+
+    # ---- pipeline / chain handling ----
+
+
+    # ---- full paths ----
+
+
+    # ---- env var prefix ----
+
+
+    # ---- unknown commands return None ----
+
+
+    # ---- edge cases ----
+
+
+    def test_only_env_vars(self):
+        """Command with only env var assignments, no actual command."""
+        assert _interpret_exit_code("FOO=bar", 1) is None
+

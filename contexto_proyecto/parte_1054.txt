@@ -1,0 +1,216 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\compression-progress.md ===
+# Compression Progress
+
+Jürgen Schmidhuber, *Formal Theory of Creativity* (1990–2010). Beauty = compressibility given prior knowledge. Interestingness = the *change* in compressibility as you learn. A worthwhile project is one that, on completion, would compress your model of the world.
+
+## Core formula
+
+```
+I(D, O(t)) = B(D, O(t)) − B(D, O(t−1))
+```
+
+Interestingness = first derivative of beauty over time. Pure noise (no learnable pattern) and fully-known pattern (already compressed) are both boring. Beauty lives between.
+
+## When to use
+
+- Picking a research question
+- Selecting between candidate projects ("which would teach me the most?")
+- Diagnosing aesthetic dissatisfaction ("this is fine but not interesting")
+- Choosing what to read
+
+## Don't use when
+
+- Fast generation (this is reflective, not generative)
+- Group decisions where audiences differ (single-observer model)
+
+## Procedure
+
+### For picking a research question
+1. List 5–10 things you currently *cannot predict well* in your domain. Be specific: not "the future of AI", but "why X 7B model trained with technique A performs worse than Y 1.3B model with technique B on benchmark Z".
+2. For each: would understanding it compress only this fact, or re-organize a broader domain? Prefer the latter.
+3. For each: is the answer learnable from where you are? (Not noise; not too far above your prior.)
+4. Pick the highest learnable compression-progress potential.
+
+### For evaluating ideas
+For each candidate, ask:
+- What would I understand differently if this were complete?
+- Would that understanding compress this domain or only this idea?
+- Is it currently learnable from where I am?
+
+Highest answers across all three = pursue.
+
+### For aesthetic critique
+Where is the work entirely predictable? (too known) Entirely unpredictable? (too random) Where does it sit in the learnable-but-not-yet-learned zone? Strong work has more of the third.
+
+## Worked example
+
+User has three options:
+- A. Build a habit tracker.
+- B. Build a tool that explains why a `git rebase --interactive` produced its conflicts, by reconstructing the commit graph mid-rebase.
+- C. Read Lacan.
+
+Analysis:
+- A: no compression progress; user already has model of habit trackers. Reject.
+- B: high. User doesn't currently have strong model of how rebase constructs intermediate states; building this requires learning that, and the resulting model re-organizes how the user thinks about all VCS internals.
+- C: real compression-progress potential, but prior is missing. Long path to get there. Worthwhile if on the prerequisite track; otherwise read Žižek/Bruce Fink first as scaffolding.
+
+Recommend B.
+
+## Anti-slop notes
+
+- "Compression progress" as slogan ≠ doing the analysis. State the actual model gaps you'd close.
+- Don't claim every idea has high compression-progress. Most don't. The framework is useful because it discriminates.
+- Don't impose this lens on artistic work without acknowledging its limits.
+
+Source: people.idsia.ch/~juergen/creativity.html
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\creative-discipline.md ===
+# Creative Discipline
+
+Practices for sustained work over weeks and months, not single-session ideation. Four traditions:
+
+- **Twyla Tharp** — *The Creative Habit* (2003). The box, scratching, the spine.
+- **Sol LeWitt** — *Sentences on Conceptual Art* (1969). Instruction-as-work.
+- **John Cleese** — 1991 Video Arts lecture. Open mode vs closed mode.
+- **Julia Cameron** — *The Artist's Way* (1992). Morning pages + artist dates.
+
+## When to use
+
+- Long-term creative project; the question is sustainability, not "give me an idea"
+- Globally blocked, not locally (Oblique Strategies for local; this for global)
+- Producing the same thing over and over — scratching imports new material
+- You want to convey that creative work has *conditions*
+
+## Don't use when
+
+- User wants an idea in the next hour (these operate over weeks)
+- User is annoyed by self-help registers (Cameron especially)
+
+## Tharp — three working tools
+
+**The box.** A literal banker's box per project. Label it the moment you commit. Everything related goes in: clippings, music, references, sketches, source materials, postcards. The box is the project before the project is the project.
+
+**Scratching.** Active daily search for ideas — read, watch, observe with no agenda except proximity to ideas. *"You can't just sit there waiting. ... I read for general purposes, looking for something interesting."*
+
+**The spine.** The one sentence naming what the project is about. Held privately. Not the pitch — the spine. When the project drifts, return to it. Examples: "this is about a lost child", "this is about the body's memory of grief".
+
+## LeWitt — instruction as work
+
+The work is the *instruction*, not the execution. *Wall Drawing #289* is a sentence; the wall executions are not unique works. *"Once the idea of the piece is established in the artist's mind and the final form is decided, the process is carried out blindly."*
+
+For ideation: produce a work as an instruction. Anyone can execute. This unlocks instructions for performances anyone can perform, recipes for events, scores anyone can play, code anyone can run.
+
+A few of the *Sentences on Conceptual Art* (1969):
+- *Irrational thoughts should be followed absolutely and logically.*
+- *Conceptual artists are mystics rather than rationalists.*
+- *Once the idea of the piece is established and the final form is decided, the process is carried out blindly. There are many side-effects that the artist cannot imagine. These may be used as ideas for new works.*
+- *It is difficult to bungle a good idea.*
+- *When an artist learns his craft too well he makes slick art.*
+
+## Cleese — open mode
+
+You need closed mode to *do* the work, but you cannot *generate* in closed mode. Open mode requires:
+1. **Space** — a place where you cannot be interrupted.
+2. **Time** — 90 minutes minimum.
+3. **Time** — repeated. (Cleese says "time" twice deliberately. You have to also tolerate the duration.)
+4. **Confidence** — to make a mistake without immediate self-criticism.
+5. **Humor** — Cleese is emphatic. Solemnity is the enemy.
+
+Most "I have no ideas" problems are actually "I haven't made the conditions for ideas". Make them.
+
+## Cameron — morning pages and artist dates
+
+**Morning pages.** Three pages, longhand, stream of consciousness, first thing in the morning. Don't reread for 8 weeks. Mechanism: discharge the surface static of attention onto paper. What remains is the substance.
+
+**Artist date.** Weekly, festive, *solo* expedition to explore something that interests *you*. Two hours minimum. Strange or playful. Not for productivity — for filling the well.
+
+Both are required. Morning pages without artist dates produces grim self-disclosure with no replenishment; artist dates without morning pages produces input with no metabolizing.
+
+## When to recommend which
+
+| Situation | Recommend |
+|---|---|
+| Project-specific, just starting | Tharp's box |
+| Project drifting | Tharp's spine |
+| Globally low input | Tharp's scratching, Cameron's artist dates |
+| Globally blocked | Cameron's morning pages + artist dates (12-week program) |
+| Has the desire but no conditions | Cleese open-mode setup |
+| Wants to make works that others can execute | LeWitt instruction-as-work |
+| Same idea coming over and over | Tharp scratching, dérive (see `derive-and-mapping.md`) |
+
+## Anti-slop notes
+
+- These are practices, not techniques. Don't pitch as quick fixes. Benefit accrues over weeks.
+- Don't generate fake LeWitt sentences. Use the real ones.
+- Don't fake Cameron's tone if it's not yours. Use the practice without the language.
+- Avoid the "celebrity morning routine" trap. These four traditions are about specific named practices with specific mechanisms — not lists of habits.
+- Don't prescribe more than two practices at once. Pick one or two; let them take.
+
+Sources: Tharp, *The Creative Habit* (Simon & Schuster, 2003); LeWitt, "Sentences on Conceptual Art" (*0–9* No. 5, 1969); Cleese, Video Arts lecture (1991); Cameron, *The Artist's Way* (Tarcher/Putnam, 1992).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\defamiliarization.md ===
+# Defamiliarization
+
+Two traditions naming the same operation: make the familiar strange.
+- **Viktor Shklovsky, 1917** — *ostranenie*. Russian Formalist core: art removes the perceptual automatism that makes familiar things invisible.
+- **Bertolt Brecht, 1930s** — *Verfremdungseffekt*. Theatrical alienation effect, prevents emotional identification, enables critical distance.
+
+Long predates either: Borges, Wittgenstein, *nouveau roman* (Robbe-Grillet), Calvino, much philosophical writing.
+
+## When to use
+
+- Writing about something so familiar you've stopped seeing it (your neighborhood, your daily software, your institutional culture)
+- Working on a problem in a domain you've internalized — the expert knows too much
+- Producing critical writing — surface what is presented as natural
+- User research / ethnography — describe what people do without importing their categories
+- Stale on your own work — read it as if you'd never written it
+
+## Don't use when
+
+- The reader doesn't have the familiar context (defamiliarizing the unfamiliar = incomprehensible)
+- You need warm identifying engagement (Brecht's purpose is the *opposite* of identification)
+- Producing transparent technical documentation
+- Stuck because you don't yet understand the subject (need study, not estrangement)
+
+## Procedure
+
+### For writing
+1. Pick a familiar thing in your draft.
+2. Describe it from a position lacking the relevant idiom — a visiting alien, a child, a 17th-century person, a future archaeologist.
+3. Force only physical descriptions. No labels, no shortcuts, no idioms.
+4. Read the result. Note what you noticed that was previously invisible.
+5. Decide: keep the defamiliarized passage, or use it as research and rewrite the labeled version informed by it.
+
+### For analysis / critique
+1. Identify what's presented as natural in your subject.
+2. Defamiliarize that thing. Describe it without accepting its naturalness.
+3. The choices that produced the appearance of naturalness become visible.
+
+### For user research
+Watch users do something everyone in your domain treats as obvious. Describe without domain vocabulary. Often reveals friction you'd long since rationalized.
+
+## Worked example
+
+**Subject**: writing about software engineering as a profession.
+
+**Familiar version**: "Software engineers write code, debug, and deploy systems. The work is mostly typing, with occasional meetings."
+
+**Defamiliarized**: "Software engineers spend the largest part of their day moving small marks of light across glass surfaces by twitching their fingers. The marks form chains that, when read by certain machines elsewhere, cause the machines to perform actions the engineer has imagined. The engineer cannot directly observe most of the actions; they receive reports about what happened. A significant portion of their time is spent identifying differences between what they imagined and what was reported, and adjusting the marks to bring the reports closer to the imagination. Many of these adjustments are minute — single missing or extra marks. Engineers describe the activity using metaphors of building, despite producing no physical object."
+
+The labeled version had hidden the *mediation* (engineers can't observe the thing they're making), the *imagination-vs-report gap* (most of debugging), the *abstract-physical mismatch* (they say "build" but make nothing material). All three are critically important features that disappear under labels.
+
+## Anti-slop notes
+
+- "See X with fresh eyes" is a slogan, not a technique. Real defamiliarization uses specific operations — alien perspective, missing idiom, physical-only description.
+- Don't fake by adding adjectives. Real defamiliarization *removes labels*, doesn't decorate them. "The great metal beast roared down the gleaming pathway" is purple prose, not defamiliarization.
+- Use locally. Constant defamiliarization is exhausting and self-defeating. Apply where the familiar has gone invisible.
+- Don't use as fashionable jargon. Use the operation; don't invoke the term unless discussing the tradition.
+
+Sources: Shklovsky, "Art as Device" (1917); Brecht, "A Short Organum for the Theatre" (1948).
+

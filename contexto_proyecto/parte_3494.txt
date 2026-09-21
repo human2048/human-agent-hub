@@ -1,0 +1,296 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_quick_commands.py ===
+"""Tests for user-defined quick commands that bypass the agent loop."""
+import os
+import subprocess
+from unittest.mock import MagicMock, patch
+from rich.text import Text
+import pytest
+
+
+# ── CLI tests ──────────────────────────────────────────────────────────────
+
+class TestCLIQuickCommands:
+    """Test quick command dispatch in HermesCLI.process_command."""
+
+    @staticmethod
+    def _printed_plain(call_arg):
+        if isinstance(call_arg, Text):
+            return call_arg.plain
+        return str(call_arg)
+
+    def _make_cli(self, quick_commands):
+        from cli import HermesCLI
+        cli = HermesCLI.__new__(HermesCLI)
+        cli.config = {"quick_commands": quick_commands}
+        cli.console = MagicMock()
+        cli.agent = None
+        cli.conversation_history = []
+        # session_id is accessed by the fallback skill/fuzzy-match path in
+        # process_command; without it, tests that exercise `/alias args`
+        # can trip an AttributeError when cross-test state leaks a skill
+        # command matching the alias target.
+        cli.session_id = "test-session"
+        return cli
+
+    def test_exec_command_runs_and_prints_output(self):
+        cli = self._make_cli({"dn": {"type": "exec", "command": "echo daily-note"}})
+        result = cli.process_command("/dn")
+        assert result is True
+        cli.console.print.assert_called_once()
+        printed = self._printed_plain(cli.console.print.call_args[0][0])
+        assert printed == "daily-note"
+
+    def test_exec_command_uses_chat_console_when_tui_is_live(self):
+        cli = self._make_cli({"dn": {"type": "exec", "command": "echo daily-note"}})
+        cli._app = object()
+        live_console = MagicMock()
+
+        with patch("cli.ChatConsole", return_value=live_console):
+            result = cli.process_command("/dn")
+
+        assert result is True
+        live_console.print.assert_called_once()
+        printed = self._printed_plain(live_console.print.call_args[0][0])
+        assert printed == "daily-note"
+        cli.console.print.assert_not_called()
+
+
+
+
+
+
+
+
+    def test_quick_command_takes_priority_over_skill_commands(self):
+        """Quick commands must be checked before skill slash commands."""
+        cli = self._make_cli({"mygif": {"type": "exec", "command": "echo overridden"}})
+        with patch("cli._skill_commands", {"/mygif": {"name": "gif-search"}}):
+            cli.process_command("/mygif")
+        cli.console.print.assert_called_once()
+        printed = self._printed_plain(cli.console.print.call_args[0][0])
+        assert printed == "overridden"
+
+
+
+
+# ── Gateway tests ──────────────────────────────────────────────────────────
+
+class TestGatewayQuickCommands:
+    """Test quick command dispatch in GatewayRunner._handle_message."""
+
+    def _make_event(self, command, args=""):
+        event = MagicMock()
+        event.get_command.return_value = command
+        event.get_command_args.return_value = args
+        event.text = f"/{command} {args}".strip()
+        event.source = MagicMock()
+        event.source.user_id = "test_user"
+        event.source.user_name = "Test User"
+        event.source.platform.value = "telegram"
+        event.source.chat_type = "dm"
+        event.source.chat_id = "123"
+        return event
+
+    @pytest.mark.asyncio
+    async def test_exec_command_returns_output(self):
+        from gateway.run import GatewayRunner
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"limits": {"type": "exec", "command": "echo ok"}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("limits")
+        result = await runner._handle_message(event)
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_does_not_leak_credentials(self):
+        """Quick command exec must sanitize env — API keys must not appear in output."""
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"leak": {"type": "exec", "command": "env"}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("leak")
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-secret-12345"}):
+            result = await runner._handle_message(event)
+
+        assert "sk-or-secret-12345" not in result, \
+            "Quick command leaked OPENROUTER_API_KEY — exec runs without env sanitization"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_output_is_redacted(self, monkeypatch):
+        """Quick command output must redact sensitive patterns before returning."""
+        from gateway.run import GatewayRunner
+
+        # Ensure redaction is active regardless of host HERMES_REDACT_SECRETS state
+        # or test ordering
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"token": {"type": "exec", "command": "echo sk-ant-api03-supersecretkey1234567890"}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("token")
+        result = await runner._handle_message(event)
+
+        assert "supersecretkey1234567890" not in result, \
+            "Quick command output not redacted — raw API key returned to user"
+
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_error(self):
+        from gateway.run import GatewayRunner
+        import asyncio
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"slow": {"type": "exec", "command": "sleep 100"}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("slow")
+        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+            result = await runner._handle_message(event)
+        assert result is not None
+        assert "timed out" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_gateway_config_object_supports_quick_commands(self):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            quick_commands={"limits": {"type": "exec", "command": "echo ok"}}
+        )
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("limits")
+        result = await runner._handle_message(event)
+        assert result == "ok"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_quiet_single_query.py ===
+"""``hermes chat -Q`` as a dispatcher's re-run of a failed bot delivery (#111721).
+
+A failed delivery turn persists its user row before the provider call; the policy-gated re-run
+replays the same session and payload in a fresh process. Told so via HERMES_RESUME_UNANSWERED_TURN,
+the re-run resumes that row instead of appending a second copy of the DM.
+"""
+
+from __future__ import annotations
+
+import os
+from types import SimpleNamespace
+
+import cli
+from agent.context_compressor import _DB_PERSISTED_MARKER
+from tools.bot_relay import RESUME_UNANSWERED_TURN_ENV
+
+
+def _quiet_turn(monkeypatch, history, marker):
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    if marker is None:
+        monkeypatch.delenv(RESUME_UNANSWERED_TURN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(RESUME_UNANSWERED_TURN_ENV, marker)
+    seen = {}
+
+    def run_conversation(**kwargs):
+        seen["history"] = list(kwargs["conversation_history"])
+        seen["env"] = os.environ.get(RESUME_UNANSWERED_TURN_ENV)
+        return {"final_response": "ok"}
+
+    agent = SimpleNamespace(run_conversation=run_conversation, session_id="s-1")
+    the_cli = SimpleNamespace(agent=agent, conversation_history=history, session_id="s-1")
+    try:
+        cli._run_quiet_single_query(the_cli, "hello")
+    except SystemExit as exc:
+        assert exc.code == 0
+    return agent, seen
+
+
+def test_rerun_resumes_the_unanswered_user_row_it_already_persisted(monkeypatch):
+    tail = {"role": "user", "content": "hello"}
+    agent, seen = _quiet_turn(monkeypatch, [{"role": "assistant", "content": "earlier"}, tail], "1")
+    # The persisted row leaves the history and becomes this turn's staged user dict, already
+    # durable — so the agent reuses it as the turn's user message and the flush writes no new row.
+    assert seen["history"] == [{"role": "assistant", "content": "earlier"}]
+    assert agent._pending_cli_user_message is tail
+    assert tail[_DB_PERSISTED_MARKER] is True
+    assert seen["env"] is None, "the marker is consumed before the turn so tool subprocesses never inherit it"
+
+
+def test_without_the_marker_or_an_unanswered_tail_nothing_is_adopted(monkeypatch):
+    """A person re-sending the same word after a failed turn has sent a second real message; an
+    answered tail is not a re-run either. Only the dispatcher's explicit marker plus an identical
+    unanswered tail adopts a row."""
+    tail = {"role": "user", "content": "hello"}
+    agent, seen = _quiet_turn(monkeypatch, [tail], None)
+    assert seen["history"] == [tail] and not hasattr(agent, "_pending_cli_user_message")
+    assert _DB_PERSISTED_MARKER not in tail
+
+    answered = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "done"}]
+    agent, seen = _quiet_turn(monkeypatch, list(answered), "1")
+    assert seen["history"] == answered and not hasattr(agent, "_pending_cli_user_message")
+
+
+def test_rerun_adopts_the_dm_behind_the_failed_attempts_tool_scaffolding(monkeypatch):
+    """A 503 after a tool round persisted user + assistant(tool_calls) + tool before the failure text,
+    and the dispatcher retries it. The DM is still unanswered: the re-run adopts it and drops the
+    failed attempt's scaffolding from the in-memory turn instead of appending a second copy."""
+    tail = {"role": "user", "content": "hello"}
+    scaffolding = [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
+                                                                "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "result"},
+    ]
+    agent, seen = _quiet_turn(monkeypatch, [{"role": "assistant", "content": "earlier"}, tail, *scaffolding], "1")
+    assert seen["history"] == [{"role": "assistant", "content": "earlier"}]
+    assert agent._pending_cli_user_message is tail and tail[_DB_PERSISTED_MARKER] is True
+
+
+def test_turn_report_is_written_before_the_exit_linger_and_the_path_is_not_inherited(monkeypatch, tmp_path):
+    """A spawner that bounds only the turn (cron Bot Chat lane, #113608) reads the outcome from
+    HERMES_QUIET_TURN_REPORT_FILE: written the moment the turn ends — before the one-shot exit
+    linger — stamped with this pid, and the variable is popped before the turn spawns anything."""
+    from hermes_cli import quiet_single_query as qsq
+
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    report = tmp_path / "turn.json"
+    monkeypatch.setenv(qsq.TURN_REPORT_FILE_ENV, str(report))
+    seen = {}
+
+    def run_conversation(**kwargs):
+        seen["env_during_turn"] = os.environ.get(qsq.TURN_REPORT_FILE_ENV)
+        seen["report_during_turn"] = report.exists()
+        return {"final_response": "ok"}
+
+    def linger(*args, **kwargs):
+        seen["report_at_linger"] = qsq.read_turn_report(str(report), os.getpid())
+        return {"waited": [], "completed": [], "timed_out": []}
+
+    monkeypatch.setattr("tools.process_registry.process_registry.wait_for_pending_completions", linger)
+    agent = SimpleNamespace(run_conversation=run_conversation, session_id="s-1")
+    try:
+        cli._run_quiet_single_query(SimpleNamespace(agent=agent, conversation_history=[], session_id="s-1"), "hello")
+    except SystemExit as exc:
+        assert exc.code == 0
+    assert seen["env_during_turn"] is None and seen["report_during_turn"] is False
+    assert seen["report_at_linger"] == {"pid": os.getpid(), "exit_code": 0, "error": ""}
+    # Another process's record is not this child's report.
+    assert qsq.read_turn_report(str(report), os.getpid() + 1) is None
+

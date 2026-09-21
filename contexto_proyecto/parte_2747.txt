@@ -1,0 +1,312 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_multiplex_unserved_shared_ingress.py ===
+"""Multiplex secondaries that enable shared-ingress platforms (WhatsApp/Relay) must not be
+silently unserved: one INFO per skipped platform, a stamped ``<profile>:<platform>`` status
+entry, and the loud "not being served" WARNING when no profile (default included) runs it."""
+
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+
+from gateway import run as gateway_run
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.run import GatewayRunner
+
+
+def _runner():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._running = True
+    runner.adapters = {}
+    runner._failed_platforms = {}
+    runner._profile_adapters = {}
+    runner._profile_failed_platforms = {}
+    runner._background_tasks = set()
+    runner._snapshot_profile_busy_modes = lambda *a, **k: None
+    runner._platform_lock_takeover_on_start = True
+    runner._startup_fail_fatal_config = lambda reason: None
+    return runner
+
+
+def _install_secondary(monkeypatch, runner, stamps):
+    @contextmanager
+    def fake_scope(profile_home, *, hydrate_secrets=True):
+        yield
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda home: {})
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config",
+        lambda: GatewayConfig(
+            multiplex_profiles=True,
+            platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+        ),
+    )
+    monkeypatch.setattr(
+        runner, "_update_platform_runtime_status",
+        lambda key, **kw: stamps.append((key, kw)),
+    )
+    runner._create_adapter = lambda platform, config: pytest.fail("shared ingress must never build a secondary adapter")
+
+
+@pytest.mark.asyncio
+async def test_secondary_whatsapp_without_primary_is_reported_unserved(monkeypatch, caplog):
+    runner = _runner()
+    stamps = []
+    _install_secondary(monkeypatch, runner, stamps)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        assert await runner._start_one_profile_adapters("work", Path("/profiles/work"), {}) == 0
+        # The secondary was skipped: the startup phase folds it into the loud warning.
+        aborted, _count = await runner._start_secondary_profiles(0, [])
+
+    assert aborted is False
+    infos = [r for r in caplog.records if r.levelno == logging.INFO and "not served" in r.getMessage()]
+    assert infos and "'work'" in infos[0].getMessage() and "default profile" in infos[0].getMessage()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("whatsapp" in w and "not being served" in w and "work" in w for w in warnings), warnings
+    # Stamped so `hermes gateway status --profile work` / the dashboard can show the reason.
+    assert ("work:whatsapp", {
+        "platform_state": "disabled", "error_code": "multiplex_shared_ingress",
+        "error_message": "not served under multiplex (shared ingress owned by default)",
+    }) in stamps
+    # ...and the CLI reader turns that stamp into the status line.
+    from gateway.status import write_runtime_status
+    from hermes_cli import gateway_multiplex_served as served
+    key, kw = next(s for s in stamps if s[0] == "work:whatsapp")
+    write_runtime_status(platform=key, **kw)
+    monkeypatch.setattr(served, "live_default_gateway_pid", lambda: 4242)
+    assert served.served_profile_unserved_platforms("work") == {
+        "whatsapp": "not served under multiplex (shared ingress owned by default)"}
+    assert served.served_profile_unserved_platforms("other") == {}
+
+
+@pytest.mark.asyncio
+async def test_secondary_whatsapp_served_by_default_is_not_warned(monkeypatch, caplog):
+    """The default owns WhatsApp: the secondary IS served through the shared adapter — no WARNING,
+    the INFO line still explains where the channel lives."""
+    runner = _runner()
+    runner.adapters[Platform.WHATSAPP] = object()
+    _install_secondary(monkeypatch, runner, [])
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        await runner._start_one_profile_adapters("work", Path("/profiles/work"), {})
+        await runner._start_secondary_profiles(1, [])
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING and "not being served" in r.getMessage()]
+    assert [r for r in caplog.records if r.levelno == logging.INFO and "not served" in r.getMessage()]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_multiplex_yaml_env_bridge_isolation.py ===
+"""A multiplexed secondary profile's config.yaml must never be bridged into the process env.
+
+``_load_secondary_profile_config`` runs ``load_gateway_config()`` inside ``_profile_runtime_scope``;
+every ``apply_yaml_config_fn`` hook and ``bridge_core_env_settings`` used to write ``os.environ`` there
+(first-writer-wins), so the first secondary's mention/allowlist policy became the DEFAULT profile's
+(#80099, #72348). The values must instead reach that profile's ``PlatformConfig.extra``.
+"""
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from agent.secret_scope import (
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+_SECONDARY_YAML = """\
+require_mention: false
+gateway:
+  allow_all_users: true
+telegram:
+  mention_patterns: ['^bot2']
+  reactions: false
+matrix:
+  require_mention: false
+  allowed_users: ['@b2:example.org']
+  session_scope: room
+whatsapp:
+  dm_policy: open
+  allow_from: ['+15550002']
+feishu:
+  allow_bots: all
+slack:
+  allow_bots: all
+  ignored_channels: [C_B2]
+dingtalk:
+  allowed_users: [b2user]
+discord:
+  auto_thread: false
+  reactions: false
+signal:
+  require_mention: false
+"""
+
+_BRIDGED_ENV = (
+    "TELEGRAM_REQUIRE_MENTION", "TELEGRAM_MENTION_PATTERNS", "TELEGRAM_REACTIONS",
+    "MATRIX_REQUIRE_MENTION", "MATRIX_ALLOWED_USERS", "MATRIX_SESSION_SCOPE",
+    "WHATSAPP_DM_POLICY", "WHATSAPP_ALLOWED_USERS", "FEISHU_ALLOW_BOTS",
+    "SLACK_ALLOW_BOTS", "SLACK_IGNORED_CHANNELS", "DINGTALK_ALLOWED_USERS",
+    "DISCORD_AUTO_THREAD", "DISCORD_REACTIONS", "SIGNAL_REQUIRE_MENTION", "GATEWAY_ALLOW_ALL_USERS",
+)
+
+_EXPECTED_EXTRA = (
+    ("telegram", "mention_patterns"), ("telegram", "reactions"), ("matrix", "session_scope"),
+    ("matrix", "allowed_users"), ("whatsapp", "dm_policy"), ("feishu", "allow_bots"),
+    ("slack", "allow_bots"), ("slack", "ignored_channels"), ("dingtalk", "allowed_users"),
+    ("discord", "auto_thread"), ("signal", "require_mention"),
+)
+
+
+@pytest.fixture
+def secondary_scope(tmp_path, monkeypatch):
+    default_home = tmp_path / "hermes"
+    secondary = default_home / "profiles" / "bot2"
+    secondary.mkdir(parents=True)
+    (default_home / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n")
+    (secondary / "config.yaml").write_text(_SECONDARY_YAML)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    for name in _BRIDGED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(secondary))
+    secret_token = set_secret_scope({"TELEGRAM_BOT_TOKEN": "222:b2"})
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+        set_multiplex_active(False)
+
+
+def test_secondary_profile_yaml_reaches_its_extra_not_the_process_env(secondary_scope):
+    from hermes_cli.plugins import discover_plugins
+    from gateway.config import Platform, load_gateway_config
+
+    discover_plugins()
+    cfg = load_gateway_config()
+
+    poisoned = {name: os.environ[name] for name in _BRIDGED_ENV if name in os.environ}
+    assert poisoned == {}, f"secondary profile wrote into process env: {poisoned}"
+    missing = [
+        f"{plat}.{key}" for plat, key in _EXPECTED_EXTRA
+        if key not in ((cfg.platforms.get(Platform(plat)) or _Empty()).extra or {})
+    ]
+    assert missing == [], f"secondary profile's own YAML not seeded into extra: {missing}"
+
+
+class _Empty:
+    extra: dict = {}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_native_image_buffer_isolation.py ===
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource, build_session_key
+
+
+def _make_runner() -> GatewayRunner:
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")},
+    )
+    runner.adapters = {}
+    runner._model = "openai/gpt-4.1-mini"
+    runner._base_url = None
+    runner._decide_image_input_mode = lambda **_: "native"
+    return runner
+
+
+def _source(chat_id: str) -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type="private",
+        user_name=f"user-{chat_id}",
+    )
+
+
+def _image_event(source: SessionSource, path: str) -> MessageEvent:
+    return MessageEvent(
+        text="see image",
+        message_type=MessageType.PHOTO,
+        source=source,
+        media_urls=[path],
+        media_types=["image/png"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_image_buffer_isolated_per_session():
+    runner = _make_runner()
+    source_a = _source("chat-a")
+    source_b = _source("chat-b")
+
+    await runner._prepare_inbound_message_text(
+        event=_image_event(source_a, "/tmp/a.png"),
+        source=source_a,
+        history=[],
+    )
+    await runner._prepare_inbound_message_text(
+        event=_image_event(source_b, "/tmp/b.png"),
+        source=source_b,
+        history=[],
+    )
+
+    assert runner._consume_pending_native_image_paths(build_session_key(source_a)) == ["/tmp/a.png"]
+    assert runner._consume_pending_native_image_paths(build_session_key(source_b)) == ["/tmp/b.png"]
+
+
+@pytest.mark.asyncio
+async def test_native_image_buffer_not_cleared_by_other_sessions_without_images():
+    runner = _make_runner()
+    source_a = _source("chat-a")
+    source_b = _source("chat-b")
+
+    await runner._prepare_inbound_message_text(
+        event=_image_event(source_a, "/tmp/a.png"),
+        source=source_a,
+        history=[],
+    )
+    await runner._prepare_inbound_message_text(
+        event=MessageEvent(text="plain text", source=source_b),
+        source=source_b,
+        history=[],
+    )
+
+    assert runner._consume_pending_native_image_paths(build_session_key(source_a)) == ["/tmp/a.png"]
+    assert runner._consume_pending_native_image_paths(build_session_key(source_b)) == []
+
+
+@pytest.mark.asyncio
+async def test_native_image_buffer_uses_resolved_session_key_when_provided():
+    runner = _make_runner()
+    source = _source("chat-a")
+    runner._session_key_for_source = lambda _source: "source-derived-key"
+
+    await runner._prepare_inbound_message_text(
+        event=_image_event(source, "/tmp/a.png"),
+        source=source,
+        history=[],
+        session_key="canonical-session-key",
+    )
+
+    assert runner._consume_pending_native_image_paths("source-derived-key") == []
+    assert runner._consume_pending_native_image_paths("canonical-session-key") == ["/tmp/a.png"]
+

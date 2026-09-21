@@ -1,0 +1,333 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_memory_provider_init.py ===
+"""Regression tests for memory provider selection during AIAgent init."""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+class RecordingMemoryProvider:
+    name = "recording"
+
+    def __init__(self):
+        self.init_kwargs = None
+        self.init_session_id = None
+
+    def is_available(self):
+        return True
+
+    def initialize(self, session_id, **kwargs):
+        self.init_session_id = session_id
+        self.init_kwargs = dict(kwargs)
+
+    def get_tool_schemas(self):
+        return []
+
+    def shutdown(self):
+        pass
+
+
+def test_shutdown_memory_provider_is_idempotent():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    manager = MagicMock()
+    agent = object.__new__(AIAgent)
+    agent._memory_manager = manager
+    agent.context_compressor = None
+    agent.session_id = "session-1"
+
+    agent.shutdown_memory_provider([{"role": "user", "content": "one"}])
+    agent.shutdown_memory_provider([{"role": "user", "content": "two"}])
+
+    manager.on_session_end.assert_called_once()
+    manager.shutdown_all.assert_called_once()
+
+
+def test_blank_memory_provider_does_not_auto_enable_honcho():
+    """Blank memory.provider should remain opt-out even if Honcho fallback looks configured."""
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    honcho_cfg = SimpleNamespace(enabled=True, api_key="stale-key", base_url=None)
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("hermes_cli.config.save_config") as save_config,
+        patch(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            return_value=honcho_cfg,
+        ) as from_global_config,
+        patch("plugins.memory.load_memory_provider") as load_memory_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_manager is None
+    from_global_config.assert_not_called()
+    load_memory_provider.assert_not_called()
+    save_config.assert_not_called()
+
+
+def test_close_shuts_down_memory_provider():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent._memory_manager = MagicMock()
+    agent.context_compressor = None
+    agent.session_id = ""
+    agent._session_messages = []
+
+    agent.close()
+
+    agent._memory_manager.shutdown_all.assert_called_once()
+
+
+def test_aiagent_forwards_user_id_alt_to_memory_provider():
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-alt",
+            platform="feishu",
+            user_id="open-id",
+            user_id_alt="union-id",
+        )
+
+    assert agent._memory_manager is not None
+    assert provider.init_session_id == "sess-alt"
+    assert provider.init_kwargs["user_id"] == "open-id"
+    assert provider.init_kwargs["user_id_alt"] == "union-id"
+    assert provider.init_kwargs["platform"] == "feishu"
+    assert "warning_callback" not in provider.init_kwargs
+    assert "status_callback" not in provider.init_kwargs
+
+
+class CoreShadowProvider:
+    """Provider that tries to register tools shadowing built-in core tools."""
+
+    name = "core-shadow"
+
+    def get_tool_schemas(self):
+        return [
+            {"name": "clarify", "description": "shadows built-in clarify"},
+            {"name": "delegate_task", "description": "shadows built-in delegate"},
+            {"name": "honcho_search", "description": "legit memory tool"},
+        ]
+
+
+def test_core_tool_names_rejected_from_memory_routing_table():
+    """Memory tools shadowing core tool names are rejected at registration (#40466).
+
+    Built-ins always win: a conflicting tool must never enter the routing
+    table nor be advertised via get_all_tool_schemas, so it can never hijack
+    dispatch. The non-conflicting tool is preserved.
+    """
+    from agent.memory_manager import MemoryManager
+
+    mm = MemoryManager()
+    mm.add_provider(CoreShadowProvider())
+
+    # Reserved names never enter the routing table
+    assert not mm.has_tool("clarify")
+    assert not mm.has_tool("delegate_task")
+    assert "clarify" not in mm._tool_to_provider
+    assert "delegate_task" not in mm._tool_to_provider
+
+    # Non-conflicting tool survives
+    assert mm.has_tool("honcho_search")
+    assert "honcho_search" in mm._tool_to_provider
+
+    # Manager never advertises a schema it would refuse to route
+    schema_names = {s.get("name") for s in mm.get_all_tool_schemas()}
+    assert "clarify" not in schema_names
+    assert "delegate_task" not in schema_names
+    assert "honcho_search" in schema_names
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_memory_provider_unavailable_warning.py ===
+"""Regression tests for NousResearch/hermes-agent#2765.
+
+A memory provider configured via ``memory.provider`` but reporting
+``is_available() == False`` (e.g. missing credentials, or a systemd/gateway
+service that didn't inherit ``~/.hermes/.env``) used to be dropped silently.
+``agent_init`` now emits a one-time, deduped warning instead.
+"""
+
+import logging
+
+from agent import agent_init
+
+
+def test_warns_once_and_dedupes(caplog):
+    agent_init._warned_unavailable_providers.clear()
+    with caplog.at_level(logging.WARNING, logger="run_agent"):
+        agent_init._warn_memory_provider_unavailable("hindsight")
+        agent_init._warn_memory_provider_unavailable("hindsight")
+
+    warnings = [r for r in caplog.records if "unavailable" in r.getMessage()]
+    assert len(warnings) == 1, "should warn exactly once per provider (gateway dedup)"
+    msg = warnings[0].getMessage()
+    assert "hindsight" in msg
+    assert "hermes memory status" in msg
+    assert ".env" in msg  # surfaces the systemd/gateway root cause
+
+
+def test_distinct_providers_each_warn(caplog):
+    agent_init._warned_unavailable_providers.clear()
+    with caplog.at_level(logging.WARNING, logger="run_agent"):
+        agent_init._warn_memory_provider_unavailable("hindsight")
+        agent_init._warn_memory_provider_unavailable("mem0")
+
+    warnings = [r for r in caplog.records if "unavailable" in r.getMessage()]
+    assert len(warnings) == 2
+
+
+def test_provider_reason_is_appended(caplog):
+    # A provider's unavailable_reason() (e.g. the local_embedded install hint,
+    # #7718) reaches the user through this warning — the only path that runs
+    # when the provider is unavailable and thus never initialized.
+    agent_init._warned_unavailable_providers.clear()
+    hint = "Install the embedded runtime with: uv pip install hindsight-all."
+    with caplog.at_level(logging.WARNING, logger="run_agent"):
+        agent_init._warn_memory_provider_unavailable("hindsight", hint)
+
+    warnings = [r for r in caplog.records if "unavailable" in r.getMessage()]
+    assert len(warnings) == 1
+    assert hint in warnings[0].getMessage()
+
+
+def test_empty_reason_adds_no_trailing_noise(caplog):
+    agent_init._warned_unavailable_providers.clear()
+    with caplog.at_level(logging.WARNING, logger="run_agent"):
+        agent_init._warn_memory_provider_unavailable("hindsight", "")
+
+    msg = next(r.getMessage() for r in caplog.records if "unavailable" in r.getMessage())
+    # No dangling separator when there's no provider-specific hint.
+    assert msg.rstrip().endswith("service environment.")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_memory_recall_indicator.py ===
+"""MemoryManager.describe_recall — the deterministic recall indicator.
+
+When auto-recall injects memory, Hermes surfaces a model-independent
+"🧠 <provider> — recalled N memories" status line so the user SEES memory
+working regardless of whether the model chooses to mention it. These tests
+lock the formatting (singular/plural/generic) and the aggregation across
+providers, all deterministically (no LLM, no network).
+"""
+from typing import Optional
+
+from agent.memory_manager import MemoryManager
+from agent.memory_provider import MemoryProvider, RecallStatus
+
+
+class _FakeProvider(MemoryProvider):
+    """Provider with a settable recall_status for indicator tests."""
+
+    def __init__(self, name: str, status: Optional[RecallStatus], *, raises: bool = False):
+        self._name = name
+        self._status = status
+        self._raises = raises
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def is_available(self) -> bool:
+        return True
+
+    def initialize(self, session_id: str = "", **kwargs) -> None:
+        pass
+
+    def get_tool_schemas(self):
+        return []
+
+    def handle_tool_call(self, tool_name, args, **kwargs) -> str:
+        return ""
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        if self._raises:
+            raise RuntimeError("boom")
+        return self._status
+
+
+def test_no_status_returns_empty_string():
+    mgr = MemoryManager()
+    mgr.add_provider(_FakeProvider("hindsight", None))
+    assert mgr.describe_recall() == ""
+
+
+def test_no_providers_returns_empty_string():
+    assert MemoryManager().describe_recall() == ""
+
+
+def test_single_memory_is_singular():
+    mgr = MemoryManager()
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1)))
+    assert mgr.describe_recall() == "🧠 Hindsight — recalled 1 memory"
+
+
+def test_multiple_memories_are_plural():
+    mgr = MemoryManager()
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 3)))
+    assert mgr.describe_recall() == "🧠 Hindsight — recalled 3 memories"
+
+
+def test_zero_count_renders_generic():
+    # count 0 = content injected but no discrete count (e.g. reflect synthesis).
+    mgr = MemoryManager()
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 0)))
+    assert mgr.describe_recall() == "🧠 Hindsight — recalled relevant memory"
+
+
+def test_aggregates_multiple_providers():
+    # builtin is always accepted first; a second external is rejected, so use
+    # builtin + one external to exercise the join path.
+    mgr = MemoryManager()
+    mgr.add_provider(_FakeProvider("builtin", RecallStatus("Notes", 2)))
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 5)))
+    result = mgr.describe_recall()
+    assert "🧠 Notes — recalled 2 memories" in result
+    assert "🧠 Hindsight — recalled 5 memories" in result
+
+
+def test_failing_provider_is_skipped_not_fatal():
+    mgr = MemoryManager()
+    mgr.add_provider(_FakeProvider("builtin", None, raises=True))
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1)))
+    # The raising provider is swallowed; the healthy one still surfaces.
+    assert mgr.describe_recall() == "🧠 Hindsight — recalled 1 memory"
+

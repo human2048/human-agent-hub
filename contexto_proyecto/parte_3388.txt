@@ -1,0 +1,297 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_cost_guard.py ===
+from decimal import Decimal
+
+import pytest
+
+from agent.models_dev import ModelInfo
+from agent.usage_pricing import PricingEntry
+from hermes_cli.model_cost_guard import expensive_model_warning
+
+
+def test_no_warning_when_known_prices_are_at_threshold():
+    info = ModelInfo(
+        id="edge/model",
+        name="edge/model",
+        family="",
+        provider_id="anthropic",
+        cost_input=20.0,
+        cost_output=100.0,
+    )
+
+    assert expensive_model_warning("edge/model", provider="anthropic", model_info=info) is None
+
+
+def test_warns_when_models_dev_input_price_exceeds_threshold():
+    info = ModelInfo(
+        id="expensive/input",
+        name="expensive/input",
+        family="",
+        provider_id="anthropic",
+        cost_input=20.01,
+        cost_output=1.0,
+    )
+
+    warning = expensive_model_warning(
+        "expensive/input",
+        provider="anthropic",
+        model_info=info,
+    )
+
+    assert warning is not None
+    assert warning.input_cost_per_million == Decimal("20.01")
+    assert "EXPENSIVE MODEL WARNING" in warning.message
+    assert "$20/M input" in warning.message
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom:routerai", "routerai"])
+def test_skips_foreign_models_dev_pricing_for_custom_or_unknown_providers(provider):
+    # NOTE: deliberately NOT openai/gpt-5.5-pro — that id carries an
+    # unconditional known-confusion warning (GPT55_PRO_OPENROUTER_ID) that is
+    # id-keyed and independent of pricing trust, so it would mask what this
+    # test asserts (foreign models.dev pricing being distrusted).
+    info = ModelInfo(
+        id="vendor/priced-model",
+        name="vendor/priced-model",
+        family="",
+        provider_id="openrouter",
+        cost_input=25.0,
+        cost_output=125.0,
+    )
+
+    assert (
+        expensive_model_warning(
+            "vendor/priced-model",
+            provider=provider,
+            model_info=info,
+        )
+        is None
+    )
+
+
+def test_skips_untrusted_provider_pricing_lookup_for_custom_provider(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.get_model_info", lambda *_args, **_kwargs: None)
+    pricing_calls = []
+
+    def fake_get_pricing_entry(*_args, **_kwargs):
+        pricing_calls.append(_args)
+        return PricingEntry(
+            input_cost_per_million=Decimal("25"),
+            output_cost_per_million=Decimal("125"),
+            source="provider_models_api",
+        )
+
+    monkeypatch.setattr("agent.usage_pricing.get_pricing_entry", fake_get_pricing_entry)
+
+    warning = expensive_model_warning(
+        "vendor/priced-model",
+        provider="custom:routerai",
+        base_url="https://routerai.example/v1",
+    )
+
+    assert warning is None
+    assert pricing_calls == []
+
+
+def test_known_confusing_model_still_warns_on_custom_provider():
+    """The gpt-5.5-pro confusion nudge is id-keyed, not pricing-keyed: it must
+    survive the custom-provider pricing distrust (54cc39aa15 x 83d373aae6)."""
+    warning = expensive_model_warning(
+        "openai/gpt-5.5-pro",
+        provider="custom:routerai",
+        base_url="https://routerai.example/v1",
+    )
+
+    assert warning is not None
+    assert "did you mean to select openai/gpt-5.5?" in warning.message
+
+
+def test_warns_when_pricing_entry_output_price_exceeds_threshold(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.get_model_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "agent.usage_pricing.get_pricing_entry",
+        lambda *_args, **_kwargs: PricingEntry(
+            input_cost_per_million=Decimal("1.00"),
+            output_cost_per_million=Decimal("100.01"),
+            source="provider_models_api",
+        ),
+    )
+
+    warning = expensive_model_warning("provider/expensive-output", provider="openrouter")
+
+    assert warning is not None
+    assert warning.output_cost_per_million == Decimal("100.01")
+    assert "$100.01/M" in warning.message
+
+
+def test_openai_gpt55_pro_adds_suggestion(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.get_model_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "agent.usage_pricing.get_pricing_entry",
+        lambda *_args, **_kwargs: PricingEntry(
+            input_cost_per_million=Decimal("25"),
+            output_cost_per_million=Decimal("125"),
+            source="provider_models_api",
+        ),
+    )
+
+    warning = expensive_model_warning("openai/gpt-5.5-pro", provider="openrouter")
+
+    assert warning is not None
+    assert "did you mean to select openai/gpt-5.5?" in warning.message
+
+
+def test_openai_gpt55_pro_warns_even_without_pricing(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.get_model_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("agent.usage_pricing.get_pricing_entry", lambda *_args, **_kwargs: None)
+
+    warning = expensive_model_warning("openai/gpt-5.5-pro", provider="openai-codex")
+
+    assert warning is not None
+    assert warning.input_cost_per_million is None
+    assert warning.output_cost_per_million is None
+    assert "did you mean to select openai/gpt-5.5?" in warning.message
+
+
+def test_openai_gpt55_pro_warns_for_nous_portal_pricing(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.get_model_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda base_url, api_key="": {
+            "openai/gpt-5.5-pro": {
+                "pricing": {
+                    "prompt": "0.000025",
+                    "completion": "0.000125",
+                }
+            }
+        },
+    )
+
+    warning = expensive_model_warning("openai/gpt-5.5-pro", provider="nous")
+
+    assert warning is not None
+    assert warning.input_cost_per_million == Decimal("25.000000")
+    assert warning.output_cost_per_million == Decimal("125.000000")
+    assert "did you mean to select openai/gpt-5.5?" in warning.message
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_data_policy_guard.py ===
+"""Tests for the data-training-tier selection guard."""
+
+from hermes_cli.model_data_policy_guard import (
+    DataTrainingWarning,
+    data_training_warning,
+)
+
+
+def test_fires_on_meta_contributor():
+    w = data_training_warning("muse-spark-1.2-contributor", provider="meta-ai")
+    assert isinstance(w, DataTrainingWarning)
+    assert w.model == "muse-spark-1.2-contributor"
+    assert "train" in w.message.lower()
+    assert "-contributor" in w.message.lower() or "contributor" in w.message.lower()  # mentions the tier
+    # Points to Meta's live pricing page instead of hardcoding prices.
+    assert "pricing and rate limits" in w.message.lower()
+    assert "$0.10" not in w.message and "$0.20" not in w.message and "$0.002" not in w.message
+    assert "prompts and completions" in w.message.lower()
+    assert "dev.meta.ai/docs/pricing-rate-limits" in w.message
+
+
+def test_silent_on_non_contributor_muse():
+    assert data_training_warning("muse-spark-1.2", provider="meta-ai") is None
+    assert data_training_warning("muse-spark-1.1", provider="meta-ai") is None
+
+
+def test_silent_on_unrelated_models():
+    for m in ("anthropic/claude-opus-4.8", "gpt-5.6-sol", "deepseek-v4-pro", ""):
+        assert data_training_warning(m, provider="anthropic") is None
+
+
+def test_fires_regardless_of_provider_string():
+    # id-keyed: must fire even if selected via custom/gateway (no meta-ai provider)
+    assert data_training_warning("muse-spark-1.2-contributor", provider="custom") is not None
+    assert data_training_warning("muse-spark-1.2-contributor") is not None
+
+
+def test_case_insensitive():
+    assert data_training_warning("MUSE-SPARK-1.2-CONTRIBUTOR", provider="meta-ai") is not None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_model_flow_pooled_credentials.py ===
+"""Pool-only credentials must be visible to interactive model setup flows."""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from hermes_cli.auth import PROVIDER_REGISTRY
+from hermes_cli.model_setup_flows_common import _existing_api_key_for_model_flow
+
+
+class _PoolEntry:
+    access_token = "pool-secret"
+    runtime_api_key = ""
+
+
+class _AvailablePool:
+    def has_credentials(self) -> bool:
+        return True
+
+    def peek(self):
+        return _PoolEntry()
+
+
+class _ExhaustedPool:
+    def has_credentials(self) -> bool:
+        return True
+
+    def peek(self):
+        return None
+
+
+
+
+
+
+def test_generic_api_key_flow_passes_pool_key_to_existing_key_prompt(monkeypatch):
+    from hermes_cli.model_setup_flows import _model_flow_api_key_provider
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    captured: dict[str, str] = {}
+
+    def capture_prompt(_pconfig, existing_key, **_kwargs):
+        captured["existing_key"] = existing_key
+        return existing_key, True
+
+    with (
+        patch("hermes_cli.config.get_env_value", return_value=""),
+        patch("agent.credential_pool.load_pool", return_value=_AvailablePool()),
+        patch("hermes_cli.main_provider_setup._prompt_api_key", side_effect=capture_prompt),
+    ):
+        _model_flow_api_key_provider({}, "deepseek")
+
+    assert captured["existing_key"] == "pool-secret"
+
+
+
+
+def test_bedrock_flow_sees_pool_key_when_no_env(monkeypatch, capsys):
+    """Bedrock API-key mode must also see pool-backed credentials."""
+    from hermes_cli.model_setup_flows_bedrock import _model_flow_bedrock_api_key
+
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+
+    with (
+        patch("hermes_cli.config.get_env_value", return_value=""),
+        patch("agent.credential_pool.load_pool", return_value=_AvailablePool()),
+        patch("builtins.input", return_value="k"),
+    ):
+        _model_flow_bedrock_api_key({}, "us-east-1")
+
+    out = capsys.readouterr().out
+    # The flow should show the pool-backed key, not prompt for a new one
+    assert "pool-secret" in out[:200] or "pool-sec" in out[:200]
+

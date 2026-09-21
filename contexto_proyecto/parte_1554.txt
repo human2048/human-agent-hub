@@ -1,0 +1,391 @@
+
+
+=== ARCHIVO: .\hermes-agent\scripts\aa_quality_sync.py ===
+"""Propose catalog quality updates from Artificial Analysis.
+
+Authoring-time helper — NEVER called at runtime (their terms forbid
+client-side keys, the fleet would burn the rate limit, and a
+recommendation must not change because a third-party endpoint
+hiccuped). Run it when adding a model or refreshing the ordering;
+review the printed diff and edit catalog.json yourself. The script
+proposes, the commit decides.
+
+The catalog's `quality` stays OUR field: AA-informed where they cover a
+model, editorially set where they don't (day-0 releases lag their evals;
+some entries never appear). AA's Intelligence Index grades the
+full-precision cloud model, not our Q4 build — fine for ordering, never
+for display.
+
+Usage:
+    export AA_API_KEY=...   # from https://artificialanalysis.ai (free tier)
+    python scripts/aa_quality_sync.py
+
+Attribution: scores by Artificial Analysis (https://artificialanalysis.ai).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.request
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CATALOG_PATH = REPO_ROOT / "hermes_cli" / "local_runtime" / "catalog.json"
+AA_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
+
+# Catalog entry id -> AA slug. Hand-maintained: AA's naming rarely matches
+# HF repo names, and a wrong match silently mis-ranks a model. An entry
+# absent here (or mapped to None) is editorial-only and never overwritten.
+AA_SLUG_BY_ENTRY = {
+    "qwen3.8-27b": "qwen3-8-27b",
+    "qwen3.8-flash-next": "qwen3-8-flash-next",
+    "qwen3.6-35b-a3b": "qwen3-6-35b-a3b",
+    "deepseek-v4-flash": "deepseek-v4-flash",
+}
+
+
+def fetch_aa_models(api_key: str) -> dict[str, dict]:
+    req = urllib.request.Request(AA_URL, headers={"x-api-key": api_key})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        doc = json.load(r)
+    return {m["slug"]: m for m in doc.get("data", [])}
+
+
+def main() -> int:
+    api_key = os.environ.get("AA_API_KEY", "").strip()
+    if not api_key:
+        print("AA_API_KEY not set — create a free key at "
+              "https://artificialanalysis.ai and export it.", file=sys.stderr)
+        return 2
+
+    catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    aa = fetch_aa_models(api_key)
+
+    print(f"{'entry':24s} {'catalog q':>9s} {'AA index':>9s}  note")
+    print("-" * 70)
+    for model in catalog["models"]:
+        entry_id = model["id"]
+        current = model.get("quality", 0)
+        slug = AA_SLUG_BY_ENTRY.get(entry_id)
+        if not slug:
+            print(f"{entry_id:24s} {current:>9d} {'—':>9s}  editorial only (no AA mapping)")
+            continue
+        hit = aa.get(slug)
+        if hit is None:
+            print(f"{entry_id:24s} {current:>9d} {'—':>9s}  not in AA data (slug {slug!r})")
+            continue
+        index = (hit.get("evaluations") or {}).get(
+            "artificial_analysis_intelligence_index")
+        if index is None:
+            print(f"{entry_id:24s} {current:>9d} {'—':>9s}  AA row lacks the index")
+            continue
+        proposed = round(float(index))
+        marker = "" if proposed == current else "  <-- proposes change"
+        print(f"{entry_id:24s} {current:>9d} {proposed:>9d}{marker}")
+
+    print("\nReview against the decision table before editing: a quality "
+          "change that flips cells in tests/hermes_cli/"
+          "test_local_recommendation.py is the actual decision being made.")
+    print("Attribution: scores by Artificial Analysis "
+          "(https://artificialanalysis.ai).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+=== ARCHIVO: .\hermes-agent\scripts\add_contributor.py ===
+#!/usr/bin/env python3
+"""Add a contributor email → GitHub login mapping.
+
+Writes one file per email under contributors/emails/ (filename = email,
+content = login). File additions never merge-conflict, unlike the legacy
+AUTHOR_MAP dict in scripts/release.py, which is frozen — do not append to it.
+
+Usage (from the repo root):
+    python3 scripts/add_contributor.py <email> <github-login> [comment...]
+
+    # e.g.
+    python3 scripts/add_contributor.py jane@example.com janedoe "PR #12345 salvage"
+
+Idempotent: if the mapping already exists with the same login, prints
+"present" and exits 0. If the email maps to a DIFFERENT login (here or in the
+legacy AUTHOR_MAP), refuses with exit 1 so a typo can't silently reassign
+someone's commits.
+"""
+
+import re
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EMAILS_DIR = REPO_ROOT / "contributors" / "emails"
+
+_EMAIL_RE = re.compile(r"^[^/\\\s]+@[^/\\\s]+$")
+# GitHub's *current* signup rules forbid consecutive hyphens, but legacy
+# accounts with them exist and are valid (e.g. Roger--Han, verified via the
+# users API July 2026). Accept any alphanumeric/hyphen login that doesn't
+# start or end with a hyphen, max 39 chars.
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+
+
+def read_mapping_file(path: Path) -> str | None:
+    """Return the login from a mapping file (first non-comment line)."""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line
+    except OSError:
+        pass
+    return None
+
+
+def _legacy_login(email: str) -> str | None:
+    """Look the email up in the frozen legacy AUTHOR_MAP in release.py."""
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        from release import LEGACY_AUTHOR_MAP  # noqa: PLC0415
+
+        return LEGACY_AUTHOR_MAP.get(email)
+    except Exception:
+        return None
+
+
+def _case_collision(email: str) -> str | None:
+    """An existing mapping whose filename differs from `email` only in case.
+
+    Returns the colliding filename, or None. Exact matches are not collisions --
+    that is the ordinary "already mapped" path handled by the caller.
+    """
+    if not EMAILS_DIR.is_dir():
+        return None
+
+    # casefold (not lower) matches how macOS/Windows fold non-ASCII text —
+    # same key scripts/check-case-collisions.py uses repo-wide.
+    folded = email.casefold()
+    for entry in EMAILS_DIR.iterdir():
+        if entry.name != email and entry.name.casefold() == folded:
+            return entry.name
+    return None
+
+
+def add_contributor(email: str, login: str, comment: str = "") -> int:
+    email = email.strip()
+    login = login.strip().lstrip("@")
+
+    if not _EMAIL_RE.match(email):
+        print(f"error: {email!r} does not look like a commit-author email", file=sys.stderr)
+        return 2
+    if not _LOGIN_RE.match(login):
+        print(f"error: {login!r} is not a valid GitHub login", file=sys.stderr)
+        return 2
+
+    path = EMAILS_DIR / email
+
+    # One file per email means the FILENAME is the key, and on a
+    # case-insensitive filesystem (Windows, default macOS) two emails differing
+    # only in case are the same file. Creating both makes the repo impossible to
+    # check out cleanly there -- `git status` reports a phantom modification
+    # forever, because whichever file git wrote second wins on disk. Refuse for
+    # the same reason a conflicting login is refused: resolve it deliberately.
+    collision = _case_collision(email)
+    if collision is not None:
+        print(
+            f"error: {email} collides with existing mapping {collision} on "
+            "case-insensitive filesystems (Windows/macOS) — the two are the same "
+            "file there. Reuse that mapping, or resolve manually.",
+            file=sys.stderr,
+        )
+        return 1
+
+    existing = read_mapping_file(path) if path.is_file() else None
+    if existing is None:
+        existing = _legacy_login(email)
+    if existing is not None:
+        if existing == login:
+            print("present")
+            return 0
+        print(
+            f"error: {email} already maps to {existing!r} (asked for {login!r}) — "
+            "resolve manually",
+            file=sys.stderr,
+        )
+        return 1
+
+    EMAILS_DIR.mkdir(parents=True, exist_ok=True)
+    body = login + "\n"
+    if comment:
+        body += f"# {comment}\n"
+    path.write_text(body, encoding="utf-8")
+    print(f"added: contributors/emails/{email} -> {login}")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    email, login = sys.argv[1], sys.argv[2]
+    comment = " ".join(sys.argv[3:])
+    return add_contributor(email, login, comment)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+=== ARCHIVO: .\hermes-agent\scripts\audit_pr_attribution.py ===
+#!/usr/bin/env python3
+"""Audit (and auto-fix) contributor email mappings for a PR branch.
+
+Mirrors the CI gate in .github/workflows/contributor-check.yml so salvage
+branches never bounce off the check-attribution job. Run it from the branch
+you are about to push:
+
+    python3 scripts/audit_pr_attribution.py            # report only
+    python3 scripts/audit_pr_attribution.py --fix      # create mapping files
+
+Logic (kept in sync with contributor-check.yml):
+  - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
+  - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
+    (CI auto-resolves those)
+  - everything else must have ``contributors/emails/<email>`` or a legacy
+    AUTHOR_MAP entry in scripts/release.py
+
+``--fix`` resolution order for an unmapped email:
+  1. bare ``<login>@users.noreply.github.com`` → ``<login>``, verified via
+     ``gh api users/<login>``. A warning is printed: the local part is
+     *usually* the GitHub login but is user-controlled (the historical
+     ``bryan@…`` → ``hydraxman`` case) — eyeball it against the PR author.
+  2. ``gh api 'search/users?q=<email>+in:email'``
+  3. otherwise: prints the manual ``add_contributor.py`` command and exits 1.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+SKIP_SUBSTRINGS = (
+    "teknium",
+    "noreply@github.com",
+    "dependabot",
+    "github-actions",
+    "anthropic.com",
+    "cursor.com",
+)
+ID_NOREPLY_RE = re.compile(r"\d+\+.+@users\.noreply\.github\.com$")
+BARE_NOREPLY_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})@users\.noreply\.github\.com$")
+
+
+def run(*args: str, check: bool = True) -> str:
+    result = subprocess.run(
+        list(args), capture_output=True, text=True, encoding="utf-8",
+        errors="replace", cwd=str(REPO_ROOT),
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def new_emails() -> list[str]:
+    base = run("git", "merge-base", "origin/main", "HEAD")
+    log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges", check=False)
+    return sorted({e for e in log.splitlines() if e.strip()})
+
+
+def is_mapped(email: str) -> bool:
+    if any(s in email for s in SKIP_SUBSTRINGS):
+        return True
+    if ID_NOREPLY_RE.search(email):
+        return True
+    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
+        return True
+    release_py = REPO_ROOT / "scripts" / "release.py"
+    try:
+        if f'"{email}"' in release_py.read_text(encoding="utf-8", errors="replace"):
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def gh_json(*args: str):
+    try:
+        out = run("gh", "api", *args, check=False)
+        return json.loads(out) if out else None
+    except (RuntimeError, json.JSONDecodeError, FileNotFoundError):
+        return None
+
+
+def resolve_login(email: str) -> tuple[str, str] | None:
+    """Return (login, how) or None."""
+    m = BARE_NOREPLY_RE.match(email)
+    if m:
+        login = m.group(1)
+        user = gh_json(f"users/{login}")
+        if user and user.get("login"):
+            return user["login"], "bare-noreply local part (verified user exists)"
+    found = gh_json(f"search/users?q={email}+in:email")
+    if found and found.get("items"):
+        return found["items"][0]["login"], "GitHub email search"
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fix", action="store_true",
+                        help="auto-create contributors/emails/ mapping files")
+    args = parser.parse_args()
+
+    unmapped = [e for e in new_emails() if not is_mapped(e)]
+    if not unmapped:
+        print("✅ All contributor emails on this branch are mapped.")
+        return 0
+
+    failed = []
+    for email in unmapped:
+        author = run("git", "log", f"--author={email}", "--format=%an", "-1", check=False)
+        if not args.fix:
+            print(f"⚠️  unmapped: {email} ({author})")
+            continue
+        resolved = resolve_login(email)
+        if resolved:
+            login, how = resolved
+            run("python3", "scripts/add_contributor.py", email, login)
+            print(f"✔ mapped {email} -> {login}  [{how}]")
+            if BARE_NOREPLY_RE.match(email):
+                print(f"  ⚠ local part is user-controlled — confirm @{login} really is "
+                      f"the contributor (git name: {author!r}) before pushing.")
+        else:
+            failed.append((email, author))
+
+    if not args.fix:
+        print("\nRun with --fix to auto-create mapping files, or manually:")
+        for email in unmapped:
+            print(f"    python3 scripts/add_contributor.py {email} <github-username>")
+        return 1
+
+    if failed:
+        print("\nCould not auto-resolve; map manually:")
+        for email, author in failed:
+            print(f"    python3 scripts/add_contributor.py {email} <github-username>  # {author}")
+        return 1
+
+    print("\nDone — remember to `git add contributors && git commit`.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

@@ -1,0 +1,299 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_image_precompress.py ===
+"""Tests for Telegram large-image pre-compression (salvage of PR #74893).
+
+Behind slow HTTP proxies, raw PNGs > 1-2MB exceed PTB's media_write_timeout.
+``_compress_image_to_jpeg`` converts large raster images to progressive JPEG
+(resizing above 1600px) before upload. These tests exercise the real Pillow
+path with real file I/O — no mocks on the compression itself.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+PIL = pytest.importorskip("PIL")
+from PIL import Image  # noqa: E402
+
+from gateway.platforms.base import PlatformConfig  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+def _adapter():
+    return TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+
+
+def _make_png(path, size=(2400, 1800), noisy=True, mode="RGB"):
+    """Write a PNG large enough to cross the 1MB compression threshold."""
+    if noisy:
+        # True random noise defeats PNG compression so the file exceeds 1MB.
+        nbytes = size[0] * size[1] * len(mode)
+        img = Image.frombytes(mode, size, os.urandom(nbytes))
+    else:
+        img = Image.new(mode, size)
+    img.save(path, "PNG")
+    return path
+
+
+class TestSniffRasterFormat:
+    def test_png_magic(self, tmp_path):
+        p = tmp_path / "x.png"
+        Image.new("RGB", (4, 4)).save(p, "PNG")
+        assert TelegramAdapter._sniff_raster_format(str(p)) == "png"
+
+    def test_webp_magic(self, tmp_path):
+        p = tmp_path / "x.webp"
+        Image.new("RGB", (4, 4)).save(p, "WEBP")
+        assert TelegramAdapter._sniff_raster_format(str(p)) == "webp"
+
+    def test_gif_excluded(self, tmp_path):
+        p = tmp_path / "x.gif"
+        Image.new("P", (4, 4)).save(p, "GIF")
+        assert TelegramAdapter._sniff_raster_format(str(p)) is None
+
+    def test_non_image(self, tmp_path):
+        p = tmp_path / "x.bin"
+        p.write_bytes(b"not an image at all")
+        assert TelegramAdapter._sniff_raster_format(str(p)) is None
+
+    def test_missing_file(self, tmp_path):
+        assert TelegramAdapter._sniff_raster_format(str(tmp_path / "nope.png")) is None
+
+
+class TestCompressImageToJpeg:
+    def test_large_png_is_compressed_and_resized(self, tmp_path):
+        adapter = _adapter()
+        src = _make_png(tmp_path / "big.png")
+        assert os.path.getsize(src) > adapter._IMG_COMPRESS_THRESHOLD_BYTES
+
+        out = adapter._compress_image_to_jpeg(str(src))
+        assert out is not None
+        try:
+            assert out.endswith(".jpg")
+            assert os.path.getsize(out) < os.path.getsize(src)
+            with Image.open(out) as jpg:
+                assert jpg.format == "JPEG"
+                assert max(jpg.size) <= adapter._IMG_MAX_DIMENSION
+        finally:
+            os.remove(out)
+
+    def test_small_png_is_left_alone(self, tmp_path):
+        adapter = _adapter()
+        src = tmp_path / "small.png"
+        Image.new("RGB", (32, 32)).save(src, "PNG")
+        assert adapter._compress_image_to_jpeg(str(src)) is None
+
+    def test_jpeg_is_left_alone(self, tmp_path):
+        adapter = _adapter()
+        src = tmp_path / "photo.jpg"
+        Image.new("RGB", (2000, 2000)).save(src, "JPEG")
+        assert adapter._compress_image_to_jpeg(str(src)) is None
+
+    def test_transparent_png_gets_white_background(self, tmp_path):
+        """RGBA must composite onto white, not collapse to a black background."""
+        adapter = _adapter()
+        src = tmp_path / "transparent.png"
+        img = Image.new("RGBA", (2000, 2000), (0, 0, 0, 0))  # fully transparent
+        img.save(src, "PNG")
+        # Fully-transparent flat PNG compresses tiny; force it over threshold
+        # by lowering the adapter threshold for this test.
+        adapter._IMG_COMPRESS_THRESHOLD_BYTES = 0
+
+        out = adapter._compress_image_to_jpeg(str(src))
+        assert out is not None
+        try:
+            with Image.open(out) as jpg:
+                # Transparent areas must render white (255), not black (0).
+                assert jpg.getpixel((10, 10))[0] > 200
+        finally:
+            os.remove(out)
+
+    def test_missing_file_returns_none(self, tmp_path):
+        adapter = _adapter()
+        assert adapter._compress_image_to_jpeg(str(tmp_path / "gone.png")) is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_inbound_warning_owner.py ===
+"""Inbound cache diagnostics use the routed owner before agent admission."""
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import GatewayConfig, PlatformConfig
+from gateway.profile_routing import ProfileRoute
+from gateway.run import GatewayRunner
+from hermes_constants import get_hermes_home
+from plugins.platforms.telegram.adapter import TelegramAdapter
+from tests.gateway.test_telegram_documents import _make_document, _make_message, _make_update
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambient", [False, True])
+@pytest.mark.parametrize("setting", [None, False, True])
+@pytest.mark.parametrize("kind", ["document", "photo", "voice", "audio", "video"])
+async def test_inbound_cache_failure_keeps_owner_policy_and_context(
+        tmp_path, monkeypatch, caplog, ambient, setting, kind):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    (root / "config.yaml").write_text(json.dumps({"display": {"suppress_warning_notifications": ambient}}))
+    for name, value in (("a", setting), ("b", not bool(setting))):
+        home = root / "profiles" / name
+        home.mkdir(parents=True)
+        config = {} if value is None else {"display": {"suppress_warning_notifications": value}}
+        (home / "config.yaml").write_text(json.dumps(config))
+    adapter = TelegramAdapter(PlatformConfig(enabled=True))
+    adapter._is_callback_user_authorized = lambda *a, **k: True
+    runner = GatewayRunner(GatewayConfig(multiplex_profiles=True))
+    runner.config.profile_routes = [
+        ProfileRoute(name=name, platform="telegram", profile=name, chat_id=chat)
+        for name, chat in (("a", "100"), ("b", "200"))]
+    adapter.gateway_runner = runner
+    adapter.handle_message = AsyncMock()
+    for name, chat_id in (("a", 100), ("b", 200), ("a", 100)):
+        media = _make_document()
+        media.get_file = AsyncMock(side_effect=RuntimeError("download failure retained"))
+        msg = _make_message()
+        setattr(msg, kind, [media] if kind == "photo" else media)
+        msg.chat.id = chat_id
+        msg.reply_to_message = msg.quote = None
+        sent_homes = []
+        async def reply(*args, **kwargs):
+            sent_homes.append(get_hermes_home())
+        msg.reply_text = AsyncMock(side_effect=reply)
+        await adapter._handle_media_message(_make_update(msg), SimpleNamespace())
+        event = adapter.handle_message.call_args.args[0]
+        suppressed = setting is True if name == "a" else not bool(setting)
+        assert event.source.profile == name
+        assert msg.reply_text.await_count == (0 if suppressed else 1)
+        assert sent_homes == ([] if suppressed else [root / "profiles" / name])
+        assert "could not be downloaded" in event.text
+        assert ("asked to retry" in event.text) is not suppressed
+        assert not event.media_urls
+        assert get_hermes_home() == root
+    assert "download failure retained" in caplog.text
+    assert adapter.handle_message.await_count == 3
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\gateway\test_telegram_ingress_delivery_gap.py ===
+"""Telegram ingress dispatch accounting (#102260).
+
+The transport probes prove getUpdates round-trips complete; these pin the one signal they cannot
+give — whether PTB's dispatcher hands the fetched updates to a handler — and the once-per-adapter
+report for an adapter with no gateway message handler at all.
+"""
+import logging
+from unittest.mock import MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
+from plugins.platforms.telegram.adapter import TelegramAdapter
+
+_DEAF = "healthy but deaf"
+
+
+def _polling_adapter() -> TelegramAdapter:
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._webhook_mode = False
+    adapter._begin_polling_generation()
+    return adapter
+
+
+def _receive(adapter: TelegramAdapter, n: int, generation: int | None = None) -> None:
+    request = MagicMock()
+    request.parse_json_payload = MagicMock(
+        return_value={"ok": True, "result": [{"update_id": i} for i in range(n)]}
+    )
+    adapter._observe_polling_request_result(
+        request, adapter._polling_generation if generation is None else generation, (200, b"{}")
+    )
+
+
+async def _dispatch(adapter: TelegramAdapter, n: int) -> None:
+    for _ in range(n):
+        await adapter._on_platform_update(MagicMock(), MagicMock())
+
+
+def _heartbeats(adapter: TelegramAdapter, n: int) -> None:
+    for _ in range(n):
+        adapter._check_ingress_dispatch_stall()
+
+
+def _deaf_reports(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if _DEAF in r.message]
+
+
+@pytest.mark.asyncio
+async def test_stall_reported_once_on_backlog_regardless_of_update_age(caplog):
+    """Healthy dispatch never reports; a wedged dispatcher is reported after two heartbeats even
+    while new updates keep arriving, and only once per stall."""
+    adapter = _polling_adapter()
+    caplog.set_level(logging.WARNING)
+    _receive(adapter, 2)
+    await _dispatch(adapter, 2)
+    _heartbeats(adapter, 3)
+    assert _deaf_reports(caplog) == []
+
+    for _ in range(3):  # a fresh update lands before every heartbeat, none dispatched
+        _receive(adapter, 1)
+        adapter._check_ingress_dispatch_stall()
+    (report,) = _deaf_reports(caplog)
+    assert "2 update(s) fetched" in report and "4 received, 2 dispatched" in report
+
+
+@pytest.mark.asyncio
+async def test_dispatch_progress_rearms_the_report(caplog):
+    adapter = _polling_adapter()
+    caplog.set_level(logging.WARNING)
+    _receive(adapter, 3)
+    _heartbeats(adapter, 3)
+    assert len(_deaf_reports(caplog)) == 1
+
+    await _dispatch(adapter, 1)  # partial drain: progress, backlog remains
+    adapter._check_ingress_dispatch_stall()
+    assert len(_deaf_reports(caplog)) == 1
+    _heartbeats(adapter, 2)
+    assert len(_deaf_reports(caplog)) == 2
+
+
+def test_new_generation_restarts_backlog_and_ignores_fenced_polls(caplog):
+    adapter = _polling_adapter()
+    caplog.set_level(logging.WARNING)
+    _receive(adapter, 3)
+    stale_generation = adapter._polling_generation
+    adapter._begin_polling_generation()
+    assert adapter._record_polling_progress(stale_generation) is False
+    _receive(adapter, 5, generation=stale_generation)
+    assert adapter._updates_received_total == 0
+    _heartbeats(adapter, 3)
+    assert _deaf_reports(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_missing_message_handler_is_logged_once_not_silent(caplog):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._message_handler = None
+    event = MessageEvent(
+        text="hi",
+        message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1", chat_type="dm"),
+    )
+    with caplog.at_level(logging.ERROR):
+        await adapter.handle_message(event)
+        await adapter.handle_message(event)
+    assert len([r for r in caplog.records if "no gateway message handler" in r.message]) == 1
+

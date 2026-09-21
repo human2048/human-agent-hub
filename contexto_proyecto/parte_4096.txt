@@ -1,0 +1,337 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_cost_footer.py ===
+#!/usr/bin/env python3
+"""Per-delegation cost in the serialized result entry.
+
+Each entry in the results array returned to the parent model should
+carry the child's spend (cost_usd + cost_status) so the model can see
+what each delegation cost — previously the cost was only folded into
+the parent session total and stripped from the entry.
+
+The parent rollup (session_estimated_cost_usd fold via _child_cost_usd)
+must stay unchanged, and the internal _child_cost_usd field must still
+be stripped before serialization.
+
+Inspired by: Perplexity Agent API result shape (idea-level)
+"""
+
+import json
+import threading
+import unittest
+from unittest.mock import MagicMock, patch
+
+from tools.delegate_tool import delegate_task
+
+
+def _make_mock_parent(depth=0):
+    parent = MagicMock()
+    parent.base_url = "https://openrouter.ai/api/v1"
+    parent.api_key = "test-key"
+    parent.provider = "openrouter"
+    parent.api_mode = "chat_completions"
+    parent.model = "anthropic/claude-sonnet-4"
+    parent.platform = "cli"
+    parent.providers_allowed = None
+    parent.providers_ignored = None
+    parent.providers_order = None
+    parent.provider_sort = None
+    parent._session_db = None
+    parent._delegate_depth = depth
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent._print_fn = None
+    parent.tool_progress_callback = None
+    parent.thinking_callback = None
+    parent.session_estimated_cost_usd = 0.0
+    parent.session_cost_source = "none"
+    parent.session_cost_status = "unknown"
+    return parent
+
+
+def _make_mock_child(cost=0.1234567, cost_status="estimated"):
+    child = MagicMock()
+    child.run_conversation.return_value = {
+        "final_response": "done",
+        "completed": True,
+        "api_calls": 2,
+        "messages": [],
+    }
+    child.session_prompt_tokens = 100
+    child.session_completion_tokens = 50
+    child.session_estimated_cost_usd = cost
+    child.session_cost_status = cost_status
+    child.model = "anthropic/claude-sonnet-4"
+    child.session_id = "child-session"
+    return child
+
+
+class TestCostInResultEntry(unittest.TestCase):
+    def _run(self, child):
+        parent = _make_mock_parent()
+        with patch("run_agent.AIAgent", return_value=child):
+            result = json.loads(
+                delegate_task(goal="Test per-delegation cost", parent_agent=parent)
+            )
+        return parent, result
+
+    def test_entry_carries_cost_usd_and_status(self):
+        child = _make_mock_child(cost=0.1234567, cost_status="estimated")
+        _, result = self._run(child)
+        entry = result["results"][0]
+        self.assertIn("cost_usd", entry)
+        self.assertAlmostEqual(entry["cost_usd"], 0.123457, places=6)
+        self.assertEqual(entry["cost_status"], "estimated")
+
+    def test_reported_status_passes_through(self):
+        child = _make_mock_child(cost=0.5, cost_status="reported")
+        _, result = self._run(child)
+        entry = result["results"][0]
+        self.assertEqual(entry["cost_status"], "reported")
+
+    def test_zero_cost_child_has_zero_cost_entry(self):
+        child = _make_mock_child(cost=0.0, cost_status="unknown")
+        _, result = self._run(child)
+        entry = result["results"][0]
+        self.assertEqual(entry["cost_usd"], 0.0)
+
+    def test_internal_child_cost_field_still_stripped(self):
+        child = _make_mock_child(cost=0.25)
+        _, result = self._run(child)
+        for entry in result["results"]:
+            self.assertNotIn("_child_cost_usd", entry)
+            self.assertNotIn("_child_role", entry)
+
+    def test_parent_rollup_unchanged(self):
+        child = _make_mock_child(cost=0.25)
+        parent, _ = self._run(child)
+        self.assertAlmostEqual(parent.session_estimated_cost_usd, 0.25, places=6)
+        self.assertEqual(parent.session_cost_source, "subagent")
+        self.assertEqual(parent.session_cost_status, "estimated")
+
+    def test_non_numeric_child_cost_degrades_to_zero(self):
+        child = _make_mock_child(cost=0.0)
+        child.session_estimated_cost_usd = "not-a-number"
+        _, result = self._run(child)
+        entry = result["results"][0]
+        self.assertEqual(entry["cost_usd"], 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_cron_sync_fallback.py ===
+"""Regression test for #86632: cron's synchronous delegate_task fallback must
+return after the child completes — the automatic background review must not
+fire inside the delegated child.
+
+Field signature (issue #86632): a cron job's top-level ``delegate_task`` takes
+the #66617 stateless-channel synchronous fallback, the child finishes its turn
+normally (``Turn ended: reason=text_response``), and the delegation never
+returns to the parent — the heartbeat monitor goes stale and the cron
+inactivity watchdog kills the job.  Root cause (traced in the issue thread and
+fixed by the ``_delegate_depth`` guard in ``AIAgent._spawn_background_review``):
+the child's turn finalization spawned the automatic memory/skill background
+review fork.  Delegated children must never spawn that fork — it inherits the
+child's (often premium) model, replays the whole conversation, and its spawn
+inside the child's finalize path is the wedge site the cron watchdog kills.
+
+This exercises the REAL end-to-end #86632 path: a genuine ``AIAgent`` child
+(mocked LLM client) with the skill-review trigger armed, dispatched through
+``delegate_task(background=True)`` under a session runtime where async delivery
+is unsupported (cron), forcing the synchronous fallback.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+
+import tools.delegate_tool as dt
+
+
+def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
+    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+    choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _make_real_child():
+    """A real AIAgent child, as the cron sync fallback runs one.
+
+    The LLM client is mocked to complete in one call, and the post-turn
+    skill-review trigger is armed the way a long child run arms it — so turn
+    finalization reaches the background-review gate.
+    """
+    from run_agent import AIAgent
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        child = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            max_iterations=10,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            platform="subagent",
+        )
+    child.client = MagicMock()
+    child.client.chat.completions.create.return_value = _mock_response(
+        content="child work done", finish_reason="stop"
+    )
+    child._cached_system_prompt = "You are helpful."
+    child._use_prompt_caching = False
+    child.compression_enabled = False
+    child.save_trajectories = False
+    child._fallback_chain = []
+    # Delegated-child identity, as _build_child_agent stamps it.
+    child._delegate_depth = 1
+    child._delegate_role = "leaf"
+    child._subagent_id = "subagent-86632"
+    child._delegate_saved_tool_names = []
+    # Arm the post-turn skill review trigger (finalize_turn's
+    # _should_review_skills gate) exactly as a long child run would.
+    child._skill_nudge_interval = 1
+    child._iters_since_skill = 5
+    child.valid_tool_names = {"skill_manage"}
+    # Keep the test hermetic: no session persistence.
+    child._persist_disabled = True
+    child._session_db = None
+
+    return child
+
+
+def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
+    """The #86632 path: sync fallback completes AND no review fork spawns.
+
+    Red on the pre-fix code: the delegated child's finalize path constructed a
+    background-review fork (``fork_constructed`` fires).  With the
+    ``_delegate_depth`` guard the fork is never built, removing the wedge site
+    entirely, and ``delegate_task`` returns the child's result promptly.
+    """
+    fork_spawned = threading.Event()
+    release_fork = threading.Event()
+
+    def _recording_review(agent_obj, messages_snapshot, prompt):
+        # Stands in for the review fork's replay; wedges like the field report.
+        fork_spawned.set()
+        release_fork.wait(timeout=60)
+
+    child = _make_real_child()
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "cron_244ee2c8b9da"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent._session_db = None
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    # spawn_background_review_thread's target resolves _run_review_in_thread
+    # from module globals at call time, so this records (and wedges) the
+    # review replay without touching the child's own code paths.
+    monkeypatch.setattr(
+        "agent.background_review._run_review_in_thread", _recording_review
+    )
+
+    done: dict = {}
+
+    def _call_delegate_task():
+        # Cron declares the channel stateless (#66617): async delivery is
+        # unsupported and there is no bound origin session id to wake, so
+        # delegate_task must run the batch synchronously.
+        with (
+            patch(
+                "gateway.session_context.async_delivery_supported",
+                return_value=False,
+            ),
+            patch(
+                "tools.async_delegation._current_origin_session_id",
+                return_value="",
+            ),
+        ):
+            done["out"] = dt.delegate_task(
+                goal="do trivial work and finish",
+                context="cron regression #86632",
+                background=True,
+                parent_agent=parent,
+            )
+
+    worker = threading.Thread(target=_call_delegate_task, daemon=True)
+    worker.start()
+    worker.join(timeout=90)
+    try:
+        # 1) The synchronous fallback must return to the parent. On the field
+        #    failure this never happened; here a non-return means the child's
+        #    finalize path (or the parent join) wedged.
+        assert not worker.is_alive(), (
+            "delegate_task synchronous fallback did not return after the "
+            "child completed (#86632 wedge)"
+        )
+        parsed = json.loads(done["out"])
+        results = parsed["results"]
+        assert len(results) == 1
+        assert results[0]["status"] == "completed"
+        assert results[0]["summary"] == "child work done"
+
+        # 2) The wedge site must not exist at all: a delegated child
+        #    (_delegate_depth > 0) must never spawn the automatic background
+        #    review fork. Give a straggling daemon spawn a moment to show up
+        #    so a race cannot mask a regression.
+        assert not fork_spawned.wait(timeout=3), (
+            "automatic background review fork was constructed inside a "
+            "delegation subagent — the #86632 wedge site is back"
+        )
+    finally:
+        # Unblock a stray fork thread if the regression reappears, so it
+        # cannot outlive this test and pollute the rest of the session.
+        release_fork.set()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_delegate_failure_copy.py ===
+"""Subagent failure lines gloss the classified `failure_reason` instead of echoing the child's raw
+exception, and always name the next step (/agents). Contract tests, not snapshots.
+"""
+
+from tools.delegate_tool_progress import describe_subagent_failure, format_subagent_failure_line
+
+
+def test_classified_reason_replaces_raw_exception_text():
+    line = format_subagent_failure_line(
+        "research pricing", "failed", error="Error code: 429 - {'error': 'rate limited'}",
+        duration_seconds=12, failure_reason="rate_limit")
+    assert "rate-limited" in line
+    assert "Error code" not in line and "429" not in line
+    assert "/agents" in line
+
+
+def test_unclassified_failure_keeps_the_cleaned_error_as_cause():
+    assert describe_subagent_failure(None, "Traceback...\nKeyError: 'x'") == "KeyError: 'x'"
+    line = format_subagent_failure_line("g", "failed", error="KeyError: 'x'")
+    assert "KeyError: 'x'" in line and "/agents" in line
+
+
+def test_timeout_line_names_outcome_and_the_timeout_setting_without_duplicating_duration():
+    raw = "Subagent timed out after 600s with 4 API call(s) completed — likely stuck on a slow API call."
+    line = format_subagent_failure_line("scan the repo", "timeout", error=raw, duration_seconds=600)
+    assert "delegation.child_timeout_seconds" in line
+    assert "carry on without it" in line
+    assert line.count("600") == 0 and "10 min" in line
+    assert "API call" not in line
+

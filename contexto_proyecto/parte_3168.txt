@@ -1,0 +1,354 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_config_read_guard.py ===
+"""Lint guard: no new raw yaml.safe_load(config.yaml) reads outside owner modules.
+
+The drift class this kills: scattered ``yaml.safe_load`` reads of the user's
+``config.yaml`` silently miss the managed-scope overlay, ``${ENV_VAR}``
+expansion, profile-aware pathing, and root-model normalization. Each new
+config feature has historically required an N-site sweep (incident chain:
+9cbcc0c9c8 → 732293cf87 → b0e47a98f9 → 1928aa0443).
+
+Canonical owners:
+
+  * ``hermes_cli/config.py`` — ``load_config()`` / ``load_config_readonly()``
+    (merged + managed + env-expanded), ``read_raw_config()`` and
+    ``read_user_config_raw()`` (the ONLY legal raw primitives: write-back
+    round-trips + raw-file diagnostics).
+  * ``gateway/config.py`` — the gateway's ``load_gateway_config`` owner.
+  * ``gateway/run.py`` — ``_load_gateway_config()``'s monkeypatched-home
+    fallback path (delegates to ``read_raw_config`` when paths agree).
+
+Everything else must import one of those. If this test fails on your new
+code, use ``load_config()``/``load_config_readonly()`` for behavioral reads,
+or ``read_user_config_raw()`` for write-back round-trips — do not add your
+file to the allowlist without a reason of the same class.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Files where a yaml.safe_load near a config.yaml reference is legal.
+# Keep this list SHORT and justified:
+ALLOWLIST = {
+    # Canonical loader owners.
+    "hermes_cli/config.py",
+    "gateway/config.py",
+    # load_gateway_config()'s config.yaml phase lives here (extracted from
+    # gateway/config.py); same owner, same managed-overlay contract.
+    "gateway/config_loader.py",
+    # _load_gateway_config()'s fallback path for tests that monkeypatch
+    # gateway.run._hermes_home (delegates to read_raw_config otherwise).
+    "gateway/run.py",
+    # Reads the MANAGED-scope config.yaml (/etc/hermes/...), not the user's —
+    # it IS the overlay source; the canonical loaders call into it.
+    "hermes_cli/managed_scope.py",
+    # Parse-health probe: intentionally answers "does the raw file parse?".
+    "gateway/readiness.py",
+}
+
+# Directories that never count (tests may build fixture configs freely).
+EXCLUDED_DIR_PARTS = {
+    "tests", ".venv", ".git", ".worktrees", "node_modules", "website",
+    "docs", "scripts", "examples", "apps",
+    # Compiled bytecode is not source. Sibling test processes also create
+    # and delete these directories while this scan walks the tree.
+    "__pycache__",
+}
+
+# A safe_load within this many lines of a config.yaml reference is treated
+# as a raw user-config read.
+PROXIMITY = 6
+
+SAFE_LOAD_RE = re.compile(r"\bsafe_load\s*\(")
+CONFIG_YAML_RE = re.compile(r"""["']config\.yaml["']""")
+
+
+def _iter_source_files():
+    # This uses os.walk with a pruned dirnames, and not rglob. rglob descends
+    # into every directory and filters after that, so it calls scandir() on
+    # __pycache__ trees that this guard never inspects. Sibling test processes
+    # create and delete those entries during the run.
+    #
+    # A directory that disappears in the middle of a walk raises
+    # FileNotFoundError out of rglob. The test then fails for a reason that it
+    # does not assert.
+    #
+    # The prune skips those trees. The onerror callback ignores a directory
+    # that disappears anyway.
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT, onerror=lambda _e: None):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_PARTS]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            path = Path(dirpath) / name
+            rel = path.relative_to(REPO_ROOT)
+            if any(part in EXCLUDED_DIR_PARTS for part in rel.parts):
+                continue
+            yield rel, path
+
+
+def test_no_raw_config_yaml_reads_outside_owner_modules():
+    offenders: list[str] = []
+    for rel, path in _iter_source_files():
+        rel_str = str(rel).replace("\\", "/")
+        if rel_str in ALLOWLIST:
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        cfg_lines = [i for i, ln in enumerate(lines) if CONFIG_YAML_RE.search(ln)]
+        if not cfg_lines:
+            continue
+        for i, ln in enumerate(lines):
+            if not SAFE_LOAD_RE.search(ln):
+                continue
+            # Comment/docstring mentions don't count.
+            stripped = ln.strip()
+            if stripped.startswith("#"):
+                continue
+            if any(abs(i - j) <= PROXIMITY for j in cfg_lines):
+                offenders.append(f"{rel_str}:{i + 1}: {stripped}")
+
+    assert not offenders, (
+        "Raw yaml.safe_load of config.yaml outside allowlisted owner modules.\n"
+        "Behavioral reads must use hermes_cli.config.load_config()/"
+        "load_config_readonly() (or gateway _load_gateway_config); write-back "
+        "round-trips and raw-file diagnostics must use "
+        "hermes_cli.config.read_user_config_raw().\nOffenders:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_read_user_config_raw_exists_and_documented():
+    """The shared raw primitive must exist and carry its legality docstring."""
+    from hermes_cli.config import read_user_config_raw
+
+    doc = read_user_config_raw.__doc__ or ""
+    assert "ONLY legal for write-back round-trips and raw-file diagnostics" in doc
+    assert "load_config()" in doc
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_config_rmw_lock.py ===
+"""Concurrent dashboard config writers must not drop each other's mutations.
+
+Only ``PUT /api/config`` (and the ``config_write_scope`` routers) held ``_CONFIG_MUTATION_LOCK``.
+The custom-endpoint handlers, the profile-create model write, ``POST /api/model/set`` and
+``PUT /api/model/moa`` ran their load→mutate→save cycles on worker threads without it, so a
+writer racing the desktop's debounced whole-record autosave interleaved as::
+
+    T1 load (providers={})     T2 load (providers={})
+    T1 mutate providers.box    T2 mutate display.x
+    T1 save (providers.box)    T2 save (providers={} + display.x)   <- T1's write erased
+
+Both tests force exactly that interleaving and assert both writes land.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+
+import pytest
+import yaml
+
+
+@pytest.fixture
+def client(monkeypatch, _isolate_hermes_home):
+    from starlette.testclient import TestClient
+
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
+
+    monkeypatch.setattr("hermes_cli.model_cost_guard.expensive_model_warning", lambda *_a, **_k: None)
+    cfg = load_config()
+    cfg["model"] = {"provider": "openrouter", "default": "openai/gpt-5.5"}
+    save_config(cfg)
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    return client
+
+
+def _race_second_writer_into_first_writers_save(monkeypatch, first, second, timeout: float = 5.0):
+    """Deterministic lost-write interleaving: ``first`` runs until it reaches ``save_config``,
+    then ``second`` is started and ``first`` waits (up to ``timeout``) for ``second`` to
+    ``load_config`` before saving. Unlocked, ``second`` loads the stale document and its save
+    erases ``first``'s mutation. With the RMW lock ``second`` blocks before its load, ``first``'s
+    wait times out, and the two writes serialize. Returns ``(first_response, second_response)``."""
+    import hermes_cli.config as cfg_mod
+
+    real_save, real_load = cfg_mod.save_config, cfg_mod.load_config
+    first_at_save, second_loaded = threading.Event(), threading.Event()
+    gate = threading.Lock()
+
+    def gated_save(config, *args, **kwargs):
+        # The first save_config call in the test is the first writer's (the second has not
+        # started yet). Hold it until the second writer has loaded — or the lock kept it out.
+        if not first_at_save.is_set():
+            first_at_save.set()
+            second_loaded.wait(timeout)
+            with gate:
+                return real_save(config, *args, **kwargs)
+        return real_save(config, *args, **kwargs)
+
+    def spied_load(*args, **kwargs):
+        cfg = real_load(*args, **kwargs)
+        # Any load while the first writer sits blocked in save_config is the second writer's.
+        if first_at_save.is_set() and not gate.locked():
+            second_loaded.set()
+        return cfg
+
+    monkeypatch.setattr(cfg_mod, "save_config", gated_save)
+    monkeypatch.setattr(cfg_mod, "load_config", spied_load)
+
+    results: list = [None, None]
+    threads = [threading.Thread(target=lambda: results.__setitem__(0, first())),
+               threading.Thread(target=lambda: results.__setitem__(1, second()))]
+    threads[0].start()
+    assert first_at_save.wait(30), "first writer never reached save_config"
+    threads[1].start()
+    for t in threads:
+        t.join(timeout=60)
+    return results
+
+
+def _on_disk() -> dict:
+    from hermes_constants import get_hermes_home
+    return yaml.safe_load((get_hermes_home() / "config.yaml").read_text(encoding="utf-8"))
+
+
+def test_custom_endpoint_upsert_racing_config_autosave_keeps_both_writes(client, monkeypatch):
+    """Saving a custom endpoint (sync-def handler on a worker thread) while the settings-page
+    autosave (PUT /api/config) is in flight: the new ``providers`` entry AND the autosaved field
+    both survive."""
+    autosave = lambda: client.put(  # noqa: E731
+        "/api/config", json={"config": {"display": {"personality": "canary"}}})
+    upsert = lambda: client.post(  # noqa: E731
+        "/api/providers/custom-endpoints",
+        json={"id": "racebox", "name": "racebox", "base_url": "http://racebox:8000/v1", "model": "race-model",
+              "discover_models": False})
+
+    r1, r2 = _race_second_writer_into_first_writers_save(monkeypatch, autosave, upsert)
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
+
+    on_disk = _on_disk()
+    assert "racebox" in on_disk["providers"]
+    assert on_disk["display"]["personality"] == "canary"
+
+
+def test_custom_endpoint_activate_racing_moa_save_keeps_both_writes(client, monkeypatch):
+    """Two worker-thread writers (custom-endpoint activate vs MoA save) serialize through the
+    same lock — the ``model`` switch and the ``moa`` section are both on disk afterwards."""
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg["providers"] = {"racebox": {"base_url": "http://racebox:8000/v1", "model": "race-model", "api_key": "k"}}
+    save_config(cfg)
+
+    activate = lambda: client.post("/api/providers/custom-endpoints/racebox/activate")  # noqa: E731
+    moa = lambda: client.put(  # noqa: E731
+        "/api/model/moa",
+        json={"reference_models": [{"provider": "openrouter", "model": "openai/gpt-5.5"}],
+              "aggregator": {"provider": "openrouter", "model": "openai/gpt-5.5"}})
+
+    r1, r2 = _race_second_writer_into_first_writers_save(monkeypatch, activate, moa)
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
+
+    on_disk = _on_disk()
+    assert on_disk["model"]["provider"] == "racebox"
+    assert on_disk["moa"]["aggregator"]["model"] == "openai/gpt-5.5"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_config_set_coercion.py ===
+"""Regression tests for `config set` value coercion + key validation (round-3 CFG).
+
+Covers:
+- CFG-02: negative / whitespace-padded numerics coerce to int/float on
+  numeric-typed keys (old code used str.isdigit() and stored strings).
+- CFG-05: null/none/~ coerce to None so a nullable field can be cleared.
+- CFG-04: malformed dotted keys with empty segments are rejected.
+- Guard: string-typed enum keys (approvals.mode) are NOT coerced.
+"""
+
+import pytest
+
+from hermes_cli import config as cfg
+
+
+def _read(tmp_path, *path):
+    """Read a nested value straight from the on-disk config.yaml."""
+    import yaml
+    data = yaml.safe_load((tmp_path / "config.yaml").read_text()) or {}
+    node = data
+    for seg in path:
+        node = node[seg]
+    return node
+
+
+class TestNumericCoercion:
+    def test_negative_int(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg.set_config_value("agent.max_turns", "-5")
+        v = _read(tmp_path, "agent", "max_turns")
+        assert v == -5 and isinstance(v, int)
+
+    def test_whitespace_padded_int(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg.set_config_value("agent.max_turns", " 42 ")
+        v = _read(tmp_path, "agent", "max_turns")
+        assert v == 42 and isinstance(v, int)
+
+    def test_negative_float(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg.set_config_value("agent.max_turns", "-2.5")
+        v = _read(tmp_path, "agent", "max_turns")
+        assert v == -2.5 and isinstance(v, float)
+
+    def test_lossy_decimal_identifier_stays_string(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        client_id = "123456789012.98765432109876"
+
+        cfg.set_config_value("mcp_servers.example.oauth.client_id", client_id)
+
+        saved = _read(
+            tmp_path, "mcp_servers", "example", "oauth", "client_id"
+        )
+        assert saved == client_id
+        assert isinstance(saved, str)
+
+
+class TestNullCoercion:
+    @pytest.mark.parametrize("token", ["null", "none", "None", "~"])
+    def test_null_tokens_coerce_to_none(self, tmp_path, monkeypatch, token):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg.set_config_value("agent.run_budget_seconds", token)
+        assert _read(tmp_path, "agent", "run_budget_seconds") is None
+
+
+class TestMalformedKey:
+    @pytest.mark.parametrize("bad", ["agent.", ".agent", "agent..max_turns", "  "])
+    def test_empty_segment_rejected(self, tmp_path, monkeypatch, bad):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            cfg.set_config_value(bad, "5")
+        assert exc.value.code == 1
+
+
+class TestStringTypedGuardPreserved:
+    def test_enum_off_stays_string(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg.set_config_value("approvals.mode", "off")
+        v = _read(tmp_path, "approvals", "mode")
+        assert v == "off" and isinstance(v, str)  # not bool False
+

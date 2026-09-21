@@ -1,0 +1,316 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_oauth_discovery_requests.py ===
+"""SDK-built OAuth discovery/registration requests: default User-Agent, and discovery context on failure.
+
+The MCP SDK constructs ``/.well-known/...`` discovery and dynamic client
+registration requests as bare ``httpx.Request`` objects inside
+``async_auth_flow``. The client's default headers never apply to them, so
+they leave with NO ``User-Agent`` at all. Some WAFs reject header-less
+requests outright: coda.io answers 403 on every discovery and registration
+call, which Hermes then misreports as "only allows pre-approved OAuth
+clients". (``oauth.user_agent`` does not help — it is stamped only on
+token-endpoint requests.)
+
+``HermesMCPOAuthProvider`` now gives such requests a default User-Agent.
+These tests drive the bridge through the 401 branch so the SDK yields a
+real discovery request, then assert on its headers.
+"""
+from __future__ import annotations
+
+import pytest
+
+
+pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
+
+
+async def _noop_redirect(url: str) -> None:
+    pass
+
+
+async def _noop_callback():
+    return ("code", None)
+
+
+async def _make_flow(tmp_path, monkeypatch, *, registered=True):
+    from tools.mcp_tool import sdk_httpx
+    httpx = sdk_httpx()
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_tokens(
+        OAuthToken(access_token="old_access", token_type="Bearer", expires_in=3600, refresh_token="old_refresh")
+    )
+    if registered:
+        await storage.set_client_info(
+            OAuthClientInformationFull(
+                client_id="test-client",
+                redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                token_endpoint_auth_method="none",
+            )
+        )
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+    req = httpx.Request("POST", "https://example.com/mcp")
+    return httpx, req, provider.async_auth_flow(req)
+
+
+@pytest.mark.asyncio
+async def test_discovery_request_gets_default_user_agent(tmp_path, monkeypatch):
+    from tools.mcp_oauth_provider import DEFAULT_AUTH_REQUEST_USER_AGENT
+
+    httpx, req, flow = await _make_flow(tmp_path, monkeypatch)
+    outbound = await flow.__anext__()
+
+    fake_401 = httpx.Response(
+        401,
+        request=outbound,
+        headers={"www-authenticate": 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"'},
+    )
+    discovery = await flow.asend(fake_401)
+
+    assert discovery is not req, "SDK must have yielded its own discovery request"
+    assert ".well-known" in str(discovery.url)
+    assert discovery.headers.get("user-agent") == DEFAULT_AUTH_REQUEST_USER_AGENT
+
+    await flow.aclose()
+
+
+@pytest.mark.asyncio
+async def test_callers_mcp_request_is_left_untouched(tmp_path, monkeypatch):
+    """The bridge must not decorate the caller's own MCP request — those
+    headers belong to the transport client, not the OAuth layer."""
+    _httpx, req, flow = await _make_flow(tmp_path, monkeypatch)
+    outbound = await flow.__anext__()
+
+    assert outbound is req
+    assert "user-agent" not in outbound.headers
+
+    await flow.aclose()
+
+
+@pytest.mark.asyncio
+async def test_registration_failure_after_failed_discovery_leads_with_discovery(tmp_path, monkeypatch):
+    """When every authorization-server metadata fetch fails, the SDK guesses ``/register`` on the MCP
+    host; the surfaced error must name the metadata refusal first, not only the fallback 404 (#113771),
+    and must not be mistaken for a DCR allowlist refusal by the humanizer."""
+    from mcp.client.auth.oauth2 import OAuthRegistrationError
+    from tools.mcp_oauth import humanize_oauth_registration_error
+
+    httpx, req, flow = await _make_flow(tmp_path, monkeypatch, registered=False)
+    outbound = await flow.__anext__()
+    response = httpx.Response(401, request=outbound, headers={"www-authenticate": "Bearer"})
+    with pytest.raises(OAuthRegistrationError) as excinfo:
+        for _ in range(10):
+            outbound = await flow.asend(response)
+            url = str(outbound.url)
+            if "oauth-authorization-server" in url or "openid-configuration" in url:
+                response = httpx.Response(403, request=outbound, text="Forbidden")
+            elif outbound.method == "POST":  # the guessed /register on the MCP host
+                response = httpx.Response(404, request=outbound, text='{"detail":"Not Found"}')
+            else:
+                response = httpx.Response(404, request=outbound)
+    msg = str(excinfo.value)
+    assert msg.startswith("Could not read authorization-server metadata (403 from https://example.com/.well-known/oauth-authorization-server")
+    assert "Registration failed: 404" in msg
+    assert humanize_oauth_registration_error("srv", excinfo.value, server_url="https://example.com/mcp") is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_oauth_integration.py ===
+"""End-to-end integration tests for the MCP OAuth consolidation.
+
+Exercises the full chain — manager, provider subclass, disk watch, 401
+dedup — with real file I/O and real imports (no transport mocks, no
+subprocesses). These are the tests that would catch Cthulhu's original
+BetterStack bug: an external process rewrites the tokens file on disk,
+and the running Hermes session picks up the new tokens on the next auth
+flow without requiring a restart.
+"""
+import asyncio
+import json
+import os
+import time
+
+import pytest
+
+
+pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
+
+
+def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
+    from unittest.mock import MagicMock
+
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = is_tty
+    monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
+
+
+@pytest.mark.asyncio
+async def test_external_refresh_picked_up_without_restart(tmp_path, monkeypatch):
+    """Simulate Cthulhu's cron workflow end-to-end.
+
+    1. A running Hermes session has OAuth tokens loaded in memory.
+    2. An external process (cron) writes fresh tokens to disk.
+    3. On the next auth flow, the manager's disk-watch invalidates the
+       in-memory state so the SDK re-reads from storage.
+    4. ``provider.context.current_tokens`` now reflects the new tokens
+       with no process restart required.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+    reset_manager_for_tests()
+
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    tokens_file = token_dir / "srv.json"
+    client_info_file = token_dir / "srv.client.json"
+
+    # Pre-seed the baseline state: valid tokens the session loaded at startup.
+    tokens_file.write_text(json.dumps({
+        "access_token": "OLD_ACCESS",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": "OLD_REFRESH",
+    }))
+    client_info_file.write_text(json.dumps({
+        "client_id": "test-client",
+        "redirect_uris": ["http://127.0.0.1:12345/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }))
+
+    mgr = MCPOAuthManager()
+    provider = mgr.get_or_build_provider(
+        "srv", "https://example.com/mcp", None,
+    )
+    assert provider is not None
+
+    # The SDK's _initialize reads tokens from storage into memory. This
+    # is what happens on the first http request under normal operation.
+    await provider._initialize()
+    assert provider.context.current_tokens.access_token == "OLD_ACCESS"
+
+    # Now record the baseline mtime in the manager (this happens
+    # automatically via the HermesMCPOAuthProvider.async_auth_flow
+    # pre-hook on the first real request, but we exercise it directly
+    # here for test determinism).
+    await mgr.invalidate_if_disk_changed("srv")
+
+    # EXTERNAL PROCESS: cron rewrites the tokens file with fresh creds.
+    # The old refresh_token has been consumed by this external exchange.
+    future_mtime = time.time() + 1
+    tokens_file.write_text(json.dumps({
+        "access_token": "NEW_ACCESS",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": "NEW_REFRESH",
+    }))
+    os.utime(tokens_file, (future_mtime, future_mtime))
+
+    # The next auth flow should detect the mtime change and reload.
+    changed = await mgr.invalidate_if_disk_changed("srv")
+    assert changed, "manager must detect the disk mtime change"
+    assert provider._initialized is False, "_initialized must flip so SDK re-reads storage"
+
+    # Simulate the next async_auth_flow: _initialize runs because _initialized=False.
+    await provider._initialize()
+    assert provider.context.current_tokens.access_token == "NEW_ACCESS"
+    assert provider.context.current_tokens.refresh_token == "NEW_REFRESH"
+
+
+@pytest.mark.asyncio
+async def test_handle_401_deduplicates_concurrent_callers(tmp_path, monkeypatch):
+    """Ten concurrent 401 handlers for the same token should fire one recovery.
+
+    Mirrors Claude Code's pending401Handlers dedup pattern — prevents N MCP
+    tool calls hitting 401 simultaneously from all independently clearing
+    caches and re-reading the keychain (which thrashes the storage and
+    bogs down startup per CC-1096).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+    reset_manager_for_tests()
+
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    (token_dir / "srv.json").write_text(json.dumps({
+        "access_token": "TOK",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }))
+
+    mgr = MCPOAuthManager()
+    provider = mgr.get_or_build_provider(
+        "srv", "https://example.com/mcp", None,
+    )
+    assert provider is not None
+
+    # Count how many times invalidate_if_disk_changed is called — proxy for
+    # how many actual recovery attempts fire.
+    call_count = 0
+    real_invalidate = mgr.invalidate_if_disk_changed
+
+    async def counting(name):
+        nonlocal call_count
+        call_count += 1
+        return await real_invalidate(name)
+
+    monkeypatch.setattr(mgr, "invalidate_if_disk_changed", counting)
+
+    # Fire 10 concurrent handlers with the same failed token.
+    results = await asyncio.gather(*(
+        mgr.handle_401("srv", "SAME_FAILED_TOKEN") for _ in range(10)
+    ))
+
+    # All callers get the same result (the shared future's resolution).
+    assert all(r == results[0] for r in results), "dedup must return identical result"
+    # Exactly ONE recovery ran — the rest awaited the same pending future.
+    assert call_count == 1, f"expected 1 recovery attempt, got {call_count}"
+
+
+@pytest.mark.asyncio
+async def test_provider_is_reused_across_reconnects(tmp_path, monkeypatch):
+    """The manager caches providers; multiple reconnects reuse the same instance.
+
+    This is what makes the disk-watch stick across reconnects: tearing down
+    the MCP session and rebuilding it (Task 5's _reconnect_event path) must
+    not create a new provider, otherwise ``last_mtime_ns`` resets and the
+    first post-reconnect auth flow would spuriously "detect" a change.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+    reset_manager_for_tests()
+
+    mgr = MCPOAuthManager()
+    p1 = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+
+    # Simulate a reconnect: _run_http calls get_or_build_provider again
+    p2 = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+
+    assert p1 is p2, "manager must cache the provider across reconnects"
+

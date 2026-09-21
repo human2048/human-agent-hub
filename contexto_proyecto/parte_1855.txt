@@ -1,0 +1,303 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_thinking_disable.py ===
+"""'Thinking off' on the native Anthropic Messages wire.
+
+Adaptive Claude models (4.6+) think by DEFAULT.  Omitting the ``thinking``
+parameter is therefore NOT a disable — it leaves the upstream default in
+place and the model keeps thinking, which is exactly what a user who turned
+thinking off is trying to stop paying for.  The disable has to be sent:
+
+    thinking: {"type": "disabled"}
+
+Reasoning-mandatory families (claude-fable) reject that with an HTTP 400
+("Thinking is mandatory for this model"), so they keep the omission — a
+silently-ignored disable is a much better failure than a dead turn.
+
+Legacy manual-thinking Claude (<= 4.5) needs no disable at all: thinking is
+opt-in there via ``budget_tokens``, so sending nothing already means off.
+
+Sibling contract on the chat_completions wire: hermes-agent#90412.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agent.anthropic_adapter import build_anthropic_kwargs
+
+MESSAGES = [{"role": "user", "content": "hello"}]
+
+# Portal ids and their bare Anthropic equivalents: the disable verdict is a
+# property of the model family, not of which route serves it.
+ADAPTIVE_DISABLEABLE = [
+    "anthropic/claude-opus-5",
+    "anthropic/claude-sonnet-5",
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-opus-4.7",
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6",
+    "claude-opus-4-6",
+]
+
+
+def _kwargs(model: str, reasoning_config: dict | None, **extra):
+    return build_anthropic_kwargs(
+        model=model,
+        messages=MESSAGES,
+        tools=None,
+        max_tokens=4096,
+        reasoning_config=reasoning_config,
+        **extra,
+    )
+
+
+class TestThinkingOffIsSentExplicitly:
+    @pytest.mark.parametrize("model", ADAPTIVE_DISABLEABLE)
+    def test_adaptive_models_receive_an_explicit_disable(self, model: str) -> None:
+        """The whole point: omission would leave thinking ON for these."""
+        kwargs = _kwargs(model, {"enabled": False})
+        assert kwargs["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.parametrize("model", ADAPTIVE_DISABLEABLE)
+    def test_disable_carries_no_effort_dial(self, model: str) -> None:
+        """``output_config.effort`` describes how hard to think — meaningless
+        alongside a disable, and it is what the enable path sets."""
+        kwargs = _kwargs(model, {"enabled": False, "effort": "high"})
+        assert kwargs["thinking"] == {"type": "disabled"}
+        assert "output_config" not in kwargs
+
+    def test_mandatory_thinking_models_keep_the_omission(self) -> None:
+        """claude-fable answers a disable with HTTP 400, so don't send one."""
+        kwargs = _kwargs("anthropic/claude-fable-5", {"enabled": False})
+        assert "thinking" not in kwargs
+
+    def test_legacy_manual_thinking_models_keep_the_omission(self) -> None:
+        """Pre-4.6 thinking is opt-in via budget_tokens: absence IS off."""
+        kwargs = _kwargs("claude-sonnet-4-5", {"enabled": False})
+        assert "thinking" not in kwargs
+
+    def test_haiku_keeps_the_omission(self) -> None:
+        """Haiku is legacy-manual, so absence already means off."""
+        kwargs = _kwargs("anthropic/claude-haiku-4.5", {"enabled": False})
+        assert "thinking" not in kwargs
+
+    def test_kimi_keeps_its_documented_omission(self) -> None:
+        """Kimi speaks the adaptive contract but is out of scope here (#13848)."""
+        kwargs = _kwargs(
+            "kimi-k2.5", {"enabled": False}, base_url="https://api.kimi.com/coding"
+        )
+        assert "thinking" not in kwargs
+
+
+class TestEnablePathIsUnchanged:
+    """The disable branch must not disturb the thinking-ON contract."""
+
+    def test_adaptive_enable_still_sends_adaptive_plus_effort(self) -> None:
+        kwargs = _kwargs("anthropic/claude-opus-5", {"enabled": True, "effort": "high"})
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "high"}
+
+    def test_mandatory_model_still_thinks_when_asked_to(self) -> None:
+        kwargs = _kwargs("anthropic/claude-fable-5", {"enabled": True, "effort": "max"})
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "max"}
+
+    def test_legacy_enable_still_sends_budget_tokens(self) -> None:
+        kwargs = _kwargs("claude-sonnet-4-5", {"enabled": True, "effort": "high"})
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+
+    def test_haiku_still_never_gets_thinking_on_the_enable_path(self) -> None:
+        kwargs = _kwargs("anthropic/claude-haiku-4.5", {"enabled": True, "effort": "high"})
+        assert "thinking" not in kwargs
+
+    def test_no_reasoning_config_sends_no_thinking_field(self) -> None:
+        assert "thinking" not in _kwargs("anthropic/claude-opus-5", None)
+
+
+class TestDisableVerdictHelper:
+    """``_accepts_thinking_disable`` is the single source of the verdict."""
+
+    def test_verdict_matches_the_mandatory_flag_the_catalog_publishes(self) -> None:
+        from agent.anthropic_adapter import _accepts_thinking_disable
+
+        # Portal catalog: reasoning.mandatory is true for fable, false for these.
+        assert _accepts_thinking_disable("anthropic/claude-opus-5") is True
+        assert _accepts_thinking_disable("anthropic/claude-sonnet-5") is True
+        assert _accepts_thinking_disable("anthropic/claude-fable-5") is False
+
+    def test_non_claude_models_are_left_alone(self) -> None:
+        from agent.anthropic_adapter import _accepts_thinking_disable
+
+        for model in ("minimax-m2.7", "qwen3-max", "kimi-k2.5"):
+            assert _accepts_thinking_disable(model) is False, model
+
+    def test_unknown_claude_releases_default_to_disableable(self) -> None:
+        """Mirrors _supports_adaptive_thinking: new Claude gets the modern
+        contract without a code change."""
+        from agent.anthropic_adapter import _accepts_thinking_disable
+
+        assert _accepts_thinking_disable("anthropic/claude-opus-6") is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_third_party_oauth_guard.py ===
+"""Tests for ``_is_anthropic_oauth`` guard against third-party Anthropic-compatible providers.
+
+The invariant: ``self._is_anthropic_oauth`` must only ever be True when
+``self.provider == 'anthropic'`` (native Anthropic).  Third-party providers
+that speak the Anthropic protocol (MiniMax, Zhipu GLM, Alibaba DashScope,
+Kimi, LiteLLM proxies, etc.) must never trip OAuth code paths — doing so
+injects Claude-Code identity headers and system prompts that cause
+401/403 from those endpoints.
+
+This test class covers all FIVE sites that assign ``_is_anthropic_oauth``:
+
+1. ``AIAgent.__init__``                              (line ~1022)
+2. ``AIAgent.switch_model``                          (line ~1832)
+3. ``AIAgent._try_refresh_anthropic_client_credentials`` (line ~5335)
+4. ``AIAgent._swap_credential``                      (line ~5378)
+5. ``AIAgent._try_activate_fallback``                (line ~6536)
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from run_agent import AIAgent
+
+
+# A plausible-looking OAuth token (``sk-ant-`` without the ``-api`` suffix).
+_OAUTH_LIKE_TOKEN = "sk-ant-oauth-example-1234567890abcdef"
+_API_KEY_TOKEN = "sk-ant-api-abcdef1234567890"
+
+
+@pytest.fixture
+def agent():
+    """Minimal AIAgent construction, skipping tool discovery."""
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        a = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        a.client = MagicMock()
+        return a
+
+
+class TestOAuthFlagOnRefresh:
+    """Site 3 — _try_refresh_anthropic_client_credentials."""
+
+    def test_third_party_provider_refresh_is_noop(self, agent):
+        """Refresh path returns False immediately when provider != anthropic — the
+        OAuth flag can never be mutated for third-party providers. Double-defended
+        by the per-assignment guard at line ~5393 so future refactors can't
+        reintroduce the bug."""
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "minimax"          # ← third-party
+        agent._anthropic_api_key = "***"
+        agent._anthropic_client = MagicMock()
+        agent._is_anthropic_oauth = False
+
+        with (
+            patch("agent.anthropic_credentials.resolve_anthropic_token",
+                  return_value=_OAUTH_LIKE_TOKEN),
+            patch("agent.anthropic_adapter.build_anthropic_client",
+                  return_value=MagicMock()),
+        ):
+            result = agent._try_refresh_anthropic_client_credentials()
+
+        # The function short-circuits on non-anthropic providers.
+        assert result is False
+        # And the flag is untouched regardless.
+        assert agent._is_anthropic_oauth is False
+
+
+
+class TestOAuthFlagOnCredentialSwap:
+    """Site 4 — _swap_credential (credential pool rotation)."""
+
+    def test_pool_swap_on_third_party_never_flips_oauth(self, agent):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "glm"              # ← Zhipu GLM via /anthropic
+        agent._anthropic_api_key = "old-key"
+        agent._anthropic_base_url = "https://open.bigmodel.cn/api/anthropic"
+        agent._anthropic_client = MagicMock()
+        agent._is_anthropic_oauth = False
+
+        entry = MagicMock()
+        entry.runtime_api_key = _OAUTH_LIKE_TOKEN
+        entry.runtime_base_url = "https://open.bigmodel.cn/api/anthropic"
+
+        with patch("agent.anthropic_adapter.build_anthropic_client",
+                   return_value=MagicMock()):
+            agent._swap_credential(entry)
+
+        assert agent._is_anthropic_oauth is False
+
+
+class TestOAuthFlagOnConstruction:
+    """Site 1 — AIAgent.__init__ on a third-party anthropic_messages provider."""
+
+    def test_minimax_init_does_not_flip_oauth(self):
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter.build_anthropic_client",
+                  return_value=MagicMock()),
+            # Simulate a stale ANTHROPIC_TOKEN in the env — the init code
+            # MUST NOT fall back to it when provider != anthropic.
+            patch("agent.anthropic_credentials.resolve_anthropic_token",
+                  return_value=_OAUTH_LIKE_TOKEN),
+        ):
+            agent = AIAgent(
+                api_key="minimax-key-1234",
+                base_url="https://api.minimax.io/anthropic",
+                provider="minimax",
+                api_mode="anthropic_messages",
+                model="claude-sonnet-4-6",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        # The effective key should be the explicit minimax-key, not the
+        # stale Anthropic OAuth token, and the OAuth flag must be False.
+        assert agent._anthropic_api_key == "minimax-key-1234"
+        assert agent._is_anthropic_oauth is False
+
+
+class TestOAuthFlagOnFallbackActivation:
+    """Site 5 — _try_activate_fallback targeting a third-party Anthropic endpoint."""
+
+    def test_fallback_to_third_party_does_not_flip_oauth(self, agent):
+        """Directly mimic the post-fallback assignment at line ~6537."""
+        from agent.anthropic_credentials import _is_oauth_token
+
+        # Emulate the relevant lines of _try_activate_fallback without
+        # running the entire recovery stack (which pulls in streaming,
+        # sessions, etc.).
+        fb_provider = "minimax"
+        effective_key = _OAUTH_LIKE_TOKEN
+        agent._is_anthropic_oauth = (
+            _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
+        )
+        assert agent._is_anthropic_oauth is False
+
+
+class TestApiKeyTokensAlwaysSafe:
+    """Regression: plain API-key shapes must always resolve to non-OAuth, any provider."""
+
+    def test_native_anthropic_with_api_key_token(self):
+        from agent.anthropic_credentials import _is_oauth_token
+        assert _is_oauth_token(_API_KEY_TOKEN) is False
+
+

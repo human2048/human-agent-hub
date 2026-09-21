@@ -1,0 +1,203 @@
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\story-skeletons.md ===
+# Story Skeletons
+
+Three traditions for narrative structure, deliberately heterogeneous (they disagree about what stories are):
+- **Emma Coats** — Pixar's 22 Story Basics (Twitter, May 2011). Working principles from Pixar's story room.
+- **George Saunders** — *A Swim in a Pond in the Rain* (Random House, 2021). Stories as escalating-stakes engines, learned by close reading Russian short fiction.
+- **Ursula K. Le Guin** — "The Carrier Bag Theory of Fiction" (1986). Argument *against* conflict-driven shape; *for* fiction as container.
+
+This file deliberately omits **Hero's Journey / Save the Cat / Story Circle / Three-Act**. Real traditions but so widely formulaic-ized in screenwriting and self-help-adjacent writing that invoking them tends to produce slop.
+
+## When to use
+
+| Situation | Reach for |
+|---|---|
+| Story has no shape, need a fast spine | Coats #4 |
+| Stuck in early draft | Coats #9, #11, #12 |
+| Draft isn't working, don't know why | Saunders attention to "what does the story now want?" |
+| Conflict-arc is producing forced or shallow work | Le Guin's carrier bag |
+| Writing about a community / place / duration not a hero | Le Guin's carrier bag |
+| Writing literary short fiction | Saunders |
+| Commercial-feature-length narrative | Coats |
+
+## Don't use when
+
+- Pure lyric or expository work (no narrative)
+- Writing for a market that demands the formula (Hero's Journey may apply; Saunders/Le Guin will read as eccentric)
+- You don't have material yet — these shape; they don't generate
+
+## Coats's 22 (the load-bearing ones)
+
+The full list is widely circulated. Most-cited:
+
+**#4 — Pixar Pitch (the spine):**
+> *Once upon a time there was ___. Every day, ___. One day ___. Because of that, ___. Because of that, ___. Until finally ___.*
+
+Six-clause skeleton: stable normalcy → disrupting event → cascading consequences → resolution. Fits most narratives.
+
+**#6** — What is your character good at, comfortable with? Throw the polar opposite at them.
+
+**#7** — Come up with your ending before you figure out your middle. Endings are hard.
+
+**#9** — When stuck, make a list of what wouldn't happen next. Lots of times the material to get unstuck shows up.
+
+**#12** — Discount the first thing that comes to mind. And the second, third, fourth, fifth — get the obvious out of the way.
+
+**#13** — Give your characters opinions. Passive/malleable might seem likable to write, but it's poison to the audience.
+
+**#14** — Why must you tell THIS story? What's the belief burning within you? That's the heart of it.
+
+**#16** — What are the stakes? What happens if they don't succeed? Stack the odds against.
+
+**#19** — Coincidences to get characters into trouble are great; coincidences to get them out are cheating.
+
+**#20** — Take the building blocks of a movie you dislike. How would you rearrange them into what you DO like?
+
+**#22** — What's the essence of your story? Most economical telling? Build out from there.
+
+## Saunders — three operating moves
+
+**Stories are escalation.** Each scene must increase stakes — emotional, moral, situational. Stagnation kills. Even quiet stories must escalate.
+
+**Specificity is the engine.** Generic verbs, generic nouns, generic adjectives produce stories that don't escalate because nothing specific is happening to anyone in particular.
+
+**The story knows more than the writer.** Strong stories are built by *responsiveness*: draft, read what you wrote, ask "what does this story now want?", write the next sentence to fulfill that want. The writer is in service to the story.
+
+This contrasts directly with formula-driven writing.
+
+## Le Guin — carrier bag
+
+Anthropology has long focused on the *spear* and the *blade* as the early human inventions defining narrative — hunter-warrior stories. The actually-more-important invention was the *container*: the bag, the basket, the sling. Human survival was overwhelmingly gathering, not hunting. The hunting story has rising action and climax. The gathering story has accretion.
+
+> *The natural, proper, fitting shape of the novel might be that of a sack, a bag. ... A novel is a medicine bundle, holding things in a particular, powerful relation to one another and to us.*
+
+For ideation: when the conflict-arc is forcing you to flatten the work, use Le Guin. The carrier-bag novel is shaped not as a hero confronting an obstacle on a journey but as a container holding many specific things in particular relation. *Always Coming Home* (1985) is the model — multi-form anthropology of an imagined people: oral histories, recipes, songs, maps, alongside (not subordinated to) the conventional narrative.
+
+Use when:
+- Work is essayistic, anthropological, polyvocal
+- About a place, a community, a duration, a way of life
+- "Hero with an obstacle" frame collapses what makes the work specific
+
+## Procedure
+
+### Shaping a story you have material for
+1. Try Coats #4 spine. Can you fill in six blanks? If not, you may not have the spine yet.
+2. Apply Saunders attention. Read sentence by sentence; ask "what does this now want?" at each transition.
+3. Ask Le Guin's question: is the conflict-arc actually right for this material, or am I forcing it?
+
+### Diagnosing a stalled draft
+- Coats #16: What are the stakes? If absent, surface them.
+- Saunders: where does the energy stop being introduced? Find the dead zone.
+- Coats #13: Are characters passive? If yes, that's the problem.
+- Le Guin: is this story trying to be a hero-journey but doesn't want to be?
+
+## Anti-slop notes
+
+- Don't default to Hero's Journey. It's overused and flattens everything into Joseph Campbell shape.
+- Don't generate fake "Coats-style" tips. Use the actual 22.
+- Saunders writes against self-help-adjacent registers. Don't drift into "the writer's journey" tone.
+- Don't apply Le Guin's carrier bag superficially. It's a serious argument with politics. Using it as "and now my story is a bag of stuff" without engaging the underlying argument is dilution.
+
+Sources: Coats, Pixar story rules tweets (May 2011); Saunders, *A Swim in a Pond in the Rain* (Random House, 2021); Le Guin, "The Carrier Bag Theory of Fiction" in *Dancing at the Edge of the World* (Grove, 1989).
+
+
+
+=== ARCHIVO: .\hermes-agent\optional-skills\creative\creative-ideation\references\methods\triz-principles.md ===
+# TRIZ — Theory of Inventive Problem Solving
+
+Genrich Altshuller, 1946–. Soviet engineering invention method derived from analysis of hundreds of thousands of patents. 40 inventive principles + contradiction matrix + Ideal Final Result. Used by Samsung, Intel, Boeing, P&G.
+
+## Core principle
+
+Most inventive problems are technical contradictions: improving X degrades Y. The trade-off is usually an artifact of how the system is decomposed, not a fundamental constraint. Solve by identifying the contradiction explicitly, then applying principles that have historically resolved similar contradictions in patent literature.
+
+The **Ideal Final Result**: the desired function performed without the system that performs it (the system has, in some sense, eliminated itself). Use as target.
+
+## When to use
+
+- Engineering / mechanism / device invention
+- Measurable parameter conflict (mass/strength, cost/reliability, speed/accuracy)
+- You suspect the trade-off is fake
+- Group brainstorming with non-arbitrary structure
+
+## Don't use when
+
+- Artistic, social, or expressive problems (TRIZ requires measurable parameters)
+- Your "contradiction" is preference, not parameter ("modern but classic" is not TRIZ)
+- A textbook fix exists; TRIZ is for inventive problems
+
+## The 40 inventive principles
+
+1. **Segmentation** — divide into independent parts, increase divisibility
+2. **Taking out** — extract the disturbing part; separate only what's needed
+3. **Local quality** — make different parts have different properties
+4. **Asymmetry** — replace symmetrical with asymmetrical
+5. **Merging** — bring identical/similar objects closer; parallelize operations
+6. **Universality** — one part performs multiple functions
+7. **Nested doll** — place objects one inside another (matryoshka)
+8. **Anti-weight** — compensate weight by combining with lift / hydro/aerodynamic forces
+9. **Preliminary anti-action** — preload with opposite stress
+10. **Preliminary action** — perform required action in advance
+11. **Beforehand cushioning** — emergency means in advance
+12. **Equipotentiality** — change conditions so object need not be raised/lowered
+13. **The other way round** — invert action; movable parts fixed and vice versa
+14. **Spheroidality / curvature** — replace linear with curved; flat with spherical
+15. **Dynamics** — make rigid moveable; let parts shift configuration
+16. **Partial or excessive actions** — slightly less or slightly more if 100% is hard
+17. **Another dimension** — move 1D→2D→3D; tilt; use the other side
+18. **Mechanical vibration** — oscillate, ultrasonics
+19. **Periodic action** — periodic instead of continuous; vary frequency; pauses
+20. **Continuity of useful action** — eliminate idle running
+21. **Skipping** — perform fast through dangerous stages
+22. **Blessing in disguise** — use harmful factors to obtain a positive effect
+23. **Feedback** — introduce or modify feedback
+24. **Intermediary** — use an intermediary article or process
+25. **Self-service** — make the object service itself; use waste resources
+26. **Copying** — cheap copies instead of fragile/expensive originals
+27. **Cheap short-living** — disposable instead of durable
+28. **Mechanics substitution** — replace mechanical with sensory (optical, acoustic, EM)
+29. **Pneumatics and hydraulics** — replace solid with gas/liquid; inflatable
+30. **Flexible shells and thin films** — instead of 3D structures
+31. **Porous materials** — make porous; use pores to introduce useful substance
+32. **Color changes** — change color or transparency
+33. **Homogeneity** — interacting objects from same material
+34. **Discarding and recovering** — portions disappear after use; restore consumables
+35. **Parameter changes** — physical state, concentration, density, flexibility, temperature
+36. **Phase transitions** — exploit phenomena at phase changes
+37. **Thermal expansion** — different coefficients of thermal expansion
+38. **Strong oxidants** — oxygen-enriched, ozonized
+39. **Inert atmosphere** — inert environment or vacuum
+40. **Composite materials** — uniform → composite
+
+## Procedure
+
+1. **State the contradiction** in the form: "I want X to improve, but X improvement causes Y to degrade." If you can't state it crisply, you don't yet have a TRIZ problem.
+2. **Compare to Ideal Final Result.** What would it look like if the system eliminated itself?
+3. **Look up candidate principles.** The contradiction matrix at triz40.com maps (X parameter, Y parameter) → recommended principles. Or scan the 40 above for fits.
+4. **Translate principle to mechanism.** A principle is general; the mechanism is specific to your situation.
+5. **Compare candidates against IFR.** Pick closest.
+
+## Worked example
+
+**Problem**: fast brew time (under 60s) vs full extraction (typically 4 min).
+**Contradiction**: speed vs completeness of extraction.
+**Candidate principles**: 1 (Segmentation), 17 (Another dimension), 19 (Periodic action), 35 (Parameter changes).
+**Translations**:
+- Segmentation: pre-extract concentrates; dilute on demand. (Nespresso.)
+- Another dimension: extract under pressure (espresso).
+- Periodic action: pulse-extract with pauses (some pour-over).
+- Parameter changes: brew at different temperature/pressure (cold brew = low T long time; espresso = high P short time).
+
+**IFR comparison**: closest to "no brewing time" is pre-extracted concentrate (Segmentation). Resolves the contradiction by *separating extraction from delivery in time*.
+
+## Anti-slop notes
+
+- Don't present the 40 principles as a generative checklist — that's SCAMPER. TRIZ's value is the contradiction lens + patent-derived priors.
+- Translate principle to mechanism, don't stop at the principle name.
+- Don't claim TRIZ where it doesn't apply (artistic, social, preference contradictions).
+- Don't invent principles in Altshuller's style.
+
+Tools: triz40.com (interactive matrix). Source: Altshuller, *And Suddenly the Inventor Appeared* (1994).
+

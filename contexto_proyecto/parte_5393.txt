@@ -1,0 +1,575 @@
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\features\web-search.md ===
+---
+title: 网页搜索与提取
+description: 通过多个后端提供商搜索网页并提取页面内容——包括免费的自托管 SearXNG。
+sidebar_label: Web Search
+sidebar_position: 6
+---
+
+# 网页搜索与提取
+
+Hermes Agent 内置两个可供模型调用的网页工具，由多个提供商支持：
+
+- **`web_search`** — 搜索网页并返回排序结果
+- **`web_extract`** — 从一个或多个 URL 获取并提取可读内容
+
+两者均通过单一后端选择进行配置。提供商可通过 `hermes tools` 选择，或直接在 `config.yaml` 中设置。
+
+## 后端
+
+| 提供商 | 环境变量 | 搜索 | 提取 | 免费层级 |
+|----------|---------|--------|---------|-----------|
+| **Firecrawl**（默认） | `FIRECRAWL_API_KEY` | ✔ | ✔ | 500 积分/月 |
+| **SearXNG** | `SEARXNG_URL` | ✔ | — | ✔ 免费（自托管） |
+| **Brave Search（免费层级）** | `BRAVE_SEARCH_API_KEY` | ✔ | — | 2 000 次查询/月 |
+| **DDGS (DuckDuckGo)** | —（无需密钥） | ✔ | — | ✔ 免费 |
+| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | 1 000 次搜索/月 |
+| **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 次搜索/月 |
+| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | 付费 |
+| **xAI (Grok)** | `XAI_API_KEY` 或 `hermes auth login xai-oauth` | ✔ | — | 付费（SuperGrok 或按 token 计费） |
+
+Brave Search、DDGS 和 xAI 均为**仅搜索**——如果同时需要 `web_extract`，可将其中任意一个与 Firecrawl/Tavily/Exa/Parallel 配合使用。DDGS 底层使用 [`ddgs` Python 包](https://pypi.org/project/ddgs/)；若尚未安装，请运行 `pip install ddgs`（或让 Hermes 在首次使用时懒加载安装）。xAI 通过 Responses API 运行 Grok 服务端的 `web_search` 工具——结果由 LLM 生成而非基于索引，因此标题、描述和 URL 选择均为模型输出（参见下方[信任模型说明](#xai-grok)）。
+
+**按能力拆分：** 搜索和提取可分别使用不同的提供商——例如搜索使用 SearXNG（免费），提取使用 Firecrawl。详见下方[按能力配置](#per-capability-configuration)。
+
+:::tip Nous 订阅用户
+如果您拥有付费 [Nous Portal](https://portal.nousresearch.com) 订阅，网页搜索和提取可通过 **[Tool Gateway](tool-gateway.md)** 使用托管的 Firecrawl——无需 API 密钥。新安装可运行 `hermes setup --portal` 登录并一次性开启所有 gateway 工具；现有安装可通过 `hermes tools` 单独开启网页功能。
+:::
+
+---
+
+## `web_extract` 如何处理长页面
+
+后端返回的原始页面 markdown 可能非常庞大（论坛帖子、文档站点、带嵌入评论的新闻文章）。为保持上下文窗口可用，`web_extract` 采用**确定性字符预算** —— 不涉及任何 LLM 摘要：
+
+| 页面大小（字符数） | 处理方式 |
+|------------------------|--------------|
+| 预算以内（默认 15 000） | 原样返回 —— 完整 markdown 直达 agent |
+| 超出预算 | 头+尾窗口（约 75% 头部 / 25% 尾部，按 markdown 行边界切分），并附带明确的 `[TRUNCATED]` 尾注。完整的干净文本存储到磁盘，尾注告知 agent 文件路径以及分页读取被省略中间部分的确切 `read_file` 调用 |
+| 超过 2 000 000 | 存储的文本上限为 2 MB |
+
+每页预算可通过 `config.yaml` 中的 `web.extract_char_limit` 配置（默认 `15000`，范围限制在 2 000–500 000），agent 也可以通过工具的 `char_limit` 参数按调用提高。
+
+### 当截断带来不便时
+
+如果您明确需要实时 DOM 而非提取的 markdown —— 例如提取内容很少的 JS 密集页面 —— 请改用 `browser_navigate` + `browser_snapshot`。浏览器工具返回实时无障碍树（超大页面受其自身快照上限约束）。
+
+---
+
+## 设置
+
+### 通过 `hermes tools` 快速设置
+
+运行 `hermes tools`，导航至 **Web Search & Extract**，选择一个提供商。向导会提示输入所需的 URL 或 API 密钥，并写入您的配置。
+
+```bash
+hermes tools
+```
+
+---
+
+### Firecrawl（默认）
+
+功能完整的搜索和提取。推荐大多数用户使用。
+
+```bash
+# ~/.hermes/.env
+FIRECRAWL_API_KEY=fc-your-key-here
+```
+
+在 [firecrawl.dev](https://firecrawl.dev) 获取密钥。免费层级包含每月 500 积分。
+
+**自托管 Firecrawl：** 指向您自己的实例而非云端 API：
+
+```bash
+# ~/.hermes/.env
+FIRECRAWL_API_URL=http://localhost:3002
+```
+
+设置 `FIRECRAWL_API_URL` 后，API 密钥为可选项（使用 `USE_DB_AUTHENTICATION=false` 禁用服务器认证）。
+
+---
+
+### SearXNG（免费，自托管）
+
+SearXNG 是一个注重隐私的开源元搜索引擎，聚合来自 70 多个搜索引擎的结果。**无需 API 密钥**——只需将 Hermes 指向一个运行中的 SearXNG 实例。
+
+SearXNG 为**仅搜索**——`web_extract` 需要单独的提取提供商。
+
+#### 方案 A — 使用 Docker 自托管（推荐）
+
+这为您提供无速率限制的私有实例。
+
+**1. 创建工作目录：**
+
+```bash
+mkdir -p ~/searxng/searxng
+cd ~/searxng
+```
+
+**2. 编写 `docker-compose.yml`：**
+
+```yaml
+# ~/searxng/docker-compose.yml
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+    restart: unless-stopped
+```
+
+**3. 启动容器：**
+
+```bash
+docker compose up -d
+```
+
+**4. 启用 JSON API 格式：**
+
+SearXNG 默认禁用 JSON 输出。复制生成的配置并启用它：
+
+```bash
+# 从容器中复制自动生成的配置
+docker cp searxng:/etc/searxng/settings.yml ~/searxng/searxng/settings.yml
+```
+
+打开 `~/searxng/searxng/settings.yml`，找到 `formats` 块（约第 84 行）：
+
+```yaml
+# 修改前（默认——JSON 已禁用）：
+formats:
+  - html
+
+# 修改后（为 Hermes 启用 JSON）：
+formats:
+  - html
+  - json
+```
+
+**5. 重启以应用更改：**
+
+```bash
+docker cp ~/searxng/searxng/settings.yml searxng:/etc/searxng/settings.yml
+docker restart searxng
+```
+
+**6. 验证是否正常工作：**
+
+```bash
+curl -s "http://localhost:8888/search?q=test&format=json" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(f'{len(d[\"results\"])} results')"
+```
+
+您应该看到类似 `10 results` 的输出。如果收到 `403 Forbidden`，说明 JSON 格式仍未启用——请重新检查第 4 步。
+
+**7. 配置 Hermes：**
+
+```bash
+# ~/.hermes/.env
+SEARXNG_URL=http://localhost:8888
+```
+
+然后在 `~/.hermes/config.yaml` 中选择 SearXNG 作为搜索后端：
+
+```yaml
+web:
+  search_backend: "searxng"
+```
+
+或通过 `hermes tools` → Web Search & Extract → SearXNG 设置。
+
+---
+
+#### 方案 B — 使用公共实例
+
+公共 SearXNG 实例列表见 [searx.space](https://searx.space/)。筛选**已启用 JSON 格式**的实例（表格中有显示）。
+
+```bash
+# ~/.hermes/.env
+SEARXNG_URL=https://searx.example.com
+```
+
+:::caution 公共实例
+公共实例有速率限制、可用性不稳定，且可能随时禁用 JSON 格式。生产环境强烈建议自托管。
+:::
+
+---
+
+#### 将 SearXNG 与提取提供商配合使用
+
+SearXNG 负责搜索；`web_extract` 需要单独的提供商。使用按能力配置的键：
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backend: "searxng"
+  extract_backend: "firecrawl"   # 或 tavily、exa、parallel
+```
+
+使用此配置，Hermes 对所有搜索查询使用 SearXNG，对 URL 提取使用 Firecrawl——将免费搜索与高质量提取相结合。
+
+---
+
+### Tavily
+
+针对 AI 优化的搜索和提取，免费层级慷慨。
+
+```bash
+# ~/.hermes/.env
+TAVILY_API_KEY=tvly-your-key-here
+```
+
+在 [app.tavily.com](https://app.tavily.com/home) 获取密钥。免费层级包含每月 1 000 次搜索。
+
+---
+
+### Exa
+
+具有语义理解的神经搜索。适合研究和查找概念相关内容。
+
+```bash
+# ~/.hermes/.env
+EXA_API_KEY=your-exa-key-here
+```
+
+在 [exa.ai](https://exa.ai) 获取密钥。免费层级包含每月 1 000 次搜索。
+
+---
+
+### Parallel
+
+具备深度研究能力的 AI 原生搜索和提取。
+
+```bash
+# ~/.hermes/.env
+PARALLEL_API_KEY=your-parallel-key-here
+```
+
+在 [parallel.ai](https://parallel.ai) 申请访问权限。
+
+---
+
+### xAI (Grok) {#xai-grok}
+
+通过 Responses API 将 `web_search` 路由至 Grok 服务端的 [web_search 工具](https://docs.x.ai/developers/tools/web-search)。Grok 执行实际搜索并以结构化 JSON 返回最佳结果。
+
+支持两种凭证路径——无需新的环境变量，无需新的设置向导：
+
+```bash
+# ~/.hermes/.env（环境变量路径）
+XAI_API_KEY=sk-xai-your-key-here
+```
+
+或对于 SuperGrok 订阅用户：
+
+```bash
+hermes auth login xai-oauth
+```
+
+然后选择 xAI 作为搜索后端：
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  backend: "xai"
+```
+
+**可选配置项：**
+
+```yaml
+web:
+  backend: "xai"
+  xai:
+    model: grok-build-0.1        # web_search 所需的推理模型（默认）
+    allowed_domains:             # 可选，最多 5 个——与 excluded_domains 互斥
+      - arxiv.org
+    excluded_domains:            # 可选，最多 5 个
+      - example-spam.com
+    timeout: 90                  # 秒（默认）
+```
+
+**仅搜索**——如果同时需要 `web_extract`，请与 Firecrawl / Tavily / Exa / Parallel 配合使用。遇到 401 时，提供商会执行一次强制 OAuth token 刷新并重试（覆盖窗口中途吊销和主动过期检查无法解码的不透明 token）；环境变量凭证跳过重试。
+
+:::caution 信任模型
+与基于索引的提供商（Brave、Tavily、Exa）返回逐字搜索引擎结果不同，xAI 是由 LLM 选择要呈现的 URL 并自行撰写标题和描述。查询的*内容*会影响输出，因此恶意构造的查询（例如通过 agent 获取的不可信上游输入注入）原则上可以引导 Grok 输出攻击者指定的 URL。对返回的 URL 应与对待任何模型生成链接一样——在获取前进行验证，尤其是当查询来自不可信输入时。
+:::
+
+---
+
+## 配置
+
+### 单一后端
+
+为所有网页功能设置一个提供商：
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
+```
+
+### 按能力配置 {#per-capability-configuration}
+
+搜索和提取使用不同的提供商。这允许您将免费搜索（SearXNG）与付费提取提供商组合使用，反之亦然：
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backend: "searxng"     # 由 web_search 使用
+  extract_backend: "firecrawl"  # 由 web_extract 使用
+```
+
+当按能力键为空时，两者均回退到 `web.backend`。当 `web.backend` 也为空时，后端根据存在的 API 密钥/URL 自动检测。
+
+**优先级顺序（按能力）：**
+1. `web.search_backend` / `web.extract_backend`（显式按能力配置）
+2. `web.backend`（共享回退）
+3. 从环境变量自动检测
+
+### 自动检测
+
+如果未显式配置后端，Hermes 根据已设置的凭证选择第一个可用的后端：
+
+| 存在的凭证 | 自动选择的后端 |
+|--------------------|-----------------------|
+| `FIRECRAWL_API_KEY` 或 `FIRECRAWL_API_URL` | firecrawl |
+| `PARALLEL_API_KEY` | parallel |
+| `TAVILY_API_KEY` | tavily |
+| `EXA_API_KEY` | exa |
+| `SEARXNG_URL` | searxng |
+
+xAI Web Search **不在**自动检测链中——设置了 `XAI_API_KEY`（或通过 xAI Grok OAuth 登录）不会自动将网页流量路由至 xAI，因为这些凭证同时用于推理/TTS/图像生成，用户可能希望为网页使用不同的后端。请通过 `web.backend: "xai"` 显式启用。
+
+---
+
+## 验证设置
+
+运行 `hermes setup` 查看检测到的网页后端：
+
+```
+✅ Web Search & Extract (searxng)
+```
+
+或通过 CLI 检查：
+
+```bash
+# 激活 venv 并直接运行网页工具模块
+source ~/.hermes/hermes-agent/.venv/bin/activate
+python -m tools.web_tools
+```
+
+这将打印活动后端及其状态：
+
+```
+✅ Web backend: searxng
+   Using SearXNG (search only): http://localhost:8888
+```
+
+---
+
+## 故障排查
+
+### `web_search` 返回 `{"success": false}`
+
+- 检查 `SEARXNG_URL` 是否可达：`curl -s "http://localhost:8888/search?q=test&format=json"`
+- 如果收到 HTTP 403，说明 JSON 格式已禁用——在 `settings.yml` 的 `formats` 列表中添加 `json` 并重启
+- 如果收到连接错误，容器可能未运行：`docker ps | grep searxng`
+
+### `web_extract` 提示"search-only backend"
+
+SearXNG 无法提取 URL 内容。将 `web.extract_backend` 设置为支持提取的提供商：
+
+```yaml
+web:
+  search_backend: "searxng"
+  extract_backend: "firecrawl"  # 或 tavily / exa / parallel
+```
+
+### SearXNG 返回 0 条结果
+
+部分公共实例禁用了某些搜索引擎或分类。请尝试：
+- 换一个查询词
+- 从 [searx.space](https://searx.space/) 换一个公共实例
+- 自托管实例以获得稳定结果
+
+### 公共实例遭遇速率限制
+
+切换到自托管实例（参见上方[方案 A](#option-a--self-host-with-docker-recommended)）。使用 Docker，您自己的实例没有速率限制。
+
+### `web_extract` 返回截断内容并附有 `[TRUNCATED]` 尾注
+
+对于超出字符预算的页面这是预期行为。尾注会给出保存完整干净文本的磁盘文件，以及分页读取被省略中间部分的确切 `read_file` 调用。若要内联查看更多内容，请在 `config.yaml` 中调大 `web.extract_char_limit`，或在调用时传入更大的 `char_limit`。
+
+---
+
+## 可选技能：`searxng-search`
+
+对于需要直接通过 `curl` 使用 SearXNG 的 agent（例如作为网页工具集不可用时的回退），请安装 `searxng-search` 可选技能：
+
+```bash
+hermes skills install official/research/searxng-search
+```
+
+这将添加一个技能，教 agent 如何：
+- 通过 `curl` 或 Python 调用 SearXNG JSON API
+- 按分类筛选（`general`、`news`、`science` 等）
+- 处理分页和错误情况
+- 在 SearXNG 不可达时优雅降级
+
+
+=== ARCHIVO: .\hermes-agent\website\i18n\zh-Hans\docusaurus-plugin-content-docs\current\user-guide\features\x-search.md ===
+---
+title: X (Twitter) 搜索
+description: 使用 xAI 内置的 x_search Responses 工具在 agent 内搜索 X (Twitter) 帖子和话题串——支持 SuperGrok OAuth 登录或 XAI_API_KEY。
+sidebar_label: X (Twitter) 搜索
+sidebar_position: 7
+---
+
+# X (Twitter) 搜索
+
+`x_search` 工具让 agent 可以直接搜索 X (Twitter) 的帖子、账号和话题串。其底层依托 xAI 在 Responses API（`https://api.x.ai/v1/responses`）上内置的 `x_search` 工具——Grok 在服务端执行搜索，并返回带有原始帖子引用的综合结果。
+
+**当你明确需要 X 上的当前讨论、反应或观点时，请使用此工具而非 `web_search`。** 对于一般网页内容，继续使用 `web_search` / `web_extract`。
+
+## 认证
+
+满足以下**任一** xAI 凭据路径时，`x_search` 即会注册：
+
+| 凭据 | 来源 | 配置方式 |
+|------|------|---------|
+| **SuperGrok / X Premium+ OAuth**（推荐） | 在 `accounts.x.ai` 浏览器登录，自动刷新 | `hermes auth add xai-oauth` — 参见 [xAI Grok OAuth (SuperGrok / X Premium+)](../../guides/xai-grok-oauth.md) |
+| **`XAI_API_KEY`** | 付费 xAI API 密钥 | 在 `~/.hermes/.env` 中设置 |
+
+两者使用相同的 endpoint 和相同的请求体，区别仅在于 bearer token。**当两者同时配置时，SuperGrok OAuth 优先**，x_search 将消耗你的订阅配额而非付费 API 用量。
+
+工具的 `check_fn` 在每次重建模型工具列表时都会运行 xAI 凭据解析器。返回 `True` 表示 bearer token 可获取、非空，且（若已过期）已成功刷新。刷新失败的已撤销 token 会将该工具从 schema 中隐藏，模型将无法感知其存在。
+
+## 启用工具
+
+当 xAI 凭据（OAuth token 或 `XAI_API_KEY`）存在时自动启用。如不需要，可通过 `hermes tools` → Search → x_search 显式禁用。
+
+```bash
+hermes tools
+# → 🐦 X (Twitter) Search   (press space to toggle on)
+```
+
+选择器提供两种凭据选项：
+
+1. **xAI Grok OAuth (SuperGrok / Premium+)** — 若尚未登录，将打开浏览器跳转至 `accounts.x.ai`
+2. **xAI API key** — 提示输入 `XAI_API_KEY`
+
+任一选项均可满足门控条件。你可以使用已有的任意凭据，工具行为完全相同。若两者均已配置，调用时 OAuth 优先。
+
+## 配置
+
+```yaml
+# ~/.hermes/config.yaml
+x_search:
+  # 用于 Responses 调用的 xAI 模型。
+  # grok-4.5 是推荐的默认值；任何支持
+  # x_search 工具访问权限的 Grok 模型均可使用。
+  model: grok-4.5
+
+  # 可选推理强度：low、medium、high 或 xhigh。省略时使用所选模型的默认值。
+  # xhigh 仅适用于明确支持它的模型，例如 grok-4.20-multi-agent。
+  # reasoning_effort: low
+
+  # 请求超时时间（秒）。复杂查询的 x_search 可能需要 60–120 秒，
+  # 默认值较为宽松。最小值：30。
+  timeout_seconds: 180
+
+  # 遇到 5xx / ReadTimeout / ConnectionError 时的自动重试次数。
+  # 每次重试按指数退避（1.5 倍尝试秒数，上限 5 秒）。
+  retries: 2
+```
+
+`reasoning_effort` 会以 `reasoning: {effort: ...}` 的形式发送到 xAI
+Responses API。不支持可配置推理的模型应留空。无效值会在发起 API 请求前失败。
+
+## 工具参数
+
+agent 调用 `x_search` 时使用以下参数：
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `query` | string（必填） | 在 X 上要查找的内容。 |
+| `allowed_x_handles` | string 数组 | 可选，**仅**包含指定账号的列表（最多 10 个）。前缀 `@` 会被自动去除。 |
+| `excluded_x_handles` | string 数组 | 可选，要排除的账号列表（最多 10 个）。与 `allowed_x_handles` 互斥。 |
+| `from_date` | string | 可选，`YYYY-MM-DD` 格式的起始日期。 |
+| `to_date` | string | 可选，`YYYY-MM-DD` 格式的结束日期。 |
+| `enable_image_understanding` | boolean | 让 xAI 分析匹配帖子中附带的图片。 |
+| `enable_video_understanding` | boolean | 让 xAI 分析匹配帖子中附带的视频。 |
+
+工具返回的 JSON 包含：
+
+- `answer` — Grok 生成的综合文本回答
+- `citations` — Responses API 顶层字段返回的引用
+- `inline_citations` — 从消息正文中提取的 `url_citation` 注释（每条包含 `url`、`title`、`start_index`、`end_index`）
+- `degraded` — 当设置了任意缩小范围的过滤器（`allowed_x_handles`、`excluded_x_handles`、`from_date`、`to_date`）且两个引用渠道均返回空时为 `true`。此时 `answer` 是基于模型自身知识合成的，而非来自 X 索引，应视为无来源内容。否则为 `false`（包括"未设置过滤器"的情况——宽泛的无来源回答只是一个回答，而非过滤器未命中）
+- `degraded_reason` — 列出哪些过滤器处于激活状态的简短字符串，当 `degraded` 为 `false` 时为 `null`
+- `credential_source` — OAuth 解析成功时为 `"xai-oauth"`，API 密钥解析成功时为 `"xai"`
+- `model`、`query`、`provider`、`tool`、`success`
+
+### 日期验证
+
+`from_date` / `to_date` 在发起 HTTP 调用前会在客户端进行验证：
+
+- 若提供，两者均须能解析为 `YYYY-MM-DD` 格式。
+- 当两者同时设置时，`from_date` 必须不晚于 `to_date`。
+- `from_date` 不得晚于今天（UTC）——尚未开始的时间窗口内不可能存在帖子，调用必然返回零引用。
+- `to_date` 允许为未来日期（调用方可能合理地请求"从昨天到明天"以捕获即将发布的帖子）。
+
+验证失败会以结构化的 `{"error": "..."}` 工具结果返回，不会向 xAI 发起 HTTP 调用。
+
+## 示例
+
+与 agent 对话：
+
+> X 上的人们对新的 Grok 图像功能有什么看法？重点关注 @xai 的回应。
+
+agent 将：
+
+1. 以 `query="reactions to new Grok image features"`、`allowed_x_handles=["xai"]` 调用 `x_search`
+2. 获取综合回答及指向具体帖子的引用列表
+3. 回复包含答案和参考来源
+
+## 故障排查
+
+### "No xAI credentials available"
+
+当两种认证路径均失败时，工具会显示此错误。请在 `~/.hermes/.env` 中设置 `XAI_API_KEY`，或运行 `hermes auth add xai-oauth` 并完成浏览器登录。然后重启会话，让 agent 重新加载工具注册表。
+
+### "`x_search` is not enabled for this model"
+
+配置的 `x_search.model` 没有访问服务端 `x_search` 工具的权限。请切换至 `grok-4.5`（默认值）或其他支持该工具的 Grok 模型。当前支持列表请查阅 [xAI 文档](https://docs.x.ai/)。
+
+### 工具未出现在 schema 中
+
+可能有两个原因：
+
+1. **工具集未启用。** 运行 `hermes tools`，确认 `🐦 X (Twitter) Search` 已勾选。
+2. **无 xAI 凭据。** `check_fn` 返回 False，schema 保持隐藏。运行 `hermes auth status` 确认 xai-oauth 登录状态，并检查 `XAI_API_KEY` 是否已设置（如使用 API 密钥路径）。
+
+### `degraded: true` — 回答无引用来源
+
+当你使用了 `allowed_x_handles`、`excluded_x_handles` 或日期范围，且响应返回 `degraded: true` 时，说明 xAI 的 X 索引未找到匹配帖子，但 Grok 仍基于自身训练数据生成了综合回答。该回答无来源支撑——请勿将其视为真实的 X 内容。
+
+值得排查的原因：
+
+- **账号名拼写错误。** 去掉 `@`，仔细核对拼写，并确认该账号存在。
+- **日期范围过窄**，或滑过了今日帖子；请扩大范围后重试。
+- **xAI 索引缺口。** 部分活跃账号即使定期发帖，也会间歇性地无法在 `x_search` 中出现。请等待几分钟后重试，或在需要精确获取某账号时间线时使用 `xurl` 技能直接调用 X API。
+
+## 另请参阅
+
+- [xAI Grok OAuth (SuperGrok / Premium+)](../../guides/xai-grok-oauth.md) — OAuth 配置指南
+- [Web 搜索与提取](web-search.md) — 用于一般（非 X）网页搜索
+- [工具参考](../../reference/tools-reference.md) — 完整工具目录

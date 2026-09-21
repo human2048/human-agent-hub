@@ -1,0 +1,359 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_hosted_room_settled_retry.py ===
+"""Deferred results survive discussion and bounded-transcript cleanup."""
+
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from gateway import hosted_room_driver as driver, hosted_rooms
+from tui_gateway.hosted_room_service import HostedRoomService
+
+
+@pytest.mark.parametrize("later_messages", [0, 25])
+def test_settled_discussion_retry_publishes_once(tmp_path, monkeypatch, later_messages):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    (tmp_path / ".hermes" / "profiles" / "reviewer").mkdir(parents=True)
+    (tmp_path / ".hermes" / "profiles" / "reviewer" / "config.yaml").write_text("{}\n")  # identity marker
+    server = SimpleNamespace(_methods={}, _sessions={}, _sessions_lock=threading.Lock())
+    service = HostedRoomService(server, db_path=tmp_path / ".hermes" / "state.db")
+    service.create_room(room_id="room", name="Room", members=[
+        {"member_id": "worker", "profile": "default", "handle": "worker"},
+        {"member_id": "reviewer", "profile": "reviewer", "handle": "reviewer"},
+    ])
+    service.send(room_id="room", event_id="source", payload={"text": "Review", "thread_id": "thread"})
+    binding = service.bindings()[0]
+    task = driver.list_tasks(service.db_path, room_id="room", status="queued")[0]
+    now = [time.time()]
+    clock = lambda: now[0]
+    service.runtime.clock = clock
+    old = driver.acquire_lease(
+        service.db_path, room_id="room", gateway_id=binding.gateway_id, authority_epoch=1,
+        process_generation="old", ttl_seconds=1, clock=clock)
+    driver.start_task(service.db_path, task["identity"], old, expected_cancel_generation=0, clock=clock)
+    now[0] += 2
+    lease = service.runtime._ensure_lease(binding)
+    driver.recover_room(service.db_path, lease, clock=clock)
+    driver.defer_indeterminate_task(
+        service.db_path, task["identity"], lease, expected_execution_generation=1,
+        expected_cancel_generation=0, reason="member_unavailable", clock=clock)
+    service.prepare_room(binding)
+    reviewer = driver.list_tasks(service.db_path, room_id="room", status="queued")[0]
+    attempt = driver.start_task(
+        service.db_path, reviewer["identity"], lease, expected_cancel_generation=0, clock=clock)
+    driver.settle_task(service.db_path, attempt, settlement_id="pass", status="settled",
+                       result={"text": "PASS"}, clock=clock)
+    service.prepare_room(binding)
+    assert [e["kind"] for e in service._events("room")] == [
+        "message.user", "turn.deferred", "turn.settled", "room.activity"]
+    for index in range(later_messages):
+        hosted_rooms.append_event(
+            service.db_path, room_id="room", event_id=f"later-{index}", kind="message.user",
+            actor={"kind": "user", "id": "test"},
+            payload={"text": "Later", "thread_id": "thread"},
+            authority_gateway_id=binding.gateway_id, authority_epoch=1)
+    service._policy_snapshot(hosted_rooms.room_state(service.db_path, room_id="room"))
+    assert service.retry_room_task("room", task_id=task["identity"].task_id)["status"] == "queued"
+    attempt = driver.start_task(
+        service.db_path, task["identity"], lease, expected_cancel_generation=0, clock=clock)
+    driver.settle_task(service.db_path, attempt, settlement_id="retry", status="settled",
+                       result={"text": "Recovered answer"}, clock=clock)
+    service.prepare_room(binding)
+    restarted = HostedRoomService(server, db_path=service.db_path)
+    for _ in range(2):
+        restarted.prepare_room(binding)
+    events = restarted._events("room")
+    assert sum(e["kind"] == "message.member" and e["payload"].get("text") == "Recovered answer"
+               for e in events) == (0 if later_messages else 1)
+    terminal = [e for e in events if e["kind"] in {"turn.settled", "turn.cancelled"}
+                and e["payload"].get("task_id") == task["identity"].task_id]
+    assert len(terminal) == 1
+    if later_messages:
+        assert terminal[0]["payload"]["reason"] == "superseded_by_newer_user_event"
+    assert restarted.policy_checkpoint.publication_exists(
+        room_id="room", task_id=task["identity"].task_id, status="settled", execution_generation=2)
+    for event_id in ("next", "after-stop"):
+        assert restarted.send(room_id="room", event_id=event_id,
+                              payload={"text": "Continue", "thread_id": "thread"})["event_id"] == event_id
+        restarted.stop_room("room", cancel_id=f"stop-{event_id}")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_hosted_room_turn_slot_release.py ===
+"""A hosted room member turn releases the profile's ``bot_room`` active-session slot when it ends.
+
+Room turns are serialized by the room driver's lease, not by the per-profile active-session
+registry. When two room workers share one home (messaging gateway + Desktop ``serve``), a slot
+held past the turn by the worker that drove turn 1 made every later worker's turn for that
+member fail with ``Refused active session … already held by pid=…`` until the first process
+exited (#106847). Ordinary sessions keep their slot for the life of the live session.
+"""
+
+from __future__ import annotations
+
+import threading
+import types
+
+from tui_gateway import server
+from tui_gateway.hosted_room_driver import ROOM_SESSION_SOURCE
+
+
+class _InlineThread:
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+class _Lease:
+    track_liveness = False
+    enabled = True
+
+    def __init__(self):
+        self.released = False
+
+    def release(self):
+        self.released = True
+
+
+def _session(source: str, lease: _Lease):
+    agent = types.SimpleNamespace(
+        session_id="agent-sid-1", run_conversation=lambda *a, **k: {"final_response": "done"},
+        clear_interrupt=lambda: None)
+    return {
+        "agent": agent, "agent_error": None, "session_key": "gw-session-key", "history": [],
+        "history_lock": threading.RLock(), "history_version": 0, "running": True, "attached_images": [],
+        "image_counter": 0, "cols": 80, "slash_worker": None, "show_reasoning": False,
+        "tool_progress_mode": "all", "inflight_turn": None, "source": source, "active_session_lease": lease}
+
+
+def _turn_env(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_emit", lambda event_type, sid, payload=None: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+
+
+def test_hosted_room_turn_releases_bot_room_slot_when_it_ends(monkeypatch, tmp_path):
+    _turn_env(monkeypatch, tmp_path)
+    lease = _Lease()
+    session = _session(ROOM_SESSION_SOURCE, lease)
+
+    assert server._run_prompt_submit("rid", "ui-sid", session, "@sentinel ping") is True
+
+    assert session["running"] is False
+    assert lease.released is True
+    assert "active_session_lease" not in session
+
+
+def test_ordinary_session_keeps_its_slot_after_a_turn(monkeypatch, tmp_path):
+    """Control: a Desktop-driven session's exclusivity is the slot itself — it must survive the turn."""
+    _turn_env(monkeypatch, tmp_path)
+    lease = _Lease()
+    session = _session("desktop", lease)
+
+    assert server._run_prompt_submit("rid", "ui-sid", session, "hello") is True
+
+    assert lease.released is False
+    assert session["active_session_lease"] is lease
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tui_gateway\test_hosted_room_two_gateway_scoped.py ===
+"""Scoped grant UAT: home service to a real peer API adapter, no Desktop."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+
+from gateway.config import PlatformConfig
+from gateway.hosted_rooms import local_authority_gateway_id
+from gateway.platforms.api_server import APIServerAdapter
+from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient
+from tui_gateway.hosted_room_peer_transport import PeerMemberRoute
+from tui_gateway.hosted_room_service import HostedRoomService
+
+
+class _LocalRPC:
+    def resolve_exact(self, **kwargs):
+        return None
+
+    def create(self, **kwargs):
+        return {"session_id": "local-session"}
+
+    def resume(self, **kwargs):
+        return {"session_id": kwargs["session_id"]}
+
+    def submit(self, **kwargs):
+        kwargs["on_terminal"]({"status": "settled", "text": "local reply"})
+        return {"accepted": True}
+
+    def history(self, **kwargs):
+        return []
+
+    def info(self, **kwargs):
+        return {"active": False, "task_id": None}
+
+    def interrupt(self, **kwargs):
+        return {"interrupted": True}
+
+
+def _server_module():
+    return SimpleNamespace(_methods={}, _sessions={}, _sessions_lock=threading.Lock())
+
+
+def _target_app(adapter):
+    app = web.Application()
+    app.router.add_post(
+        "/v1/room-members/invitations",
+        adapter._handle_room_member_invitation,
+    )
+    app.router.add_get(
+        "/v1/room-members/capabilities",
+        adapter._handle_room_member_capabilities,
+    )
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    return app
+
+
+@pytest.mark.asyncio
+async def test_in_process_scoped_transport_contract_finishes_headlessly(
+    tmp_path: Path,
+):
+    target = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "target-peer-key-1234567890"})
+    )
+    target._run_idempotency_store.close()
+    from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+
+    target._run_idempotency_store = RunIdempotencyStore(
+        str(tmp_path / "target-runs.db")
+    )
+    server = TestServer(_target_app(target))
+    await server.start_server()
+    client = PeerRunsHTTPClient(
+        base_url=str(server.make_url("")).rstrip("/"),
+        api_key="target-peer-key-1234567890",
+    )
+    home_install_id = local_authority_gateway_id()
+    invitation = await asyncio.to_thread(
+        client.issue_invitation,
+        room_id="room-1",
+        home_install_id=home_install_id,
+        authority_gateway_id=home_install_id,
+        authority_epoch=1,
+        member_id="member-peer",
+        grant_id="grant-room-1",
+    )
+    catalog = invitation["catalog"]
+    probe = await asyncio.to_thread(
+        client.probe,
+        grant=invitation["grant"],
+    )
+    assert probe["catalog"] == catalog
+    route = PeerMemberRoute(
+        home_install_id=home_install_id,
+        member_id="member-peer",
+        target_install_id=catalog["installation_id"],
+        target_profile="default",
+        capability_digest=catalog["catalog_digest"],
+        execution_policy_digest=catalog["execution_policy"]["policy_digest"],
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant=invitation["grant"],
+    )
+    home = HostedRoomService(
+        _server_module(),
+        db_path=tmp_path / "home-state.db",
+        peer_routes={("room-1", "member-peer"): route},
+        peer_clients={catalog["installation_id"]: client},
+    )
+    home.rpc = _LocalRPC()
+    home.runtime.rpc = home.rpc
+    home.local_profiles = lambda: ("local",)
+    home.create_room(
+        room_id="room-1",
+        name="Scoped room",
+        members=[
+            {"member_id": "local", "profile": "local", "handle": "local"},
+            {
+                "member_id": "member-peer",
+                "profile": "default",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-target",
+                    "installation_id": catalog["installation_id"],
+                    "profile": "default",
+                    "capability_digest": catalog["catalog_digest"],
+                },
+            },
+        ],
+    )
+
+    agent = MagicMock()
+    agent.run_conversation.return_value = {
+        "final_response": "Scoped peer response."
+    }
+    agent.session_prompt_tokens = agent.session_completion_tokens = (
+        agent.session_total_tokens
+    ) = 0
+    with patch.object(target, "_create_agent", return_value=agent):
+        home.start()
+        home.send(
+            room_id="room-1",
+            event_id="user-1",
+            payload={"text": "@reviewer inspect", "thread_id": "thread-1"},
+        )
+        deadline = asyncio.get_running_loop().time() + 5
+        while asyncio.get_running_loop().time() < deadline:
+            if any(
+                event["kind"] == "message.member"
+                for event in home._events("room-1")
+            ):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError(
+                "peer reply was not published: "
+                f"status={home.runtime.status()} events={home._events('room-1')}"
+            )
+        assert home.stop(timeout=5.0)
+
+    reply = next(
+        event
+        for event in home._events("room-1")
+        if event["kind"] == "message.member"
+    )
+    assert reply["payload"]["text"] == "Scoped peer response."
+    assert reply["actor"]["connection_id"] == "peer-target"
+    await server.close()
+    target._run_idempotency_store.close()
+

@@ -1,0 +1,363 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_hook_output_spill.py ===
+"""Tests for tools.hook_output_spill."""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tools import hook_output_spill as hos
+
+
+class GetSpillConfigTests(unittest.TestCase):
+    def test_defaults_when_no_config(self):
+        with patch.object(hos, "load_config", create=True, return_value={}):
+            # load_config is resolved at call time via local import;
+            # patch the module's source instead.
+            pass
+        with patch("hermes_cli.config.load_config", return_value={}):
+            cfg = hos.get_spill_config()
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["max_chars"], hos.DEFAULT_MAX_CHARS)
+        self.assertEqual(cfg["preview_head"], hos.DEFAULT_PREVIEW_HEAD)
+        self.assertEqual(cfg["preview_tail"], hos.DEFAULT_PREVIEW_TAIL)
+        self.assertIsNone(cfg["directory"])
+
+
+    def test_load_config_exception_is_swallowed(self):
+        with patch("hermes_cli.config.load_config", side_effect=RuntimeError("bad")):
+            cfg = hos.get_spill_config()
+        self.assertEqual(cfg["max_chars"], hos.DEFAULT_MAX_CHARS)
+        self.assertTrue(cfg["enabled"])
+
+
+class SpillIfOversizedTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="hermes-spill-test-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _cfg(self, **overrides):
+        base = {
+            "enabled": True,
+            "max_chars": 100,
+            "preview_head": 20,
+            "preview_tail": 20,
+            "directory": self.tmpdir,
+        }
+        base.update(overrides)
+        return base
+
+    def test_empty_and_none_are_noops(self):
+        self.assertEqual(hos.spill_if_oversized("", config=self._cfg()), "")
+        self.assertEqual(hos.spill_if_oversized(None, config=self._cfg()), "")
+
+    def test_text_under_cap_is_unchanged(self):
+        small = "x" * 50
+        self.assertEqual(hos.spill_if_oversized(small, config=self._cfg()), small)
+
+
+    def test_default_directory_uses_hermes_home(self):
+        """When no directory override, spill under HERMES_HOME/hook_outputs."""
+        test_home = tempfile.mkdtemp(prefix="hermes-home-")
+        try:
+            with patch.dict(os.environ, {"HERMES_HOME": test_home}):
+                # Also patch get_hermes_home to the env var to mirror production.
+                cfg = self._cfg(directory=None, max_chars=5)
+                hos.spill_if_oversized("x" * 200, session_id="sess", config=cfg)
+            # Spill directory exists somewhere under test_home OR default
+            # ~/.hermes/hook_outputs depending on get_hermes_home behaviour.
+            candidates = [
+                Path(test_home) / "hook_outputs" / "sess",
+                Path(os.path.expanduser("~/.hermes/hook_outputs/sess")),
+            ]
+            # At least one of the candidate dirs now exists and has a file.
+            existing = [c for c in candidates if c.is_dir() and list(c.iterdir())]
+            self.assertTrue(existing, f"No spill dir found in {candidates}")
+        finally:
+            import shutil
+            shutil.rmtree(test_home, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_hub_lock_non_utf8.py ===
+"""Regression test for #68053 — hub lock.json with Windows-1252 bytes.
+
+`_read_hub_installed_names()` reads `~/.hermes/skills/.hub/lock.json` with a
+strict UTF-8 decode. A hub skill description carrying a Windows-1252 typographic
+byte (em-dash `0x97`, smart quotes, bullets) makes `read_text(encoding="utf-8")`
+raise `UnicodeDecodeError` — a `ValueError` sibling that is NOT caught by the
+function's `except (OSError, json.JSONDecodeError)`, so it escapes and returns
+HTTP 500 from the entire `/api/skills` endpoint, blanking the desktop Skills
+panel. The fix decodes with `errors="replace"`, so the offending byte degrades
+to U+FFFD and every skill name in the (structurally valid) lock stays readable.
+"""
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def skills_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "skills").mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import tools.skill_usage as mod
+    importlib.reload(mod)
+    return home
+
+
+def _write_hub_lock(home: Path, raw: bytes) -> None:
+    hub_dir = home / "skills" / ".hub"
+    hub_dir.mkdir(parents=True, exist_ok=True)
+    (hub_dir / "lock.json").write_bytes(raw)
+
+
+def test_windows_1252_em_dash_does_not_raise(skills_home):
+    """A 0x97 em-dash byte in a description must not blow up the reader."""
+    import tools.skill_usage as mod
+
+    # Valid JSON structure, but the description value contains a raw cp1252
+    # em-dash byte (0x97) instead of the UTF-8 sequence.
+    raw = (
+        b'{"installed": {"supply-chain": '
+        b'{"description": "guidance: safe \x97 3 finding(s)"}}}'
+    )
+    _write_hub_lock(skills_home, raw)
+
+    names = mod._read_hub_installed_names()
+
+    # The skill name is still recovered; no UnicodeDecodeError / 500.
+    assert "supply-chain" in names
+
+
+def test_clean_utf8_lock_still_read(skills_home):
+    """A well-formed UTF-8 lock keeps working unchanged."""
+    import tools.skill_usage as mod
+
+    raw = '{"installed": {"alpha": {}, "beta": {}}}'.encode("utf-8")
+    _write_hub_lock(skills_home, raw)
+
+    names = mod._read_hub_installed_names()
+
+    assert {"alpha", "beta"} <= names
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_image_generate_schema.py ===
+"""image_generate dynamic schema — capability-gated params (#95681 diet).
+
+Contract: args the active model cannot honor are NOT advertised. Coverage
+is guaranteed two ways — every in-tree FAL catalog entry must declare the
+capability keys the schema builder reads (test below fails when a new
+model is added without them), and the plugin provider ABC's capabilities()
+default fails closed to text-only/no-upscale.
+"""
+import json
+import os
+import sys
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+import tools.image_generation_tool as ig
+from tools.image_generation_tool import (
+    FAL_MODELS,
+    IMAGE_GENERATE_SCHEMA,
+    _build_dynamic_image_schema,
+)
+
+
+class TestCatalogCapabilityCoverage(unittest.TestCase):
+    """Every FAL catalog entry must carry what the schema builder reads."""
+
+    def test_every_model_declares_capability_keys(self):
+        for model_id, meta in FAL_MODELS.items():
+            with self.subTest(model=model_id):
+                # upscale default flag must be present and boolean.
+                self.assertIn("upscale", meta, model_id)
+                self.assertIsInstance(meta["upscale"], bool, model_id)
+                # Edit-capable models must cap their reference images.
+                if meta.get("edit_endpoint"):
+                    self.assertIn("max_reference_images", meta, model_id)
+                    self.assertGreaterEqual(
+                        int(meta["max_reference_images"]), 1, model_id,
+                    )
+
+    def test_provider_abc_default_fails_closed(self):
+        from agent.image_gen_provider import ImageGenProvider
+
+        caps_src = ImageGenProvider.capabilities
+        # Instantiate via a minimal concrete subclass.
+        class _P(ImageGenProvider):
+            name = "t"
+            display_name = "T"
+            def generate(self, prompt, aspect_ratio="landscape", **kw):
+                return {}
+            def list_models(self):
+                return []
+        caps = _P().capabilities()
+        self.assertEqual(caps.get("modalities"), ["text"])
+        self.assertFalse(caps.get("supports_upscale", False))
+
+    def test_every_intree_plugin_declares_what_it_implements(self):
+        """Fleet-wide declaration ⇄ implementation contract (maintainer
+        requirement: EVERY provider combo must carry capability info).
+
+        For each in-tree image_gen plugin: if its generate() source
+        implements an upscale pass, capabilities() must declare
+        supports_upscale — and vice versa, so a stale declaration can't
+        advertise an upscale that silently no-ops. modalities and
+        max_reference_images must always be declared."""
+        import ast
+        import pathlib
+
+        plugins_dir = (pathlib.Path(__file__).resolve().parents[2]
+                       / "plugins" / "image_gen")
+        assert plugins_dir.is_dir(), plugins_dir
+        checked = 0
+        for plugin in sorted(plugins_dir.iterdir()):
+            src_file = plugin / "__init__.py"
+            if not src_file.is_file():
+                continue
+            src = src_file.read_text(encoding="utf-8")
+            if "def capabilities" not in src:
+                continue
+            checked += 1
+            with self.subTest(provider=plugin.name):
+                # capabilities() must declare the two mandatory axes.
+                self.assertIn("modalities", src, plugin.name)
+                self.assertIn("max_reference_images", src, plugin.name)
+                # upscale: declaration ⇄ implementation, both directions.
+                declares = "supports_upscale" in src
+                # Implementation = generate() (or its helpers in the same
+                # file) reads the upscale kwarg directly, or passes it
+                # through in a delegation whitelist (fal plugin → in-tree
+                # Clarity chain).
+                implements = ('kwargs.get("upscale")' in src
+                              or "upscale_requested" in src
+                              or 'kwargs["upscale"]' in src
+                              or "def _upscale" in src
+                              or '"upscale",' in src)
+                self.assertEqual(
+                    declares, implements,
+                    f"{plugin.name}: supports_upscale declaration "
+                    f"({declares}) != implementation ({implements}) — "
+                    "declare it in capabilities() iff generate() honors it",
+                )
+        # The audit must actually have covered the fleet.
+        self.assertGreaterEqual(checked, 6, "plugin sweep found too few providers")
+
+
+class TestDynamicParamGating(unittest.TestCase):
+    def _schema_for(self, model_id):
+        with patch.object(ig, "_resolve_fal_model",
+                          return_value=(model_id, FAL_MODELS[model_id])), \
+             patch.object(ig, "_read_configured_image_provider",
+                          return_value=None):
+            return _build_dynamic_image_schema()
+
+    def _t2i_only(self):
+        return next(m for m, meta in FAL_MODELS.items()
+                    if not meta.get("edit_endpoint"))
+
+    def _edit_multi_ref(self):
+        return next(m for m, meta in FAL_MODELS.items()
+                    if meta.get("edit_endpoint")
+                    and int(meta.get("max_reference_images") or 0) > 1)
+
+    def test_t2i_only_model_hides_edit_args(self):
+        schema = self._schema_for(self._t2i_only())
+        props = schema["parameters"]["properties"]
+        self.assertNotIn("image_url", props)
+        self.assertNotIn("reference_image_urls", props)
+        self.assertIn("cannot edit", schema["description"])
+
+    def test_edit_model_advertises_edit_args_with_cap(self):
+        model = self._edit_multi_ref()
+        schema = self._schema_for(model)
+        props = schema["parameters"]["properties"]
+        self.assertIn("image_url", props)
+        self.assertIn("reference_image_urls", props)
+        self.assertEqual(
+            props["reference_image_urls"]["maxItems"],
+            int(FAL_MODELS[model]["max_reference_images"]),
+        )
+
+    def test_fal_always_advertises_upscale(self):
+        # Clarity Upscaler chains for any FAL model on explicit request.
+        for model in (self._t2i_only(), self._edit_multi_ref()):
+            schema = self._schema_for(model)
+            self.assertIn("upscale", schema["parameters"]["properties"], model)
+
+    def test_text_only_plugin_provider_hides_edit_and_upscale(self):
+        class _Prov:
+            display_name = "Codex Images"
+            def capabilities(self):
+                return {"modalities": ["text"], "max_reference_images": 0}
+            def default_model(self):
+                return "img-1"
+        with patch.object(ig, "_read_configured_image_provider",
+                          return_value="codex"), \
+             patch("agent.image_gen_registry.get_provider",
+                   return_value=_Prov()), \
+             patch("hermes_cli.plugins._ensure_plugins_discovered"):
+            schema = _build_dynamic_image_schema()
+        props = schema["parameters"]["properties"]
+        self.assertEqual(sorted(props), ["aspect_ratio", "prompt"])
+        self.assertNotIn("upscale", props)
+
+    def test_managed_krea_model_advertises_krea_edit_args_and_upscale(self):
+        """provider nous + a Krea model id is served by the Krea gateway, so the
+        schema must advertise what the Krea plugin declares, not the FAL catalog."""
+        from plugins.image_gen.krea import KreaImageGenProvider
+
+        with patch.object(ig, "_read_configured_image_provider",
+                          return_value="nous"), \
+             patch.object(ig, "_read_configured_image_model",
+                          return_value="krea-2-medium"):
+            schema = _build_dynamic_image_schema()
+        props = schema["parameters"]["properties"]
+        self.assertIn("image_url", props)
+        self.assertEqual(
+            props["reference_image_urls"]["maxItems"],
+            KreaImageGenProvider().capabilities()["max_reference_images"],
+        )
+        self.assertIn("upscale", props)
+
+    def test_static_schema_carries_no_capability_args(self):
+        """The registration-time placeholder must stay minimal — dynamic
+        overrides own the capability args (do-not-re-add guard)."""
+        props = IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
+        self.assertEqual(sorted(props), ["aspect_ratio", "prompt"])
+
+    def test_handler_still_rejects_unadvertised_edit_with_teaching_error(self):
+        """Wire compat: image_url on a t2i-only model is accepted by the
+        handler and answered with the capability error (not a schema-level
+        unknown-arg failure). Pin the error text's presence in the source."""
+        import inspect
+        handler_src = inspect.getsource(ig)
+        self.assertIn("capable of image-to-image / editing", handler_src)
+        self.assertIn("omit image_url", handler_src)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

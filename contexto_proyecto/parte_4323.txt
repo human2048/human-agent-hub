@@ -1,0 +1,343 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_subprocess_stdin_guard.py ===
+"""Verify that TUI-context subprocess calls specify stdin=.
+
+This is the pytest wrapper for scripts/check_subprocess_stdin.py.
+It runs as part of the test suite so CI catches regressions when new
+subprocess calls are added without stdin=subprocess.DEVNULL.
+"""
+
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "check_subprocess_stdin.py"
+
+
+def _load_guard():
+    spec = importlib.util.spec_from_file_location("_stdin_guard", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_all_tui_subprocess_calls_have_stdin():
+    """Every subprocess.run/Popen in TUI-context code must set stdin=."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"subprocess stdin= check failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_oauth_setup_token_keeps_inherited_stdin():
+    """The interactive 'claude setup-token' login must NOT be muzzled.
+
+    Forcing stdin=subprocess.DEVNULL here would feed the OAuth prompt EOF and
+    break interactive token setup. A blanket DEVNULL sweep over TUI-context
+    subprocess calls must leave this one inheriting stdin. Regression guard for
+    the over-application caught while salvaging the stdin-EOF fix.
+
+    The call's owner moved from agent/anthropic_adapter.py into
+    agent/anthropic_credentials.py in the adapter godfile split; the guard
+    scans both seams so a future move fails loudly instead of going dark.
+    """
+    candidates = [
+        REPO_ROOT / "agent" / "anthropic_credentials.py",
+        REPO_ROOT / "agent" / "anthropic_adapter.py",
+    ]
+    sources = [p.read_text() for p in candidates if p.exists()]
+    owners = [
+        src for src in sources
+        if 'subprocess.run([claude_path, "setup-token"])' in src
+    ]
+    assert owners, (
+        "interactive setup-token call changed shape or moved; re-verify it "
+        "still inherits stdin (no stdin=subprocess.DEVNULL) and update this "
+        "guard's candidate list"
+    )
+    for src in sources:
+        assert 'subprocess.run([claude_path, "setup-token"], stdin' not in src, (
+            "setup-token must inherit stdin so the user can complete the OAuth "
+            "login prompt; do not add stdin=subprocess.DEVNULL"
+        )
+
+
+def test_inline_noqa_marker_exempts_a_call():
+    """The guard honors an inline 'noqa: subprocess-stdin' exemption marker."""
+    guard = _load_guard()
+    flagged = guard.find_subprocess_calls(
+        "import subprocess\nsubprocess.run(['ls'])\n", "x.py"
+    )
+    assert len(flagged) == 1, "unmarked missing-stdin call should be flagged"
+
+    exempt = guard.find_subprocess_calls(
+        "import subprocess\nsubprocess.run(['ls'])  # noqa: subprocess-stdin\n",
+        "x.py",
+    )
+    assert exempt == [], "inline marker should exempt the call"
+
+
+
+def test_splatted_kwargs_helper_counts_only_when_it_sets_stdin():
+    """``**_KW`` / ``**_kw()`` splats are safe only when the same-file definition sets stdin=."""
+    guard = _load_guard()
+    safe_const = (
+        "import subprocess\n"
+        "_KW = dict(capture_output=True, stdin=subprocess.DEVNULL)\n"
+        "subprocess.run(['ls'], **_KW)\n"
+    )
+    safe_fn = (
+        "import subprocess\n"
+        "def _kw(timeout):\n"
+        "    return dict(timeout=timeout, stdin=subprocess.DEVNULL)\n"
+        "subprocess.run(['ls'], **_kw(3))\n"
+    )
+    unsafe_const = (
+        "import subprocess\n"
+        "_KW = dict(capture_output=True, text=True)\n"
+        "subprocess.run(['ls'], **_KW)\n"
+    )
+    undefined = "import subprocess\nsubprocess.run(['ls'], **_KW)\n"
+    # A later unrelated call passing stdin= must NOT vouch for the splat (reviewer-found false negative
+    # in the 30-line text-window version).
+    unrelated_later = (
+        "import subprocess\n"
+        "kwargs = {'capture_output': True}\n"
+        "subprocess.run(['child'], **kwargs)\n"
+        "subprocess.run(['other'], stdin=subprocess.DEVNULL)\n"
+    )
+    assert guard.find_subprocess_calls(safe_const, "x.py") == []
+    assert guard.find_subprocess_calls(safe_fn, "x.py") == []
+    assert len(guard.find_subprocess_calls(unsafe_const, "x.py")) == 1
+    assert len(guard.find_subprocess_calls(undefined, "x.py")) == 1
+    assert [v["line"] for v in guard.find_subprocess_calls(unrelated_later, "x.py")] == [3]
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_subprocess_utf8_encoding.py ===
+"""Regression test for issue #53428 — subprocess.run(text=True) without
+explicit ``encoding=`` triggers ``UnicodeDecodeError`` on Chinese Windows
+(cp936/GBK default encoding).
+
+PR #55339 covers 21 call sites in ``agent/``, ``gateway/``, ``cli.py``,
+``cron/``, plus 5 more in ``tools/`` and ``hermes_cli/`` (main.py,
+setup.py, tts_tool.py, transcription_tools.py). The two call sites it
+misses — ``hermes_cli/onepassword_secrets_cli.py::_op_whoami`` and
+``_op_version`` — are guarded here.
+
+Without ``encoding=``, ``text=True`` decodes child output with
+``locale.getpreferredencoding(False)`` — cp936 on Chinese Windows —
+which crashes on non-GBK bytes (issues #47939, #53428, #57238).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+
+def _assert_utf8_kwargs(mock_run):
+    """Lift the encoding/errors kwargs out of the mock and assert them."""
+    assert mock_run.called, "subprocess.run was not called"
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs.get("encoding") == "utf-8", (
+        f"subprocess.run called without encoding='utf-8' "
+        f"(got encoding={kwargs.get('encoding')!r}). "
+        f"On Chinese Windows (cp936), text=True without explicit encoding "
+        f"crashes with UnicodeDecodeError on non-GBK bytes. See #53428."
+    )
+    assert kwargs.get("errors") == "replace", (
+        f"subprocess.run called without errors='replace' "
+        f"(got errors={kwargs.get('errors')!r}). encoding='utf-8' alone "
+        f"still raises UnicodeDecodeError on non-UTF-8 bytes emitted by "
+        f"Windows-native CLIs. See #53428."
+    )
+
+
+def test_op_whoami_passes_utf8_encoding(tmp_path):
+    """_op_whoami must pass encoding='utf-8', errors='replace' so op CLI
+    output containing non-ASCII account names doesn't crash on cp936."""
+    from hermes_cli import onepassword_secrets_cli as op_cli
+
+    fake_binary = tmp_path / "op"
+    fake_binary.write_bytes(b"")
+    with patch.object(op_cli.subprocess, "run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="user@example.com", stderr=""
+        )
+        op_cli._op_whoami(fake_binary, account="")
+    _assert_utf8_kwargs(mock_run)
+
+
+def test_op_version_passes_utf8_encoding(tmp_path):
+    """_op_version must pass encoding='utf-8', errors='replace' so op CLI
+    output containing non-ASCII bytes doesn't crash on cp936. Pairs with
+    _op_whoami — both run in the same setup/status CLI flow."""
+    from hermes_cli import onepassword_secrets_cli as op_cli
+
+    fake_binary = tmp_path / "op"
+    fake_binary.write_bytes(b"")
+    with patch.object(op_cli.subprocess, "run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="2.24.0", stderr=""
+        )
+        op_cli._op_version(fake_binary)
+    _assert_utf8_kwargs(mock_run)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_symlink_prefix_confusion.py ===
+"""Tests for the symlink boundary check prefix confusion fix in skills_guard.py.
+
+Regression test: the original check used startswith() without a trailing
+separator, so a symlink resolving to 'axolotl-backdoor/' passed the check
+for 'axolotl/' because the string prefix matched. Now uses
+Path.is_relative_to() which handles directory boundaries correctly.
+"""
+
+import pytest
+from pathlib import Path
+
+
+def _old_check_escapes(resolved: Path, skill_dir_resolved: Path) -> bool:
+    """The BROKEN check that used startswith without separator.
+
+    Returns True when the path is OUTSIDE the skill directory.
+    """
+    return (
+        not str(resolved).startswith(str(skill_dir_resolved))
+        and resolved != skill_dir_resolved
+    )
+
+
+def _new_check_escapes(resolved: Path, skill_dir_resolved: Path) -> bool:
+    """The FIXED check using is_relative_to().
+
+    Returns True when the path is OUTSIDE the skill directory.
+    """
+    return not resolved.is_relative_to(skill_dir_resolved)
+
+
+class TestPrefixConfusionRegression:
+    """The core bug: startswith() can't distinguish directory boundaries."""
+
+    def test_old_check_misses_sibling_with_shared_prefix(self, tmp_path):
+        """Old startswith check fails on sibling dirs that share a prefix."""
+        skill_dir = tmp_path / "skills" / "axolotl"
+        sibling_file = tmp_path / "skills" / "axolotl-backdoor" / "evil.py"
+        skill_dir.mkdir(parents=True)
+        sibling_file.parent.mkdir(parents=True)
+        sibling_file.write_text("evil")
+
+        resolved = sibling_file.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        # Bug: old check says the file is INSIDE the skill dir
+        assert _old_check_escapes(resolved, skill_dir_resolved) is False
+
+
+    def test_both_agree_on_completely_outside_path(self, tmp_path):
+        """Both checks block a path that's completely outside."""
+        skill_dir = tmp_path / "skills" / "axolotl"
+        outside_file = tmp_path / "etc" / "passwd"
+        skill_dir.mkdir(parents=True)
+        outside_file.parent.mkdir(parents=True)
+        outside_file.write_text("root:x:0:0")
+
+        resolved = outside_file.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        assert _old_check_escapes(resolved, skill_dir_resolved) is True
+        assert _new_check_escapes(resolved, skill_dir_resolved) is True
+
+    def test_skill_dir_itself_allowed(self, tmp_path):
+        """Requesting the skill directory itself is fine."""
+        skill_dir = tmp_path / "skills" / "axolotl"
+        skill_dir.mkdir(parents=True)
+
+        resolved = skill_dir.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        # Both should allow the dir itself
+        assert _old_check_escapes(resolved, skill_dir_resolved) is False
+        assert _new_check_escapes(resolved, skill_dir_resolved) is False
+
+
+def _can_symlink():
+    """Check if we can create symlinks (needs admin/dev-mode on Windows)."""
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.write_text("x")
+            lnk = Path(d) / "lnk"
+            lnk.symlink_to(src)
+            return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _can_symlink(), reason="Symlinks need elevated privileges")
+class TestSymlinkEscapeWithActualSymlinks:
+    """Test the full symlink scenario with real filesystem symlinks."""
+
+    def test_symlink_to_sibling_prefix_dir_detected(self, tmp_path):
+        """A symlink from axolotl/ to axolotl-backdoor/ must be caught."""
+        skills = tmp_path / "skills"
+        skill_dir = skills / "axolotl"
+        sibling_dir = skills / "axolotl-backdoor"
+        skill_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+
+        malicious = sibling_dir / "malicious.py"
+        malicious.write_text("evil code")
+
+        link = skill_dir / "helper.py"
+        link.symlink_to(malicious)
+
+        resolved = link.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        # Old check would miss this (prefix confusion)
+        assert _old_check_escapes(resolved, skill_dir_resolved) is False
+        # New check catches it
+        assert _new_check_escapes(resolved, skill_dir_resolved) is True
+
+    def test_symlink_within_skill_dir_allowed(self, tmp_path):
+        """A symlink that stays within the skill directory is fine."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        real_file = skill_dir / "real.py"
+        real_file.write_text("print('ok')")
+        link = skill_dir / "alias.py"
+        link.symlink_to(real_file)
+
+        resolved = link.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        assert _new_check_escapes(resolved, skill_dir_resolved) is False
+
+    def test_symlink_to_parent_dir_blocked(self, tmp_path):
+        """A symlink pointing outside (to parent) is blocked."""
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        outside = tmp_path / "secret.env"
+        outside.write_text("SECRET=123")
+
+        link = skill_dir / "config.env"
+        link.symlink_to(outside)
+
+        resolved = link.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        assert _new_check_escapes(resolved, skill_dir_resolved) is True
+

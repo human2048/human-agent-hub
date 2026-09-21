@@ -1,0 +1,252 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\transports\test_meta_codex_cache.py ===
+"""Tests for Meta api.meta.ai prompt_cache_retention and transport plumbing."""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from agent.transports import get_transport
+from agent.transports.codex import _default_prompt_cache_retention_for_request
+
+
+@pytest.fixture
+def transport():
+    import agent.transports.codex  # noqa: F401
+    return get_transport("codex_responses")
+
+
+class TestMetaRetention:
+    def test_meta_retention_24h(self, transport):
+        kw = transport.build_kwargs(
+            model="muse-spark-1.2",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            base_url="https://api.meta.ai/v1",
+            session_id="test-session",
+        )
+        assert kw.get("prompt_cache_retention") == "24h"
+
+    def test_meta_retention_also_for_generic_model_name(self, transport):
+        for model in ["muse-spark", "meta/muse-spark-1.2-2026-04-01", "gpt-5.4", ""]:
+            kw = transport.build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=[],
+                base_url="https://api.meta.ai/v1",
+                session_id="sid",
+            )
+            assert kw.get("prompt_cache_retention") == "24h", f"model={model!r}"
+
+    def test_meta_retention_helper_direct(self):
+        assert _default_prompt_cache_retention_for_request("muse-spark-1.2", "https://api.meta.ai/v1") == "24h"
+        assert _default_prompt_cache_retention_for_request("muse-spark-1.2", "https://API.META.AI/v1") == "24h"
+        assert _default_prompt_cache_retention_for_request("muse-spark-1.2", "https://api.meta.ai:443/v1") == "24h"
+
+    def test_meta_retention_override_wins(self, transport):
+        kw = transport.build_kwargs(
+            model="muse-spark-1.2",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            base_url="https://api.meta.ai/v1",
+            session_id="sid",
+            request_overrides={"prompt_cache_retention": "in_memory"},
+        )
+        assert kw.get("prompt_cache_retention") == "in_memory"
+
+    def test_non_meta_no_retention(self, transport):
+        kw = transport.build_kwargs(
+            model="muse-spark-1.2",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            base_url="https://generic.example.com/v1",
+            session_id="sid",
+        )
+        assert "prompt_cache_retention" not in kw
+
+    def test_non_meta_no_retention_helper(self):
+        assert _default_prompt_cache_retention_for_request("muse-spark-1.2", "https://generic.example.com/v1") is None
+
+    def test_meta_prompt_cache_key_is_content_addressed(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="muse-spark-1.2",
+            messages=messages,
+            tools=[],
+            base_url="https://api.meta.ai/v1",
+            session_id="cron_job_xxx_20260624_143000",
+        )
+        pck = kw.get("prompt_cache_key", "")
+        assert pck.startswith("pck_")
+        # stable across different cron fire timestamps (same scope)
+        kw2 = transport.build_kwargs(
+            model="muse-spark-1.2",
+            messages=messages,
+            tools=[],
+            base_url="https://api.meta.ai/v1",
+            session_id="cron_job_xxx_20260624_143500",
+        )
+        assert kw["prompt_cache_key"] == kw2["prompt_cache_key"]
+
+    def test_meta_reasoning_effort_passthrough(self, transport):
+        kw = transport.build_kwargs(
+            model="muse-spark-1.2",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            base_url="https://api.meta.ai/v1",
+            session_id="sid",
+            reasoning_config={"effort": "high", "enabled": True},
+        )
+        assert kw.get("reasoning") == {"effort": "high", "summary": "auto"}
+
+    def test_meta_request_hits_responses_plan(self, transport):
+        # Transport api_mode must be codex_responses so conversation_loop hits /v1/responses
+        assert transport.api_mode == "codex_responses"
+        kw = transport.build_kwargs(
+            model="muse-spark-1.2",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{"type": "function", "function": {"name": "terminal", "description": "x", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}],
+            base_url="https://api.meta.ai/v1",
+            session_id="sid",
+        )
+        # Ensure instructions/input/tools and retention present - i.e., responses shape
+        assert "instructions" in kw or "input" in kw
+        assert kw.get("prompt_cache_retention") == "24h"
+        assert "prompt_cache_key" in kw
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\transports\test_reasoning_effort_sibling_sites.py ===
+"""Sibling-site coverage for the reasoning-effort wire-vocabulary class (#89503).
+
+The chat-completions chokepoint fix (ultra → max for every model) is covered
+by tests/agent/test_reasoning_effort_wire_translation.py. These tests pin the
+sibling sites fixed in the same sweep:
+
+- Kimi/Moonshot top-level ``reasoning_effort``: K3 accepts low/high/max only
+  (docs: default high); K2-era models accept low/medium/high. Previously the
+  transport forwarded only {low,medium,high} and silently dropped everything
+  else to "medium", so K3 400'd on "medium" requests and ultra resolved
+  WEAKER than an explicit high (ladder inversion).
+- Tencent TokenHub: accepts low/medium/high; upper-ladder levels previously
+  dropped to the "high" default (accidentally right) but "minimal" also
+  dropped to high — asked for the least, got the most.
+- Codex/Responses transport: ultra → max for EVERY model, not just gpt-5.6.
+"""
+
+from agent.transports import get_transport
+import agent.transports.chat_completions  # noqa: F401
+import agent.transports.codex  # noqa: F401
+
+
+def _cc():
+    return get_transport("chat_completions")
+
+
+def _kimi_kwargs(model, reasoning_config):
+    return _cc().build_kwargs(
+        model=model,
+        messages=[{"role": "user", "content": "hi"}],
+        is_kimi=True,
+        reasoning_config=reasoning_config,
+    )
+
+
+class TestKimiEffortVocabulary:
+    def test_k3_maps_full_hermes_ladder(self):
+        expected = {
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max",
+            "ultra": "max",
+        }
+        for hermes_level, wire_level in expected.items():
+            kw = _kimi_kwargs(
+                "kimi-k3", {"enabled": True, "effort": hermes_level}
+            )
+            assert kw["reasoning_effort"] == wire_level, hermes_level
+
+    def test_k3_default_is_high(self):
+        kw = _kimi_kwargs("kimi-k3", None)
+        assert kw["reasoning_effort"] == "high"
+
+    def test_k2_upper_ladder_caps_at_high_not_medium(self):
+        """Pre-fix, ultra/max/xhigh on K2-era models silently dropped to the
+        'medium' default — the strongest ask resolved weaker than an explicit
+        high (ladder inversion, same class as #74295)."""
+        for level in ("xhigh", "max", "ultra"):
+            kw = _kimi_kwargs(
+                "moonshotai/kimi-k2.6", {"enabled": True, "effort": level}
+            )
+            assert kw["reasoning_effort"] == "high", level
+
+    def test_k2_native_levels_pass_through(self):
+        for level in ("low", "medium", "high"):
+            kw = _kimi_kwargs(
+                "moonshotai/kimi-k2.6", {"enabled": True, "effort": level}
+            )
+            assert kw["reasoning_effort"] == level
+
+    def test_k2_minimal_maps_to_low(self):
+        kw = _kimi_kwargs(
+            "moonshotai/kimi-k2.6", {"enabled": True, "effort": "minimal"}
+        )
+        assert kw["reasoning_effort"] == "low"
+
+    def test_disabled_omits_effort(self):
+        kw = _kimi_kwargs("kimi-k3", {"enabled": False})
+        assert "reasoning_effort" not in kw
+
+
+class TestTokenHubEffortVocabulary:
+    def _kwargs(self, reasoning_config):
+        return _cc().build_kwargs(
+            model="hunyuan-t2",
+            messages=[{"role": "user", "content": "hi"}],
+            is_tokenhub=True,
+            reasoning_config=reasoning_config,
+        )
+
+    def test_upper_ladder_caps_at_high(self):
+        for level in ("xhigh", "max", "ultra"):
+            kw = self._kwargs({"enabled": True, "effort": level})
+            assert kw["reasoning_effort"] == "high", level
+
+    def test_minimal_maps_to_low_not_high(self):
+        """Pre-fix, 'minimal' fell through to the 'high' default — asked for
+        the least reasoning, got the most."""
+        kw = self._kwargs({"enabled": True, "effort": "minimal"})
+        assert kw["reasoning_effort"] == "low"
+
+    def test_native_levels_pass_through(self):
+        for level in ("low", "medium", "high"):
+            kw = self._kwargs({"enabled": True, "effort": level})
+            assert kw["reasoning_effort"] == level
+
+
+class TestCodexUltraForEveryModel:
+    def test_ultra_never_leaks_and_respects_per_model_ceiling(self):
+        """'ultra' must never reach the Codex wire. Live-verified vocabulary
+        (#68365): gpt-5.6 accepts max (its ceiling), gpt-5.5/o5 do not —
+        their ceiling is xhigh."""
+        transport = get_transport("codex_responses")
+        expected = {
+            "gpt-5.6-codex": "max",
+            "o5-pro": "xhigh",
+            "gpt-5.5": "xhigh",
+            "some-responses-model": "xhigh",
+        }
+        for model, wire in expected.items():
+            kw = transport.build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                reasoning_config={"enabled": True, "effort": "ultra"},
+            )
+            assert kw["reasoning"]["effort"] == wire, model
+

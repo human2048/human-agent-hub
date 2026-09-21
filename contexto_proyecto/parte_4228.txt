@@ -1,0 +1,319 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_memory_tool_import_fallback.py ===
+"""Regression tests for memory-tool import fallbacks."""
+
+import builtins
+import importlib
+import sys
+
+from tools.registry import registry
+
+
+def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
+    original_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fcntl":
+            raise ImportError("simulated missing fcntl")
+        return original_import(name, globals, locals, fromlist, level)
+
+    registry.deregister("memory")
+    monkeypatch.delitem(sys.modules, "tools.memory_tool", raising=False)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    memory_tool = importlib.import_module("tools.memory_tool")
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: tmp_path)
+
+    store = memory_tool.MemoryStore(memory_char_limit=200, user_char_limit=200)
+    store.load_from_disk()
+    result = store.add("memory", "fact learned during import fallback test")
+
+    assert memory_tool.fcntl is None
+    assert registry.get_entry("memory") is not None
+    assert result["success"] is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_memory_tool_schema.py ===
+"""Schema-shape tests for the built-in memory tool.
+
+The memory tool previously used ``allOf: [{if: ..., then: {required: ...}}]``
+at the top level of ``parameters`` to hint per-action required fields.  That
+form was:
+
+  1. Ignored by every provider (Chat Completions doesn't honour ``if/then``
+     on function schemas), so it never actually enforced anything.
+  2. **Rejected outright by strict backends** — OpenAI's Codex endpoint
+     (``chatgpt.com/backend-api/codex``, gpt-5.x) returns
+     ``Invalid schema for function 'memory': schema must have type 'object'
+     and not have 'oneOf'/'anyOf'/'allOf'/'enum'/'not' at the top level``.
+
+We now rely on the runtime handler (``memory_tool()`` in ``tools/memory_tool.py``)
+to validate required fields per action and return actionable error messages.
+These tests guard the schema against regressing back to a shape strict
+backends reject.
+"""
+
+import json
+
+from tools.memory_tool import MEMORY_SCHEMA
+
+
+_FORBIDDEN_TOP_LEVEL_KEYS = ("allOf", "anyOf", "oneOf", "enum", "not")
+
+
+def test_memory_schema_has_no_forbidden_top_level_combinators():
+    """OpenAI's Codex backend rejects these at the top level of parameters."""
+    params = MEMORY_SCHEMA["parameters"]
+    for key in _FORBIDDEN_TOP_LEVEL_KEYS:
+        assert key not in params, (
+            f"top-level {key!r} in memory tool parameters will break the "
+            "Codex backend (chatgpt.com/backend-api/codex). Per-action "
+            "required-field checks belong in the runtime handler, not the schema."
+        )
+
+
+def test_memory_schema_is_json_serializable():
+    json.dumps(MEMORY_SCHEMA)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_microsoft_graph_auth.py ===
+"""Tests for tools/microsoft_graph_auth.py."""
+
+from __future__ import annotations
+
+import asyncio
+
+import httpx
+import pytest
+
+from tools.microsoft_graph_auth import (
+    CachedAccessToken,
+    DEFAULT_GRAPH_SCOPE,
+    GraphCredentials,
+    MicrosoftGraphConfigError,
+    MicrosoftGraphTokenError,
+    MicrosoftGraphTokenProvider,
+)
+
+
+class TestGraphCredentials:
+    def test_from_env_raises_for_missing_required_values(self):
+        with pytest.raises(MicrosoftGraphConfigError) as exc:
+            GraphCredentials.from_env({})
+        assert "MSGRAPH_TENANT_ID" in str(exc.value)
+        assert "MSGRAPH_CLIENT_ID" in str(exc.value)
+        assert "MSGRAPH_CLIENT_SECRET" in str(exc.value)
+
+    def test_from_env_optional_returns_none_when_not_configured(self):
+        assert GraphCredentials.from_env({}, required=False) is None
+
+    def test_from_env_builds_normalized_credentials(self):
+        creds = GraphCredentials.from_env(
+            {
+                "MSGRAPH_TENANT_ID": "tenant-123",
+                "MSGRAPH_CLIENT_ID": "client-456",
+                "MSGRAPH_CLIENT_SECRET": "secret-789",
+            }
+        )
+        assert creds is not None
+        assert creds.scope == DEFAULT_GRAPH_SCOPE
+        assert creds.token_url.endswith("/tenant-123/oauth2/v2.0/token")
+
+
+@pytest.mark.anyio
+class TestMicrosoftGraphTokenProvider:
+    async def test_reuses_cached_token_until_expiry(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": f"token-{len(calls)}",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+
+        provider = MicrosoftGraphTokenProvider(
+            GraphCredentials("tenant", "client", "secret"),
+            transport=httpx.MockTransport(handler),
+        )
+
+        first = await provider.get_access_token()
+        second = await provider.get_access_token()
+
+        assert first == "token-1"
+        assert second == "token-1"
+        assert len(calls) == 1
+
+    async def test_concurrent_calls_share_one_token_fetch(self):
+        calls: list[int] = []
+
+        provider = MicrosoftGraphTokenProvider(
+            GraphCredentials("tenant", "client", "secret"),
+        )
+
+        async def _fake_fetch():
+            calls.append(1)
+            await asyncio.sleep(0)
+            return CachedAccessToken(
+                access_token="token-1",
+                token_type="Bearer",
+                expires_at=9_999_999_999,
+            )
+
+        provider._fetch_access_token = _fake_fetch  # type: ignore[method-assign]
+
+        first, second = await asyncio.gather(
+            provider.get_access_token(),
+            provider.get_access_token(),
+        )
+
+        assert first == "token-1"
+        assert second == "token-1"
+        assert len(calls) == 1
+
+
+    async def test_http_error_includes_server_message(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                401,
+                json={"error": "invalid_client", "error_description": "bad secret"},
+            )
+
+        provider = MicrosoftGraphTokenProvider(
+            GraphCredentials("tenant", "client", "secret"),
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(MicrosoftGraphTokenError) as exc:
+            await provider.get_access_token()
+        assert "bad secret" in str(exc.value)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_microsoft_graph_client.py ===
+"""Tests for tools/microsoft_graph_client.py."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import httpx
+import pytest
+
+from tools.microsoft_graph_auth import GraphCredentials, MicrosoftGraphTokenProvider
+from tools.microsoft_graph_client import (
+    MicrosoftGraphAPIError,
+    MicrosoftGraphClient,
+    MicrosoftGraphClientError,
+)
+
+
+def _make_provider() -> MicrosoftGraphTokenProvider:
+    provider = MicrosoftGraphTokenProvider(GraphCredentials("tenant", "client", "secret"))
+    provider._cached_token = type(  # type: ignore[attr-defined]
+        "Token",
+        (),
+        {
+            "access_token": "cached-token",
+            "is_expired": lambda self, skew_seconds=0: False,
+            "expires_in_seconds": 3600,
+        },
+    )()
+    return provider
+
+
+@pytest.mark.anyio
+class TestMicrosoftGraphClient:
+    async def test_attaches_bearer_token_header(self):
+        captured_auth: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_auth.append(request.headers["Authorization"])
+            return httpx.Response(200, json={"ok": True})
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+        )
+        payload = await client.get_json("/me")
+        assert payload == {"ok": True}
+        assert captured_auth == ["Bearer cached-token"]
+
+    async def test_retries_on_rate_limit_and_uses_retry_after(self):
+        calls: list[int] = []
+        sleeps: list[float] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(
+                    429,
+                    json={"error": {"code": "TooManyRequests", "message": "slow down"}},
+                    headers={"Retry-After": "3"},
+                )
+            return httpx.Response(200, json={"ok": True})
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            max_retries=2,
+        )
+
+        payload = await client.get_json("/me")
+
+        assert payload == {"ok": True}
+        assert len(calls) == 2
+        assert sleeps == [3.0]
+
+    async def test_download_accepts_stream_content_by_default(self, tmp_path: Path):
+        captured_accept: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_accept.append(request.headers["Accept"])
+            return httpx.Response(
+                200,
+                content=b"recording-bytes",
+                headers={"content-type": "video/mp4"},
+            )
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+        )
+        destination = tmp_path / "recording.mp4"
+
+        result = await client.download_to_file(
+            "/recordings/recording-1/content", destination
+        )
+
+        assert captured_accept == ["*/*"]
+        assert destination.read_bytes() == b"recording-bytes"
+        assert result["content_type"] == "video/mp4"
+
+    async def test_invalid_json_response_raises_client_error(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=b"not-json",
+                headers={"content-type": "application/json"},
+            )
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(MicrosoftGraphClientError):
+            await client.get_json("/me")
+

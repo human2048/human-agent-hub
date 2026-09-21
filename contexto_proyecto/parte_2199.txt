@@ -1,0 +1,430 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_pydantic_dump_warning_leak.py ===
+"""Serializer-warning leak regression tests (#82xxx).
+
+The Anthropic SDK's streaming accumulator builds ``ParsedMessage`` snapshots
+whose content blocks (``ParsedTextBlock``) don't match the generic union
+pydantic expects at serialization time. ``model_dump()`` on those objects
+emits ``PydanticSerializationUnexpectedValue`` UserWarnings that leak
+straight into the user's terminal mid-response.
+
+Every Hermes serialization helper that dumps arbitrary SDK models must pass
+``warnings=False`` (with a TypeError fallback for duck-typed models). These
+tests pin that contract for all four helpers.
+"""
+
+import warnings
+
+import pytest
+
+anthropic = pytest.importorskip("anthropic")
+
+from anthropic._models import build
+from anthropic.lib.streaming._messages import accumulate_event
+from anthropic.lib.streaming._types import ParsedMessageStopEvent
+from anthropic.types import (
+    Message,
+    RawContentBlockDeltaEvent,
+    RawContentBlockStartEvent,
+    RawMessageStartEvent,
+    Usage,
+)
+
+
+def _accumulated_stop_event():
+    """Build a message_stop event exactly the way the SDK stream does."""
+    start = RawMessageStartEvent(
+        type="message_start",
+        message=Message(
+            id="msg_1",
+            content=[],
+            model="claude-x",
+            role="assistant",
+            stop_reason=None,
+            stop_sequence=None,
+            type="message",
+            usage=Usage(input_tokens=1, output_tokens=0),
+        ),
+    )
+    cb_start = RawContentBlockStartEvent(
+        type="content_block_start", index=0, content_block={"type": "text", "text": ""}
+    )
+    cb_delta = RawContentBlockDeltaEvent(
+        type="content_block_delta",
+        index=0,
+        delta={"type": "text_delta", "text": "hello"},
+    )
+    snapshot = None
+    for event in (start, cb_start, cb_delta):
+        snapshot = accumulate_event(event=event, current_snapshot=snapshot)
+    return build(ParsedMessageStopEvent, type="message_stop", message=snapshot), snapshot
+
+
+def _pydantic_warnings(recorded):
+    return [w for w in recorded if "Pydantic serializer warnings" in str(w.message)]
+
+
+def test_stop_event_dump_actually_warns_without_suppression():
+    """Precondition: the fixture really trips the SDK/pydantic warning.
+
+    If a future SDK/pydantic release stops warning here, the other tests
+    pass vacuously — this test tells us the guard can be simplified.
+    """
+    stop_event, _ = _accumulated_stop_event()
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        stop_event.model_dump()
+    assert _pydantic_warnings(recorded), (
+        "fixture no longer reproduces the pydantic serializer warning; "
+        "the warnings=False guards may be removable"
+    )
+
+
+def test_relay_llm_jsonable_no_warning_leak():
+    from agent.relay_llm import _jsonable
+
+    stop_event, _ = _accumulated_stop_event()
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        payload = _jsonable(stop_event)
+    assert not _pydantic_warnings(recorded)
+    assert payload["message"]["content"][0]["text"] == "hello"
+
+
+def test_relay_tools_jsonable_no_warning_leak():
+    from agent.relay_tools import _jsonable
+
+    stop_event, _ = _accumulated_stop_event()
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        payload = _jsonable(stop_event)
+    assert not _pydantic_warnings(recorded)
+    assert payload["message"]["content"][0]["text"] == "hello"
+
+
+def test_anthropic_to_plain_data_no_warning_leak():
+    from agent.anthropic_message_convert import _to_plain_data
+
+    _, snapshot = _accumulated_stop_event()
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        payload = _to_plain_data(snapshot)
+    assert not _pydantic_warnings(recorded)
+    assert payload["content"][0]["text"] == "hello"
+
+
+def test_hook_jsonable_no_warning_leak():
+    from run_agent import AIAgent
+
+    stop_event, _ = _accumulated_stop_event()
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        payload = AIAgent._hook_jsonable(stop_event)
+    assert not _pydantic_warnings(recorded)
+    assert payload["message"]["content"][0]["text"] == "hello"
+
+
+def test_duck_typed_model_dump_fallback():
+    """Non-pydantic objects with a bare model_dump() must still serialize."""
+    from agent.relay_llm import _jsonable as rl_jsonable
+    from agent.relay_tools import _jsonable as rt_jsonable
+    from agent.anthropic_message_convert import _to_plain_data
+
+    class Duck:
+        def model_dump(self):  # no mode/warnings kwargs
+            return {"quack": True}
+
+    assert rl_jsonable(Duck()) == {"quack": True}
+    assert rt_jsonable(Duck()) == {"quack": True}
+    assert _to_plain_data(Duck()) == {"quack": True}
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_rate_limit_tracker.py ===
+"""Tests for agent.rate_limit_tracker — header parsing and formatting."""
+
+import time
+import pytest
+from agent.rate_limit_tracker import (
+    RateLimitBucket,
+    RateLimitState,
+    parse_rate_limit_headers,
+    format_rate_limit_display,
+    format_rate_limit_compact,
+    _fmt_count,
+    _fmt_seconds,
+    _bar,
+)
+
+
+# ── Sample headers from Nous inference API ──────────────────────────────
+
+NOUS_HEADERS = {
+    "x-ratelimit-limit-requests": "800",
+    "x-ratelimit-limit-requests-1h": "33600",
+    "x-ratelimit-limit-tokens": "8000000",
+    "x-ratelimit-limit-tokens-1h": "336000000",
+    "x-ratelimit-remaining-requests": "795",
+    "x-ratelimit-remaining-requests-1h": "33590",
+    "x-ratelimit-remaining-tokens": "7999500",
+    "x-ratelimit-remaining-tokens-1h": "335999000",
+    "x-ratelimit-reset-requests": "45.5",
+    "x-ratelimit-reset-requests-1h": "3500.0",
+    "x-ratelimit-reset-tokens": "42.3",
+    "x-ratelimit-reset-tokens-1h": "3490.0",
+}
+
+
+class TestParseHeaders:
+    def test_basic_parsing(self):
+        state = parse_rate_limit_headers(NOUS_HEADERS, provider="nous")
+        assert state is not None
+        assert state.provider == "nous"
+        assert state.has_data
+
+        assert state.requests_min.limit == 800
+        assert state.requests_min.remaining == 795
+        assert state.requests_min.reset_seconds == 45.5
+
+        assert state.requests_hour.limit == 33600
+        assert state.requests_hour.remaining == 33590
+
+        assert state.tokens_min.limit == 8000000
+        assert state.tokens_min.remaining == 7999500
+
+        assert state.tokens_hour.limit == 336000000
+        assert state.tokens_hour.remaining == 335999000
+        assert state.tokens_hour.reset_seconds == 3490.0
+
+    def test_no_headers(self):
+        state = parse_rate_limit_headers({})
+        assert state is None
+
+
+
+
+
+class TestBucket:
+
+    def test_usage_pct(self):
+        b = RateLimitBucket(limit=100, remaining=20, reset_seconds=30.0, captured_at=time.time())
+        assert b.usage_pct == pytest.approx(80.0)
+
+
+    def test_remaining_seconds_now(self):
+        now = time.time()
+        b = RateLimitBucket(limit=800, remaining=795, reset_seconds=60.0, captured_at=now - 10)
+        # ~50 seconds should remain
+        assert 49 <= b.remaining_seconds_now <= 51
+
+
+
+class TestFormatting:
+
+
+
+    def test_fmt_seconds_short(self):
+        assert _fmt_seconds(45) == "45s"
+        assert _fmt_seconds(0) == "0s"
+
+
+
+    def test_bar(self):
+        bar = _bar(50.0, width=10)
+        assert bar == "[█████░░░░░]"
+        assert _bar(0.0, width=10) == "[░░░░░░░░░░]"
+        assert _bar(100.0, width=10) == "[██████████]"
+
+
+
+
+    def test_format_compact(self):
+        state = parse_rate_limit_headers(NOUS_HEADERS, provider="nous")
+        result = format_rate_limit_compact(state)
+        assert "RPM:" in result
+        assert "RPH:" in result
+        assert "TPM:" in result
+        assert "TPH:" in result
+        assert "resets" in result
+
+
+
+class TestAgentIntegration:
+    """Test that AIAgent captures rate limit state correctly."""
+
+    def test_capture_rate_limits_from_headers(self):
+        """Simulate the header capture path without a real API call."""
+        # Use a mock httpx-like response
+        class MockResponse:
+            headers = NOUS_HEADERS
+
+        # Import AIAgent minimally
+
+        # Test the parsing directly
+        state = parse_rate_limit_headers(MockResponse.headers, provider="nous")
+        assert state is not None
+        assert state.requests_min.limit == 800
+        assert state.tokens_hour.limit == 336000000
+
+    def test_capture_rate_limits_none_response(self):
+        """_capture_rate_limits should handle None gracefully."""
+        from agent.rate_limit_tracker import parse_rate_limit_headers
+        # None should not crash
+        result = parse_rate_limit_headers({})
+        assert result is None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_reactions.py ===
+"""Behavior tests for the token-free reaction detector."""
+
+import pytest
+
+from agent.reactions import VIBE, detect_reaction
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "good bot",
+        "Good Bot!",
+        "ily",
+        "ilysm",
+        "i love you",
+        "love you",
+        "love u",
+        "luv ya",
+        "thanks",
+        "thank you",
+        "thx",
+        "ty",
+        "tysm",
+        "you're the best <3",
+        "here you go <33",
+        "❤️",
+        "🥰 amazing",
+        "sending 💖",
+        "great job, thank you so much!",
+    ],
+)
+def test_affection_fires_vibe(text):
+    assert detect_reaction(text) == VIBE
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        None,
+        "run the tests",
+        "this is great",  # positive sentiment, NOT affection — must not fire
+        "awesome work on the refactor",
+        "it's broken </3",  # broken heart is not affection
+        "the ferry departs at 3",  # 'ty' must be word-bounded, not match 'ferTY'-like
+        "commit the changes",
+    ],
+)
+def test_neutral_or_negative_does_not_fire(text):
+    assert detect_reaction(text) is None
+
+
+def test_case_insensitive_invariant():
+    # Casing must never change the classification.
+    for text in ("ILY", "iLy", "ily"):
+        assert detect_reaction(text) == detect_reaction("ily")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_reasoning_disable_recovery.py ===
+"""Main-loop recovery for a route that rejects a reasoning disable by field name (#114460).
+
+The classifier maps the rejection to ``reasoning_mandatory``; ``recover_after_classification``
+drops the disable once; a SECOND rejection in the same turn means the configured reasoning
+controls themselves are refused, so the settle path takes the fallback chain instead of
+replaying the identical request until ``max_retries``.
+"""
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from agent.error_classifier import FailoverReason, classify_api_error
+
+_REVERSED_400 = "reasoning_effort 'none' unsupported; use minimal|low|medium|high|xhigh"
+
+
+class _FakeApiError(Exception):
+    def __init__(self, status_code, message):
+        super().__init__(f"Error code: {status_code} - {{'error': {{'message': {message!r}}}}}")
+        self.status_code = status_code
+        self.message = message
+        self.body = {"error": {"message": message, "type": "invalid_request_error"}}
+
+
+class _Agent:
+    log_prefix = ""
+    verbose = False
+    provider = "custom"
+    model = "chat-only"
+    _fallback_chain = [object()]
+    _fallback_index = 0
+    _credential_pool = None
+
+    def __init__(self):
+        self.activated = []
+        self._reasoning_disable_rejected = False
+
+    def _recover_with_credential_pool(self, **kwargs):
+        return False, False
+
+    def _has_pending_fallback(self):
+        return True
+
+    def _try_activate_fallback(self, **kwargs):
+        self.activated.append(True)
+        return True
+
+    def _summarize_api_error(self, error):
+        return str(error)
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+def _settle(disable_drop_attempted):
+    from agent.turn_api_error import settle_unrecovered_error
+
+    agent = _Agent()
+    err = _FakeApiError(400, _REVERSED_400)
+    classified = classify_api_error(err, provider="custom", model=agent.model)
+    assert classified.reason == FailoverReason.reasoning_mandatory
+    retry = SimpleNamespace(
+        reasoning_mandatory_retry_attempted=disable_drop_attempted, image_shrink_retry_attempted=False,
+        copilot_stale_cred_retry_attempted=False, primary_recovery_attempted=False,
+        restart_with_redirected_messages=False,
+    )
+    with patch("agent.conversation_loop._is_copilot_provider", lambda a: False), patch(
+        "agent.conversation_loop._arm_fallback_restart", lambda agent, msgs, prompt, retry: prompt
+    ), patch("agent.turn_api_error.compute_error_backoff", lambda *a, **k: 0), patch(
+        "agent.turn_api_error.interruptible_backoff_sleep", lambda *a, **k: None
+    ):
+        verdict = settle_unrecovered_error(
+            agent, api_error=err, classified=classified, _retry=retry, status_code=400, error_msg=str(err),
+            is_context_length_error=False, is_rate_limited=False, _is_zai_coding_overload=False,
+            _provider="custom", _base="http://relay.example/v1", _model=agent.model, messages=[],
+            api_messages=[], api_kwargs={}, active_system_prompt="", conversation_history=None,
+            approx_tokens=10, retry_count=0, max_retries=3, compression_attempts=0, api_call_count=1,
+        )
+    return agent, verdict
+
+
+def test_spent_disable_drop_falls_back_instead_of_replaying_the_request():
+    agent, verdict = _settle(disable_drop_attempted=True)
+    assert verdict.action == "break"
+    assert agent.activated == [True]
+
+    # Control: before the drop has run the verdict stays retryable (the rung gets its shot;
+    # the one-shot drop itself is pre-existing ``turn_recovery`` behaviour, not asserted here).
+    agent, verdict = _settle(disable_drop_attempted=False)
+    assert verdict.action == "fallthrough"
+    assert agent.activated == []
+

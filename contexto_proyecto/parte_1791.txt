@@ -1,0 +1,260 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_credential_file_permissions.py ===
+"""Read-time permission warnings for on-disk credential/token files.
+
+``utils.warn_if_credential_file_broadly_readable`` is the shared helper for
+the class of bug PR #60009 reported for ``slack_tokens.json``: token files
+provisioned by hand (or written by older Hermes versions without an explicit
+mode) end up group/world-readable under the default umask, silently exposing
+plaintext secrets to other local users. The helper warns with a remediation
+hint; adapters call it on every read path.
+"""
+
+import logging
+import os
+
+import pytest
+
+from utils import warn_if_credential_file_broadly_readable
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix", reason="POSIX permission-bit semantics required"
+)
+
+
+class TestWarnIfCredentialFileBroadlyReadable:
+    def test_warns_on_world_readable(self, tmp_path, caplog):
+        f = tmp_path / "slack_tokens.json"
+        f.write_text("{}")
+        f.chmod(0o644)
+
+        with caplog.at_level(logging.WARNING):
+            warned = warn_if_credential_file_broadly_readable(f, label="[Slack]")
+
+        assert warned is True
+        assert "group/world-readable" in caplog.text
+        assert "chmod 600" in caplog.text
+        assert "[Slack]" in caplog.text
+
+    def test_warns_on_group_readable(self, tmp_path, caplog):
+        f = tmp_path / "tokens.json"
+        f.write_text("{}")
+        f.chmod(0o640)
+
+        with caplog.at_level(logging.WARNING):
+            assert warn_if_credential_file_broadly_readable(f) is True
+
+    def test_silent_on_0600(self, tmp_path, caplog):
+        f = tmp_path / "tokens.json"
+        f.write_text("{}")
+        f.chmod(0o600)
+
+        with caplog.at_level(logging.WARNING):
+            assert warn_if_credential_file_broadly_readable(f) is False
+        assert "group/world-readable" not in caplog.text
+
+    def test_silent_on_missing_file(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert (
+                warn_if_credential_file_broadly_readable(tmp_path / "nope.json")
+                is False
+            )
+        assert caplog.text == ""
+
+    def test_uses_provided_logger(self, tmp_path):
+        f = tmp_path / "tokens.json"
+        f.write_text("{}")
+        f.chmod(0o644)
+
+        records = []
+
+        class _Sink(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        log = logging.getLogger("test.credfile.sink")
+        log.addHandler(_Sink())
+        try:
+            assert warn_if_credential_file_broadly_readable(f, log=log) is True
+        finally:
+            log.handlers.clear()
+        assert records and "chmod 600" in records[0].getMessage()
+
+
+class TestGoogleChatReadPathWarns:
+    def test_load_user_credentials_warns_on_broad_perms(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The google_chat legacy token read path shares the Slack fix."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # google-auth may not be installed in this environment; the warning
+        # fires before the import guard, so a None return is fine either way.
+        token = tmp_path / "google_chat_user_token.json"
+        token.write_text("{}")
+        token.chmod(0o644)
+
+        from plugins.platforms.google_chat.oauth import load_user_credentials
+
+        with caplog.at_level(logging.WARNING):
+            load_user_credentials()
+
+        assert "group/world-readable" in caplog.text
+        assert "chmod 600" in caplog.text
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_dispatch_session_id.py ===
+"""Tests that handle_function_call forwards session_id into registry.dispatch."""
+
+import json
+from unittest.mock import MagicMock, patch
+
+
+def _make_registry(captured: dict):
+    """Return a mock registry whose dispatch records the kwargs it receives."""
+    registry = MagicMock()
+
+    def _dispatch(name, args, **kwargs):
+        captured.update(kwargs)
+        return json.dumps({"result": "ok"})
+
+    registry.dispatch.side_effect = _dispatch
+    return registry
+
+
+class TestSessionIdForwarding:
+
+    def test_standard_path_forwards_session_id(self):
+        """registry.dispatch receives session_id on the normal tool path."""
+        captured = {}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                session_id="sess-abc",
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured.get("session_id") == "sess-abc"
+
+    def test_execute_code_path_forwards_session_id(self):
+        """registry.dispatch receives session_id on the execute_code path."""
+        captured = {}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "execute_code",
+                {"code": "print(1)"},
+                task_id="t1",
+                session_id="sess-xyz",
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured.get("session_id") == "sess-xyz"
+
+    def test_session_id_default_is_none(self):
+        """When session_id is omitted, dispatch receives None."""
+        captured = {}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                skip_pre_tool_call_hook=True,
+            )
+        assert "session_id" in captured
+        assert captured["session_id"] is None
+
+    def test_task_id_still_forwarded(self):
+        """Existing task_id forwarding is not broken by this change."""
+        captured = {}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="task-999",
+                session_id="sess-1",
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured.get("task_id") == "task-999"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\test_display_hermes_home.py ===
+"""display_hermes_home() renders POSIX separators on every platform.
+
+Maintainer catch (#95681 arc): on Windows with a custom HERMES_HOME under
+the user profile (e.g. AppData/Local/hermes), ``"~/" +
+str(home.relative_to(Path.home()))`` produced the mixed-separator chimera
+``~/AppData\\Local\\hermes`` — which then leaked into every consumer that
+appends sub-paths (the skill_manage schema showed the agent
+``~/AppData\\Local\\hermes/skills/``). The ``~/`` shorthand implies POSIX
+rendering; the whole string must be consistent.
+"""
+import os
+import sys
+import unittest
+from pathlib import Path, PureWindowsPath
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+class TestDisplayHermesHomePosix(unittest.TestCase):
+    def test_nested_home_renders_forward_slashes(self):
+        """Simulate the Windows shape portably: home nested several levels
+        under the user profile must render with forward slashes only."""
+        import hermes_constants as hc
+
+        fake_userhome = Path.home()
+        nested = fake_userhome / "AppData" / "Local" / "hermes"
+        with patch.object(hc, "get_hermes_home", return_value=nested):
+            out = hc.display_hermes_home()
+        self.assertEqual(out, "~/AppData/Local/hermes")
+        self.assertNotIn("\\", out)
+
+    def test_default_home_unchanged(self):
+        import hermes_constants as hc
+
+        with patch.object(hc, "get_hermes_home",
+                          return_value=Path.home() / ".hermes"):
+            out = hc.display_hermes_home()
+        self.assertEqual(out, "~/.hermes")
+
+    def test_outside_home_falls_back_to_absolute(self):
+        import hermes_constants as hc
+
+        outside = Path("/opt/hermes-custom") if os.name != "nt" else Path("C:/opt/hermes-custom")
+        with patch.object(hc, "get_hermes_home", return_value=outside):
+            out = hc.display_hermes_home()
+        self.assertEqual(out, str(outside))
+
+    def test_no_serving_schema_carries_tilde_backslash_chimera(self):
+        """Fleet guard: no served tool schema string may combine '~/' with
+        a backslash — the class of bug, not the one site."""
+        from model_tools import get_tool_definitions
+
+        offenders = []
+
+        def walk(o, tool):
+            if isinstance(o, str):
+                if "~/" in o and "\\" in o:
+                    offenders.append((tool, o[:80]))
+            elif isinstance(o, dict):
+                for v in o.values():
+                    walk(v, tool)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v, tool)
+
+        for t in get_tool_definitions(quiet_mode=True):
+            walk(t, t["function"]["name"])
+        self.assertEqual(offenders, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

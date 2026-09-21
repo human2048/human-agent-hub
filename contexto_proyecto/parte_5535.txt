@@ -1,0 +1,184 @@
+
+
+=== ARCHIVO: .\opencode\cmd\schema\README.md ===
+# OpenCode Configuration Schema Generator
+
+This tool generates a JSON Schema for the OpenCode configuration file. The schema can be used to validate configuration files and provide autocompletion in editors that support JSON Schema.
+
+## Usage
+
+```bash
+go run cmd/schema/main.go > opencode-schema.json
+```
+
+This will generate a JSON Schema file that can be used to validate configuration files.
+
+## Schema Features
+
+The generated schema includes:
+
+- All configuration options with descriptions
+- Default values where applicable
+- Validation for enum values (e.g., model IDs, provider types)
+- Required fields
+- Type checking
+
+## Using the Schema
+
+You can use the generated schema in several ways:
+
+1. **Editor Integration**: Many editors (VS Code, JetBrains IDEs, etc.) support JSON Schema for validation and autocompletion. You can configure your editor to use the generated schema for `.opencode.json` files.
+
+2. **Validation Tools**: You can use tools like [jsonschema](https://github.com/Julian/jsonschema) to validate your configuration files against the schema.
+
+3. **Documentation**: The schema serves as documentation for the configuration options.
+
+## Example Configuration
+
+Here's an example configuration that conforms to the schema:
+
+```json
+{
+  "data": {
+    "directory": ".opencode"
+  },
+  "debug": false,
+  "providers": {
+    "anthropic": {
+      "apiKey": "your-api-key"
+    }
+  },
+  "agents": {
+    "coder": {
+      "model": "claude-3.7-sonnet",
+      "maxTokens": 5000,
+      "reasoningEffort": "medium"
+    },
+    "task": {
+      "model": "claude-3.7-sonnet",
+      "maxTokens": 5000
+    },
+    "title": {
+      "model": "claude-3.7-sonnet",
+      "maxTokens": 80
+    }
+  }
+}
+```
+
+
+
+=== ARCHIVO: .\skills\generate_report.py ===
+import os
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+from fpdf import FPDF
+
+def create_docx_report(title: str, content_paragraphs: list, output_path: str = "reporte.docx") -> str:
+    """
+    Genera un archivo .docx profesional con estilo corporativo.
+    """
+    doc = Document()
+    
+    # Configurar título principal
+    heading = doc.add_heading(title, level=0)
+    heading.style.font.color.rgb = RGBColor(0, 51, 102)  # Azul corporativo
+    
+    # Agregar párrafos
+    for para in content_paragraphs:
+        p = doc.add_paragraph(para)
+        p.style.font.name = 'Calibri'
+        p.style.font.size = Pt(11)
+        
+    doc.save(output_path)
+    return output_path
+
+
+class PDFReport(FPDF):
+    def header(self):
+        self.set_font('Helvetica', 'B', 12)
+        self.set_text_color(0, 51, 102)
+        self.cell(0, 10, 'CyberNiche Lab - Reporte Autónomo', border=False, ln=True, align='R')
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Helvetica', 'I', 8)
+        self.set_text_color(128, 128, 128)
+        self.cell(0, 10, f'Página {self.page_no()}', align='C')
+
+def create_pdf_report(title: str, content_paragraphs: list, output_path: str = "reporte.pdf") -> str:
+    """
+    Genera un archivo .pdf limpio usando fpdf2.
+    """
+    pdf = PDFReport()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=16, style='B')
+    pdf.cell(0, 10, title, ln=True, align='L')
+    pdf.ln(5)
+    
+    pdf.set_font("Helvetica", size=11)
+    for para in content_paragraphs:
+        # fpdf2 soporta encode automático UTF-8 mediante multi_cell
+        pdf.multi_cell(0, 8, para)
+        pdf.ln(2)
+        
+    pdf.output(output_path)
+    return output_path
+
+
+=== ARCHIVO: .\skills\receive_telegram_media.py ===
+import os
+from telegram import Update
+from telegram.ext import ContextTypes
+
+# Carpeta para guardar entradas recibidas
+INPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "inputs")
+os.makedirs(INPUT_DIR, exist_ok=True)
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Descarga notas de voz enviadas por el usuario."""
+    voice = update.message.voice
+    file_id = voice.file_id
+    new_file = await context.bot.get_file(file_id)
+    
+    file_path = os.path.join(INPUT_DIR, f"audio_{file_id[:8]}.ogg")
+    await new_file.download_to_drive(file_path)
+    
+    await update.message.reply_text(f"🎙️ Audio recibido y guardado para procesamiento: `{os.path.basename(file_path)}`", parse_mode="Markdown")
+    print(f"--> [InputSkill] Audio guardado en: {file_path}")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Descarga documentos o imágenes enviadas por el usuario."""
+    doc = update.message.document
+    file_id = doc.file_id
+    file_name = doc.file_name or f"doc_{file_id[:8]}"
+    
+    new_file = await context.bot.get_file(file_id)
+    file_path = os.path.join(INPUT_DIR, file_name)
+    await new_file.download_to_drive(file_path)
+    
+    await update.message.reply_text(f"📄 Documento recibido: `{file_name}`", parse_mode="Markdown")
+    print(f"--> [InputSkill] Documento guardado en: {file_path}")
+
+
+=== ARCHIVO: .\skills\send_telegram_media.py ===
+import os
+from telegram import Bot
+
+async def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption: str = ""):
+    """
+    Skill para enviar documentos (PDF, DOCX) directamente a Telegram.
+    $0 Inversión - Usa API nativa de Telegram.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"El archivo {file_path} no existe.")
+        
+    bot = Bot(token=bot_token)
+    with open(file_path, 'rb') as doc:
+        await bot.send_document(
+            chat_id=chat_id,
+            document=doc,
+            caption=caption,
+            parse_mode="Markdown"
+        )

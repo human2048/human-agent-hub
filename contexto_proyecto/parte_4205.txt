@@ -1,0 +1,402 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_oauth_user_agent.py ===
+"""Tests for the per-server ``oauth.user_agent`` on MCP OAuth token requests.
+
+Some authorization servers and WAFs reject httpx's default User-Agent on the
+token endpoint (#75576). The header is opt-in, per-server, and applied ONLY to
+the two token-endpoint requests (authorization-code exchange and refresh) —
+never to MCP traffic or discovery.
+
+The tests drive the REAL provider classes' request builders end to end: the
+``httpx.Request`` the SDK would send is what gets inspected, not a mocked
+constructor call.
+"""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+pytest.importorskip(
+    "mcp.client.auth.oauth2",
+    reason="MCP SDK required for OAuth support",
+)
+
+from tools.mcp_oauth import (  # noqa: E402 — after the SDK availability gate
+    build_oauth_auth,
+    token_request_user_agent,
+)
+
+
+def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = is_tty
+    monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
+
+
+@pytest.fixture(autouse=True)
+def clean_port_state():
+    import tools.mcp_oauth as mod
+
+    mod._assigned_cimd_ports.clear()
+    yield
+    mod._assigned_cimd_ports.clear()
+    for port in list(mod._reserved_sockets):
+        sock = mod._reserved_sockets.pop(port, None)
+        if sock is not None:
+            sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Config parsing
+# ---------------------------------------------------------------------------
+
+
+def test_configured_user_agent_is_returned():
+    assert token_request_user_agent({"user_agent": "My-MCP-Client/1.0"}) == "My-MCP-Client/1.0"
+
+
+@pytest.mark.parametrize("cfg", [
+    pytest.param({}, id="absent"),
+    pytest.param({"user_agent": None}, id="null"),
+    pytest.param({"user_agent": ""}, id="empty"),
+    pytest.param({"user_agent": "   "}, id="whitespace-only"),
+    pytest.param({"user_agent": 7}, id="non-string"),
+])
+def test_unset_user_agent_values_are_treated_as_absent(cfg):
+    assert token_request_user_agent(cfg) is None
+
+
+def test_user_agent_is_stripped():
+    assert token_request_user_agent({"user_agent": "  UA/2 "}) == "UA/2"
+
+
+# ---------------------------------------------------------------------------
+# The requests the SDK actually sends
+# ---------------------------------------------------------------------------
+
+
+def _ready_for_token_requests(provider):
+    """Give the provider the minimum context both builders require."""
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+
+    provider.context.oauth_metadata = SimpleNamespace(
+        token_endpoint="https://idp.example.com/oauth/token"
+    )
+    provider.context.client_info = OAuthClientInformationFull.model_validate({
+        "client_id": "client-1",
+        "redirect_uris": ["http://127.0.0.1:33333/callback"],
+    })
+    provider.context.current_tokens = OAuthToken.model_validate({
+        "access_token": "at",
+        "token_type": "Bearer",
+        "refresh_token": "rt",
+    })
+
+
+def _build_provider_via(builder, monkeypatch, tmp_path, cfg):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    return builder("srv", "https://mcp.example.com/mcp", cfg)
+
+
+def _manager_builder(server_name, server_url, cfg):
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    return MCPOAuthManager().get_or_build_provider(server_name, server_url, cfg)
+
+
+@pytest.mark.parametrize("builder", [
+    pytest.param(build_oauth_auth, id="build_oauth_auth"),
+    pytest.param(_manager_builder, id="oauth_manager"),
+])
+def test_token_requests_carry_the_configured_user_agent(
+    builder, tmp_path, monkeypatch
+):
+    """Both token-endpoint requests, on both provider construction paths."""
+    provider = _build_provider_via(
+        builder, monkeypatch, tmp_path, {"user_agent": "My-MCP-Client/1.0"}
+    )
+    _ready_for_token_requests(provider)
+
+    exchange = asyncio.run(
+        provider._exchange_token_authorization_code("code", "verifier")
+    )
+    refresh = asyncio.run(provider._refresh_token())
+
+    assert exchange.headers["User-Agent"] == "My-MCP-Client/1.0"
+    assert refresh.headers["User-Agent"] == "My-MCP-Client/1.0"
+
+
+@pytest.mark.parametrize("builder", [
+    pytest.param(build_oauth_auth, id="build_oauth_auth"),
+    pytest.param(_manager_builder, id="oauth_manager"),
+])
+def test_unconfigured_user_agent_leaves_the_default_header(
+    builder, tmp_path, monkeypatch
+):
+    """No config → httpx's own default, exactly as before the feature."""
+    import httpx
+
+    provider = _build_provider_via(builder, monkeypatch, tmp_path, {})
+    _ready_for_token_requests(provider)
+
+    exchange = asyncio.run(
+        provider._exchange_token_authorization_code("code", "verifier")
+    )
+    refresh = asyncio.run(provider._refresh_token())
+
+    default_ua = httpx.Request("POST", "https://x.example/").headers.get("User-Agent")
+    assert exchange.headers.get("User-Agent") == default_ua
+    assert refresh.headers.get("User-Agent") == default_ua
+
+
+def test_user_agent_does_not_disturb_token_auth_preparation(tmp_path, monkeypatch):
+    """The stamp runs after prepare_token_auth — a confidential client's
+    Authorization header must survive alongside the custom User-Agent."""
+    provider = _build_provider_via(
+        build_oauth_auth, monkeypatch, tmp_path,
+        {"user_agent": "UA/1", "client_id": "pre", "client_secret": "shh",
+         "token_endpoint_auth_method": "client_secret_basic"},
+    )
+    _ready_for_token_requests(provider)
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    provider.context.client_info = OAuthClientInformationFull.model_validate({
+        "client_id": "pre",
+        "client_secret": "shh",
+        "token_endpoint_auth_method": "client_secret_basic",
+        "redirect_uris": ["http://127.0.0.1:33333/callback"],
+    })
+
+    exchange = asyncio.run(
+        provider._exchange_token_authorization_code("code", "verifier")
+    )
+
+    assert exchange.headers["User-Agent"] == "UA/1"
+    assert exchange.headers.get("Authorization", "").startswith("Basic ")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_parked_probe_no_browser.py ===
+"""A parked MCP server's timed self-probe is unattended: it must never start a browser OAuth
+flow. Left interactive, an expired refresh token opened a new authorize tab every
+``_PARKED_RETRY_INTERVAL`` for the life of the gateway (92 tabs in one night)."""
+
+import asyncio
+
+import pytest
+
+
+@pytest.mark.no_isolate
+def test_self_probe_revival_runs_with_interactive_oauth_suppressed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_oauth import _is_interactive, force_interactive_oauth
+    from tools.mcp_tool import MCPServerTask
+
+    monkeypatch.setattr(mcp_tool, "_MAX_INITIAL_CONNECT_RETRIES", 0)
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 0.05)
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_delay, *a, **kw):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(mcp_tool.asyncio, "sleep", _fast_sleep)
+    attempts: list = []
+
+    class _Task(MCPServerTask):
+        def _is_http(self):
+            return False
+
+        def _deregister_tools(self):
+            self._registered_tool_names = []
+
+        async def _run_stdio(self, config):
+            attempts.append(_is_interactive())
+            if len(attempts) == 1:
+                raise RuntimeError("down")  # parks at once (initial ladder = 0 retries)
+            self.session = object()
+            await self._wait_for_lifecycle_event()
+            return "shutdown"
+
+    async def _scenario():
+        # The gateway/TTY parent context IS interactive; the self-probe must still not be.
+        with force_interactive_oauth():
+            task = _Task("srv")
+            run_task = asyncio.ensure_future(task.run({"command": "x"}))
+            for _ in range(400):
+                await _real_sleep(0.01)
+                if len(attempts) >= 2:
+                    break
+            await task.shutdown()
+            await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(_scenario())
+    assert attempts[0] is True, "the attended initial connect may still prompt"
+    assert len(attempts) >= 2 and attempts[-1] is False, (
+        "timed self-probe revival ran with interactive OAuth enabled -> browser tab per probe")
+
+
+def test_explicit_reconnect_request_keeps_the_callers_interactivity():
+    """Only the TIMED wake is unattended; ``_reconnect_event`` (OAuth recovery, /mcp refresh) is an
+    explicit request and is reported as such."""
+    from tools.mcp_tool import MCPServerTask
+
+    async def _scenario():
+        task = MCPServerTask("srv")
+        task._reconnect_event.set()
+        assert await task._wait_for_reconnect_or_shutdown(timeout=1) == "reconnect"
+        assert await task._wait_for_reconnect_or_shutdown(timeout=0.01) == "self-probe"
+        task._shutdown_event.set()
+        assert await task._wait_for_reconnect_or_shutdown(timeout=0.01) == "shutdown"
+
+    asyncio.run(_scenario())
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_mcp_parked_self_probe.py ===
+"""Tests for the parked-server self-probe revival path (#57129).
+
+Parking deregisters a server's tools, so no tool call can reach the
+circuit-breaker half-open probe or ``_signal_reconnect`` — the only
+things that set ``_reconnect_event``. The parked wait must therefore be
+timed: the run task wakes on ``_PARKED_RETRY_INTERVAL`` and attempts one
+revival probe on its own.
+"""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+def test_revival_discovery_registers_tools_while_ready_is_cleared(monkeypatch):
+    """A managed server revival must publish tools before readiness is reset."""
+    from tools import mcp_tool
+    from tools import mcp_tool_registration as _mcp_registration
+    from tools.mcp_tool import MCPServerTask
+
+    server = MCPServerTask("srv")
+    server._config = {"url": "https://example.test/mcp"}
+    server.session = SimpleNamespace(
+        list_tools=AsyncMock(
+            return_value=SimpleNamespace(
+                tools=[SimpleNamespace(name="send_message")],
+            )
+        )
+    )
+    server._ready.clear()
+    server._registered_tool_names = []
+    monkeypatch.setitem(mcp_tool._servers, server.name, server)
+
+    register = MagicMock(return_value=["srv__send_message"])
+    monkeypatch.setattr(_mcp_registration, "_register_server_tools", register)
+
+    asyncio.run(server._discover_tools())
+
+    register.assert_called_once_with(server.name, server, server._config)
+    assert server._registered_tool_names == ["srv__send_message"]
+
+
+@pytest.mark.no_isolate
+def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
+    """A parked server must revive on its own once the backend recovers,
+    without any explicit _reconnect_event.set()."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import MCPServerTask
+
+    monkeypatch.setattr(mcp_tool, "_MAX_RECONNECT_RETRIES", 1)
+    # Keep the self-probe cadence tiny so the test is fast.
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 0.05)
+
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_delay, *a, **kw):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(mcp_tool.asyncio, "sleep", _fast_sleep)
+
+    state = {
+        "transport_calls": 0,
+        "deregistered": 0,
+        "backend_up": False,
+        "revived_registration": 0,
+    }
+
+    async def _scenario():
+        class _Task(MCPServerTask):
+            def _is_http(self):
+                return False
+
+            def _deregister_tools(self):
+                state["deregistered"] += 1
+                self._registered_tool_names = []
+
+            def _register_discovered_tools_if_needed(self):
+                if self._ready.is_set() and not self._registered_tool_names:
+                    state["revived_registration"] += 1
+                    self._registered_tool_names = ["srv__tool"]
+
+            async def _run_stdio(self, config):
+                state["transport_calls"] += 1
+                if state["transport_calls"] == 1:
+                    # First connect succeeds (sets _ready), then dies.
+                    self.session = object()
+                    self._ready.set()
+                    self._ever_connected = True
+                    self.session = None
+                    raise RuntimeError("backend outage begins")
+                if not state["backend_up"]:
+                    raise RuntimeError("backend still down")
+                # Backend recovered: establish a session and park in the
+                # lifecycle wait like the real transport does.
+                self.session = object()
+                self._register_discovered_tools_if_needed()
+                await self._wait_for_lifecycle_event()
+
+        task = _Task("srv")
+        task._registered_tool_names = ["srv__tool"]
+
+        run_task = asyncio.ensure_future(task.run({"command": "x"}))
+
+        # Let it exhaust the budget (1 retry) and park.
+        for _ in range(2000):
+            await _real_sleep(0)
+            if state["deregistered"] >= 1:
+                break
+        assert state["deregistered"] >= 1, "server never parked"
+        assert not run_task.done(), "run task exited instead of parking"
+
+        # The backend comes back. NOTHING sets _reconnect_event — revival
+        # must come from the timed self-probe alone.
+        state["backend_up"] = True
+        for _ in range(200):
+            await _real_sleep(0.01)
+            if task.session is not None:
+                break
+
+        assert task.session is not None, (
+            "parked server never self-probed back to life "
+            f"(transport_calls={state['transport_calls']})"
+        )
+        assert state["revived_registration"] >= 1, (
+            "revived server did not re-register its tools"
+        )
+
+        task._shutdown_event.set()
+        task._reconnect_event.set()
+        try:
+            await asyncio.wait_for(run_task, timeout=15)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            run_task.cancel()
+
+    asyncio.run(_scenario())
+

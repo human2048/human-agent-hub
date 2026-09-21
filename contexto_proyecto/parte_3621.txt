@@ -1,0 +1,233 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_handoff_desktop_rebuild.py ===
+"""The current-checkout repair path must rebuild the Desktop app (#97343).
+
+A Windows git install runs `hermes update` from `hermes.exe`, which reexecs a
+venv-Python child to finish the dependency sync. That child completes through
+``_repair_node_deps_on_current_checkout`` / the hand-off repair branch, never
+through the commits-pulled path that owns the Desktop rebuild — so a
+successful-looking update left the packaged desktop app on the previous build.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+from hermes_cli import update_cmd
+
+
+def test_current_checkout_repair_rebuilds_desktop_under_project_root():
+    """The repair passes PROJECT_ROOT/apps/desktop and the pre-update flag."""
+    completion = MagicMock(return_value=True)
+    with (
+        patch.object(update_cmd, "_update_node_dependencies", return_value=[]),
+        patch.object(update_cmd, "_m") as m,
+        patch.object(update_cmd, "_check_and_apply_config_migration"),
+        patch.object(
+            update_cmd, "_rebuild_desktop_after_update", return_value=True
+        ) as rebuild,
+    ):
+        m.return_value.PROJECT_ROOT = update_cmd.Path("/fake/hermes")
+        complete = update_cmd._repair_node_deps_on_current_checkout(
+            completion, had_desktop_app_before_update=True
+        )
+
+    assert complete is True
+    rebuild.assert_called_once()
+    assert rebuild.call_args[0][0] == update_cmd.Path("/fake/hermes/apps/desktop")
+    assert rebuild.call_args[1]["had_desktop_app_before_update"] is True
+    completion.assert_called_once_with("✓ Already up to date!")
+
+
+def test_failed_desktop_rebuild_withholds_success_completion():
+    """A failed rebuild must not report success and must return False."""
+    completion = MagicMock(return_value=True)
+    with (
+        patch.object(update_cmd, "_update_node_dependencies", return_value=[]),
+        patch.object(update_cmd, "_m") as m,
+        patch.object(update_cmd, "_check_and_apply_config_migration"),
+        patch.object(update_cmd, "_rebuild_desktop_after_update", return_value=False),
+    ):
+        m.return_value.PROJECT_ROOT = update_cmd.Path("/fake/hermes")
+        complete = update_cmd._repair_node_deps_on_current_checkout(completion)
+
+    assert complete is False
+    for call in completion.call_args_list:
+        assert not call[0][0].startswith("✓")
+
+
+def test_handoff_venv_repair_finishes_node_and_web_phase(tmp_path):
+    """A successful Python repair must not bypass the remaining update work."""
+    project_root = tmp_path / "hermes"
+    venv_python = project_root / "venv" / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.touch()
+
+    with (
+        patch.object(update_cmd, "venv_python_path", return_value=venv_python),
+        patch.object(update_cmd, "_pip_install_prefix", return_value=(["uv", "pip"], None)),
+        patch.object(update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")),
+        patch.object(update_cmd, "_write_update_incomplete_marker"),
+        patch.object(update_cmd, "_update_node_dependencies", return_value=[]) as update_node,
+        patch.object(update_cmd, "_check_and_apply_config_migration"),
+        patch.object(update_cmd, "_rebuild_desktop_after_update", return_value=True),
+        patch.object(update_cmd, "_print_verified_update_completion", return_value=True) as completion,
+        patch("hermes_cli.managed_uv.ensure_uv", return_value="uv"),
+        patch.object(update_cmd, "_m") as m,
+    ):
+        m.return_value.PROJECT_ROOT = project_root
+        complete = update_cmd._repair_venv_on_current_checkout(
+            assume_yes=True,
+            gateway_mode=False,
+            pre_update_snapshot_id=None,
+            had_desktop_app_before_update=False,
+            active_lazy_features=(),
+            active_tool_dependencies=(),
+            _windows_gateway_resume=None,
+        )
+
+    assert complete is True
+    update_node.assert_called_once_with()
+    m.return_value._build_web_ui.assert_called_once_with(project_root / "web")
+    completion.assert_called_once_with("✓ Update complete!")
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_update_handoff_exit.py ===
+"""Windows hand-off child must hard-exit once the update is durably done (#93581).
+
+The re-exec'd venv child (spawned by
+``_reexec_dependency_sync_off_windows_shim`` with ``HERMES_UPDATE_REEXEC=1``)
+completes all update work — the receipt records ``success`` / ``completed at
+command boundary`` — but then hangs in interpreter shutdown on a leftover
+non-daemon thread, freezing the PowerShell window for minutes. The fix: on
+the hand-off path only, after the receipt is finalized, the lock released,
+and stdio restored, flush and ``os._exit(code)`` instead of unwinding.
+
+These tests pin: the hard exit fires (with the right code) only when the
+re-exec marker env is set, it happens after lock release + stdio restore,
+early ``SystemExit`` codes propagate to it, and real exceptions keep the
+normal raise path (traceback intact, no hard exit).
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+import hermes_cli.main as main_mod
+from hermes_cli import update_cmd
+from hermes_cli.main import cmd_update
+from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON
+
+
+class _FakeLock:
+    def __init__(self, events):
+        self._events = events
+
+    def acquire(self):
+        self._events.append("acquire")
+        return True
+
+    def release(self):
+        self._events.append("release")
+
+
+# Events from the most recent _run_cmd_update call, also filled in when
+# cmd_update propagates an exception (the return value is unreachable then).
+_LAST = {}
+
+
+def _run_cmd_update(monkeypatch, impl, *, reexec: bool):
+    """Run cmd_update with everything external mocked; return the events."""
+    events = {"order": [], "exit_codes": [], "receipts": []}
+
+    def fake_impl(args, gateway_mode=False):
+        events["order"].append("impl")
+        impl(args, gateway_mode=gateway_mode)
+
+    def fake_finalize_io(state):
+        events["order"].append("restore-stdio")
+
+    def fake_receipt(code, reason):
+        events["receipts"].append((code, reason))
+
+    def fake_exit(code):
+        events["order"].append("hard-exit")
+        events["exit_codes"].append(code)
+
+    monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda root: "git")
+    monkeypatch.setattr("hermes_cli.update_lock.UpdateLock", lambda: _FakeLock(events["order"]))
+    monkeypatch.setattr(update_cmd, "_cmd_update_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_install_hangup_protection", lambda gateway_mode=False: None)
+    monkeypatch.setattr(main_mod, "_finalize_update_output", fake_finalize_io)
+    monkeypatch.setattr("hermes_cli.update_receipt.finalize_pending_update_receipt", fake_receipt)
+    monkeypatch.setattr("os._exit", fake_exit)
+    if reexec:
+        monkeypatch.setenv("HERMES_UPDATE_REEXEC", "1")
+    else:
+        monkeypatch.delenv("HERMES_UPDATE_REEXEC", raising=False)
+
+    args = SimpleNamespace(plan=False, check=False, gateway=False, branch=None)
+    try:
+        cmd_update(args)
+    finally:
+        _LAST.clear()
+        _LAST.update(events)
+    return events
+
+
+def _noop_impl(args, gateway_mode=False):
+    return None
+
+
+def test_handoff_child_hard_exits_zero_after_success(monkeypatch):
+    events = _run_cmd_update(monkeypatch, _noop_impl, reexec=True)
+    assert events["exit_codes"] == [0]
+    assert events["receipts"] == [(0, COMMAND_BOUNDARY_STOP_REASON)]
+    # The hard exit is the last thing, after lock release and stdio restore.
+    assert events["order"] == ["acquire", "impl", "release", "restore-stdio", "hard-exit"]
+
+
+def test_non_handoff_run_never_hard_exits(monkeypatch):
+    events = _run_cmd_update(monkeypatch, _noop_impl, reexec=False)
+    assert events["exit_codes"] == []
+    assert "hard-exit" not in events["order"]
+    assert events["receipts"] == [(0, COMMAND_BOUNDARY_STOP_REASON)]
+
+
+def test_handoff_child_propagates_early_systemexit_code(monkeypatch):
+    def early_refusal(args, gateway_mode=False):
+        raise SystemExit(3)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run_cmd_update(monkeypatch, early_refusal, reexec=True)
+    assert excinfo.value.code == 3
+    # The finally-block hard exit ran (before the re-raise propagated)
+    # and carried the early exit's code, not a blanket 0.
+    assert _LAST["exit_codes"] == [3]
+
+
+def test_handoff_child_systemexit_none_means_zero(monkeypatch):
+    def bare_exit(args, gateway_mode=False):
+        raise SystemExit(None)
+
+    with pytest.raises(SystemExit):
+        _run_cmd_update(monkeypatch, bare_exit, reexec=True)
+    assert _LAST["exit_codes"] == [0]
+
+
+def test_unhandled_exception_keeps_raise_path_no_hard_exit(monkeypatch):
+    def boom(args, gateway_mode=False):
+        raise RuntimeError("update tail exploded")
+
+    # With os._exit patched to record, the re-raised RuntimeError reaches
+    # pytest with the finally block already run — and no hard exit fires.
+    with pytest.raises(RuntimeError, match="update tail exploded"):
+        _run_cmd_update(monkeypatch, boom, reexec=True)
+    assert "hard-exit" not in _LAST["order"]
+    assert _LAST["receipts"] == [(1, "RuntimeError: update tail exploded")]
+

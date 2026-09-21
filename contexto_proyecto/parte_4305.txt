@@ -1,0 +1,376 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_skill_view_dedup.py ===
+"""Tests for skill_view repeat-view dedup (unchanged-skill stub)."""
+
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from tools.skills_tool import (
+    _skill_view_with_bump,
+    reset_skill_view_dedup,
+)
+
+
+@pytest.fixture
+def skills_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    skills = home / "skills"
+    d = skills / "demo-dedup-skill"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: demo-dedup-skill\ndescription: Demo skill for dedup tests.\n---\n"
+        "# Demo\n\nStep one: run the demo procedure fully.\n",
+        encoding="utf-8",
+    )
+    refs = d / "references"
+    refs.mkdir()
+    (refs / "guide.md").write_text("# Guide\n\nDetailed reference content here.\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    reset_skill_view_dedup()
+    from tools.skill_manager_guards import _reset_background_review_read_marks
+    _reset_background_review_read_marks()
+    return home
+
+
+def _view(name, file_path=None, task="t-svd"):
+    args = {"name": name}
+    if file_path:
+        args["file_path"] = file_path
+    return json.loads(_skill_view_with_bump(args, task_id=task))
+
+
+class TestSkillViewDedup:
+    def test_first_view_returns_full_content(self, skills_home):
+        r = _view("demo-dedup-skill")
+        assert r["success"] is True
+        assert "Step one" in r.get("content", "")
+
+    def test_repeat_view_returns_stub(self, skills_home):
+        _view("demo-dedup-skill")
+        r2 = _view("demo-dedup-skill")
+        assert r2["success"] is True
+        assert r2.get("dedup") is True
+        assert r2.get("content_returned") is False
+        assert "unchanged" in r2["message"]
+        assert "content" not in r2
+
+    def test_modified_skill_returns_full_content(self, skills_home):
+        _view("demo-dedup-skill")
+        md = skills_home / "skills" / "demo-dedup-skill" / "SKILL.md"
+        time.sleep(0.01)
+        md.write_text(md.read_text(encoding="utf-8") + "\nStep two: new instruction.\n", encoding="utf-8")
+        r2 = _view("demo-dedup-skill")
+        assert "Step two" in r2.get("content", "")
+        assert r2.get("dedup") is None
+
+    def test_linked_file_dedup_is_independent(self, skills_home):
+        _view("demo-dedup-skill")
+        # First view of a DIFFERENT file within the skill: full content.
+        r = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert "Detailed reference" in r.get("content", "")
+        # Repeat of that file: stub.
+        r2 = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert r2.get("dedup") is True
+
+    def test_different_tasks_do_not_share_cache(self, skills_home):
+        _view("demo-dedup-skill", task="task-A")
+        r = _view("demo-dedup-skill", task="task-B")
+        assert "Step one" in r.get("content", "")
+
+    def test_reset_returns_full_content(self, skills_home):
+        _view("demo-dedup-skill")
+        reset_skill_view_dedup("t-svd")
+        r2 = _view("demo-dedup-skill")
+        assert "Step one" in r2.get("content", "")
+
+    def test_no_task_id_never_dedups(self, skills_home):
+        args = {"name": "demo-dedup-skill"}
+        r1 = json.loads(_skill_view_with_bump(args, task_id=None))
+        r2 = json.loads(_skill_view_with_bump(args, task_id=None))
+        assert "Step one" in r2.get("content", "")
+
+    def test_background_review_skips_dedup_and_marks_read(self, skills_home):
+        from tools.skill_provenance import (
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        _view("demo-dedup-skill")
+
+        token = set_current_write_origin("background_review")
+        try:
+            review = _view("demo-dedup-skill")
+        finally:
+            reset_current_write_origin(token)
+
+        assert review["success"] is True
+        assert "Step one" in review.get("content", "")
+        assert review.get("dedup") is None
+        assert review.get("content_returned") is None
+        # The real read marks the file, so the fork's read-before-write guard now admits the patch.
+        from tools.skill_manager_guards import _background_review_has_read
+        assert _background_review_has_read(skills_home / "skills" / "demo-dedup-skill" / "SKILL.md")
+
+    def test_background_review_does_not_pollute_foreground_cache(self, skills_home):
+        from tools.skill_provenance import (
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        token = set_current_write_origin("background_review")
+        try:
+            _view("demo-dedup-skill")
+        finally:
+            reset_current_write_origin(token)
+
+        foreground = _view("demo-dedup-skill")
+        assert "Step one" in foreground.get("content", "")
+
+        repeat = _view("demo-dedup-skill")
+        assert repeat.get("dedup") is True
+        assert repeat.get("content_returned") is False
+
+    def test_compression_hook_importable(self):
+        # conversation_compression imports this lazily; keep the seam stable.
+        from tools.skills_tool import reset_skill_view_dedup as f
+        f(None)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_skill_view_path_check.py ===
+"""Tests for the skill_view path boundary check.
+
+Regression test: the original check used a hardcoded "/" separator which
+fails on Windows where Path.resolve() returns backslash-separated paths.
+Now uses Path.is_relative_to() which handles all platforms correctly.
+"""
+
+import pytest
+from pathlib import Path
+
+
+def _path_escapes_skill_dir(resolved: Path, skill_dir_resolved: Path) -> bool:
+    """Reproduce the boundary check from tools/skills_tool.py.
+
+    Returns True when the resolved path is OUTSIDE the skill directory.
+    """
+    return not resolved.is_relative_to(skill_dir_resolved)
+
+
+class TestSkillViewPathBoundaryCheck:
+    """Verify the path boundary check works on all platforms."""
+
+    def test_valid_subpath_allowed(self, tmp_path):
+        """A file inside the skill directory must NOT be flagged."""
+        skill_dir = tmp_path / "skills" / "axolotl"
+        ref_file = skill_dir / "references" / "api.md"
+        skill_dir.mkdir(parents=True)
+        ref_file.parent.mkdir()
+        ref_file.write_text("content")
+
+        resolved = ref_file.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        assert _path_escapes_skill_dir(resolved, skill_dir_resolved) is False
+
+
+    def test_outside_path_blocked(self, tmp_path):
+        """A file outside the skill directory must be flagged."""
+        skill_dir = tmp_path / "skills" / "axolotl"
+        skill_dir.mkdir(parents=True)
+        outside_file = tmp_path / "secret.env"
+        outside_file.write_text("SECRET=123")
+
+        resolved = outside_file.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        assert _path_escapes_skill_dir(resolved, skill_dir_resolved) is True
+
+    def test_sibling_skill_dir_blocked(self, tmp_path):
+        """A file in a sibling skill directory must be flagged.
+
+        This catches prefix confusion: 'axolotl-v2' starts with 'axolotl'
+        as a string but is a different directory.
+        """
+        skill_dir = tmp_path / "skills" / "axolotl"
+        sibling_dir = tmp_path / "skills" / "axolotl-v2"
+        skill_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+        sibling_file = sibling_dir / "SKILL.md"
+        sibling_file.write_text("other skill")
+
+        resolved = sibling_file.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        assert _path_escapes_skill_dir(resolved, skill_dir_resolved) is True
+
+    def test_skill_dir_itself_allowed(self, tmp_path):
+        """Requesting the skill directory itself must be allowed."""
+        skill_dir = tmp_path / "skills" / "axolotl"
+        skill_dir.mkdir(parents=True)
+
+        resolved = skill_dir.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        assert _path_escapes_skill_dir(resolved, skill_dir_resolved) is False
+
+
+class TestOldCheckWouldFail:
+    """Demonstrate the bug: the old hardcoded '/' check fails on Windows."""
+
+    def _old_path_escapes(self, resolved: Path, skill_dir_resolved: Path) -> bool:
+        """The BROKEN check that used hardcoded '/'."""
+        return (
+            not str(resolved).startswith(str(skill_dir_resolved) + "/")
+            and resolved != skill_dir_resolved
+        )
+
+    # ``windows_only`` rather than ``skipif(os.sep == "/")``: the Windows CI
+    # job greps for the marker to decide which files to import, so a bare
+    # skipif leaves this running on no host at all.
+    @pytest.mark.windows_only
+    def test_old_check_false_positive_on_windows(self, tmp_path):
+        """On Windows, the old check incorrectly blocks valid subpaths."""
+        skill_dir = tmp_path / "skills" / "axolotl"
+        ref_file = skill_dir / "references" / "api.md"
+        skill_dir.mkdir(parents=True)
+        ref_file.parent.mkdir()
+        ref_file.write_text("content")
+
+        resolved = ref_file.resolve()
+        skill_dir_resolved = skill_dir.resolve()
+
+        # Old check says it escapes (WRONG on Windows)
+        assert self._old_path_escapes(resolved, skill_dir_resolved) is True
+        # New check correctly allows it
+        assert _path_escapes_skill_dir(resolved, skill_dir_resolved) is False
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\tools\test_skill_view_traversal.py ===
+"""Tests for path traversal prevention in skill_view.
+
+Regression tests for issue #220: skill_view file_path parameter allowed
+reading arbitrary files (e.g., ~/.hermes/.env) via path traversal.
+"""
+
+import json
+import pytest
+from unittest.mock import patch
+
+from tools.skills_tool import skill_view
+
+
+@pytest.fixture()
+def fake_skills(tmp_path):
+    """Create a fake skills directory with one skill and a sensitive file outside."""
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "test-skill"
+    skill_dir.mkdir(parents=True)
+
+    # Create SKILL.md
+    (skill_dir / "SKILL.md").write_text("# Test Skill\nA test skill.")
+
+    # Create a legitimate file inside the skill
+    refs = skill_dir / "references"
+    refs.mkdir()
+    (refs / "api.md").write_text("API docs here")
+
+    # Create a sensitive file outside skills dir (simulating .env)
+    (tmp_path / ".env").write_text("SECRET_API_KEY=sk-do-not-leak")
+
+    with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+        yield {"skills_dir": skills_dir, "skill_dir": skill_dir, "tmp_path": tmp_path}
+
+
+class TestPathTraversalBlocked:
+    def test_dotdot_in_skill_name_blocked(self, fake_skills):
+        """A traversal skill name must not escape the skills search root.
+
+        Regression: `name` was joined onto each search dir to build the lookup
+        path with no `..`/absolute guard (while file_path WAS validated), so
+        name="../outside-skill" could select a sibling dir outside SKILLS_DIR.
+        """
+        tmp_path = fake_skills["tmp_path"]
+        outside_skill = tmp_path / "outside-skill"
+        outside_skill.mkdir()
+        (outside_skill / "SKILL.md").write_text("# Outside Skill\n")
+        (outside_skill / ".env").write_text("ESCAPED_SECRET=do-not-leak")
+
+        result = json.loads(skill_view("../outside-skill", file_path=".env"))
+
+        assert result["success"] is False
+        assert "traversal" in result["error"].lower()
+        assert "do-not-leak" not in json.dumps(result)
+
+    def test_absolute_skill_name_blocked(self, fake_skills):
+        """An absolute skill name must not bypass the trusted search root."""
+        tmp_path = fake_skills["tmp_path"]
+        outside_skill = tmp_path / "outside-absolute"
+        outside_skill.mkdir()
+        (outside_skill / "SKILL.md").write_text("# Outside Absolute\n")
+        (outside_skill / ".env").write_text("ABSOLUTE_SECRET=do-not-leak")
+
+        result = json.loads(skill_view(str(outside_skill), file_path=".env"))
+
+        assert result["success"] is False
+        assert "relative path" in result["error"].lower()
+        assert "do-not-leak" not in json.dumps(result)
+
+    def test_legit_skill_name_still_works(self, fake_skills):
+        """A normal skill name must still resolve after the name guard."""
+        result = json.loads(skill_view("test-skill"))
+        assert result["success"] is True
+
+    def test_dotdot_in_file_path(self, fake_skills):
+        """Direct .. traversal should be rejected."""
+        result = json.loads(skill_view("test-skill", file_path="../../.env"))
+        assert result["success"] is False
+        assert "traversal" in result["error"].lower()
+
+    def test_dotdot_nested(self, fake_skills):
+        """Nested .. traversal should also be rejected."""
+        result = json.loads(skill_view("test-skill", file_path="references/../../../.env"))
+        assert result["success"] is False
+        assert "traversal" in result["error"].lower()
+
+    def test_legitimate_file_still_works(self, fake_skills):
+        """Valid paths within the skill directory should work normally."""
+        result = json.loads(skill_view("test-skill", file_path="references/api.md"))
+        assert result["success"] is True
+        assert "API docs here" in result["content"]
+
+    def test_no_file_path_shows_skill(self, fake_skills):
+        """Calling skill_view without file_path should return the SKILL.md."""
+        result = json.loads(skill_view("test-skill"))
+        assert result["success"] is True
+
+    def test_symlink_escape_blocked(self, fake_skills):
+        """Symlinks pointing outside the skill directory should be blocked."""
+        skill_dir = fake_skills["skill_dir"]
+        secret = fake_skills["tmp_path"] / "secret.txt"
+        secret.write_text("TOP SECRET DATA")
+
+        symlink = skill_dir / "evil-link"
+        try:
+            symlink.symlink_to(secret)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        result = json.loads(skill_view("test-skill", file_path="evil-link"))
+        # The resolve() check should catch the symlink escaping
+        assert result["success"] is False
+        assert "escapes" in result["error"].lower() or "boundary" in result["error"].lower()
+
+    def test_sensitive_file_not_leaked(self, fake_skills):
+        """Even if traversal somehow passes, sensitive content must not leak."""
+        result = json.loads(skill_view("test-skill", file_path="../../.env"))
+        assert result["success"] is False
+        assert "sk-do-not-leak" not in result.get("content", "")
+        assert "sk-do-not-leak" not in json.dumps(result)
+

@@ -1,0 +1,352 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_empty_session_hygiene.py ===
+"""Tests for empty-session hygiene — gemini-cli#27770 port.
+
+Starting the CLI and immediately quitting (or rotating sessions with /new)
+used to leave empty untitled rows in the session DB that clutter /resume
+and `hermes sessions list`. ``SessionDB.delete_session_if_empty`` removes
+a just-ended session row only when it never gained resumable content:
+no messages, no title, and no child sessions.
+"""
+
+import pytest
+
+from hermes_state import SessionDB
+
+
+@pytest.fixture()
+def db(tmp_path):
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    yield session_db
+    session_db.close()
+
+
+class TestDeleteSessionIfEmpty:
+
+    def test_keeps_session_with_messages(self, db):
+        db.create_session(session_id="busy", source="cli", model="test")
+        db.append_message("busy", role="user", content="hello")
+        db.end_session("busy", "cli_close")
+
+        assert db.delete_session_if_empty("busy") is False
+        assert db.get_session("busy") is not None
+
+    def test_keeps_titled_session(self, db):
+        """A user-assigned title is resumable content even without messages."""
+        db.create_session(session_id="titled", source="cli", model="test")
+        db.set_session_title("titled", "Important plans")
+        db.end_session("titled", "cli_close")
+
+        assert db.delete_session_if_empty("titled") is False
+        assert db.get_session("titled") is not None
+
+    def test_keeps_session_with_children(self, db):
+        """A parent that spawned delegate subagent runs is not empty."""
+        db.create_session(session_id="parent", source="cli", model="test")
+        db.create_session(
+            session_id="child",
+            source="tool",
+            model="test",
+            parent_session_id="parent",
+        )
+        db.end_session("parent", "cli_close")
+
+        assert db.delete_session_if_empty("parent") is False
+        assert db.get_session("parent") is not None
+        assert db.get_session("child") is not None
+
+
+    def test_removes_on_disk_transcripts(self, db, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "empty.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "empty.jsonl").write_text("", encoding="utf-8")
+
+        db.create_session(session_id="empty", source="cli", model="test")
+        db.end_session("empty", "cli_close")
+
+        assert db.delete_session_if_empty("empty", sessions_dir=sessions_dir)
+        assert not (sessions_dir / "empty.json").exists()
+        assert not (sessions_dir / "empty.jsonl").exists()
+
+    def test_no_file_cleanup_when_kept(self, db, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "busy.json").write_text("{}", encoding="utf-8")
+
+        db.create_session(session_id="busy", source="cli", model="test")
+        db.append_message("busy", role="user", content="hello")
+
+        assert not db.delete_session_if_empty("busy", sessions_dir=sessions_dir)
+        assert (sessions_dir / "busy.json").exists()
+
+
+
+class TestCLIDiscardSessionIfEmpty:
+    """Wiring tests for HermesCLI._discard_session_if_empty."""
+
+    def _make_cli(self, db):
+        from cli import HermesCLI
+
+        cli = HermesCLI.__new__(HermesCLI)
+        cli._session_db = db
+        cli.conversation_history = []
+        return cli
+
+
+
+
+    def test_none_session_id_is_noop(self, db):
+        cli = self._make_cli(db)
+        assert cli._discard_session_if_empty(None) is False
+
+    def test_db_error_swallowed(self, db):
+        class Boom:
+            def delete_session_if_empty(self, *a, **k):
+                raise RuntimeError("locked")
+
+        cli = self._make_cli(Boom())
+        assert cli._discard_session_if_empty("x") is False
+
+    def test_in_memory_history_blocks_prune(self, db):
+        """The live transcript is authoritative: even if the DB row has no
+        flushed messages yet, a CLI holding conversation history must not
+        prune the session (covers flush-failed / not-yet-flushed turns)."""
+        db.create_session(session_id="unflushed", source="cli", model="test")
+        db.end_session("unflushed", "new_session")
+
+        cli = self._make_cli(db)
+        cli.conversation_history = [{"role": "user", "content": "hello"}]
+        assert cli._discard_session_if_empty("unflushed") is False
+        assert db.get_session("unflushed") is not None
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_ensure_acp_launcher.py ===
+"""`hermes update` must self-heal the ``hermes-acp`` launcher.
+
+ACP hosts (Zed, JetBrains, Buzz Desktop) resolve the agent by the
+``hermes-acp`` command name on the login-shell PATH. Fresh installs get the
+launcher from ``scripts/install.sh``; existing installs get it from
+``_ensure_acp_launcher()`` during ``hermes update``.
+"""
+
+import os
+import stat
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli.update_cmd import _ensure_acp_launcher
+
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    bin_dir = tmp_path / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    return bin_dir
+
+
+
+
+
+
+
+
+def test_does_not_follow_symlink_into_venv(fake_home, tmp_path):
+    """#21454 failure mode: never write through a symlinked hermes-acp."""
+    (fake_home / "hermes").write_text("#!/bin/sh\n", encoding="utf-8")
+    console_script = tmp_path / "venv" / "bin" / "hermes-acp"
+    console_script.parent.mkdir(parents=True)
+    marker = "#!/usr/bin/env python\n# real console script\n"
+    console_script.write_text(marker, encoding="utf-8")
+    (fake_home / "hermes-acp").symlink_to(console_script)
+
+    _ensure_acp_launcher()
+
+    assert console_script.read_text(encoding="utf-8") == marker
+    assert (fake_home / "hermes-acp").is_symlink()
+
+
+
+
+
+
+def test_unwritable_bin_dir_is_skipped(fake_home):
+    (fake_home / "hermes").write_text("#!/bin/sh\n", encoding="utf-8")
+    if not hasattr(os, "geteuid"):
+        # Windows: no geteuid, and chmod can't make a directory unwritable
+        # anyway. _ensure_acp_launcher is an explicit no-op there, so the
+        # assertion below still holds — vacuously.
+        _ensure_acp_launcher()
+        assert not (fake_home / "hermes-acp").exists()
+        return
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory write permissions")
+    fake_home.chmod(0o555)
+    try:
+        _ensure_acp_launcher()  # must not raise
+        assert not (fake_home / "hermes-acp").exists()
+    finally:
+        fake_home.chmod(0o755)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_ensure_gateway_service.py ===
+"""Tests for hermes_cli.gateway.ensure_gateway_service — the zero-prompt
+service install/start path used by `hermes setup` and `hermes import`.
+
+The helper's contract:
+  * never prompts, never raises (returns False on any failure)
+  * no-ops in containers and on hosts without a service manager
+  * short-circuits True when a service is already running
+  * installs (user scope) then starts when nothing is installed
+  * starts without reinstalling when a unit exists but isn't running
+  * refuses to install on top of conflicting user+system systemd units
+"""
+
+import hermes_cli.gateway as gateway_mod
+
+
+def _patch_host(monkeypatch, *, container=False, systemd=True, macos=False, windows=False):
+    monkeypatch.setattr("hermes_constants.is_container", lambda: container)
+    monkeypatch.setattr(gateway_mod, "supports_systemd_services", lambda: systemd)
+    monkeypatch.setattr(gateway_mod, "is_macos", lambda: macos)
+    monkeypatch.setattr(gateway_mod, "is_windows", lambda: windows)
+
+
+class TestEnsureGatewayService:
+    def test_container_is_noop(self, monkeypatch, capsys):
+        _patch_host(monkeypatch, container=True)
+        called = []
+        monkeypatch.setattr(gateway_mod, "systemd_install", lambda **kw: called.append("install"))
+
+        assert gateway_mod.ensure_gateway_service() is False
+        assert not called
+        out = capsys.readouterr().out
+        assert "restart policy" in out
+
+    def test_no_service_manager_is_noop(self, monkeypatch, capsys):
+        _patch_host(monkeypatch, systemd=False)
+        assert gateway_mod.ensure_gateway_service() is False
+        out = capsys.readouterr().out
+        assert "hermes gateway" in out
+
+    def test_already_running_short_circuits(self, monkeypatch):
+        _patch_host(monkeypatch)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: True)
+        called = []
+        monkeypatch.setattr(gateway_mod, "systemd_install", lambda **kw: called.append("install"))
+        monkeypatch.setattr(gateway_mod, "systemd_start", lambda **kw: called.append("start"))
+
+        assert gateway_mod.ensure_gateway_service() is True
+        assert not called
+
+    def test_fresh_host_installs_and_starts_user_scope(self, monkeypatch):
+        _patch_host(monkeypatch)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+        monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+        monkeypatch.setattr(gateway_mod, "has_conflicting_systemd_units", lambda: False)
+        calls = []
+        monkeypatch.setattr(
+            gateway_mod, "systemd_install",
+            lambda force=False, non_interactive=False, **kw: calls.append(
+                ("install", force, non_interactive, kw)
+            ),
+        )
+        monkeypatch.setattr(gateway_mod, "systemd_start", lambda **kw: calls.append(("start", kw)))
+
+        assert gateway_mod.ensure_gateway_service() is True
+        assert calls[0][0] == "install"
+        # user scope: no system=True ever passed from this path
+        assert "system" not in calls[0][3] or not calls[0][3]["system"]
+        # non_interactive so legacy-unit cleanup can't prompt
+        assert calls[0][2] is True
+        assert calls[1][0] == "start"
+
+    def test_installed_but_stopped_starts_without_reinstall(self, monkeypatch):
+        _patch_host(monkeypatch)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+        monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: True)
+        calls = []
+        monkeypatch.setattr(gateway_mod, "systemd_install", lambda **kw: calls.append("install"))
+        monkeypatch.setattr(gateway_mod, "systemd_start", lambda **kw: calls.append("start"))
+
+        assert gateway_mod.ensure_gateway_service() is True
+        assert calls == ["start"]
+
+    def test_conflicting_units_block_install(self, monkeypatch):
+        _patch_host(monkeypatch)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+        monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+        monkeypatch.setattr(gateway_mod, "has_conflicting_systemd_units", lambda: True)
+        warned = []
+        monkeypatch.setattr(
+            gateway_mod, "print_systemd_scope_conflict_warning", lambda: warned.append(True)
+        )
+        calls = []
+        monkeypatch.setattr(gateway_mod, "systemd_install", lambda **kw: calls.append("install"))
+
+        assert gateway_mod.ensure_gateway_service() is False
+        assert warned and not calls
+
+    def test_macos_uses_launchd(self, monkeypatch):
+        _patch_host(monkeypatch, systemd=False, macos=True)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+        monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+        calls = []
+        monkeypatch.setattr(gateway_mod, "launchd_install", lambda force=False: calls.append("install"))
+        monkeypatch.setattr(gateway_mod, "launchd_start", lambda: calls.append("start"))
+
+        assert gateway_mod.ensure_gateway_service() is True
+        assert calls == ["install", "start"]
+
+    def test_never_raises_on_install_failure(self, monkeypatch, capsys):
+        _patch_host(monkeypatch)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+        monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+        monkeypatch.setattr(gateway_mod, "has_conflicting_systemd_units", lambda: False)
+
+        def boom(**kw):
+            raise RuntimeError("dbus fell over")
+
+        monkeypatch.setattr(gateway_mod, "systemd_install", boom)
+
+        assert gateway_mod.ensure_gateway_service() is False
+        out = capsys.readouterr().out
+        assert "hermes gateway install" in out
+
+    def test_never_raises_on_sys_exit(self, monkeypatch, capsys):
+        """Install paths that sys.exit() must not abort setup/import."""
+        _patch_host(monkeypatch)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+        monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+        monkeypatch.setattr(gateway_mod, "has_conflicting_systemd_units", lambda: False)
+
+        def bail(**kw):
+            raise SystemExit(1)
+
+        monkeypatch.setattr(gateway_mod, "systemd_install", bail)
+
+        assert gateway_mod.ensure_gateway_service() is False
+        out = capsys.readouterr().out
+        assert "hermes gateway install" in out
+
+    def test_user_systemd_unreachable_reports_remediation(self, monkeypatch, capsys):
+        _patch_host(monkeypatch)
+        monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
+        monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: True)
+
+        def unreachable(**kw):
+            raise gateway_mod.UserSystemdUnavailableError("no D-Bus session\nenable linger")
+
+        monkeypatch.setattr(gateway_mod, "systemd_start", unreachable)
+
+        assert gateway_mod.ensure_gateway_service() is False
+        out = capsys.readouterr().out
+        assert "enable linger" in out
+

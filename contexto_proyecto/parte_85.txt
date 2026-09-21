@@ -1,0 +1,246 @@
+
+
+=== ARCHIVO: .\hermes-agent\agent\auxiliary_fallback_recovery.py ===
+"""Parameter-rejection recovery for auxiliary fallback candidates.
+
+The primary auxiliary request runs the full recovery ladder in ``auxiliary_client``; a fallback
+candidate (per-task chain, main fallback chain, discovery) used to get a single shot, so a fallback
+model that rejects ``temperature``, ``max_tokens`` or a reasoning field failed the whole task even
+though the same parameter rungs would have recovered it on the primary path (#78273, #72351).
+This module runs those rungs — and only those — around a candidate's request.
+"""
+from typing import Any, Awaitable, Callable, Dict, Optional
+
+
+def _parameter_ladder(first_err: Exception, client: Any, kwargs: Dict[str, Any], *,
+                      task: Optional[str], tag: str):
+    from agent.auxiliary_client import _LadderRoute, _ladder_parameter_rungs
+    # Keyword construction: the route tuple grows with every new ladder rung (a positional 13-tuple
+    # broke the moment a sibling PR added ``timeout``); fields this ladder never reads stay None.
+    route = _LadderRoute(**{**dict.fromkeys(_LadderRoute._fields), "client": client, "task": task,
+                            "tag": tag, "async_mode": bool(tag), "resolved_provider": "",
+                            "base_info": str(getattr(client, "base_url", "") or "")})
+    max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
+    resp, err, _ = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
+    if err is None:
+        return resp
+    raise err
+
+
+def send_with_parameter_rungs(
+    send: Callable[[Any, Dict[str, Any]], Any], client: Any, kwargs: Dict[str, Any], *, task: Optional[str],
+) -> Any:
+    """``send(client, kwargs)``; on a parameter 400, retry through the parameter rungs. Any other
+    error (auth, payment, connection) propagates unchanged for the caller's own handling."""
+    from agent.auxiliary_client import _drive_ladder
+    try:
+        return send(client, kwargs)
+    except Exception as first_err:
+        ladder = _parameter_ladder(first_err, client, kwargs, task=task, tag="")
+        return _drive_ladder(ladder, lambda step: send(*step.args))
+
+
+async def send_with_parameter_rungs_async(
+    send: Callable[[Any, Dict[str, Any]], Awaitable[Any]], client: Any, kwargs: Dict[str, Any], *,
+    task: Optional[str],
+) -> Any:
+    """Async twin of :func:`send_with_parameter_rungs`."""
+    from agent.auxiliary_client import _drive_ladder_async
+    try:
+        return await send(client, kwargs)
+    except Exception as first_err:
+        ladder = _parameter_ladder(first_err, client, kwargs, task=task, tag=" (async)")
+        return await _drive_ladder_async(ladder, lambda step: send(*step.args))
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\auxiliary_health.py ===
+"""Endpoint identity for auxiliary custom-provider health checks."""
+import contextlib
+from typing import Any, Optional
+
+from hermes_cli.route_identity import normalize_route_base_url
+
+def _unhealthy_cache_key(provider: str, base_url: Optional[str] = None) -> Any:
+    """Provider-wide key, or endpoint-specific key for an explicit custom endpoint — prefixed with the
+    active profile home: a 402 on profile A's account must not hide the provider from profile B's
+    (differently funded) account in the same multiplexed process."""
+    from agent.auxiliary_client import _normalize_chain_label
+    from hermes_constants import hermes_home_key
+    label = _normalize_chain_label(provider)
+    endpoint = normalize_route_base_url(_custom_health_base_url(provider, base_url))
+    home_key = hermes_home_key()
+    if endpoint:
+        return home_key, "custom-endpoint", endpoint
+    return home_key, label
+
+
+def _custom_health_base_url(provider: str, explicit_base_url: Optional[str] = None) -> str:
+    """Return the concrete custom endpoint used to scope health and failed-route checks."""
+    from agent.auxiliary_client import _current_custom_base_url
+    explicit = str(explicit_base_url or "").strip()
+    from agent.auxiliary_client import _normalize_chain_label
+    label = _normalize_chain_label(provider)
+    if label == "local/custom":
+        return explicit or _current_custom_base_url()
+    if label.startswith("custom:") and explicit:
+        return explicit
+    with contextlib.suppress(ImportError):
+        from hermes_cli.runtime_provider import _get_named_custom_provider, _resolves_to_custom
+        if _resolves_to_custom(label):
+            return explicit or _current_custom_base_url()
+        entry = _get_named_custom_provider(provider)
+        if entry:
+            return explicit or str(entry.get("base_url") or "").strip()
+    return ""
+
+
+
+
+def fallback_candidate_unavailable_reason(exc: Exception) -> Optional[str]:
+    """Why a fallback candidate cannot serve this walk (``_FALLBACK_REASONS`` label), or None.
+
+    The same capacity classes that admitted the primary failure into the chain (payment/quota,
+    rate limit, connection, route-incompatible model, malformed response) mean "this lane is out
+    for now, try the next configured one"; anything else (a 400 request-shape error, a ValueError)
+    is the caller's bug and must still propagate. Auth errors are excluded on purpose: they have
+    their own refresh-then-quarantine path in the candidate helpers (#106367)."""
+    from agent.auxiliary_client import _FALLBACK_REASONS
+    return next(
+        (label for predicate, label in _FALLBACK_REASONS if label != "auth error" and predicate(exc)),
+        None,
+    )
+
+
+# Quarantine hold per unavailable-reason label. Payment/quota depletion and a dead credential
+# last hours, so those keep the long default TTL (None); a per-minute 429, a dropped connection or
+# a garbled body clears in seconds — holding the lane for 10 minutes process-wide would hide a
+# healthy fallback from every aux task over one transient blip.
+_TRANSIENT_CANDIDATE_QUARANTINE_SECONDS = 60.0
+_CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
+    "rate limit": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    "connection error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+}
+
+
+def fallback_candidate_quarantine_ttl(reason: Optional[str]) -> Optional[float]:
+    """Seconds to hide a fallback candidate for ``reason`` (a ``_FALLBACK_REASONS`` label, or None
+    for a stale credential); None means the long default TTL."""
+    return _CANDIDATE_QUARANTINE_TTL.get(reason or "")
+
+
+
+=== ARCHIVO: .\hermes-agent\agent\auxiliary_structured_output.py ===
+"""Structured-output (``response_format``) capability for auxiliary requests.
+
+Two sources decide whether an aux request may carry a ``response_format`` type up front:
+
+* the provider profile's ``unsupported_response_formats`` (DeepSeek's native API implements only
+  ``json_object`` — https://api-docs.deepseek.com/guides/json_mode — and answers ``json_schema`` with
+  HTTP 400 "This response_format type is unavailable now"), also consulted when a ``custom`` route's
+  base_url points at a profiled provider's host, and
+* a process-level memo of (endpoint, model, type) triples that already rejected the type once; the
+  recovery ladder records the triple when its retry without the field succeeded.
+
+Either way the field is dropped before the first request instead of burning a guaranteed-fail
+round-trip per call (#83390, #105191, #113064). Dropping — not downgrading to ``json_object`` — is the
+same end state the rejection retry already produces: ``json_object`` needs the prompt to mention JSON
+and some relays return empty content under it, so callers already tolerate prompt compliance.
+
+The memo carries the model because capability is per model on aggregators (openrouter.ai, the Nous
+Portal, api.openai.com host dozens of models with different structured-output support), and it is
+fed only by rejections that name the *capability* — not by schema-validation 400s from providers that
+do implement ``json_schema`` ("Invalid schema for response_format 'json_schema': additionalProperties
+must be false"), which the ladder still retries once but which say nothing about the next schema.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
+# (route key, model, response_format type) triples a provider rejected in this process.
+_REJECTED_ROUTES: set[tuple[str, str, str]] = set()
+
+# Rejections that describe the route/model's capability rather than this request's schema.
+_CAPABILITY_REJECTION_MARKERS = (
+    "unavailable", "does not support", "doesn't support", "not supported", "unsupported parameter",
+    "unsupported_parameter", "unknown parameter", "unrecognized request argument", "unrecognized parameter",
+    "extra inputs are not permitted",
+)
+
+
+def _route_key(provider: Optional[str], base_url: Optional[str]) -> str:
+    """Endpoint host:port when known (a base_url override turns a named provider into ``custom``; local
+    servers differ by port), else the provider name."""
+    return (urlparse(base_url or "").netloc or "").lower() or str(provider or "").strip().lower()
+
+
+def _response_format_type(request_kwargs: Dict[str, Any]) -> Optional[str]:
+    extra_body = request_kwargs.get("extra_body")
+    response_format = (extra_body or {}).get("response_format") if isinstance(extra_body, dict) else None
+    if response_format is None:
+        response_format = request_kwargs.get("response_format")
+    return response_format.get("type") if isinstance(response_format, dict) else None
+
+
+def _profile_unsupported_formats(provider: Optional[str], base_url: Optional[str]) -> tuple:
+    """The provider profile's declared unsupported types; a ``custom`` route whose base_url is a profiled
+    provider's own host (``api.deepseek.com``) gets that provider's profile."""
+    try:
+        from providers import get_provider_profile
+        name = str(provider or "").strip().lower()
+        if name == "custom" and base_url:
+            from agent.model_metadata import _infer_provider_from_url
+            name = _infer_provider_from_url(base_url) or name
+        profile = get_provider_profile(name)
+    except Exception:
+        return ()
+    return tuple(getattr(profile, "unsupported_response_formats", ()) or ()) if profile is not None else ()
+
+
+def is_capability_rejection(error: Optional[BaseException]) -> bool:
+    """Whether a structured-output rejection speaks to the route/model's capability (memoisable) rather
+    than to this request's schema (retry once, remember nothing)."""
+    err_lower = str(error or "").lower()
+    if "invalid schema" in err_lower:
+        return False
+    return any(marker in err_lower for marker in _CAPABILITY_REJECTION_MARKERS)
+
+
+def remember_structured_output_rejection(
+    provider: Optional[str], base_url: Optional[str], rejected_kwargs: Dict[str, Any], error: BaseException,
+) -> None:
+    """Record that this route's ``rejected_kwargs["model"]`` rejected the ``response_format`` type carried
+    by *rejected_kwargs* — only when *error* names the capability, never for a schema-validation 400."""
+    format_type = _response_format_type(rejected_kwargs)
+    if format_type and is_capability_rejection(error):
+        _REJECTED_ROUTES.add((_route_key(provider, base_url), str(rejected_kwargs.get("model") or ""), format_type))
+
+
+def without_unsupported_response_format(
+    extra_body: Dict[str, Any], provider: Optional[str], base_url: Optional[str], model: Optional[str],
+    task: Optional[str] = None,
+) -> Dict[str, Any]:
+    """*extra_body* minus a ``response_format`` whose type this route+model is known to reject; unchanged
+    otherwise."""
+    response_format = extra_body.get("response_format")
+    format_type = response_format.get("type") if isinstance(response_format, dict) else None
+    if not format_type:
+        return extra_body
+    known_unsupported = (
+        format_type in _profile_unsupported_formats(provider, base_url)
+        or (_route_key(provider, base_url), str(model or ""), format_type) in _REJECTED_ROUTES
+    )
+    if not known_unsupported:
+        return extra_body
+    logger.info(
+        "Auxiliary %s: %s (%s) does not accept response_format %s; sending without it "
+        "(schema enforcement degrades to prompt compliance)",
+        task or "call", _route_key(provider, base_url) or "provider", model or "model", format_type,
+    )
+    return {k: v for k, v in extra_body.items() if k != "response_format"}
+

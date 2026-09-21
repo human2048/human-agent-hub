@@ -1,12 +1,12 @@
 import json
-import os
-import sys
-
-# Asegurar que el directorio raíz esté en el path para importar módulos correctamente
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from pathlib import Path
 
 from database.db_agent import DatabaseAgent
 from backend.financial_agent import FinancialAgent
+
+
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "cyberniche.db"
+
 
 class ExecutiveDashboard:
     """
@@ -14,7 +14,7 @@ class ExecutiveDashboard:
     Consolida la métrica financiera en tiempo real consultando
     la BD Multi-Tenant y el FinancialAgent.
     """
-    def __init__(self, db_path: str = "cyberniche.db"):
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db = DatabaseAgent(db_path=db_path)
         self.financial_agent = FinancialAgent(monthly_fee=29.00)
 

@@ -1,0 +1,344 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_stream_pool_cleanup.py ===
+"""Anthropic stream cleanup must not call _replace_primary_openai_client() and
+must not hang on Anthropic-native configs (#28161), now via the request-local
+client model (#67142).
+
+Originally three cleanup sites in interruptible_streaming_api_call() called
+_replace_primary_openai_client() unconditionally; for api_mode=anthropic_messages
+that silently failed (no OPENAI_API_KEY) and left the in-flight httpx stream
+unclosed, blocking the worker until the 900s read-timeout fired.
+
+Since #67142, anthropic streams run on a per-request client: the stale/retry
+cleanup closes the *request-local* client (worker-owned) and builds a fresh one
+next attempt — the shared _anthropic_client is never closed/rebuilt from inside
+a request (that poll-thread close was the TLS-FD→SQLite corruption vector). The
+no-hang guarantee is preserved because the poll thread aborts the request
+client's sockets, which unblocks the worker.
+
+Tests cover:
+- stream_retry cleanup  (connection error on fresh stream)
+- stale_stream cleanup  (outer poll loop detects stale stream)
+
+Fixes #28161. Extends #67142.
+"""
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_anthropic_agent(**kwargs):
+    from run_agent import AIAgent
+
+    defaults = dict(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="claude-opus-4-7",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    defaults.update(kwargs)
+    agent = AIAgent(**defaults)
+    agent.api_mode = "anthropic_messages"
+    agent._anthropic_client = MagicMock()
+    agent._anthropic_api_key = "test-anthropic-key"
+    # #67142: anthropic streams now run on a request-local client; route it to
+    # the test mock so .messages.stream is exercised and its cleanup observed.
+    agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
+    return agent
+
+
+def _good_stream_cm():
+    """Context manager whose stream yields no events and returns a valid message."""
+    cm = MagicMock()
+    stream = MagicMock()
+    stream.__iter__ = MagicMock(return_value=iter([]))
+    msg = MagicMock()
+    msg.content = []
+    msg.stop_reason = "end_turn"
+    msg.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+    stream.get_final_message = MagicMock(return_value=msg)
+    cm.__enter__ = MagicMock(return_value=stream)
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
+def _failing_stream_cm():
+    """Context manager whose __enter__ raises ConnectError immediately."""
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(
+        side_effect=httpx.ConnectError("connection reset by peer")
+    )
+    return cm
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicStreamPoolCleanup:
+    """Anthropic cleanup must never touch the OpenAI primary or the shared
+    Anthropic client, and must not hang (#28161 / #67142)."""
+
+    @pytest.mark.filterwarnings(
+        "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+    )
+    def test_stream_retry_closes_request_client_not_openai(self):
+        """Connection error during stream retry → close the request-local
+        Anthropic client (worker-owned) and retry; never rebuild the shared
+        Anthropic client, never touch the OpenAI primary."""
+        agent = _make_anthropic_agent()
+
+        attempt_count = [0]
+
+        def _stream_side_effect(*args, **kwargs):
+            attempt_count[0] += 1
+            if attempt_count[0] == 1:
+                return _failing_stream_cm()
+            return _good_stream_cm()
+
+        agent._anthropic_client.messages.stream.side_effect = _stream_side_effect
+
+        with patch.object(agent, "_rebuild_anthropic_client") as mock_rebuild:
+            with patch.object(
+                agent, "_replace_primary_openai_client"
+            ) as mock_replace:
+                agent._interruptible_streaming_api_call({})
+
+        mock_replace.assert_not_called()
+        # #67142: the shared client is never rebuilt from inside a request; the
+        # request-local client (routed to this mock) is closed instead.
+        mock_rebuild.assert_not_called()
+        agent._anthropic_client.close.assert_called()
+        assert attempt_count[0] == 2  # retried once, then succeeded
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_anthropic_structured_output.py ===
+"""Structured-output translation for Anthropic auxiliary calls."""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+
+def _capture_anthropic_kwargs(
+    extra_body: dict | None, *, model: str = "claude-sonnet-4-6",
+    async_call: bool = False, top_level_kwargs: dict | None = None,
+) -> dict:
+    from agent.auxiliary_client import (
+        _AnthropicCompletionsAdapter,
+        _AsyncAnthropicCompletionsAdapter,
+    )
+
+    captured = {}
+    sync_adapter = _AnthropicCompletionsAdapter(
+        MagicMock(name="anthropic_client"), model, is_oauth=False,
+    )
+    adapter = (
+        _AsyncAnthropicCompletionsAdapter(sync_adapter)
+        if async_call
+        else sync_adapter
+    )
+
+    def _fake_create(_client, api_kwargs, **_kwargs):
+        captured.update(api_kwargs)
+        return SimpleNamespace()
+
+    normalized = SimpleNamespace(
+        content="ok",
+        tool_calls=None,
+        reasoning=None,
+        finish_reason="stop",
+    )
+    call_kwargs = dict(top_level_kwargs or {})
+    if extra_body is not None:
+        call_kwargs["extra_body"] = extra_body
+    with patch(
+        "agent.anthropic_adapter.create_anthropic_message",
+        side_effect=_fake_create,
+    ), patch("agent.transports.get_transport") as mock_get_transport:
+        mock_get_transport.return_value.normalize_response.return_value = normalized
+        call = adapter.create(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            **call_kwargs,
+        )
+        if async_call:
+            asyncio.run(call)
+
+    return captured
+
+
+def _assert_no_raw_response_format(api_kwargs: dict) -> None:
+    assert "response_format" not in api_kwargs
+    assert "response_format" not in api_kwargs.get("extra_body", {})
+
+
+def test_json_schema_response_format_uses_native_output_config():
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+    }
+    api_kwargs = _capture_anthropic_kwargs({
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "thread_title",
+                "schema": schema,
+                "strict": False,
+            },
+        },
+    })
+
+    assert api_kwargs["output_config"]["format"] == {
+        "type": "json_schema",
+        "schema": schema,
+    }
+    _assert_no_raw_response_format(api_kwargs)
+
+
+def test_json_object_response_format_uses_permissive_object_schema():
+    api_kwargs = _capture_anthropic_kwargs({
+        "response_format": {"type": "json_object"},
+    })
+
+    assert api_kwargs["output_config"]["format"] == {
+        "type": "json_schema",
+        "schema": {"type": "object"},
+    }
+    _assert_no_raw_response_format(api_kwargs)
+
+
+def test_response_format_merges_with_adaptive_thinking_effort():
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    api_kwargs = _capture_anthropic_kwargs({
+        "reasoning": {"enabled": True, "effort": "high"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"schema": schema},
+        },
+    })
+
+    assert api_kwargs["output_config"] == {
+        "effort": "high",
+        "format": {"type": "json_schema", "schema": schema},
+    }
+    assert api_kwargs["thinking"] == {
+        "type": "adaptive",
+        "display": "summarized",
+    }
+    _assert_no_raw_response_format(api_kwargs)
+
+
+def test_unrelated_extra_body_keys_still_pass_through():
+    api_kwargs = _capture_anthropic_kwargs({
+        "response_format": {"type": "json_object"},
+        "metadata": {"user_id": "thread-autotitle"},
+        "vendor_option": True,
+    })
+
+    assert api_kwargs["extra_body"] == {
+        "metadata": {"user_id": "thread-autotitle"},
+        "vendor_option": True,
+    }
+    _assert_no_raw_response_format(api_kwargs)
+
+
+def test_async_anthropic_adapter_uses_the_same_translation():
+    schema = {"type": "object"}
+    api_kwargs = _capture_anthropic_kwargs(
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": schema},
+            },
+        },
+        async_call=True,
+    )
+
+    assert api_kwargs["output_config"]["format"] == {
+        "type": "json_schema",
+        "schema": schema,
+    }
+    _assert_no_raw_response_format(api_kwargs)
+
+
+def test_top_level_response_format_kwarg_is_translated_not_dropped():
+    """#85626 review, point 2: the top-level kwarg shape must also translate.
+
+    ``client.chat.completions.create(..., response_format=...)`` is the
+    OpenAI SDK's documented call shape. The adapter builds the Messages body
+    from a fixed allow-list of kwargs, so before this an unrecognized
+    top-level kwarg was dropped on the floor: the request succeeded, but the
+    schema contract silently became prompt compliance. Pin-test pattern from
+    PR #85626 (Matt McClean), adapted from strip to translate semantics.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+    }
+    api_kwargs = _capture_anthropic_kwargs(
+        None,
+        top_level_kwargs={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "session_title", "schema": schema},
+            },
+        },
+    )
+
+    assert api_kwargs["output_config"]["format"] == {
+        "type": "json_schema",
+        "schema": schema,
+    }
+    _assert_no_raw_response_format(api_kwargs)
+
+
+def test_extra_body_response_format_wins_over_top_level_kwarg():
+    """When both shapes are present, extra_body wins.
+
+    Every in-tree caller uses the extra_body shape. The top-level kwarg is
+    the compatibility path, so it must not override an explicit extra_body
+    value when a caller somehow sends both.
+    """
+    eb_schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+    top_schema = {"type": "object", "properties": {"b": {"type": "string"}}}
+    api_kwargs = _capture_anthropic_kwargs(
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": eb_schema},
+            },
+        },
+        top_level_kwargs={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": top_schema},
+            },
+        },
+    )
+
+    assert api_kwargs["output_config"]["format"] == {
+        "type": "json_schema",
+        "schema": eb_schema,
+    }
+    _assert_no_raw_response_format(api_kwargs)
+

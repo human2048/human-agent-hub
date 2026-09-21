@@ -1,0 +1,388 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_warning_callback_conservation.py ===
+"""Concrete CLI sinks own filtering; generic agent callbacks remain observable."""
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+from agent.status_output import StatusOutputMixin
+from hermes_cli.cli_stream_mixin import CLIStreamMixin
+
+
+class Agent(StatusOutputMixin):
+    suppress_status_output = True
+    platform = "cli"
+
+    def _touch_activity(self, *args):
+        pass
+
+
+class CLI(CLIStreamMixin):
+    _spinner_text = ""
+
+    def _invalidate(self):
+        pass
+
+
+@pytest.mark.parametrize("setting", [None, False, True])
+def test_cli_notice_and_wait_callbacks_keep_default_output(tmp_path, monkeypatch, setting):
+    import cli
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(
+        {} if setting is None else {"display": {"suppress_warning_notifications": setting}}))
+    printed = []
+    monkeypatch.setattr(cli, "_cprint", printed.append)
+    surface = CLI()
+    agent = Agent()
+    surface.agent = agent
+    agent.notice_callback = surface._on_notice
+    agent.thinking_callback = surface._on_thinking
+    agent._emit_notice(SimpleNamespace(level="warn", text="arbitrary warning wording"))
+    agent._emit_diagnostic_wait("arbitrary retry wording")
+    surface._flush_credit_notices()
+    assert bool(printed) is not (setting is True)
+    assert surface._spinner_text == ("" if setting is True else "arbitrary retry wording")
+    agent._emit_notice(SimpleNamespace(level="info", text="ordinary progress"))
+    agent._emit_wait_notice("⚠ requested progress")
+    surface._flush_credit_notices()
+    assert "ordinary progress" in printed[-1]
+    assert surface._spinner_text == "⚠ requested progress"
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_webhook_cli.py ===
+"""Tests for hermes_cli/webhook.py — webhook subscription CLI."""
+
+import json
+import os
+import pytest
+import stat
+from argparse import Namespace
+
+from hermes_cli.webhook import (
+    webhook_command,
+    _get_webhook_base_url,
+    _load_subscriptions,
+    _save_subscriptions,
+    _subscriptions_path,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Default: webhooks enabled (most tests need this)
+    monkeypatch.setattr(
+        "hermes_cli.webhook._is_webhook_enabled", lambda: True
+    )
+
+
+def _make_args(**kwargs):
+    defaults = {
+        "webhook_action": None,
+        "name": "",
+        "prompt": "",
+        "events": "",
+        "description": "",
+        "skills": "",
+        "deliver": "log",
+        "deliver_chat_id": "",
+        "secret": "",
+        "route_profile": None,
+        "payload": "",
+        "script": "",
+    }
+    defaults.update(kwargs)
+    return Namespace(**defaults)
+
+
+@pytest.mark.parametrize("host", [None, "", "0.0.0.0", "::"])
+def test_webhook_base_url_maps_wildcard_hosts_to_localhost(monkeypatch, host):
+    monkeypatch.setattr(
+        "hermes_cli.webhook._get_webhook_config",
+        lambda: {"extra": {"host": host, "port": 9123}},
+    )
+    assert _get_webhook_base_url() == "http://localhost:9123"
+
+
+class TestSubscribe:
+
+
+    def test_custom_secret(self):
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="s", secret="my-secret"
+        ))
+        assert _load_subscriptions()["s"]["secret"] == "my-secret"
+
+
+    def test_auto_secret(self):
+        webhook_command(_make_args(webhook_action="subscribe", name="s"))
+        secret = _load_subscriptions()["s"]["secret"]
+        assert len(secret) > 20
+
+    def test_profile_binding_and_secret_survive_update(self, tmp_path, capsys):
+        profile_dir = tmp_path / "profiles" / "compta"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("{}\n")  # identity marker
+
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="notifier", route_profile="compta"
+        ))
+        created = _load_subscriptions()["notifier"]
+        first_secret = created["secret"]
+        assert created["profile"] == "compta"
+        assert "/p/compta/webhooks/notifier" in capsys.readouterr().out
+
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="notifier", description="updated"
+        ))
+        updated = _load_subscriptions()["notifier"]
+        assert updated["profile"] == "compta"
+        assert updated["secret"] == first_secret
+
+    def test_rejects_unknown_profile_without_replacing_subscription(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="notifier", secret="original"
+        ))
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="notifier", route_profile="missing"
+        ))
+
+        assert "does not exist" in capsys.readouterr().out
+        assert _load_subscriptions()["notifier"]["secret"] == "original"
+
+
+class TestCronJobSubscribe:
+    """--cron-job: event-triggered cron jobs."""
+
+    def test_valid_job_ref_stored_as_id(self, monkeypatch):
+        # resolve_job_ref is imported inside _cmd_subscribe from cron.jobs
+        import cron.jobs as jobs_mod
+
+        monkeypatch.setattr(
+            jobs_mod, "resolve_job_ref",
+            lambda ref: {"id": "job-abc123", "name": ref},
+        )
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="ev", cron_job="sweeper"
+        ))
+        assert _load_subscriptions()["ev"]["cron_job"] == "job-abc123"
+
+    def test_unknown_job_rejected(self, monkeypatch, capsys):
+        import cron.jobs as jobs_mod
+
+        monkeypatch.setattr(jobs_mod, "resolve_job_ref", lambda ref: None)
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="ev", cron_job="nope"
+        ))
+        assert "no cron job matches" in capsys.readouterr().out
+        assert "ev" not in _load_subscriptions()
+
+    def test_cron_job_plus_deliver_only_rejected(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="ev",
+            cron_job="sweeper",
+            deliver_only=True,
+            deliver="telegram",
+        ))
+        assert "mutually exclusive" in capsys.readouterr().out
+        assert "ev" not in _load_subscriptions()
+
+
+class TestList:
+
+    def test_with_entries(self, capsys):
+        webhook_command(_make_args(webhook_action="subscribe", name="a"))
+        webhook_command(_make_args(webhook_action="subscribe", name="b"))
+        capsys.readouterr()  # clear
+        webhook_command(_make_args(webhook_action="list"))
+        out = capsys.readouterr().out
+        assert "2 webhook" in out
+        assert "a" in out
+        assert "b" in out
+
+
+class TestRemove:
+
+
+    def test_selective_remove(self):
+        webhook_command(_make_args(webhook_action="subscribe", name="keep"))
+        webhook_command(_make_args(webhook_action="subscribe", name="drop"))
+        webhook_command(_make_args(webhook_action="remove", name="drop"))
+        subs = _load_subscriptions()
+        assert "keep" in subs
+        assert "drop" not in subs
+
+
+class TestPersistence:
+
+    def test_corrupted_file(self):
+        path = _subscriptions_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("broken{{{")
+        assert _load_subscriptions() == {}
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
+    def test_save_creates_secret_file_owner_only_under_permissive_umask(self):
+        old_umask = os.umask(0o022)
+        try:
+            _save_subscriptions({"demo": {"secret": "TOPSECRET", "prompt": "x"}})
+        finally:
+            os.umask(old_umask)
+
+        path = _subscriptions_path()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert "TOPSECRET" in path.read_text(encoding="utf-8")
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
+    def test_save_narrows_existing_broad_secret_file_mode(self):
+        # Simulate a pre-existing 0o644 file from before this hardening landed.
+        path = _subscriptions_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"old": {"secret": "stale", "prompt": "x"}}))
+        path.chmod(0o644)
+
+        _save_subscriptions({"demo": {"secret": "FRESH", "prompt": "x"}})
+
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert "FRESH" in path.read_text(encoding="utf-8")
+
+
+class TestWebhookEnabledGate:
+
+    def test_blocks_list_when_disabled(self, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.webhook._is_webhook_enabled", lambda: False)
+        webhook_command(_make_args(webhook_action="list"))
+        out = capsys.readouterr().out
+        assert "not enabled" in out.lower()
+
+    def test_allows_when_enabled(self, capsys):
+        # _is_webhook_enabled already patched to True by autouse fixture
+        webhook_command(_make_args(webhook_action="subscribe", name="allowed"))
+        out = capsys.readouterr().out
+        assert "Created" in out
+        assert "allowed" in _load_subscriptions()
+
+    def test_real_check_disabled(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.webhook._get_webhook_config",
+            lambda: {},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.webhook._is_webhook_enabled",
+            lambda: bool({}.get("enabled")),
+        )
+        import hermes_cli.webhook as wh_mod
+        assert wh_mod._is_webhook_enabled() is False
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_analytics_corrupt_store.py ===
+"""A malformed state.db must not turn dashboard analytics polling into a traceback storm (#96591)."""
+import logging
+import sqlite3
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from hermes_cli.web_routers import _common, analytics
+from hermes_state import SessionDB
+
+
+def _malformed_state_db(home: Path) -> Path:
+    db_path = home / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("s1", source="cli", model="m")
+    db.close()
+    for side in ("-wal", "-shm"):
+        Path(str(db_path) + side).unlink(missing_ok=True)
+    with open(db_path, "r+b") as f:
+        f.seek(100)
+        f.write(b"\xff" * (4096 - 100))
+    with pytest.raises(sqlite3.DatabaseError):
+        sqlite3.connect(str(db_path)).execute("SELECT count(*) FROM sqlite_master")
+    return db_path
+
+
+def test_corrupt_store_polls_return_status_and_warn_once_per_interval(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_state
+    db_path = _malformed_state_db(tmp_path)
+    monkeypatch.setattr(hermes_state, "_default_db_path", lambda: db_path)
+    monkeypatch.setattr(_common, "_corrupt_store_warned_at", {})
+    app = FastAPI()
+    app.include_router(analytics.router)
+    client = TestClient(app)
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_cli.web_server"):
+        first = client.get("/api/analytics/usage?days=7")
+        second = client.get("/api/analytics/usage?days=7")
+        third = client.get("/api/analytics/models?days=7")
+    for resp in (first, second, third):
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["error"] == "state_db_corrupt"
+        assert "hermes doctor" in resp.json()["detail"]["message"]
+    # Only the dashboard's own warning counts: hermes_state logs an unrelated
+    # once-per-process SQLite-version advisory on some interpreters (CI's 3.50.4).
+    warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name.startswith("hermes_cli.web_server")
+    ]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert not any(r.exc_info for r in caplog.records), "no tracebacks for a known corrupt store"
+    assert db_path.exists() and db_path.stat().st_size > 0, "dashboard must never quarantine the file"
+
+    # The gate re-arms once the interval has elapsed (aged, not slept).
+    _common._corrupt_store_warned_at[str(db_path)] -= _common._CORRUPT_STORE_WARN_INTERVAL_S + 1
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.web_server"):
+        assert client.get("/api/analytics/usage?days=7").status_code == 503
+    assert sum(
+        r.levelno >= logging.WARNING and r.name.startswith("hermes_cli.web_server")
+        for r in caplog.records
+    ) == 1
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\hermes_cli\test_web_chat_ws_errors.py ===
+"""Copy contract for dashboard chat start failures (``/api/pty`` close 1011).
+
+The terminal pane used to show the raw exception (``Chat unavailable: [Errno 2]
+No such file or directory: 'node'``, ``Chat unavailable: 1``, or an empty
+``Chat unavailable:`` for a full registry). Each failure must now say what
+happened and what to do, with no errno or exception class in the lead.
+"""
+
+from fastapi import HTTPException
+
+from hermes_cli.pty_session import RegistryFull
+from hermes_cli.web_routers.chat_ws_errors import chat_start_failure_message
+
+
+def test_registry_full_names_the_fix_and_carries_a_message():
+    exc = RegistryFull()
+    assert str(exc)  # was empty before; the SPA printed "Chat unavailable:"
+    msg = chat_start_failure_message(exc)
+    assert "too many chat terminals" in msg
+    assert "Start new session" in msg
+
+
+def test_missing_node_points_at_installing_node_not_errno():
+    for exc in (FileNotFoundError(2, "No such file or directory", "node"), SystemExit(1)):
+        msg = chat_start_failure_message(exc)
+        assert "Node" in msg and "nodejs.org" in msg
+        assert "Errno" not in msg and "SystemExit" not in msg
+        assert not msg.endswith(": 1")
+
+
+def test_unknown_profile_keeps_detail_and_adds_next_step():
+    msg = chat_start_failure_message(HTTPException(status_code=404, detail="Profile 'nope' not found"))
+    assert msg.startswith("Chat could not start: Profile 'nope' not found.")
+    assert "profile" in msg.lower()
+

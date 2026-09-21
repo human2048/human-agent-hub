@@ -1,0 +1,299 @@
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_preflight_compression_gate.py ===
+"""Regression tests for issue #27405.
+
+The preflight compression gate must trigger when *either* the message
+count exceeds the protected ranges OR the cheap char-based token
+estimate already crosses the configured threshold. Pre-fix, only the
+message-count condition was checked, so a session with a small number
+of huge messages would silently skip compression and eventually hit a
+hard context-overflow error.
+"""
+
+from agent.turn_context import _should_run_preflight_estimate
+
+
+# Protected-range counts mirror the compressor defaults. THRESHOLD_TOKENS is an
+# arbitrary test threshold passed explicitly into the helper — it is NOT the
+# live runtime threshold (which is max(0.5*window, MINIMUM_CONTEXT_LENGTH) per
+# model); the helper takes the threshold as a parameter so the tests are
+# self-contained and independent of model metadata.
+PROTECT_FIRST_N = 3
+PROTECT_LAST_N = 20
+THRESHOLD_TOKENS = 64_000
+
+
+def _msg(content: str) -> dict:
+    return {"role": "user", "content": content}
+
+
+def test_few_messages_huge_content_triggers_gate():
+    """The bug from #27405: 8 messages with one massive content blob."""
+    # ~280K chars in one message ~= 70K tokens at 4 chars/token.
+    big = "x" * 280_000
+    messages = [_msg("hi")] * 7 + [_msg(big)]
+    assert len(messages) <= PROTECT_FIRST_N + PROTECT_LAST_N + 1  # would fail old gate
+    assert _should_run_preflight_estimate(
+        messages, PROTECT_FIRST_N, PROTECT_LAST_N, THRESHOLD_TOKENS
+    ) is True
+
+
+
+
+
+
+def test_content_above_threshold_triggers():
+    """A single message comfortably above the threshold trips branch (b)."""
+    # ~threshold*4 chars => ~threshold tokens; +1000 tokens of margin so the
+    # test doesn't depend on per-message dict-wrapping overhead in the
+    # shared estimator's (chars+3)//4 rounding.
+    messages = [_msg("x" * ((THRESHOLD_TOKENS + 1000) * 4))]
+    assert _should_run_preflight_estimate(
+        messages, PROTECT_FIRST_N, PROTECT_LAST_N, THRESHOLD_TOKENS
+    ) is True
+
+
+def test_content_below_threshold_does_not_trigger():
+    """A single message comfortably below the threshold (and few messages)
+    must not trigger — the estimator stays under and the count gate is not
+    tripped."""
+    messages = [_msg("x" * ((THRESHOLD_TOKENS - 1000) * 4))]
+    assert _should_run_preflight_estimate(
+        messages, PROTECT_FIRST_N, PROTECT_LAST_N, THRESHOLD_TOKENS
+    ) is False
+
+
+
+
+
+
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_preflight_compression_timeout_fail_closed.py ===
+"""Regression coverage for stalled preflight compression."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from agent.turn_context import (
+    PreflightCompressionTimedOut,
+    _fail_closed_after_preflight_timeout,
+)
+
+
+def test_preflight_timeout_blocks_unchanged_provider_payload():
+    """Unknown window (no compressor): the conservative #98424 default — never send blind."""
+    agent = SimpleNamespace(_last_compression_timed_out=True)
+
+    with pytest.raises(PreflightCompressionTimedOut, match="provider call was not sent"):
+        _fail_closed_after_preflight_timeout(agent, 190_035)
+
+
+def test_structural_noop_keeps_existing_preflight_behavior():
+    agent = SimpleNamespace(_last_compression_timed_out=False)
+
+    _fail_closed_after_preflight_timeout(agent, 190_035)
+
+
+def test_preflight_timeout_sends_a_request_that_fits_the_model_window():
+    """Over the compression threshold but under the window (#113646): the turn runs uncompressed, exactly
+    like the cooldown-blocked path sends it; above the window it still fails closed."""
+    fits = SimpleNamespace(
+        _last_compression_timed_out=True, context_compressor=SimpleNamespace(context_length=120_000),
+    )
+    _fail_closed_after_preflight_timeout(fits, 99_347)
+
+    over = SimpleNamespace(
+        _last_compression_timed_out=True, context_compressor=SimpleNamespace(context_length=1_000_000),
+    )
+    with pytest.raises(PreflightCompressionTimedOut):
+        _fail_closed_after_preflight_timeout(over, 1_313_423)
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_preflight_lock_defer.py ===
+"""Preflight lock-defer must not arm the insufficient-progress blocker.
+
+Companion to ``tests/agent/test_compression_lock_defer.py`` — pins the
+``build_turn_context`` preflight loop's handling of a lock-contended
+compression no-op (#69870 lock-skip signal, consumer salvaged from #49874):
+
+* the pass stops the preflight loop (the lock winner is already shrinking
+  the session) WITHOUT setting ``preflight_compression_blocked``, so the
+  loop's provider-proven error handlers keep their full retry budget;
+* a genuine no-progress no-op (flag unset) still arms the blocker exactly
+  as before;
+* a MagicMock-style truthy junk flag value does NOT take the defer branch
+  (type-pin rule).
+"""
+
+from __future__ import annotations
+
+import types
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from tests.agent.test_turn_context import _FakeAgent, _build
+
+
+@pytest.fixture(autouse=True)
+def _stub_runtime_main():
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+        yield
+
+
+def _pressured_compressor():
+    """Over-threshold compressor stub that opens the preflight threshold path."""
+    return types.SimpleNamespace(
+        protect_first_n=0,
+        protect_last_n=0,
+        threshold_tokens=1,
+        context_length=100_000,
+        last_prompt_tokens=0,
+        should_compress=lambda _tokens=None: True,
+        should_compress_info=lambda _tokens=None: (True, None),
+        should_defer_preflight_to_real_usage=lambda _t: False,
+        get_active_compression_failure_cooldown=lambda: None,
+    )
+
+
+def _make_agent():
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent.context_compressor = _pressured_compressor()
+    agent._emit_status = MagicMock()
+    return agent
+
+
+_HISTORY = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "older"}]
+
+
+def test_preflight_lock_skip_does_not_set_blocked_flag():
+    agent = _make_agent()
+    calls = []
+
+    def _lock_skip_compress(messages, _system_message, **_kwargs):
+        calls.append(1)
+        agent._compression_skipped_due_to_lock = "pid=1:tid=2:agent=aa:nonce=bb"
+        return messages, "SYSTEM"
+
+    agent._compress_context = _lock_skip_compress
+
+    ctx = _build(agent, conversation_history=list(_HISTORY))
+
+    # Exactly one pass: the defer stops the loop without arming the blocker.
+    assert calls == [1]
+    assert ctx.preflight_compression_blocked is False
+
+
+
+
+
+
+def test_preflight_magicmock_flag_value_is_not_a_defer():
+    """Type-pin: truthy junk (MagicMock auto-attribute shape) must not be
+    treated as lock contention — the blocker arms as for a plain no-op."""
+    agent = _make_agent()
+
+    def _junk_flag_compress(messages, _system_message, **_kwargs):
+        agent._compression_skipped_due_to_lock = MagicMock()
+        return messages, "SYSTEM"
+
+    agent._compress_context = _junk_flag_compress
+
+    ctx = _build(agent, conversation_history=list(_HISTORY))
+
+    assert ctx.preflight_compression_blocked is True
+
+
+
+=== ARCHIVO: .\hermes-agent\tests\agent\test_preflight_timeout_typed_result.py ===
+"""The turn-start preflight timeout surfaces as a typed result, not a traceback.
+
+Companion to the #98424 fail-closed boundary and the #98741/#99710 typed
+timeout chain: when ``build_turn_context`` raises
+``PreflightCompressionTimedOut``, ``run_conversation`` must convert it into
+the same typed recovery dict the in-loop timeout consumers return —
+``failed=True`` + ``compression_exhausted=True`` + the actionable message —
+because the gateway's generic exception handler deliberately hides raw
+exception text from users (it would deliver "Sorry, I encountered an
+unexpected error" and skip the clean-session recovery contract).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+
+def test_turn_start_preflight_timeout_returns_typed_result_not_exception():
+    from run_agent import AIAgent
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = True
+    agent.context_compressor.protect_first_n = 0
+    agent.context_compressor.protect_last_n = 0
+    agent.context_compressor.threshold_tokens = 1
+    # The typed result is the over-window outcome; a request that fits its window is sent uncompressed.
+    agent.context_compressor._resolved_context_length = 1
+    agent.context_compressor.should_compress = MagicMock(return_value=True)
+    agent.context_compressor.should_defer_preflight_to_real_usage = MagicMock(
+        return_value=False
+    )
+    agent.context_compressor.get_active_compression_failure_cooldown = MagicMock(
+        return_value=None
+    )
+
+    def _timed_out(messages, _system_message, **_kwargs):
+        from agent.conversation_compression import (
+            mark_context_compression_timed_out,
+            reset_context_compression_timeout_outcome,
+        )
+
+        reset_context_compression_timeout_outcome(agent)
+        mark_context_compression_timed_out(agent)
+        return messages, agent._cached_system_prompt
+
+    agent._compress_context = _timed_out
+
+    history = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old response"},
+    ]
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        # Must NOT raise PreflightCompressionTimedOut out of run_conversation.
+        result = agent.run_conversation("continue", conversation_history=history)
+
+    agent.client.chat.completions.create.assert_not_called()
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["compression_exhausted"] is True
+    assert result["turn_exit_reason"] == "context_compression_timeout"
+    # The actionable preflight guidance survives into both user-facing fields.
+    assert "provider call was not sent" in result["final_response"]
+    assert "provider call was not sent" in result["error"]
+

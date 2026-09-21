@@ -1,0 +1,332 @@
+
+
+=== ARCHIVO: .\hermes-agent\tools\connectors\mcp.py ===
+"""MCP targets of ``manage_connections``: the renderer runs install / enable / OAuth and answers
+through ``connection.respond``; nothing else observes an MCP flow today (PR3 moves OAuth
+observation server-side). Calls without an approval callback settle unavailable."""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Callable, Dict, List, Optional
+
+from tools.connectors.contract import Actor, SettleReason, TargetState
+from tools.connectors.gateway.config import operation_session_key, session_platform
+from tools.connectors.operation import ConnectionOperation, Target
+from tools.connectors.run import Kind, run_operation
+from tools.registry import tool_error
+
+logger = logging.getLogger(__name__)
+
+# The renderer's answer vocabulary → target state. A failed approval stays open; a decline resolves.
+_OUTCOME_STATES = {
+    "installed": TargetState.connected, "enabled": TargetState.connected, "authorized": TargetState.connected,
+    "connected": TargetState.connected,
+    "declined": TargetState.skipped, "skipped": TargetState.skipped,
+    "error": TargetState.failed, "failed": TargetState.failed,
+}
+
+UNAVAILABLE_HINT = "hermes mcp install {name} / hermes mcp login {name}"
+
+NOTE = (
+    "Settled once; do not re-ask for any target the user skipped or that timed out — continue "
+    "without it or ask in chat. Tools of a newly installed or authorized server become available "
+    "on your next turn."
+)
+
+
+def _catalog_names() -> List[str]:
+    from hermes_cli.mcp_catalog import list_catalog
+
+    return sorted(e.name for e in list_catalog())
+
+
+def _configured_names() -> List[str]:
+    from hermes_cli.mcp_catalog import installed_servers
+
+    return sorted(installed_servers())
+
+
+def validate_mcp_names(action: str, names: List[str]) -> Optional[str]:
+    try:
+        catalog = _catalog_names()
+        configured = _configured_names()
+    except Exception as exc:
+        return f"could not read the MCP catalog: {exc}"
+    allowed = set(catalog) if action == "install" else set(configured)
+    unknown = [n for n in names if n not in allowed]
+    if not unknown:
+        return None
+    if action == "install":
+        return (
+            f"unknown MCP server(s) for install: {', '.join(unknown)}. Install works for "
+            f"catalog entries only: {', '.join(catalog) or '(empty catalog)'}."
+            + (f" Already configured (use enable/authorize): {', '.join(configured)}." if configured else "")
+        )
+    return (
+        f"unknown MCP server(s) for {action}: {', '.join(unknown)}. {action} works for servers "
+        f"already in mcp_servers: {', '.join(configured) or '(none configured)'}."
+        + (f" Catalog entries you can install: {', '.join(catalog)}." if catalog else "")
+    )
+
+
+def apply_answer(operation: ConnectionOperation, raw: str) -> None:
+    """Fold the card's ``connection.respond`` payload into the operation. Settlement is derived
+    from target states afterwards, never from the card's own ``settled_by`` claim."""
+    try:
+        answer = json.loads(raw)
+    except (TypeError, ValueError):
+        answer = {}
+    if not isinstance(answer, dict):
+        answer = {}
+    for entry in answer.get("targets") or ():
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip().lower()
+        state = _OUTCOME_STATES.get(str(entry.get("state") or entry.get("status") or "").lower())
+        target = operation.target(name)
+        if target is None or state is None:
+            continue
+        actor = Actor.user if state == TargetState.skipped else Actor.renderer_flow
+        extra = {k: v for k, v in entry.items() if k in ("tools",)}
+        if target.state == TargetState.pending and state != TargetState.skipped:
+            operation.transition(name, TargetState.initiated, Actor.renderer_flow)
+        operation.transition(name, state, actor, detail=str(entry.get("detail") or ""), **extra)
+    if answer.get("settled_by") == SettleReason.continue_.value and not operation.all_resolved:
+        operation.settle(SettleReason.continue_)
+
+
+def _unavailable(operation: ConnectionOperation) -> str:
+    for target in operation.targets:
+        target.state = TargetState.unavailable
+        target.detail = "no approval surface in this session"
+        target.extra = {"hint": UNAVAILABLE_HINT.format(name=target.name)}
+    operation.settle(SettleReason.unavailable)
+    payload = operation.result()
+    payload["status"] = "unavailable"
+    payload["note"] = (
+        "This session has no approval card, so local MCP servers cannot be set up here. Tell "
+        "the user to run the terminal commands in each target's 'hint', then continue."
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def run_mcp_operation(
+    names: List[str],
+    action: str,
+    *,
+    connection_callback: Optional[Callable[[Dict[str, Any]], Optional[str]]],
+    session_id: Optional[str],
+    tool_call_id: Optional[str] = None,
+) -> str:
+    error = validate_mcp_names(action, names)
+    if error:
+        return tool_error(error)
+    targets = [Target(n, "mcp", action) for n in names]
+    session_key = operation_session_key(session_id)
+    # The surface decides, not the callback: every tui_gateway session has the callback attached,
+    # the Ink TUI included, and only the desktop renders the card.
+    if session_platform() != "desktop" or connection_callback is None:
+        return _unavailable(ConnectionOperation(targets, session_key=session_key))
+    def prepare(operation: ConnectionOperation) -> None:
+        pass
+
+    return run_operation(
+        targets, Kind(prepare=prepare, observe=lambda op: None, note=NOTE),
+        session_key=session_key, tool_call_id=tool_call_id, connection_callback=connection_callback,
+        with_urls_in_result=False,
+    )
+
+
+
+=== ARCHIVO: .\hermes-agent\tools\connectors\operation.py ===
+"""One backend-owned connection operation per ``manage_connections`` call. Pure data, no I/O."""
+
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable, ClassVar, Dict, List, Optional
+
+from tools.connectors.contract import RESOLVED_STATES, Actor, SettleReason, TargetState, allowed
+
+# Not a config key: a user-tunable wait with clamp rails was a foot-gun (PR1 shipped one, unmerged).
+OPERATION_DEADLINE_SECONDS = 300.0
+
+
+class IllegalTransition(ValueError):
+    pass
+
+
+@dataclass
+class Target:
+    name: str
+    kind: str
+    action: str
+    state: TargetState = TargetState.pending
+    detail: str = ""
+    connect_url: Optional[str] = None
+    # Opaque per-attempt handle when the gateway mints one (absent today; the status route adds it).
+    attempt: Optional[str] = None
+    # `reconnect force` on a connected account: the list reports the OLD account `active` until the user
+    # signs in again, so `connected` is not believed until the row has read as anything else once.
+    awaiting_new_attempt: bool = False
+    # Renderer-reported fields passed through to the model (``tools`` after MCP OAuth).
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def resolved(self) -> bool:
+        return self.state in RESOLVED_STATES
+
+    def snapshot(self, *, with_url: bool = True) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"name": self.name, "kind": self.kind, "action": self.action, "state": self.state.value}
+        if self.detail:
+            out["detail"] = self.detail
+        if with_url and self.connect_url:
+            out["connect_url"] = self.connect_url
+        if self.attempt:
+            out["attempt"] = self.attempt
+        out.update(self.extra)
+        return out
+
+
+@dataclass
+class ConnectionOperation:
+    # The gateway installs its ``connection.update`` emitter here once; pure data otherwise.
+    on_change: ClassVar[Optional[Callable[["ConnectionOperation", Optional[Dict[str, Any]]], None]]] = None
+
+    targets: List[Target]
+    session_key: str = ""
+    # The model's id for the call that opened the operation; the card binds to that tool row only.
+    tool_call_id: Optional[str] = None
+    op_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    created_at: float = field(default_factory=time.time)
+    deadline_at: float = 0.0
+    settled_at: Optional[float] = None
+    settled_by: Optional[SettleReason] = None
+    # Set on every transition and on settle; the waiting loop sleeps on it.
+    wake: threading.Event = field(default_factory=threading.Event, repr=False)
+    _settled_snapshot: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.deadline_at:
+            self.deadline_at = self.created_at + OPERATION_DEADLINE_SECONDS
+
+    def target(self, name: str) -> Optional[Target]:
+        return next((t for t in self.targets if t.name == name), None)
+
+    def transition(
+        self, name: str, to: TargetState, actor: Actor, *, detail: Optional[str] = None,
+        connect_url: Optional[str] = None, attempt: Optional[str] = None, **extra: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Move one target; the contract decides whether ``actor`` may. Returns the change, or None
+        when the target is already in ``to``. Allowed after settlement: the frozen result stays."""
+        target = self.target(name)
+        if target is None:
+            raise IllegalTransition(f"unknown target {name!r}")
+        with self._lock:
+            if target.state == to:
+                return None
+            if allowed(target.kind, target.state, to) != actor:
+                raise IllegalTransition(f"{target.kind} {name}: {target.state.value} -> {to.value} by {actor.value}")
+            change = {"target": name, "from": target.state.value, "to": to.value, "actor": actor.value}
+            target.state = to
+            if detail is not None:
+                target.detail = detail
+            change["detail"] = target.detail
+            if connect_url is not None:
+                target.connect_url = connect_url
+            if attempt is not None:
+                target.attempt = attempt
+            if extra:
+                target.extra = dict(extra)
+        self.wake.set()
+        self._changed(change)
+        return change
+
+    def refresh(self, name: str, *, connect_url: Optional[str], detail: str) -> None:
+        """Replace a target's link and detail without a state change (a repeated failure)."""
+        target = self.target(name)
+        if target is None:
+            raise IllegalTransition(f"unknown target {name!r}")
+        with self._lock:
+            target.connect_url = connect_url
+            target.detail = detail
+            change = {"target": name, "from": target.state.value, "to": target.state.value, "actor": Actor.user.value,
+                      "detail": detail}
+        self.wake.set()
+        self._changed(change)
+
+    def _changed(self, change: Optional[Dict[str, Any]]) -> None:
+        hook = type(self).on_change
+        if hook is not None:
+            hook(self, change)
+
+    @property
+    def all_resolved(self) -> bool:
+        return bool(self.targets) and all(t.resolved for t in self.targets)
+
+    @property
+    def settled(self) -> bool:
+        return self.settled_at is not None
+
+    def remaining_seconds(self, now: Optional[float] = None) -> float:
+        return max(0.0, self.deadline_at - (time.time() if now is None else now))
+
+    def settle(self, by: SettleReason, now: Optional[float] = None) -> bool:
+        """Compare-and-set: the first caller freezes the result."""
+        with self._lock:
+            if self.settled_at is not None:
+                return False
+            self.settled_at = time.time() if now is None else now
+            self.settled_by = by
+            for target in self.targets:
+                if not target.resolved:
+                    target.state = TargetState.not_connected
+            self._settled_snapshot = self._snapshot_locked()
+        self.wake.set()
+        self._changed(None)
+        return True
+
+    def settle_if_all_resolved(self) -> bool:
+        return self.all_resolved and self.settle(SettleReason.all_resolved)
+
+    def _snapshot_locked(self, *, with_urls: bool = True) -> Dict[str, Any]:
+        return {
+            "op_id": self.op_id,
+            "deadline_at": self.deadline_at,
+            "settled_at": self.settled_at,
+            "settled_by": self.settled_by.value if self.settled_by else None,
+            "targets": [t.snapshot(with_url=with_urls) for t in self.targets],
+        }
+
+    def result(self, *, with_urls: bool = True) -> Dict[str, Any]:
+        """The settled result (frozen at settle time), or the live snapshot before settlement."""
+        with self._lock:
+            if self._settled_snapshot is not None:
+                targets = [dict(t) for t in self._settled_snapshot["targets"]]
+                if not with_urls:
+                    for t in targets:
+                        t.pop("connect_url", None)
+                return dict(self._settled_snapshot, targets=targets)
+            return self._snapshot_locked(with_urls=with_urls)
+
+    def request_payload(self) -> Dict[str, Any]:
+        """The ``connection.request`` payload and the resume snapshot: identity, live target snapshots
+        (links included, the panel owns them), server-owned deadline."""
+        with self._lock:
+            targets = [t.snapshot() for t in self.targets]
+        payload: Dict[str, Any] = {
+            "op_id": self.op_id,
+            "deadline_at": self.deadline_at,
+            "timeout_seconds": OPERATION_DEADLINE_SECONDS,
+            "targets": targets,
+        }
+        if self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
+        return payload
+
